@@ -1,0 +1,9 @@
+name: Check
+on: [push, pull_request, merge_group]
+permissions:
+  contents: read
+jobs:
+  check:
+    uses: project-silica/.github/.github/workflows/pre-merge.yml@main
+    with:
+      repo: system
