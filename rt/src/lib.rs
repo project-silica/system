@@ -164,10 +164,16 @@ pub struct ProcessInfo {
 static CLOCK: [AtomicU64; 3] = [const { AtomicU64::new(1) }; 3];
 static DEBUG: AtomicU64 = AtomicU64::new(0);
 
-/// Tell the runtime where the debug console is and how to read the clock.
-/// Called by [`main!`] for an ordinary program; the root task, which has no
-/// [`ProcessInfo`], calls it itself.
-pub fn init(debug: Cap, clock: [u64; 3]) {
+/// Start the runtime in the root task, which has no [`ProcessInfo`]: where
+/// the debug console is, how to read the clock, where the thread's IPC
+/// buffer is mapped, and which slots of its CapSpace are free
+/// (`first_free..slots`). `silica_proc::root` calls this.
+pub fn start_root(debug: Cap, clock: [u64; 3], ipc_buffer: u64, first_free: u64, slots: u64) {
+    init(debug, clock);
+    ipc::init(ipc_buffer, first_free, slots);
+}
+
+fn init(debug: Cap, clock: [u64; 3]) {
     DEBUG.store(debug.0, Ordering::Relaxed);
     for (c, v) in CLOCK.iter().zip(clock) {
         c.store(v, Ordering::Relaxed);

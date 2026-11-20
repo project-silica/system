@@ -14,7 +14,10 @@
 
 use libsys::{self as sys, Cap, Error, ObjectType, Rights};
 use silica_formats::elf::{EM_X86_64, Elf, ElfError, PF_W, PF_X};
+use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::{PROCESS_MAGIC, ProcessInfo, slots};
+
+pub mod root;
 
 /// Where a child finds its start-up record.
 pub const INFO_VADDR: usize = 0x7F00_0000_0000;
@@ -36,15 +39,14 @@ const FIRST_IMAGE_SLOT: u64 = 64;
 pub const MAX_GRANTS: usize = (FIRST_IMAGE_SLOT - slots::FIRST_GRANT) as usize;
 
 /// What the parent spawns with: its own capabilities and working space.
-pub struct Parent<'a> {
+#[derive(Clone, Copy, Debug)]
+pub struct Parent {
     /// The parent's CapSpace.
     pub space: Cap,
     /// The parent's address space.
     pub aspace: Cap,
     /// The Untyped children are carved from.
     pub untyped: Cap,
-    /// Gives a free slot of the parent's CapSpace each time it is called.
-    pub free_slot: &'a mut dyn FnMut() -> u64,
     /// A page-aligned address in the parent's address space with 1 MiB of
     /// nothing mapped after it: where the child's memory is filled in.
     pub scratch: usize,
@@ -84,6 +86,25 @@ pub struct Child {
     pub aspace: Cap,
 }
 
+impl Parent {
+    /// The parent an ordinary program is: it spawns from its own Untyped,
+    /// into its own CapSpace, and its children report their exit on `exit`
+    /// (an endpoint of the program's) and print where it prints. `scratch`
+    /// is as in [`Parent::scratch`].
+    pub fn of(info: &ProcessInfo, exit: Cap, scratch: usize) -> Parent {
+        Parent {
+            space: slots::SPACE,
+            aspace: slots::ASPACE,
+            untyped: slots::UNTYPED,
+            scratch,
+            exit,
+            debug: slots::DEBUG,
+            cpus: info.cpus,
+            clock: info.clock,
+        }
+    }
+}
+
 impl Child {
     /// End the child and take back all of its memory.
     pub fn destroy(self) -> Result<(), Error> {
@@ -92,8 +113,13 @@ impl Child {
         #[allow(unsafe_code)]
         unsafe {
             sys::cap_revoke(self.untyped)?;
-            sys::cap_delete(self.untyped)
+            sys::cap_delete(self.untyped)?;
         }
+        // The revocation emptied the other three slots.
+        for cap in [self.untyped, self.thread, self.space, self.aspace] {
+            release_slot(cap.0);
+        }
+        Ok(())
     }
 }
 
@@ -107,6 +133,8 @@ pub enum SpawnError {
     Segment,
     /// More than [`MAX_GRANTS`] capabilities, or an image in too many pieces.
     TooMany,
+    /// The parent's CapSpace has no free slot left.
+    NoSlot,
     /// A kernel operation failed: most often `NoMemory` (the budget is too
     /// small for the image) or `BadCap` (a grant names no capability).
     Kernel(Error),
@@ -120,27 +148,57 @@ impl From<Error> for SpawnError {
 
 /// Start the program in `image` with `2^mem_bits` bytes of memory in all.
 /// `id` badges the child's capability to the parent's exit endpoint.
-pub fn spawn(p: &mut Parent<'_>, image: &[u8], mem_bits: u8, id: u64, grants: &[Grant], args: [u64; 8]) -> Result<Child, SpawnError> {
-    let untyped = Cap((p.free_slot)());
-    sys::retype(p.untyped, ObjectType::Untyped, mem_bits, p.space, untyped.0, 1)?;
-    let child = Child { untyped, thread: Cap((p.free_slot)()), space: Cap((p.free_slot)()), aspace: Cap((p.free_slot)()) };
-    match build(p, &child, image, mem_bits, id, grants, args) {
+pub fn spawn(p: &Parent, image: &[u8], mem_bits: u8, id: u64, grants: &[Grant], args: [u64; 8]) -> Result<Child, SpawnError> {
+    // Four slots for the child and two to work with.
+    let mut got = [0u64; 6];
+    for i in 0..got.len() {
+        let Some(s) = free_slot() else {
+            got[..i].iter().for_each(|s| release_slot(*s));
+            return Err(SpawnError::NoSlot);
+        };
+        got[i] = s;
+    }
+    let child = Child { untyped: Cap(got[0]), thread: Cap(got[1]), space: Cap(got[2]), aspace: Cap(got[3]) };
+    let work = [Cap(got[4]), Cap(got[5])];
+    let made = sys::retype(p.untyped, ObjectType::Untyped, mem_bits, p.space, child.untyped.0, 1)
+        .map_err(SpawnError::from)
+        .and_then(|()| build(p, &child, work, image, mem_bits, id, grants, args));
+    let result = match made {
         Ok(()) => Ok(child),
         Err(e) => {
-            // Nothing half-made stays behind.
-            let _ = child.destroy();
+            // Nothing half-made stays behind: revoking the child's Untyped
+            // empties every slot used on the way, the working ones included.
+            // SAFETY: as in `Child::destroy`.
+            #[allow(unsafe_code)]
+            unsafe {
+                let _ = sys::cap_revoke(child.untyped);
+                let _ = sys::cap_delete(child.untyped);
+            }
+            got[..4].iter().for_each(|s| release_slot(*s));
             Err(e)
         }
-    }
+    };
+    // On success both working slots are empty: their capabilities moved to the child.
+    work.iter().for_each(|c| release_slot(c.0));
+    result
 }
 
-fn build(p: &mut Parent<'_>, c: &Child, image: &[u8], mem_bits: u8, id: u64, grants: &[Grant], args: [u64; 8]) -> Result<(), SpawnError> {
+#[allow(clippy::too_many_arguments)]
+fn build(
+    p: &Parent,
+    c: &Child,
+    [tmp, own]: [Cap; 2],
+    image: &[u8],
+    mem_bits: u8,
+    id: u64,
+    grants: &[Grant],
+    args: [u64; 8],
+) -> Result<(), SpawnError> {
     let elf = Elf::parse(image, EM_X86_64).map_err(SpawnError::Image)?;
     if grants.len() > MAX_GRANTS {
         return Err(SpawnError::TooMany);
     }
     let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
-    let (tmp, own) = (Cap((p.free_slot)()), Cap((p.free_slot)()));
     // The child's own allocatable memory comes first: half the budget.
     sys::retype(c.untyped, ObjectType::Untyped, mem_bits - 1, p.space, own.0, 1)?;
     sys::retype(c.untyped, ObjectType::CapSpace, SPACE_BITS, p.space, c.space.0, 1)?;
