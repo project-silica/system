@@ -15,7 +15,7 @@
 //!
 //! A program declares its entry with [`main!`]:
 //!
-//! ```ignore
+//! ```text
 //! #![no_std]
 //! #![no_main]
 //! silica_rt::main!(main);
