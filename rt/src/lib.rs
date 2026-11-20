@@ -100,6 +100,7 @@
 #![deny(unsafe_code)]
 
 pub mod ipc;
+pub mod mem;
 
 pub use libsys as sys;
 
@@ -167,7 +168,8 @@ static DEBUG: AtomicU64 = AtomicU64::new(0);
 /// Start the runtime in the root task, which has no [`ProcessInfo`]: where
 /// the debug console is, how to read the clock, where the thread's IPC
 /// buffer is mapped, and which slots of its CapSpace are free
-/// (`first_free..slots`). `silica_proc::root` calls this.
+/// (`first_free..slots`). `silica_proc::root` calls this, and then tells
+/// [`mem`] which Untyped capabilities are the machine's memory.
 pub fn start_root(debug: Cap, clock: [u64; 3], ipc_buffer: u64, first_free: u64, slots: u64) {
     init(debug, clock);
     ipc::init(ipc_buffer, first_free, slots);
@@ -237,6 +239,7 @@ pub fn start(info: &'static ProcessInfo, main: fn(&'static ProcessInfo) -> i64) 
     }
     init(slots::DEBUG, info.clock);
     ipc::init(info.ipc_buffer, info.first_free_slot, info.capspace_slots);
+    mem::add_source(slots::UNTYPED, info.untyped_bits as u8);
     exit(main(info))
 }
 

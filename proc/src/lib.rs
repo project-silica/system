@@ -15,6 +15,7 @@
 use libsys::{self as sys, Cap, Error, ObjectType, Rights};
 use silica_formats::elf::{EM_X86_64, Elf, ElfError, PF_W, PF_X};
 use silica_rt::ipc::{free_slot, release_slot};
+use silica_rt::mem;
 use silica_rt::{PROCESS_MAGIC, ProcessInfo, slots};
 
 pub mod root;
@@ -45,8 +46,6 @@ pub struct Parent {
     pub space: Cap,
     /// The parent's address space.
     pub aspace: Cap,
-    /// The Untyped children are carved from.
-    pub untyped: Cap,
     /// A page-aligned address in the parent's address space with 1 MiB of
     /// nothing mapped after it: where the child's memory is filled in.
     pub scratch: usize,
@@ -76,8 +75,11 @@ pub struct Grant {
 /// A running child, as its parent holds it.
 #[derive(Clone, Copy, Debug)]
 pub struct Child {
-    /// The Untyped everything of the child was made from.
+    /// The Untyped everything of the child was made from: a block of the
+    /// parent's memory (`silica_rt::mem`) of `2^mem_bits` bytes.
     pub untyped: Cap,
+    /// See `untyped`.
+    pub mem_bits: u8,
     /// The child's first thread.
     pub thread: Cap,
     /// The child's CapSpace.
@@ -92,31 +94,32 @@ impl Parent {
     /// (an endpoint of the program's) and print where it prints. `scratch`
     /// is as in [`Parent::scratch`].
     pub fn of(info: &ProcessInfo, exit: Cap, scratch: usize) -> Parent {
-        Parent {
-            space: slots::SPACE,
-            aspace: slots::ASPACE,
-            untyped: slots::UNTYPED,
-            scratch,
-            exit,
-            debug: slots::DEBUG,
-            cpus: info.cpus,
-            clock: info.clock,
-        }
+        Parent { space: slots::SPACE, aspace: slots::ASPACE, scratch, exit, debug: slots::DEBUG, cpus: info.cpus, clock: info.clock }
     }
 }
 
 impl Child {
+    /// Move the child's first thread to processor `cpu` and let it run on
+    /// from where it was.
+    pub fn place(&self, cpu: usize) -> Result<(), Error> {
+        // The kernel stops a thread to move it and leaves it stopped.
+        sys::thread_set_cpu(self.thread, cpu)?;
+        sys::thread_resume(self.thread)
+    }
+
     /// End the child and take back all of its memory.
     pub fn destroy(self) -> Result<(), Error> {
         // SAFETY: everything derived from this Untyped is the child's; the
         // parent uses none of it.
         #[allow(unsafe_code)]
         unsafe {
+            // Checked here so that a failure is reported; returning the
+            // block revokes again, which is then nothing to do.
             sys::cap_revoke(self.untyped)?;
-            sys::cap_delete(self.untyped)?;
+            mem::free(self.untyped, self.mem_bits);
         }
         // The revocation emptied the other three slots.
-        for cap in [self.untyped, self.thread, self.space, self.aspace] {
+        for cap in [self.thread, self.space, self.aspace] {
             release_slot(cap.0);
         }
         Ok(())
@@ -149,8 +152,8 @@ impl From<Error> for SpawnError {
 /// Start the program in `image` with `2^mem_bits` bytes of memory in all.
 /// `id` badges the child's capability to the parent's exit endpoint.
 pub fn spawn(p: &Parent, image: &[u8], mem_bits: u8, id: u64, grants: &[Grant], args: [u64; 8]) -> Result<Child, SpawnError> {
-    // Four slots for the child and two to work with.
-    let mut got = [0u64; 6];
+    // Three slots for the child's objects and two to work with.
+    let mut got = [0u64; 5];
     for i in 0..got.len() {
         let Some(s) = free_slot() else {
             got[..i].iter().for_each(|s| release_slot(*s));
@@ -158,28 +161,31 @@ pub fn spawn(p: &Parent, image: &[u8], mem_bits: u8, id: u64, grants: &[Grant], 
         };
         got[i] = s;
     }
-    let child = Child { untyped: Cap(got[0]), thread: Cap(got[1]), space: Cap(got[2]), aspace: Cap(got[3]) };
-    let work = [Cap(got[4]), Cap(got[5])];
-    let made = sys::retype(p.untyped, ObjectType::Untyped, mem_bits, p.space, child.untyped.0, 1)
-        .map_err(SpawnError::from)
-        .and_then(|()| build(p, &child, work, image, mem_bits, id, grants, args));
-    let result = match made {
+    let give_back = |slots: &[u64]| slots.iter().for_each(|s| release_slot(*s));
+    let untyped = match mem::alloc(mem_bits) {
+        Ok(u) => u,
+        Err(e) => {
+            give_back(&got);
+            return Err(e.into());
+        }
+    };
+    let child = Child { untyped, mem_bits, thread: Cap(got[0]), space: Cap(got[1]), aspace: Cap(got[2]) };
+    let result = match build(p, &child, [Cap(got[3]), Cap(got[4])], image, mem_bits, id, grants, args) {
         Ok(()) => Ok(child),
         Err(e) => {
-            // Nothing half-made stays behind: revoking the child's Untyped
-            // empties every slot used on the way, the working ones included.
-            // SAFETY: as in `Child::destroy`.
+            // Nothing half-made stays behind: returning the block revokes
+            // it, which empties every slot used on the way.
+            // SAFETY: everything made from the block was the child's.
             #[allow(unsafe_code)]
             unsafe {
-                let _ = sys::cap_revoke(child.untyped);
-                let _ = sys::cap_delete(child.untyped);
-            }
-            got[..4].iter().for_each(|s| release_slot(*s));
+                mem::free(untyped, mem_bits)
+            };
+            give_back(&got[..3]);
             Err(e)
         }
     };
     // On success both working slots are empty: their capabilities moved to the child.
-    work.iter().for_each(|c| release_slot(c.0));
+    give_back(&got[3..]);
     result
 }
 

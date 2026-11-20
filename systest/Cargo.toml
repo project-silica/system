@@ -1,0 +1,22 @@
+[package]
+name = "systest"
+description = "A root task that runs the tests of what programs can do to each other: IPC under load and revocation, memory exhaustion."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "systest"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-proc = { workspace = true }
+silica-formats = { workspace = true }
+libsys = { workspace = true }
+
+[lints]
+workspace = true

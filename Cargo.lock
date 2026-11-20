@@ -78,6 +78,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "stress"
+version = "0.0.0"
+dependencies = [
+ "silica-rt",
+]
+
+[[package]]
+name = "systest"
+version = "0.0.0"
+dependencies = [
+ "libsys",
+ "silica-formats",
+ "silica-proc",
+ "silica-rt",
+]
+
+[[package]]
 name = "trial-client"
 version = "0.0.0"
 dependencies = [

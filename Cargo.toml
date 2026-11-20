@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["rt", "proc", "init", "hello", "echo-server", "echo-client", "trial-server", "trial-client"]
+members = ["rt", "proc", "init", "hello", "echo-server", "echo-client", "trial-server", "trial-client", "stress", "systest"]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
 default-members = ["rt", "proc"]
 

@@ -13,11 +13,11 @@
 #![no_main]
 
 use libsys::root::RootInfo;
-use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
+use libsys::{self as sys, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, finish};
 use silica_proc::{Grant, spawn};
-use silica_rt::ipc::{free_slot, release_slot};
+use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, println};
 
 macro_rules! fail {
@@ -67,10 +67,8 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         let (Some(server_image), Some(client_image)) = (ramdisk::find(archive, server_name), ramdisk::find(archive, client_name)) else {
             fail!("the ramdisk lacks {server_name} or {client_name}")
         };
-        let Some(endpoint) = free_slot().map(Cap) else { fail!("the root CapSpace is full") };
-        if sys::retype(parent.untyped, ObjectType::Endpoint, 0, parent.space, endpoint.0, 1).is_err() {
-            fail!("cannot create an endpoint for the echo programs");
-        }
+        let Ok(endpoint_object) = Object::new(ObjectType::Endpoint, 0) else { fail!("cannot create an endpoint for the echo programs") };
+        let endpoint = endpoint_object.cap();
         let receive = Grant { cap: endpoint, rights: Rights::READ, badge: 0 };
         let send = Grant { cap: endpoint, rights: Rights(Rights::WRITE.0 | Rights::GRANT.0), badge: 7 };
         let server = spawn(parent, server_image, 22, id, &[receive], [0; 8]);
@@ -82,13 +80,14 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         if m.badge != id + 1 || m.words[0] != 0 {
             fail!("program {} of the pair {server_name}, {client_name} exited with status {}", m.badge, m.words[0] as i64);
         }
-        // SAFETY: the endpoint was made for this pair, which is about to go.
-        #[allow(unsafe_code)]
-        let gone = client.destroy().is_ok() && server.destroy().is_ok() && unsafe { sys::cap_delete(endpoint) }.is_ok();
-        if !gone {
+        if client.destroy().is_err() || server.destroy().is_err() {
             fail!("cannot take back the echo programs' memory");
         }
-        release_slot(endpoint.0);
+        // SAFETY: the endpoint was made for this pair, which is gone.
+        #[allow(unsafe_code)]
+        unsafe {
+            endpoint_object.destroy()
+        };
         println!("init: {client_name} and {server_name} talked over sample.Echo; both are gone and their memory is back");
     }
     println!("BOOT OK");
