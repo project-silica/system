@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["rt", "proc", "init", "hello"]
+members = ["rt", "proc", "init", "hello", "echo-server", "echo-client"]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
 default-members = ["rt", "proc"]
 
@@ -17,11 +17,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("silica"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 
-# The kernel's interface crates come from the kernel checkout beside this
-# one: the workshop layout is the build layout (spec/REPOSITORIES.md).
+# The kernel's interface crates and the IDL runtime and compiler come from
+# the checkouts beside this one: the workshop layout is the build layout (spec/REPOSITORIES.md).
 [workspace.dependencies]
 libsys = { path = "../kernel/libsys" }
 silica-formats = { path = "../kernel/formats" }
+silica-idl-rt = { path = "../idl/rt" }
+silica-idlc = { path = "../idl/idlc" }
 silica-rt = { path = "rt" }
 silica-proc = { path = "proc" }
 

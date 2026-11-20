@@ -27,6 +27,8 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+pub mod ipc;
+
 pub use libsys as sys;
 
 use core::fmt;
@@ -156,6 +158,7 @@ pub fn start(info: &'static ProcessInfo, main: fn(&'static ProcessInfo) -> i64) 
         exit(-1);
     }
     init(slots::DEBUG, info.clock);
+    ipc::init(info.ipc_buffer, info.first_free_slot, info.capspace_slots);
     exit(main(info))
 }
 

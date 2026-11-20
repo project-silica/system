@@ -3,6 +3,24 @@
 version = 4
 
 [[package]]
+name = "echo-client"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-idlc",
+ "silica-rt",
+]
+
+[[package]]
+name = "echo-server"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-idlc",
+ "silica-rt",
+]
+
+[[package]]
 name = "hello"
 version = "0.0.0"
 dependencies = [
@@ -35,6 +53,14 @@ name = "silica-formats"
 version = "0.0.0"
 
 [[package]]
+name = "silica-idl-rt"
+version = "0.0.0"
+
+[[package]]
+name = "silica-idlc"
+version = "0.0.0"
+
+[[package]]
 name = "silica-proc"
 version = "0.0.0"
 dependencies = [
@@ -48,4 +74,5 @@ name = "silica-rt"
 version = "0.0.0"
 dependencies = [
  "libsys",
+ "silica-idl-rt",
 ]

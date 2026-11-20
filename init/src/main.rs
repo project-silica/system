@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use libsys::root::{KIND_RAM, KIND_RAMDISK, RootInfo, SLOT_ASPACE, SLOT_CAPSPACE, SLOT_FIRST_UNTYPED, SLOT_PORTS};
 use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
-use silica_proc::{Parent, spawn};
+use silica_proc::{Grant, Parent, spawn};
 use silica_rt::{EXIT_LABEL, println};
 
 const SPACE: Cap = Cap(SLOT_CAPSPACE);
@@ -125,6 +125,32 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         }
         println!("init: hello (id {}) exited with status {}; its memory is back", m.badge, m.words[0]);
     }
+    // Two programs that talk: a provider of the sample.Echo protocol and a
+    // client of it, connected by one endpoint. The provider may only
+    // receive on it; the client may only send (and pass capabilities).
+    let (Some(server_image), Some(client_image)) = (ramdisk::find(archive, "echo-server"), ramdisk::find(archive, "echo-client")) else {
+        fail("the ramdisk lacks echo-server or echo-client")
+    };
+    let endpoint = Cap((parent.free_slot)());
+    if sys::retype(parent.untyped, ObjectType::Endpoint, 0, SPACE, endpoint.0, 1).is_err() {
+        fail("cannot create the echo endpoint");
+    }
+    let receive = Grant { cap: endpoint, rights: Rights::READ, badge: 0 };
+    let send = Grant { cap: endpoint, rights: Rights(Rights::WRITE.0 | Rights::GRANT.0), badge: 7 };
+    let server = spawn(&mut parent, server_image, 22, 200, &[receive], [0; 8]);
+    let client = spawn(&mut parent, client_image, 22, 201, &[send], [0; 8]);
+    let (Ok(server), Ok(client)) = (server, client) else { fail("cannot start the echo programs") };
+    let Ok(m) = sys::recv(exit, Wait::Until(silica_rt::clock().now() + 10_000_000_000)) else {
+        fail("the echo client did not finish within 10 s")
+    };
+    if m.badge != 201 || m.words[0] != 0 {
+        println!("ERROR: init: the echo client (id {}) exited with status {}", m.badge, m.words[0] as i64);
+        finish(false);
+    }
+    if client.destroy().is_err() || server.destroy().is_err() {
+        fail("cannot take back the echo programs' memory");
+    }
+    println!("init: echo client and server talked over sample.Echo; both are gone and their memory is back");
     println!("BOOT OK");
     finish(true)
 }
