@@ -1,0 +1,15 @@
+[package]
+name = "silica-proc"
+description = "Starting a program: from an ELF image and a memory budget to a running thread holding exactly what it was granted."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libsys = { workspace = true }
+silica-formats = { workspace = true }
+silica-rt = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "init"
+description = "The root task: takes what the kernel hands over and starts the system from the ramdisk."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libsys = { workspace = true }
+silica-formats = { workspace = true }
+silica-rt = { workspace = true }
+silica-proc = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,184 @@
+//! The native runtime: what every Silica program starts with.
+//!
+//! A program is started by its parent (`silica-proc`) with one thread, its
+//! own address space and its own CapSpace. The kernel knows nothing of
+//! programs; this crate is the convention between a parent and its child:
+//!
+//! - the child's first argument is the address of a read-only
+//!   [`ProcessInfo`];
+//! - its CapSpace starts with the capabilities named in [`slots`], then the
+//!   capabilities its parent granted, in the order the parent listed them,
+//!   from [`slots::FIRST_GRANT`];
+//! - when it is finished it tells its parent through [`slots::PARENT`] and
+//!   stops ([`exit`]). The parent reclaims everything by revoking the
+//!   Untyped the child was made from.
+//!
+//! A program declares its entry with [`main!`]:
+//!
+//! ```ignore
+//! #![no_std]
+//! #![no_main]
+//! silica_rt::main!(main);
+//! fn main(info: &silica_rt::ProcessInfo) -> i64 {
+//!     silica_rt::println!("hello");
+//!     0
+//! }
+//! ```
+#![no_std]
+#![deny(unsafe_code)]
+
+pub use libsys as sys;
+
+use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
+use sys::{Cap, Clock, MsgInfo};
+
+/// The capabilities every program starts with, by slot.
+pub mod slots {
+    use libsys::Cap;
+
+    /// The program's own (first) thread.
+    pub const THREAD: Cap = Cap(1);
+    /// The program's CapSpace.
+    pub const SPACE: Cap = Cap(2);
+    /// The program's address space.
+    pub const ASPACE: Cap = Cap(3);
+    /// The Untyped the program may make objects and memory from.
+    pub const UNTYPED: Cap = Cap(4);
+    /// The frame of the first thread's IPC buffer.
+    pub const IPC_BUFFER: Cap = Cap(5);
+    /// An endpoint of the parent's, to send on: how the program reports
+    /// that it has finished (and, later, asks for more).
+    pub const PARENT: Cap = Cap(6);
+    /// The debug console (a serial port's I/O ports), when the parent
+    /// grants one; otherwise empty and [`crate::print!`] discards.
+    pub const DEBUG: Cap = Cap(7);
+    /// The first capability the parent granted beyond these.
+    pub const FIRST_GRANT: u64 = 8;
+}
+
+/// `ProcessInfo::magic`.
+pub const PROCESS_MAGIC: u64 = 0x4F46_4E49_434F_5250; // "PROCINFO"
+
+/// Label of the message a program sends its parent when it finishes; word 0
+/// is its exit status.
+pub const EXIT_LABEL: u64 = 1;
+
+/// What a program is told when it starts. Read-only, mapped by the parent.
+#[repr(C)]
+pub struct ProcessInfo {
+    /// [`PROCESS_MAGIC`].
+    pub magic: u64,
+    /// Address of the first thread's IPC buffer.
+    pub ipc_buffer: u64,
+    /// Number of slots in the CapSpace.
+    pub capspace_slots: u64,
+    /// The first slot nothing was put in.
+    pub first_free_slot: u64,
+    /// Size in bits of the Untyped at [`slots::UNTYPED`].
+    pub untyped_bits: u64,
+    /// How many capabilities were granted from [`slots::FIRST_GRANT`].
+    pub grants: u64,
+    /// Number of processors.
+    pub cpus: u64,
+    /// The timestamp counter's calibration, as in `RootInfo::clock`.
+    pub clock: [u64; 3],
+    /// Arguments from the parent; their meaning is between the two.
+    pub args: [u64; 8],
+}
+
+static CLOCK: [AtomicU64; 3] = [const { AtomicU64::new(1) }; 3];
+static DEBUG: AtomicU64 = AtomicU64::new(0);
+
+/// Tell the runtime where the debug console is and how to read the clock.
+/// Called by [`main!`] for an ordinary program; the root task, which has no
+/// [`ProcessInfo`], calls it itself.
+pub fn init(debug: Cap, clock: [u64; 3]) {
+    DEBUG.store(debug.0, Ordering::Relaxed);
+    for (c, v) in CLOCK.iter().zip(clock) {
+        c.store(v, Ordering::Relaxed);
+    }
+}
+
+/// The monotonic clock.
+pub fn clock() -> Clock {
+    Clock::new([CLOCK[0].load(Ordering::Relaxed), CLOCK[1].load(Ordering::Relaxed), CLOCK[2].load(Ordering::Relaxed)])
+}
+
+/// The debug console: a 16550 serial port reached through an I/O port
+/// capability. Polled, unbuffered, for bring-up and panics; the logging
+/// service (D08) replaces it for everything else.
+pub struct Debug;
+
+impl fmt::Write for Debug {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let port = Cap(DEBUG.load(Ordering::Relaxed));
+        if port.0 == 0 {
+            return Ok(());
+        }
+        for b in s.bytes() {
+            // Wait for the transmitter; give up on a port that never is ready.
+            let mut tries = 0;
+            while sys::port_in(port, 0x3FD, 1).unwrap_or(0x20) & 0x20 == 0 && tries < 100_000 {
+                tries += 1;
+            }
+            let _ = sys::port_out(port, 0x3F8, 1, b as u32);
+        }
+        Ok(())
+    }
+}
+
+/// Write to the debug console.
+#[macro_export]
+macro_rules! print {
+    ($($a:tt)*) => {{ use core::fmt::Write as _; let _ = write!($crate::Debug, $($a)*); }};
+}
+
+/// Write a line to the debug console.
+#[macro_export]
+macro_rules! println {
+    ($($a:tt)*) => {{ use core::fmt::Write as _; let _ = write!($crate::Debug, $($a)*); let _ = $crate::Debug.write_str("\r\n"); }};
+}
+
+/// Finish the program: tell the parent the status and stop this thread. The
+/// parent takes back the program's memory.
+pub fn exit(status: i64) -> ! {
+    let _ = sys::send(slots::PARENT, MsgInfo::new(EXIT_LABEL, 1), [status as u64, 0, 0, 0]);
+    loop {
+        let _ = sys::thread_suspend(slots::THREAD);
+        sys::yield_now();
+    }
+}
+
+/// Start-up of an ordinary program; called by the code [`main!`] generates.
+pub fn start(info: &'static ProcessInfo, main: fn(&'static ProcessInfo) -> i64) -> ! {
+    if info.magic != PROCESS_MAGIC {
+        exit(-1);
+    }
+    init(slots::DEBUG, info.clock);
+    exit(main(info))
+}
+
+/// Declare the program's entry: a `fn(&'static ProcessInfo) -> i64` whose
+/// return value is the exit status.
+#[macro_export]
+macro_rules! main {
+    ($main:path) => {
+        /// Entered from `_start` in libsys with the start-up record.
+        // SAFETY: the one definition of the symbol libsys's `_start` calls.
+        #[unsafe(no_mangle)]
+        extern "C" fn silica_main(info: &'static $crate::ProcessInfo) -> ! {
+            $crate::start(info, $main)
+        }
+    };
+}
+
+#[cfg(target_os = "silica")]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    println!("PANIC: {}", info.message());
+    if let Some(l) = info.location() {
+        println!("  at {}:{}", l.file(), l.line());
+    }
+    exit(-2)
+}

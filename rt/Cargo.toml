@@ -1,0 +1,13 @@
+[package]
+name = "silica-rt"
+description = "The native runtime every Silica program links: start-up record, entry and exit, debug console, panics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libsys = { workspace = true }
+
+[lints]
+workspace = true

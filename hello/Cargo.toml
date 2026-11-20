@@ -1,0 +1,19 @@
+[package]
+name = "hello"
+description = "The smallest Silica program: says hello on the debug console and exits."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+
+[lints]
+workspace = true
