@@ -1,2 +1,4 @@
 max_width = 140
 use_small_heuristics = "Max"
+# Written from the published documentation alone and kept as first built.
+ignore = ["trial-server", "trial-client"]

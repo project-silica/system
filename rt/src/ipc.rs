@@ -12,23 +12,50 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use silica_idl_rt::{CapList, Capability, MAX_CAPS, MAX_MESSAGE, Transport, TransportError};
 
 static BUFFER: AtomicU64 = AtomicU64::new(0);
-static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
-static SLOT_END: AtomicU64 = AtomicU64::new(0);
+/// Slots the allocator manages: one bit each, set while the slot is in use.
+/// A CapSpace larger than this has its further slots left to the program.
+const MANAGED: usize = 4096;
+static USED: [AtomicU64; MANAGED / 64] = [const { AtomicU64::new(u64::MAX) }; MANAGED / 64];
+/// The slots registered in the IPC buffer for arriving capabilities.
+static INCOMING: [AtomicU64; MAX_CAPS] = [const { AtomicU64::new(0) }; MAX_CAPS];
 
 /// Tell the transport where this thread's IPC buffer is mapped and which
-/// slots of the CapSpace are free for received capabilities. Called by the
-/// runtime's start-up.
+/// slots of the CapSpace are free. Called by the runtime's start-up.
 pub(crate) fn init(buffer: u64, first_free: u64, slots: u64) {
     BUFFER.store(buffer, Ordering::Relaxed);
-    NEXT_SLOT.store(first_free, Ordering::Relaxed);
-    SLOT_END.store(slots, Ordering::Relaxed);
+    for s in first_free..slots.min(MANAGED as u64) {
+        release_slot(s);
+    }
+    let buf = self::buffer();
+    for (i, slot) in INCOMING.iter().enumerate() {
+        let s = free_slot().unwrap_or(0);
+        slot.store(s, Ordering::Relaxed);
+        buf.accept(i, s);
+    }
 }
 
-/// A slot of this program's CapSpace that nothing uses, or `None` when the
-/// CapSpace is full. (Slots are not yet reused once given out.)
+/// A slot of this program's CapSpace that nothing uses, now reserved for
+/// the caller, or `None` when the CapSpace is full. Give it back with
+/// [`release_slot`], or by dropping the [`Handle`] of the capability put in it.
 pub fn free_slot() -> Option<u64> {
-    let s = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
-    (s < SLOT_END.load(Ordering::Relaxed)).then_some(s)
+    for (i, word) in USED.iter().enumerate() {
+        let mut w = word.load(Ordering::Relaxed);
+        while w != u64::MAX {
+            let bit = (!w).trailing_zeros() as u64;
+            match word.compare_exchange_weak(w, w | 1 << bit, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(i as u64 * 64 + bit),
+                Err(now) => w = now,
+            }
+        }
+    }
+    None
+}
+
+/// Return the empty slot `slot` to the allocator.
+pub fn release_slot(slot: u64) {
+    if let Some(word) = USED.get(slot as usize / 64) {
+        word.fetch_and(!(1 << (slot % 64)), Ordering::Relaxed);
+    }
 }
 
 fn buffer() -> IpcBuffer {
@@ -41,7 +68,8 @@ fn buffer() -> IpcBuffer {
 }
 
 /// A capability that arrived in, or is to be sent in, an IDL message: the
-/// program's own, in a slot of its CapSpace. Dropping it deletes the capability.
+/// program's own, in a slot of its CapSpace. Dropping it deletes the
+/// capability and returns the slot to the allocator.
 #[derive(Debug)]
 pub struct Handle(Cap);
 
@@ -69,6 +97,7 @@ impl Drop for Handle {
         unsafe {
             let _ = sys::cap_delete(self.0);
         }
+        release_slot(self.0.0);
     }
 }
 
@@ -100,30 +129,40 @@ fn unpack(buf: &IpcBuffer, words: [u64; 4], len: usize, out: &mut [u8]) -> usize
     len
 }
 
-/// List the capabilities of `caps` for sending (they move). Returns how many.
-fn give(buf: &IpcBuffer, caps: &mut CapList<Handle>) -> usize {
+/// List the capabilities of `caps` for sending (they move). Returns the
+/// slots they are in.
+fn give(buf: &IpcBuffer, caps: &mut CapList<Handle>) -> ([u64; MAX_CAPS], usize) {
     let n = caps.len();
-    for i in 0..n {
+    let mut slots = [0; MAX_CAPS];
+    for (i, slot) in slots.iter_mut().enumerate().take(n) {
         if let Some(h) = caps.take(i) {
-            buf.pass(i, h.into_cap(), Pass::Give);
+            *slot = h.into_cap().0;
+            buf.pass(i, Cap(*slot), Pass::Give);
         }
     }
-    n
+    (slots, n)
 }
 
-/// Fresh slots for whatever capabilities the next message brings.
-fn expect(buf: &IpcBuffer) -> [u64; MAX_CAPS] {
-    let slots = core::array::from_fn(|_| free_slot().unwrap_or(0));
-    for (i, s) in slots.iter().enumerate() {
-        buf.accept(i, *s);
+/// The message that listed `given` has been sent, or could not be: the
+/// slots are the allocator's again. A capability still there (the message
+/// did not reach anyone) was the transport's to release.
+fn given(slots: [u64; MAX_CAPS], n: usize) {
+    for s in slots.iter().take(n).filter(|s| **s != 0) {
+        drop(Handle(Cap(*s)));
     }
-    slots
 }
 
-/// The first `arrived` of `slots` now hold capabilities: hand them over.
-fn collect(slots: [u64; MAX_CAPS], arrived: usize, into: &mut CapList<Handle>) {
-    for s in slots.iter().take(arrived) {
-        let _ = into.push(Handle(Cap(*s)));
+/// The first `arrived` incoming slots now hold capabilities: hand them
+/// over and register fresh slots in their place.
+fn collect(buf: &IpcBuffer, arrived: usize, into: &mut CapList<Handle>) {
+    for (i, slot) in INCOMING.iter().enumerate().take(arrived) {
+        let s = slot.load(Ordering::Relaxed);
+        if s != 0 {
+            let _ = into.push(Handle(Cap(s)));
+        }
+        let fresh = free_slot().unwrap_or(0);
+        slot.store(fresh, Ordering::Relaxed);
+        buf.accept(i, fresh);
     }
 }
 
@@ -154,16 +193,17 @@ impl Transport<Handle> for Channel {
         reply_caps: &mut CapList<Handle>,
     ) -> Result<usize, TransportError> {
         let buf = buffer();
-        let sent = give(&buf, &mut caps);
-        let slots = expect(&buf);
+        let (slots, sent) = give(&buf, &mut caps);
         let words = pack(&buf, request);
-        let m = sys::call(self.endpoint, info(request.len(), sent), words).map_err(|e| match e {
+        let result = sys::call(self.endpoint, info(request.len(), sent), words);
+        given(slots, sent);
+        let m = result.map_err(|e| match e {
             // The endpoint, or the provider holding the call, went away.
             Error::Gone => TransportError::PeerGone,
             // BadCap, NoRights, WrongType: this capability does not reach a provider.
             _ => TransportError::Revoked,
         })?;
-        collect(slots, m.info.caps(), reply_caps);
+        collect(&buf, m.info.caps(), reply_caps);
         Ok(unpack(&buf, m.words, m.info.label() as usize, reply))
     }
 }
@@ -179,13 +219,17 @@ impl Transport<Handle> for Channel {
 /// })
 /// ```
 ///
+/// A caller that has gone by the time its reply is ready is not an error
+/// here: the reply is dropped and the loop takes the next request. The loop
+/// ends (the program exits with status -3) only when the endpoint itself is
+/// gone. Capabilities of a reply nobody received are deleted.
+///
 /// The request's capabilities are `handle`'s: what it does not move out of
 /// the list is deleted when the list is dropped.
 pub fn serve(endpoint: Cap, mut handle: impl FnMut(u64, &[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize) -> ! {
     let buf = buffer();
     let mut request = [0u8; MAX_MESSAGE];
     let mut reply = [0u8; MAX_MESSAGE];
-    let mut slots = expect(&buf);
     let mut next = sys::recv(endpoint, Wait::Forever);
     loop {
         let m = match next {
@@ -194,13 +238,13 @@ pub fn serve(endpoint: Cap, mut handle: impl FnMut(u64, &[u8], CapList<Handle>, 
             Err(_) => crate::exit(-3),
         };
         let mut caps = CapList::new();
-        collect(slots, m.info.caps(), &mut caps);
+        collect(&buf, m.info.caps(), &mut caps);
         let len = unpack(&buf, m.words, m.info.label() as usize, &mut request);
         let mut reply_caps = CapList::new();
         let n = handle(m.badge, &request[..len], caps, &mut reply, &mut reply_caps).min(MAX_MESSAGE);
-        let sent = give(&buf, &mut reply_caps);
-        slots = expect(&buf);
+        let (slots, sent) = give(&buf, &mut reply_caps);
         let words = pack(&buf, &reply[..n]);
         next = sys::reply_recv(endpoint, info(n, sent), words);
+        given(slots, sent);
     }
 }

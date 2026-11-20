@@ -128,29 +128,39 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     // Two programs that talk: a provider of the sample.Echo protocol and a
     // client of it, connected by one endpoint. The provider may only
     // receive on it; the client may only send (and pass capabilities).
-    let (Some(server_image), Some(client_image)) = (ramdisk::find(archive, "echo-server"), ramdisk::find(archive, "echo-client")) else {
-        fail("the ramdisk lacks echo-server or echo-client")
-    };
-    let endpoint = Cap((parent.free_slot)());
-    if sys::retype(parent.untyped, ObjectType::Endpoint, 0, SPACE, endpoint.0, 1).is_err() {
-        fail("cannot create the echo endpoint");
+    // The first pair is the runtime's own; the second was written from the
+    // published documentation alone and is kept exactly as it first built.
+    for (n, (server_name, client_name)) in [("echo-server", "echo-client"), ("trial-server", "trial-client")].into_iter().enumerate() {
+        let id = 200 + 2 * n as u64;
+        let (Some(server_image), Some(client_image)) = (ramdisk::find(archive, server_name), ramdisk::find(archive, client_name)) else {
+            println!("ERROR: init: the ramdisk lacks {server_name} or {client_name}");
+            finish(false)
+        };
+        let endpoint = Cap((parent.free_slot)());
+        if sys::retype(parent.untyped, ObjectType::Endpoint, 0, SPACE, endpoint.0, 1).is_err() {
+            fail("cannot create an endpoint for the echo programs");
+        }
+        let receive = Grant { cap: endpoint, rights: Rights::READ, badge: 0 };
+        let send = Grant { cap: endpoint, rights: Rights(Rights::WRITE.0 | Rights::GRANT.0), badge: 7 };
+        let server = spawn(&mut parent, server_image, 22, id, &[receive], [0; 8]);
+        let client = spawn(&mut parent, client_image, 22, id + 1, &[send], [0; 8]);
+        let (Ok(server), Ok(client)) = (server, client) else {
+            println!("ERROR: init: cannot start {server_name} and {client_name}");
+            finish(false)
+        };
+        let Ok(m) = sys::recv(exit, Wait::Until(silica_rt::clock().now() + 10_000_000_000)) else {
+            println!("ERROR: init: {client_name} did not finish within 10 s");
+            finish(false)
+        };
+        if m.badge != id + 1 || m.words[0] != 0 {
+            println!("ERROR: init: program {} of the pair {server_name}, {client_name} exited with status {}", m.badge, m.words[0] as i64);
+            finish(false);
+        }
+        if client.destroy().is_err() || server.destroy().is_err() {
+            fail("cannot take back the echo programs' memory");
+        }
+        println!("init: {client_name} and {server_name} talked over sample.Echo; both are gone and their memory is back");
     }
-    let receive = Grant { cap: endpoint, rights: Rights::READ, badge: 0 };
-    let send = Grant { cap: endpoint, rights: Rights(Rights::WRITE.0 | Rights::GRANT.0), badge: 7 };
-    let server = spawn(&mut parent, server_image, 22, 200, &[receive], [0; 8]);
-    let client = spawn(&mut parent, client_image, 22, 201, &[send], [0; 8]);
-    let (Ok(server), Ok(client)) = (server, client) else { fail("cannot start the echo programs") };
-    let Ok(m) = sys::recv(exit, Wait::Until(silica_rt::clock().now() + 10_000_000_000)) else {
-        fail("the echo client did not finish within 10 s")
-    };
-    if m.badge != 201 || m.words[0] != 0 {
-        println!("ERROR: init: the echo client (id {}) exited with status {}", m.badge, m.words[0] as i64);
-        finish(false);
-    }
-    if client.destroy().is_err() || server.destroy().is_err() {
-        fail("cannot take back the echo programs' memory");
-    }
-    println!("init: echo client and server talked over sample.Echo; both are gone and their memory is back");
     println!("BOOT OK");
     finish(true)
 }

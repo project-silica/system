@@ -85,10 +85,17 @@
 //! #![no_main]
 //! silica_rt::main!(main);
 //! fn main(info: &silica_rt::ProcessInfo) -> i64 {
-//!     silica_rt::println!("hello");
+//!     silica_rt::println!("hello, I was given {} capabilities", info.grants);
 //!     0
 //! }
 //! ```
+//!
+//! `main` receives the start-up record ([`ProcessInfo`], which lives as long
+//! as the program) and returns the exit status. The runtime supplies the
+//! panic handler (a panic prints its message on the debug console and exits
+//! with status -1), so a program defines none. [`print!`] and [`println!`]
+//! take the same format strings and arguments as `core::format_args!`. A
+//! grant is used as `sys::Cap(slots::FIRST_GRANT + n)`.
 #![no_std]
 #![deny(unsafe_code)]
 

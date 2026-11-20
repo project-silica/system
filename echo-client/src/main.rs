@@ -70,6 +70,22 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         println!("echo-client: capabilities did not move there and back (came back: {came_back}, moved: {moved})");
         return 6;
     }
+    // Far more round trips than the CapSpace has slots: every slot a
+    // capability leaves or is deleted from is used again.
+    let (mut frame, mut any) = (returned.frame, returned.any);
+    for round in 0..5000 {
+        match client.echo_caps(frame, None, any) {
+            Ok(r) => (frame, any) = (r.frame, r.any),
+            Err(e) => {
+                println!("echo-client: echo_caps failed in round {round}: {e:?}");
+                return 7;
+            }
+        }
+    }
+    if sys::signal(any.cap()).is_err() {
+        println!("echo-client: the notification stopped working after 5000 round trips");
+        return 8;
+    }
     println!("echo-client: bytes, records and capabilities all came back as sent");
     0
 }

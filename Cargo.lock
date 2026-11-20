@@ -76,3 +76,21 @@ dependencies = [
  "libsys",
  "silica-idl-rt",
 ]
+
+[[package]]
+name = "trial-client"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-idlc",
+ "silica-rt",
+]
+
+[[package]]
+name = "trial-server"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-idlc",
+ "silica-rt",
+]
