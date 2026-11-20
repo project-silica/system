@@ -13,7 +13,72 @@
 //!   stops ([`exit`]). The parent reclaims everything by revoking the
 //!   Untyped the child was made from.
 //!
-//! A program declares its entry with [`main!`]:
+//! # Writing a program
+//!
+//! A program is a `no_std`, `no_main` binary crate that depends on
+//! `silica-rt` and declares its entry with [`main!`]. Its `Cargo.toml`, as a
+//! member of the `system` workspace:
+//!
+//! ```text
+//! [package]
+//! name = "my-program"
+//! version.workspace = true
+//! edition.workspace = true
+//! license.workspace = true
+//! publish.workspace = true
+//!
+//! [[bin]]
+//! name = "my-program"
+//! path = "src/main.rs"
+//! test = false
+//! bench = false
+//!
+//! [dependencies]
+//! silica-rt = { workspace = true }
+//! silica-idl-rt = { workspace = true }    # if it calls or provides a protocol
+//!
+//! [build-dependencies]
+//! silica-idlc = { workspace = true }      # if it calls or provides a protocol
+//!
+//! [lints]
+//! workspace = true
+//! ```
+//!
+//! and it is listed in `members` of the workspace's `Cargo.toml`. The
+//! workshop's `tools/boot.sh --system` builds every program of the workspace
+//! for the Silica target and puts each in the ramdisk under its binary name.
+//!
+//! A program that uses a protocol generates the protocol's Rust module in
+//! its build script (`build.rs`) and includes it:
+//!
+//! ```text
+//! // build.rs
+//! use std::path::PathBuf;
+//! fn main() {
+//!     let idl = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../idl/protocols/sample/echo.idl");
+//!     println!("cargo::rerun-if-changed={}", idl.display());
+//!     let protocols = idlc::load(&[idl]).expect("the protocol does not compile");
+//!     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+//!     for p in &protocols {
+//!         std::fs::write(out.join(idlc::rustgen::file_name(p)), idlc::rustgen::rust(p).expect("code generation")).unwrap();
+//!     }
+//! }
+//!
+//! // src/main.rs
+//! include!(concat!(env!("OUT_DIR"), "/sample_echo.rs"));   // defines `pub mod echo`
+//! ```
+//!
+//! The file is named after the protocol: `a.b.Name` gives `a_b_name.rs`
+//! defining `pub mod name`. The protocol's reference page
+//! (`silica-idlc docs`) lists the module's client calls and the trait a
+//! provider implements; [`ipc`] connects them to the kernel.
+//!
+//! A program gets the capabilities it needs as grants from whoever starts
+//! it: grant number `n` is in slot [`slots::FIRST_GRANT`]` + n`. What each
+//! grant is, is between the program and its parent (for a program started
+//! by `init`, see `init`'s source or the service manifest when there is one).
+//!
+//! The entry:
 //!
 //! ```text
 //! #![no_std]
