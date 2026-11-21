@@ -54,7 +54,13 @@ fn server(endpoint: Cap) -> i64 {
     let mut served = 0u64;
     let mut next = sys::recv(endpoint, Wait::Forever);
     loop {
-        let Ok(m) = next else { return 1 };
+        let m = match next {
+            Ok(m) => m,
+            Err(e) => {
+                println!("stress server: receive failed after {served} pings: {e:?}");
+                return 1;
+            }
+        };
         let answer = match m.info.label() {
             PING => {
                 served += 1;

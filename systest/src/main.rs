@@ -9,7 +9,7 @@ use libsys::root::RootInfo;
 use libsys::{self as sys, Cap, Error, MsgInfo, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
-use silica_proc::{Child, Grant, report, spawn};
+use silica_proc::{Child, Grant, Program, report, spawn};
 use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, print, println};
@@ -42,14 +42,17 @@ impl Tests {
     fn start(&mut self, role: u64, args: [u64; 2], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
         self.next_id += 1;
         let place = self.children.iter_mut().find(|c| c.is_none()).ok_or("a test starts too many programs")?;
-        let child =
-            spawn(&self.root.parent, self.stress, 22, self.next_id, grants, [role, args[0], args[1], 0, 0, 0, 0, 0]).map_err(|e| {
-                println!("systest:   spawn failed: {e:?}");
-                "cannot start a program"
-            })?;
-        let child = place.insert(child);
-        child.place((cpu % self.root.parent.cpus) as usize).map_err(|_| "cannot place a program on its processor")?;
-        Ok((child, self.next_id))
+        let prog = Program {
+            grants,
+            args: [role, args[0], args[1], 0, 0, 0, 0, 0],
+            cpu: (cpu % self.root.parent.cpus) as usize,
+            ..Program::new(self.stress, self.next_id)
+        };
+        let child = spawn(&self.root.parent, &prog).map_err(|e| {
+            println!("systest:   spawn failed: {e:?}");
+            "cannot start a program"
+        })?;
+        Ok((place.insert(child), self.next_id))
     }
 
     /// The next exit report, as (badge, status).
@@ -135,6 +138,38 @@ impl Tests {
             }
         }
         Ok(())
+    }
+
+    /// Round trips while the root task keeps moving both programs between
+    /// processors: a move is invisible to the thread moved, even in the
+    /// middle of a call, so the client loses and repeats nothing.
+    fn moved_mid_call(&mut self) -> Outcome {
+        let ep = self.endpoint()?;
+        let cpus = self.root.parent.cpus;
+        let server = self.start(SERVER, [0, 0], 1, &[Grant { cap: ep, rights: Rights::READ, badge: 0 }])?.0.thread();
+        let (client, id) = self.start(CLIENT, [200_000, 0], 2, &[Grant { cap: ep, rights: SEND, badge: 1 }])?;
+        let client = client.thread();
+        let (start, mut moves) = (silica_rt::clock().now(), 0u64);
+        loop {
+            match sys::recv(self.root.parent.exit, Wait::Until(silica_rt::clock().now() + 50_000)) {
+                Ok(m) if m.badge == id && m.words[0] == 0 => break,
+                Ok(m) => {
+                    println!("systest:   exit report from {} (client {id}, server {}): status {}", m.badge, id - 1, m.words[0] as i64);
+                    return Err("the client lost or repeated a round trip, or the server exited (a line above says which)");
+                }
+                Err(Error::Timeout) => {}
+                Err(_) => return Err("cannot receive exit reports"),
+            }
+            if silica_rt::clock().now() - start > 120 * SECOND {
+                return Err("the round trips did not finish within 120 s");
+            }
+            moves += 1;
+            for (thread, k) in [(client, 0), (server, 3)] {
+                sys::thread_set_cpu(thread, ((moves + k) % cpus) as usize).map_err(|_| "cannot move a running program")?;
+            }
+        }
+        println!("systest: the pair was moved {moves} times during its round trips");
+        if moves < 10 { Err("the pair finished before it was moved often enough to test anything") } else { Ok(()) }
     }
 
     /// A million round trips while a third program takes the client's
@@ -285,12 +320,13 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8] };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 8] = [
+    let tests: [(&str, Test); 9] = [
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("a_million_round_trips_on_one_processor", |t| t.round_trips(1, 1_000_000, |_| (1, 1))),
         ("a_million_round_trips_across_processors", |t| t.round_trips(1, 1_000_000, |_| (1, 2))),
         ("four_pairs_on_eight_processors", |t| t.round_trips(4, 250_000, |i| (2 * i, 2 * i + 1))),
         ("a_million_round_trips_while_the_capability_is_revoked_and_regranted", Tests::revoke_and_regrant),
+        ("programs_moved_between_processors_mid_call_lose_nothing", Tests::moved_mid_call),
         ("running_out_of_memory_is_an_error_to_that_program_only", Tests::exhaustion),
         ("a_capability_revoked_mid_call_fails_the_call_on_both_sides", Tests::revoked_mid_call),
         ("the_debug_console_lists_every_thread_and_capability", Tests::the_debug_console_lists_every_thread_and_capability),

@@ -61,7 +61,7 @@ pub struct Parent {
 }
 
 /// One capability to give the child.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Grant {
     /// The parent's capability. The child's is derived from it: revoking
     /// this one takes the child's away.
@@ -126,12 +126,10 @@ impl Child {
         self.aspace
     }
 
-    /// Move the child's first thread to processor `cpu` and let it run on
-    /// from where it was.
+    /// Move the child's first thread to processor `cpu`. It carries on
+    /// with what it was doing (a call in progress included) there.
     pub fn place(&self, cpu: usize) -> Result<(), Error> {
-        // The kernel stops a thread to move it and leaves it stopped.
-        sys::thread_set_cpu(self.thread, cpu)?;
-        sys::thread_resume(self.thread)
+        sys::thread_set_cpu(self.thread, cpu)
     }
 
     /// End the child and take back all of its memory.
@@ -176,9 +174,40 @@ impl From<Error> for SpawnError {
     }
 }
 
-/// Start the program in `image` with `2^mem_bits` bytes of memory in all.
-/// `id` badges the child's capability to the parent's exit endpoint.
-pub fn spawn(p: &Parent, image: &[u8], mem_bits: u8, id: u64, grants: &[Grant], args: [u64; 8]) -> Result<Child, SpawnError> {
+/// A program to start: what [`spawn`] needs to know about the child.
+#[derive(Clone, Copy, Debug)]
+pub struct Program<'a> {
+    /// The ELF image.
+    pub image: &'a [u8],
+    /// The child is made from `2^mem_bits` bytes in all, half of which it
+    /// can allocate from (at least 2^20: the child's tables, image and stack
+    /// come out of the other half).
+    pub mem_bits: u8,
+    /// Badges the child's capability to the parent's exit endpoint, so the
+    /// parent knows whose exit report it receives.
+    pub id: u64,
+    /// The capabilities the child gets, in order from `slots::FIRST_GRANT`.
+    pub grants: &'a [Grant],
+    /// Words the child reads from `ProcessInfo::args`.
+    pub args: [u64; 8],
+    /// The processor its first thread runs on (an index below `Parent::cpus`).
+    pub cpu: usize,
+}
+
+impl<'a> Program<'a> {
+    /// `image` with 4 MiB, no grants, no arguments, on processor 0.
+    pub fn new(image: &'a [u8], id: u64) -> Self {
+        Program { image, mem_bits: 22, id, grants: &[], args: [0; 8], cpu: 0 }
+    }
+}
+
+/// Start `prog`: its first thread runs on `prog.cpu` from its first
+/// instruction.
+pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
+    let Program { image, mem_bits, id, grants, args, cpu } = *prog;
+    if cpu as u64 >= p.cpus {
+        return Err(SpawnError::Kernel(Error::BadArg));
+    }
     // Three slots for the child's objects and two to work with.
     let mut got = [0u64; 5];
     for i in 0..got.len() {
@@ -197,7 +226,7 @@ pub fn spawn(p: &Parent, image: &[u8], mem_bits: u8, id: u64, grants: &[Grant], 
         }
     };
     let child = Child { untyped, mem_bits, thread: Cap(got[0]), space: Cap(got[1]), aspace: Cap(got[2]) };
-    let result = match build(p, &child, [Cap(got[3]), Cap(got[4])], image, mem_bits, id, grants, args) {
+    let result = match build(p, &child, [Cap(got[3]), Cap(got[4])], image, mem_bits, id, grants, args, cpu) {
         Ok(()) => Ok(child),
         Err(e) => {
             // Nothing half-made stays behind: returning the block revokes
@@ -226,6 +255,7 @@ fn build(
     id: u64,
     grants: &[Grant],
     args: [u64; 8],
+    cpu: usize,
 ) -> Result<(), SpawnError> {
     let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
     if grants.len() > MAX_GRANTS {
@@ -327,6 +357,7 @@ fn build(
     for (i, g) in grants.iter().enumerate() {
         sys::cap_derive(c.space, slots::FIRST_GRANT + i as u64, g.cap, g.rights, g.badge)?;
     }
+    sys::thread_set_cpu(c.thread, cpu)?;
     // SAFETY: the entry point of an image just loaded into the thread's
     // address space, on the stack just mapped there.
     #[allow(unsafe_code)]

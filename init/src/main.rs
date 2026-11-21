@@ -16,7 +16,7 @@ use libsys::root::RootInfo;
 use libsys::{self as sys, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, finish};
-use silica_proc::{Grant, spawn};
+use silica_proc::{Grant, Program, spawn};
 use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, println};
 
@@ -41,7 +41,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     let Some(image) = ramdisk::find(archive, "hello") else { fail!("the ramdisk has no program named hello") };
     // Twice: the second start must find all of the first one's memory back.
     for round in 0..2u64 {
-        let child = match spawn(parent, image, 22, 100 + round, &[], [7 + round, 0, 0, 0, 0, 0, 0, 0]) {
+        let child = match spawn(parent, &Program { args: [7 + round, 0, 0, 0, 0, 0, 0, 0], ..Program::new(image, 100 + round) }) {
             Ok(c) => c,
             Err(e) => fail!("cannot start hello: {e:?}"),
         };
@@ -71,8 +71,8 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         let endpoint = endpoint_object.cap();
         let receive = Grant { cap: endpoint, rights: Rights::READ, badge: 0 };
         let send = Grant { cap: endpoint, rights: Rights(Rights::WRITE.0 | Rights::GRANT.0), badge: 7 };
-        let server = spawn(parent, server_image, 22, id, &[receive], [0; 8]);
-        let client = spawn(parent, client_image, 22, id + 1, &[send], [0; 8]);
+        let server = spawn(parent, &Program { grants: &[receive], ..Program::new(server_image, id) });
+        let client = spawn(parent, &Program { grants: &[send], ..Program::new(client_image, id + 1) });
         let (Ok(server), Ok(client)) = (server, client) else { fail!("cannot start {server_name} and {client_name}") };
         let Ok(m) = sys::recv(parent.exit, Wait::Until(silica_rt::clock().now() + 10_000_000_000)) else {
             fail!("{client_name} did not finish within 10 s")
