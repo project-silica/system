@@ -9,10 +9,10 @@ use libsys::root::RootInfo;
 use libsys::{self as sys, Cap, Error, MsgInfo, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
-use silica_proc::{Child, Grant, spawn};
+use silica_proc::{Child, Grant, report, spawn};
 use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::mem::Object;
-use silica_rt::{EXIT_LABEL, println};
+use silica_rt::{EXIT_LABEL, print, println};
 
 // The roles of `stress` (its first argument).
 const SERVER: u64 = 0;
@@ -196,6 +196,49 @@ impl Tests {
         Ok(())
     }
 
+    /// The owner's view of a running program: every capability it holds and
+    /// every thread with its state. A server waiting on an endpoint granted
+    /// with a badge is listed holding that endpoint in its first grant slot
+    /// and receiving on the very object the slot names.
+    fn the_debug_console_lists_every_thread_and_capability(&mut self) -> Outcome {
+        let ep = self.endpoint()?;
+        let (server, _) = self.start(SERVER, [0, 0], 1, &[Grant { cap: ep, rights: Rights::READ, badge: 0 }])?;
+        let (thread, space) = (server.thread(), server.space());
+        let until = silica_rt::clock().now() + 10 * SECOND;
+        while sys::inspect_thread(thread).map(|t| t.state) != Ok(sys::THREAD_RECEIVING) {
+            if silica_rt::clock().now() > until {
+                return Err("the server never waited on its endpoint");
+            }
+            sys::yield_now();
+        }
+        let mut text = Text::new();
+        let (caps, threads) = report(&mut text, "server", space).map_err(|_| "the report could not read the server")?;
+        print!("{}", text.as_str());
+        let ep_id = sys::inspect_slot(self.root.parent.space, ep.0).ok().flatten().ok_or("the endpoint is gone")?.object;
+        let grant =
+            sys::inspect_slot(space, silica_rt::slots::FIRST_GRANT).ok().flatten().ok_or("the server's first grant slot is empty")?;
+        if grant.ty != ObjectType::Endpoint || grant.object != ep_id {
+            return Err("the server's first grant is not the endpoint it was given");
+        }
+        let want_slot = format_args!("  slot {}: Endpoint rights r--- ", silica_rt::slots::FIRST_GRANT);
+        let mut line = Text::new();
+        let _ = core::fmt::Write::write_fmt(&mut line, want_slot);
+        if !text.as_str().contains(line.as_str()) {
+            return Err("the report does not list the granted endpoint with its rights");
+        }
+        let mut waiting = Text::new();
+        let _ = core::fmt::Write::write_fmt(&mut waiting, format_args!("receiving on processor 1, at "));
+        if threads != 1 || caps < 7 || !text.as_str().contains(waiting.as_str()) {
+            return Err("the report does not show the one thread, receiving, with every capability");
+        }
+        let mut on = Text::new();
+        let _ = core::fmt::Write::write_fmt(&mut on, format_args!("waiting on {ep_id:#x}"));
+        if !text.as_str().contains(on.as_str()) {
+            return Err("the report does not say which object the thread waits on");
+        }
+        Ok(())
+    }
+
     /// A capability revoked in the middle of a call fails the call on both
     /// sides: the caller gets `Gone`, the server's reply `NoCaller`.
     fn revoked_mid_call(&mut self) -> Outcome {
@@ -242,7 +285,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8] };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 7] = [
+    let tests: [(&str, Test); 8] = [
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("a_million_round_trips_on_one_processor", |t| t.round_trips(1, 1_000_000, |_| (1, 1))),
         ("a_million_round_trips_across_processors", |t| t.round_trips(1, 1_000_000, |_| (1, 2))),
@@ -250,6 +293,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         ("a_million_round_trips_while_the_capability_is_revoked_and_regranted", Tests::revoke_and_regrant),
         ("running_out_of_memory_is_an_error_to_that_program_only", Tests::exhaustion),
         ("a_capability_revoked_mid_call_fails_the_call_on_both_sides", Tests::revoked_mid_call),
+        ("the_debug_console_lists_every_thread_and_capability", Tests::the_debug_console_lists_every_thread_and_capability),
     ];
     println!("systest: {cpus} processors, {} tests", tests.len());
     for (name, test) in tests {
@@ -269,4 +313,28 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     println!("SYSTEST OK");
     finish(true)
+}
+
+/// Text written with `write!` into a fixed buffer (the test has no heap).
+struct Text {
+    buf: [u8; 4096],
+    len: usize,
+}
+
+impl Text {
+    fn new() -> Text {
+        Text { buf: [0; 4096], len: 0 }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for Text {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
 }

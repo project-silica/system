@@ -355,3 +355,63 @@ fn write_info(info: &ProcessInfo, to: usize) {
         core::ptr::copy_nonoverlapping(core::ptr::from_ref(info), to as *mut ProcessInfo, 1)
     }
 }
+
+/// What a program holds, for its owner: every capability in the CapSpace
+/// `space` (a capability in the caller's own CapSpace), and once per
+/// thread among them, what that thread is doing. One line each on `out`:
+///
+/// ```text
+/// process <name>: <n> capabilities, <m> threads
+///   slot <i>: <type> rights <r> bits <b> object <id> badge <b> depth <d>
+///   thread <id>: <state> on processor <c>, at <ip>, waiting on <id>
+/// ```
+///
+/// An object's id (`SlotInfo::object`) is the same in every line about it,
+/// so a thread waiting on an endpoint names the id its capabilities show.
+/// Returns the numbers of capabilities and threads.
+pub fn report(out: &mut dyn core::fmt::Write, name: &str, space: Cap) -> Result<(u64, u64), Error> {
+    let size = sys::inspect_slot(slots::SPACE, space.0)?.filter(|i| i.ty == ObjectType::CapSpace).ok_or(Error::WrongType)?;
+    let slots = 1u64 << size.bits;
+    let (mut caps, mut threads) = (0u64, 0u64);
+    for i in 1..slots {
+        if sys::inspect_slot(space, i)?.is_some() {
+            caps += 1;
+        }
+    }
+    // Threads are listed once each, however many capabilities name them.
+    let mut seen = [0u64; 64];
+    for i in 1..slots {
+        let Some(info) = sys::inspect_slot(space, i)? else { continue };
+        if info.ty == ObjectType::Thread && !seen[..threads.min(64) as usize].contains(&info.object) {
+            if (threads as usize) < seen.len() {
+                seen[threads as usize] = info.object;
+            }
+            threads += 1;
+        }
+    }
+    let _ = writeln!(out, "process {name}: {caps} capabilities, {threads} threads");
+    let mut listed = [0u64; 64];
+    let mut n = 0usize;
+    for i in 1..slots {
+        let Some(info) = sys::inspect_slot(space, i)? else { continue };
+        let r = info.rights.0;
+        let rights = [(1, 'r'), (2, 'w'), (4, 'x'), (8, 'g')].map(|(b, c)| if r & b != 0 { c } else { '-' });
+        let _ = writeln!(
+            out,
+            "  slot {i}: {:?} rights {}{}{}{} bits {} object {:#x} badge {:#x} depth {}",
+            info.ty, rights[0], rights[1], rights[2], rights[3], info.bits, info.object, info.badge, info.depth
+        );
+        if info.ty == ObjectType::Thread && !listed[..n].contains(&info.object) {
+            if n < listed.len() {
+                listed[n] = info.object;
+                n += 1;
+            }
+            let t = sys::inspect_thread_in(space, i)?;
+            let state =
+                ["inactive", "runnable", "sending", "receiving", "waiting for a reply"].get(t.state as usize).copied().unwrap_or("unknown");
+            let _ =
+                writeln!(out, "  thread {:#x}: {state} on processor {}, at {:#x}, waiting on {:#x}", info.object, t.cpu, t.ip, t.waits_on);
+        }
+    }
+    Ok((caps, threads))
+}
