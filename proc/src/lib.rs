@@ -72,20 +72,22 @@ pub struct Grant {
     pub badge: u64,
 }
 
-/// A running child, as its parent holds it.
-#[derive(Clone, Copy, Debug)]
+/// A running child owned by its parent. Destroying it consumes this handle
+/// and returns its memory and capability slots to the parent's allocators.
+///
+/// ```compile_fail,E0382
+/// fn end_twice(child: silica_proc::Child) {
+///     child.destroy().unwrap();
+///     child.destroy().unwrap();
+/// }
+/// ```
+#[derive(Debug)]
 pub struct Child {
-    /// The Untyped everything of the child was made from: a block of the
-    /// parent's memory (`silica_rt::mem`) of `2^mem_bits` bytes.
-    pub untyped: Cap,
-    /// See `untyped`.
-    pub mem_bits: u8,
-    /// The child's first thread.
-    pub thread: Cap,
-    /// The child's CapSpace.
-    pub space: Cap,
-    /// The child's address space.
-    pub aspace: Cap,
+    untyped: Cap,
+    mem_bits: u8,
+    thread: Cap,
+    space: Cap,
+    aspace: Cap,
 }
 
 impl Parent {
@@ -99,6 +101,31 @@ impl Parent {
 }
 
 impl Child {
+    /// The Untyped holding the child's objects and memory.
+    pub fn untyped(&self) -> Cap {
+        self.untyped
+    }
+
+    /// Size in bits of the child's memory budget.
+    pub fn mem_bits(&self) -> u8 {
+        self.mem_bits
+    }
+
+    /// The child's first thread.
+    pub fn thread(&self) -> Cap {
+        self.thread
+    }
+
+    /// The child's CapSpace.
+    pub fn space(&self) -> Cap {
+        self.space
+    }
+
+    /// The child's address space.
+    pub fn aspace(&self) -> Cap {
+        self.aspace
+    }
+
     /// Move the child's first thread to processor `cpu` and let it run on
     /// from where it was.
     pub fn place(&self, cpu: usize) -> Result<(), Error> {

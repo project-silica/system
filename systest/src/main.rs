@@ -39,7 +39,7 @@ type Outcome = Result<(), &'static str>;
 impl Tests {
     /// Start `stress` in `role` on processor `cpu` (modulo how many there
     /// are). Returns the program and the badge its exit report will carry.
-    fn start(&mut self, role: u64, args: [u64; 2], cpu: u64, grants: &[Grant]) -> Result<(Child, u64), &'static str> {
+    fn start(&mut self, role: u64, args: [u64; 2], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
         self.next_id += 1;
         let place = self.children.iter_mut().find(|c| c.is_none()).ok_or("a test starts too many programs")?;
         let child =
@@ -47,7 +47,7 @@ impl Tests {
                 println!("systest:   spawn failed: {e:?}");
                 "cannot start a program"
             })?;
-        *place = Some(child);
+        let child = place.insert(child);
         child.place((cpu % self.root.parent.cpus) as usize).map_err(|_| "cannot place a program on its processor")?;
         Ok((child, self.next_id))
     }
@@ -57,7 +57,7 @@ impl Tests {
         let Ok(m) = sys::recv(self.root.parent.exit, Wait::Until(silica_rt::clock().now() + within)) else {
             // Say where everyone is: the owner's first question.
             for c in self.children.iter().flatten() {
-                match sys::inspect_thread(c.thread) {
+                match sys::inspect_thread(c.thread()) {
                     Ok(t) => println!(
                         "systest:   a program's thread: state {} on processor {}, ip {:#x}, waits on {:#x}",
                         t.state, t.cpu, t.ip, t.waits_on
@@ -146,7 +146,7 @@ impl Tests {
         // The revoker's source is its own child of the endpoint, so revoking
         // it touches only what the revoker granted.
         let source = Grant { cap: ep, rights: SEND, badge: 0 };
-        let space = Grant { cap: client.space, rights: Rights::ALL, badge: 0 };
+        let space = Grant { cap: client.space(), rights: Rights::ALL, badge: 0 };
         self.start(REVOKER, [200_000, 0], 3, &[source, space])?;
         match self.next_exit(300 * SECOND)? {
             (who, 0) if who == id => Ok(()),
@@ -225,7 +225,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         finish(false)
     };
     let cpus = root.parent.cpus;
-    let mut t = Tests { root, stress, next_id: 0, children: [None; 16], caps: [None; 16], objects: [const { None }; 8] };
+    let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8] };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
     let tests: [(&str, Test); 6] = [
