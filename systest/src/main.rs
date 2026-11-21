@@ -155,6 +155,20 @@ impl Tests {
         }
     }
 
+    /// Create a 256-slot capability table and use its last slot. The block
+    /// holding it must account for the size of each slot.
+    fn object_storage(&mut self) -> Outcome {
+        let space = Object::new(ObjectType::CapSpace, 8).map_err(|_| "cannot allocate a 256-slot CapSpace")?;
+        let endpoint = self.endpoint()?;
+        let copied = sys::cap_derive(space.cap(), 255, endpoint, Rights::READ, 0);
+        // SAFETY: this table holds only the derived endpoint and nobody uses it.
+        #[allow(unsafe_code)]
+        unsafe {
+            space.destroy()
+        };
+        copied.map_err(|_| "cannot use the last slot of the allocated CapSpace")
+    }
+
     /// A program that uses up its memory gets an error; a pair running
     /// beside it is not affected, and the memory comes back with the program.
     fn exhaustion(&mut self) -> Outcome {
@@ -228,7 +242,8 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8] };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 6] = [
+    let tests: [(&str, Test); 7] = [
+        ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("a_million_round_trips_on_one_processor", |t| t.round_trips(1, 1_000_000, |_| (1, 1))),
         ("a_million_round_trips_across_processors", |t| t.round_trips(1, 1_000_000, |_| (1, 2))),
         ("four_pairs_on_eight_processors", |t| t.round_trips(4, 250_000, |i| (2 * i, 2 * i + 1))),

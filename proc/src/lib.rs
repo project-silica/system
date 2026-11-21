@@ -13,7 +13,7 @@
 #![deny(unsafe_code)]
 
 use libsys::{self as sys, Cap, Error, ObjectType, Rights};
-use silica_formats::elf::{EM_X86_64, Elf, ElfError, PF_W, PF_X};
+use silica_formats::elf::{EM_NATIVE, Elf, ElfError, PF_W, PF_X};
 use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::mem;
 use silica_rt::{PROCESS_MAGIC, ProcessInfo, slots};
@@ -227,7 +227,7 @@ fn build(
     grants: &[Grant],
     args: [u64; 8],
 ) -> Result<(), SpawnError> {
-    let elf = Elf::parse(image, EM_X86_64).map_err(SpawnError::Image)?;
+    let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
     if grants.len() > MAX_GRANTS {
         return Err(SpawnError::TooMany);
     }

@@ -119,9 +119,12 @@ impl Object {
     /// A new object of type `ty` and size `2^bits` bytes (`bits` is 0 for
     /// the types that have one size), in a slot of the program's CapSpace.
     pub fn new(ty: ObjectType, bits: u8) -> Result<Object, Error> {
-        // Every fixed-size object fits a page.
-        let block_bits = bits.max(12);
+        let block_bits = ty.storage_bits(bits.into())?;
         let block = alloc(block_bits)?;
+        // The allocator already returned an Untyped of exactly this size.
+        if ty == ObjectType::Untyped {
+            return Ok(Object { cap: block, block, bits: block_bits });
+        }
         let made = free_slot()
             .ok_or(Error::NoMemory)
             .and_then(|slot| sys::retype(block, ty, bits, slots::SPACE, slot, 1).map(|()| slot).inspect_err(|_| release_slot(slot)));
@@ -154,6 +157,8 @@ impl Object {
     pub unsafe fn destroy(self) {
         // SAFETY: the caller's promise is this function's.
         unsafe { free(self.block, self.bits) };
-        release_slot(self.cap.0);
+        if self.cap != self.block {
+            release_slot(self.cap.0);
+        }
     }
 }

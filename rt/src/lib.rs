@@ -125,8 +125,8 @@ pub mod slots {
     /// An endpoint of the parent's, to send on: how the program reports
     /// that it has finished (and, later, asks for more).
     pub const PARENT: Cap = Cap(6);
-    /// The debug console (a serial port's I/O ports), when the parent
-    /// grants one; otherwise empty and [`crate::print!`] discards.
+    /// The debug console (a console capability: `sys::console_write`), when
+    /// the parent grants one; otherwise empty and [`crate::print!`] discards.
     pub const DEBUG: Cap = Cap(7);
     /// The first capability the parent granted beyond these.
     pub const FIRST_GRANT: u64 = 8;
@@ -187,24 +187,18 @@ pub fn clock() -> Clock {
     Clock::new([CLOCK[0].load(Ordering::Relaxed), CLOCK[1].load(Ordering::Relaxed), CLOCK[2].load(Ordering::Relaxed)])
 }
 
-/// The debug console: a 16550 serial port reached through an I/O port
-/// capability. Polled, unbuffered, for bring-up and panics; the logging
-/// service (D08) replaces it for everything else.
+/// The debug console: the kernel's console, through a console capability.
+/// Unbuffered, for bring-up and panics; the logging service (D08) replaces
+/// it for everything else. Each `write_str` is written whole (a few system
+/// calls of 32 bytes), so lines from different programs do not tear within
+/// a call.
 pub struct Debug;
 
 impl fmt::Write for Debug {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        let port = Cap(DEBUG.load(Ordering::Relaxed));
-        if port.0 == 0 {
-            return Ok(());
-        }
-        for b in s.bytes() {
-            // Wait for the transmitter; give up on a port that never is ready.
-            let mut tries = 0;
-            while sys::port_in(port, 0x3FD, 1).unwrap_or(0x20) & 0x20 == 0 && tries < 100_000 {
-                tries += 1;
-            }
-            let _ = sys::port_out(port, 0x3F8, 1, b as u32);
+        let console = Cap(DEBUG.load(Ordering::Relaxed));
+        if console.0 != 0 {
+            let _ = sys::console_write(console, s.as_bytes());
         }
         Ok(())
     }
