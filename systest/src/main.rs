@@ -236,7 +236,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         ("running_out_of_memory_is_an_error_to_that_program_only", Tests::exhaustion),
         ("a_capability_revoked_mid_call_fails_the_call_on_both_sides", Tests::revoked_mid_call),
     ];
-    println!("systest: {cpus} processors");
+    println!("systest: {cpus} processors, {} tests", tests.len());
     for (name, test) in tests {
         let began = silica_rt::clock().now();
         // Whatever the test made is taken back before the next one starts.
