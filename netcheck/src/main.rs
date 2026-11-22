@@ -7,6 +7,14 @@
 //! <driver>.<name> PASS` for each check and the round trip of a ping as a
 //! `BENCH` line (the user-mode network's, not a gate: it answers in the
 //! emulator's own time).
+//!
+//! Where the host's benchmark echo answers (`os/bench/net/echo.c`, on a tap
+//! interface: frames of EtherType 0x88B5 come back, 0x88B6 are dropped),
+//! it then measures what `tools/bench.sh` compares with Linux: the round
+//! trip of a 60-byte frame (`net_rtt`, median and p99 of 20,000 after 2,000
+//! to warm up), and how many 1514-byte frames a second the interface sends
+//! with 128 in flight (`net_tx`). On the user-mode network there is no echo,
+//! and no benchmark.
 
 #![no_std]
 #![no_main]
@@ -34,6 +42,9 @@ const ME: [u8; 4] = [10, 0, 2, 15];
 const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 /// Tags of transmits: from here up (receives are 1 to `BUFFERS`).
 const SENT: u64 = 1 << 32;
+/// The benchmark echo's EtherTypes: sent back, and dropped.
+const ECHO: [u8; 2] = [0x88, 0xB5];
+const SINK: [u8; 2] = [0x88, 0xB6];
 
 fn main(_info: &'static ProcessInfo) -> i64 {
     match run() {
@@ -170,14 +181,19 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
     c.put(o + 42, &[0; 18]);
     c.send(42)?;
     let mut gateway = [0u8; 6];
-    c.receive(silica_rt::clock().now() + 5 * SECOND, &mut |c, at, n| {
+    let answered = c.receive(silica_rt::clock().now() + 2 * SECOND, &mut |c, at, n| {
         let f = c.get(at, n.min(42));
         let reply = n >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2] && f[28..32] == GATEWAY && f[0..6] == c.mac;
         if reply {
             gateway.copy_from_slice(&f[22..28]);
         }
         reply
-    })?;
+    });
+    if answered.is_err() {
+        // Not the user-mode network (a tap): no gateway, no ARP or ping.
+        println!("netcheck: no gateway answers on this network");
+        return bench(&mut c, driver);
+    }
     println!(
         "netcheck: the gateway is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         gateway[0], gateway[1], gateway[2], gateway[3], gateway[4], gateway[5]
@@ -222,5 +238,69 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
     pass("ping");
     times.sort_unstable();
     println!("BENCH {driver}_ping_user_mode {} ns", times[times.len() / 2]);
+    bench(&mut c, driver)
+}
+
+/// The benchmarks, where the host's echo answers.
+fn bench(c: &mut Check, driver: &str) -> Result<(), &'static str> {
+    let o = OUT as usize;
+    let clock = silica_rt::clock();
+    // virtio-net's are the gated `net_*`; another driver's are named after it.
+    let prefix = if driver == "virtio-net" { "net" } else { driver };
+    let echo = |c: &mut Check, seq: u32| -> Result<(), &'static str> {
+        c.put(o, &[0xFF; 6]);
+        c.put(o + 6, &c.mac);
+        c.put(o + 12, &ECHO);
+        c.put(o + 14, &seq.to_le_bytes());
+        c.send(60)
+    };
+    let back = |seq: u32| {
+        move |c: &Check, at: usize, n: usize| -> bool {
+            let f = c.get(at, n.min(18));
+            n >= 18 && f[0..6] == c.mac && f[12..14] == ECHO && f[14..18] == seq.to_le_bytes()
+        }
+    };
+    echo(c, 0)?;
+    if c.receive(clock.now() + SECOND / 4, &mut back(0)).is_err() {
+        println!("netcheck: no benchmark echo on this network");
+        return Ok(());
+    }
+    let mut times = Vec::new();
+    for seq in 1..=22_000u32 {
+        let t = clock.now();
+        echo(c, seq)?;
+        c.receive(clock.now() + SECOND, &mut back(seq))?;
+        if seq > 2000 {
+            times.push(clock.now() - t);
+        }
+    }
+    times.sort_unstable();
+    println!("BENCH {prefix}_rtt {} ns", times[times.len() / 2]);
+    println!("BENCH {prefix}_rtt_p99 {} ns", times[times.len() * 99 / 100]);
+
+    // Transmit: the same 1514-byte frame, 128 in flight, for a second.
+    c.put(o, &[0xFF; 6]);
+    c.put(o + 6, &c.mac);
+    c.put(o + 12, &SINK);
+    let (mut sent, mut done) = (0u64, 0u64);
+    let start = clock.now();
+    let end = start + SECOND;
+    while clock.now() < end || done < sent {
+        while sent - done < 128 && clock.now() < end {
+            sent += 1;
+            let r = Request { op: Op::Transmit, memory: 0, offset: OUT, length: 1514, tag: SENT + c.sent + sent };
+            c.nic.submit(&r).map_err(|e| why(e, "cannot send"))?;
+        }
+        c.nic.kick();
+        let got = c.nic.wait(Some(end + SECOND)).map_err(|e| why(e, "a frame was not sent in time"))?;
+        if got.tag > SENT + c.sent {
+            got.result.map_err(|e| why(e, "a frame could not be sent"))?;
+            done += 1;
+        } else if got.tag <= BUFFERS {
+            c.offer(got.tag)?;
+        }
+    }
+    let ns = clock.now() - start;
+    println!("BENCH {prefix}_tx {} frames/s", done * SECOND / ns.max(1));
     Ok(())
 }
