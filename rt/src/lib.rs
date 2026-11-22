@@ -112,6 +112,7 @@ pub mod ipc;
 pub mod log;
 pub mod mem;
 pub mod mmio;
+pub mod random;
 pub mod ring;
 
 pub use libsys as sys;
@@ -190,8 +191,9 @@ static DEBUG: AtomicU64 = AtomicU64::new(0);
 /// buffer is mapped, and which slots of its CapSpace are free
 /// (`first_free..slots`). `silica_proc::root` calls this, and then tells
 /// [`mem`] which Untyped capabilities are the machine's memory.
-pub fn start_root(debug: Cap, clock: [u64; 3], ipc_buffer: u64, first_free: u64, slots: u64) {
+pub fn start_root(debug: Cap, clock: [u64; 3], ipc_buffer: u64, first_free: u64, slots: u64, seed: &[u8; 32]) {
     init(debug, clock);
+    random::seed(seed);
     ipc::init(ipc_buffer, first_free, slots);
 }
 
@@ -308,6 +310,22 @@ pub fn start(info: &'static ProcessInfo, main: fn(&'static ProcessInfo) -> i64) 
         exit(-1);
     }
     init(slots::DEBUG, info.clock);
+    // The seed the parent put after the record (`random::SEED_OFFSET`), in
+    // the start-up page, which is the program's own and mapped read-write:
+    // taken, then overwritten, so it is not there to be read later.
+    let at = core::ptr::from_ref(info).expose_provenance() + random::SEED_OFFSET;
+    // SAFETY: the start-up page is mapped read-write for the whole program,
+    // `at` lies inside it (SEED_OFFSET + 32 <= 4096), nothing refers to
+    // those bytes, and this is the only thread yet.
+    #[allow(unsafe_code)]
+    let mut seed = unsafe {
+        let p = core::ptr::with_exposed_provenance_mut::<[u8; 32]>(at);
+        let seed = core::ptr::read_volatile(p);
+        core::ptr::write_volatile(p, [0; 32]);
+        seed
+    };
+    random::seed(&seed);
+    seed.fill(0);
     log::start();
     ipc::init(info.ipc_buffer, info.first_free_slot, info.capspace_slots);
     mem::add_source(slots::UNTYPED, info.untyped_bits as u8);

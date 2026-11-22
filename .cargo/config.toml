@@ -14,8 +14,5 @@ offline = true
 # program changes with the checkout's directory and system.img is not
 # reproducible (tools/repro.sh --system). With it (Cargo since 2026-10-24,
 # hence the pinned nightly) only their kind is hashed.
-[unstable]
-trim-paths = true
-
 [profile.release]
 trim-paths = "object"
