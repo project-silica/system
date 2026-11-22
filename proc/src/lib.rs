@@ -14,8 +14,9 @@
 
 use libsys::{self as sys, Cap, Error, ObjectType, Rights};
 use silica_formats::elf::{EM_NATIVE, Elf, ElfError, PF_W, PF_X};
+use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{free_slot, release_slot};
-use silica_rt::mem;
+use silica_rt::mem::{self, Object};
 use silica_rt::{PROCESS_MAGIC, ProcessInfo, slots};
 
 pub mod root;
@@ -42,6 +43,9 @@ pub const FAULT_BADGE: u64 = 1 << 62;
 pub const MAX_GRANTS: usize = 2048;
 /// The lowest slot of a child's CapSpace used for its image, stack and record.
 const FIRST_IMAGE_SLOT: u64 = 64;
+/// Most pages of zeros one run of a child is given in place of lent memory
+/// taken back ([`Child::answer_peer_fault`]).
+pub const ZERO_PAGES: usize = 64;
 
 /// What the parent spawns with: its own capabilities and working space.
 #[derive(Clone, Copy, Debug)]
@@ -127,6 +131,9 @@ pub struct Child {
     thread: Cap,
     space: Cap,
     aspace: Cap,
+    /// Pages of zeros mapped where lent memory was taken back, from the
+    /// parent's memory: a child cannot be made to pay for its peers.
+    zero_pages: Vec<Object>,
 }
 
 impl Parent {
@@ -180,6 +187,34 @@ impl Child {
         sys::thread_set_cpu(self.thread, cpu)
     }
 
+    /// Answer the kernel's report of the child's fault `m` (on
+    /// [`Parent::fault`]) if it is the child touching memory a peer lent it
+    /// and took back (an address from [`mem::PEER_BASE`] to
+    /// [`mem::PEER_END`]): a page of zeros is mapped there and the child
+    /// carries on, as `silica_rt::mem` promises every program. Returns
+    /// whether it was answered; any other fault, or more than
+    /// [`ZERO_PAGES`] of them in one run, is the child's own.
+    pub fn answer_peer_fault(&mut self, m: &sys::Message) -> bool {
+        let at = m.words[1];
+        if m.info.label() != sys::FAULT_LABEL + sys::Fault::Page as u64
+            || !(mem::PEER_BASE..mem::PEER_END).contains(&at)
+            || self.zero_pages.len() >= ZERO_PAGES
+        {
+            return false;
+        }
+        let Ok(page) = Object::new(ObjectType::Frame, 12) else { return false };
+        if sys::fault_map(self.aspace, page.cap(), at as usize & !0xFFF, Rights(Rights::READ.0 | Rights::WRITE.0)).is_ok() {
+            self.zero_pages.push(page);
+            return true;
+        }
+        // SAFETY: mapped nowhere.
+        #[allow(unsafe_code)]
+        unsafe {
+            page.destroy()
+        };
+        false
+    }
+
     /// End the child and take back all of its memory.
     pub fn destroy(self) -> Result<(), Error> {
         // SAFETY: everything derived from this Untyped is the child's; the
@@ -194,6 +229,13 @@ impl Child {
         // The revocation emptied the other three slots.
         for cap in [self.thread, self.space, self.aspace] {
             release_slot(cap.0);
+        }
+        for page in self.zero_pages {
+            // SAFETY: mapped only in the child, which is gone.
+            #[allow(unsafe_code)]
+            unsafe {
+                page.destroy()
+            };
         }
         Ok(())
     }
@@ -280,7 +322,7 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
             return Err(e.into());
         }
     };
-    let child = Child { untyped, mem_bits, thread: Cap(got[0]), space: Cap(got[1]), aspace: Cap(got[2]) };
+    let child = Child { untyped, mem_bits, thread: Cap(got[0]), space: Cap(got[1]), aspace: Cap(got[2]), zero_pages: Vec::new() };
     let result = match build(p, &child, [Cap(got[3]), Cap(got[4])], image, prog) {
         Ok(()) => Ok(child),
         Err(e) => {

@@ -3,7 +3,11 @@
 //! - [`device::manager`]: `silica.device.Manager`, how a program finds the
 //!   devices of a class that have a running driver and opens one's driver;
 //! - [`system::manager`]: `silica.system.Manager`, the services of the
-//!   system and the machine's power, provided by the service manager.
+//!   system and the machine's power, provided by the service manager;
+//! - [`input::device`]: `silica.input.Device`, the input device class;
+//! - [`display::device`]: `silica.display.Device`, the display device
+//!   class;
+//! - [`console::terminal`]: `silica.console.Terminal`, the local console.
 //!
 //! Each module's reference page is `silica-idlc docs`'s page for the
 //! protocol. A program wraps a capability it was granted to a provider as
@@ -18,4 +22,19 @@ pub mod device {
 /// `silica.system.Manager`.
 pub mod system {
     include!(concat!(env!("OUT_DIR"), "/silica_system_manager.rs"));
+}
+
+/// `silica.input.Device`.
+pub mod input {
+    include!(concat!(env!("OUT_DIR"), "/silica_input_device.rs"));
+}
+
+/// `silica.display.Device`.
+pub mod display {
+    include!(concat!(env!("OUT_DIR"), "/silica_display_device.rs"));
+}
+
+/// `silica.console.Terminal`.
+pub mod console {
+    include!(concat!(env!("OUT_DIR"), "/silica_console_terminal.rs"));
 }

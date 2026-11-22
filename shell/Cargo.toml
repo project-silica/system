@@ -1,0 +1,28 @@
+[package]
+name = "shell"
+description = "The shell (component D20): commands to look at and steer the system, on the local console."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+needs = ["silica.console.Terminal", "silica.system.Manager", "silica.device.Manager"]
+memory = 22
+start = "boot"
+restart = "always"
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+
+[lints]
+workspace = true

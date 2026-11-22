@@ -359,3 +359,147 @@ impl Listener {
         given(slots, sent);
     }
 }
+
+/// Notifications calls are parked on, made as they are needed and kept
+/// (`serve_parked`): one bit each, set while it holds a call.
+const PARKS: usize = 32;
+static PARK_SLOTS: [AtomicU64; PARKS] = [const { AtomicU64::new(0) }; PARKS];
+static PARK_BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// A free parking notification and its index, made the first time it is used.
+fn take_park() -> Option<(usize, Cap)> {
+    for (i, slot) in PARK_SLOTS.iter().enumerate() {
+        let bit = 1u64 << i;
+        if PARK_BUSY.fetch_or(bit, Ordering::Acquire) & bit != 0 {
+            continue;
+        }
+        let mut cap = slot.load(Ordering::Relaxed);
+        if cap == 0 {
+            match crate::mem::Object::new(sys::ObjectType::Notification, 0) {
+                // It lives as long as the program (an Object is never
+                // destroyed unless asked).
+                Ok(o) => {
+                    cap = o.cap().0;
+                    slot.store(cap, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    PARK_BUSY.fetch_and(!bit, Ordering::Release);
+                    return None;
+                }
+            }
+        }
+        return Some((i, Cap(cap)));
+    }
+    None
+}
+
+fn free_park(i: usize) {
+    PARK_BUSY.fetch_and(!(1u64 << i), Ordering::Release);
+}
+
+/// A call kept waiting (`serve_parked`): its caller waits until it is
+/// answered, which any thread of the program may do, at any later time.
+/// Dropping it unanswered fails the caller's call (`peer_gone`).
+#[derive(Debug)]
+pub struct Parked {
+    index: usize,
+    note: Cap,
+}
+
+impl Parked {
+    /// Answer with the reply message `reply` (as a generated reply type's
+    /// `encode_message` writes it) and its capabilities.
+    pub fn answer(self, reply: &[u8], mut caps: CapList<Handle>) {
+        let buf = buffer();
+        let (slots, sent) = give(&buf, &mut caps);
+        let words = pack(&buf, reply);
+        let _ = sys::answer(self.note, info(reply.len(), sent), words);
+        given(slots, sent);
+        free_park(self.index);
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        // Answered with nothing: the caller decodes no reply and fails.
+        let _ = sys::answer(self.note, MsgInfo::new(0, 0), [0; 4]);
+        free_park(self.index);
+    }
+}
+
+/// What a provider whose calls may wait does with each call and signal: the
+/// two halves of the loop [`serve_parked`] runs.
+pub trait Waiting {
+    /// A request arrived through a capability with `badge`. Write the reply
+    /// and return its length to answer now; or take the call out of
+    /// `parked` (`parked.take()`) to answer it later with
+    /// [`Parked::answer`]: a long-poll method, one that waits for something
+    /// to happen (the reply written now is then not sent). `parked` is
+    /// `None` when this call could not be parked: it must be answered now.
+    fn call(
+        &mut self,
+        badge: u64,
+        request: &[u8],
+        caps: CapList<Handle>,
+        reply: &mut [u8],
+        reply_caps: &mut CapList<Handle>,
+        parked: &mut Option<Parked>,
+    ) -> usize;
+    /// The notification was signalled with `signals` (see [`Events::signals`]):
+    /// often what a kept call was waiting for.
+    fn signals(&mut self, signals: u64);
+}
+
+/// Provide a protocol on `endpoint` whose calls may wait, and listen on
+/// `notification` (as [`serve_events`] does). Every call arrives parked on a
+/// notification of the program's own, so the provider can keep any number
+/// of callers waiting (up to 32) while it takes further calls and signals.
+/// Costs a system call more per call than [`serve_events`]; for protocols
+/// with long-poll methods.
+pub fn serve_parked(endpoint: Cap, notification: Cap, handler: &mut impl Waiting) -> ! {
+    let buf = buffer();
+    let mut request = [0u8; MAX_MESSAGE];
+    let mut reply = [0u8; MAX_MESSAGE];
+    loop {
+        let park = take_park();
+        let park_cap = park.map_or(Cap::NONE, |(_, c)| c);
+        let m = match sys::recv_with(endpoint, notification, Wait::Forever, park_cap) {
+            Ok(m) => m,
+            Err(_) => crate::exit(-3),
+        };
+        if let Some(signals) = m.signals() {
+            if let Some((i, _)) = park {
+                free_park(i);
+            }
+            handler.signals(signals);
+            continue;
+        }
+        let mut caps = CapList::new();
+        collect(&buf, m.info.caps(), &mut caps);
+        let len = unpack(&buf, m.words, m.info.label() as usize, &mut request);
+        // The call is parked when the kernel could park it (it can on the
+        // receiving processor, which is where this thread's notifications
+        // are); otherwise it waits on this thread and is answered now.
+        let parked = park.filter(|(_, c)| sys::recv(*c, Wait::Poll) == Err(Error::InUse));
+        if let (Some((i, _)), None) = (park, parked) {
+            free_park(i);
+        }
+        let mut token = parked.map(|(index, note)| Parked { index, note });
+        let mut reply_caps = CapList::new();
+        let n = handler.call(m.badge, &request[..len], caps, &mut reply, &mut reply_caps, &mut token).min(MAX_MESSAGE);
+        match (parked, token) {
+            // Kept for later.
+            (Some(_), None) => {}
+            // Answered now, through the notification it is parked on.
+            (Some(_), Some(t)) => t.answer(&reply[..n], reply_caps),
+            // Not parked: it waits on this thread.
+            (None, _) => {
+                let (slots, sent) = give(&buf, &mut reply_caps);
+                let words = pack(&buf, &reply[..n]);
+                let _ = sys::reply(info(n, sent), words);
+                given(slots, sent);
+            }
+        }
+    }
+}

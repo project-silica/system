@@ -22,6 +22,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-ring",
+ "silica-rt",
+]
+
+[[package]]
 name = "devmgr"
 version = "0.0.0"
 dependencies = [
@@ -53,6 +63,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbdisplay"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "hello"
 version = "0.0.0"
 dependencies = [
@@ -76,6 +96,15 @@ name = "libsys"
 version = "0.0.0"
 dependencies = [
  "silica-abi",
+]
+
+[[package]]
+name = "shell"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
 ]
 
 [[package]]
@@ -185,6 +214,17 @@ version = "0.0.0"
 dependencies = [
  "silica-block",
  "silica-driver",
+ "silica-rt",
+]
+
+[[package]]
+name = "virtio-input"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-ring",
  "silica-rt",
 ]
 

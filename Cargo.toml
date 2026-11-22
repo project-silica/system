@@ -20,6 +20,10 @@ members = [
     "drivers/framework",
     "drivers/virtio-blk",
     "drivers/virtio-rogue",
+    "drivers/virtio-input",
+    "drivers/fbdisplay",
+    "console",
+    "shell",
 ]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
 default-members = ["rt", "proc", "ring", "protocols", "storage/block", "drivers/framework"]

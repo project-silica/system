@@ -16,7 +16,7 @@
 //! A driver reads memory its clients lend it (the rings of a block
 //! connection), which a client can take back at any moment. A page fault
 //! there is the client's doing, not the driver's: it is answered with a
-//! page of zeros (up to [`ZERO_PAGES`] in one run of a driver), which the
+//! page of zeros (up to [`silica_proc::ZERO_PAGES`] in one run of a driver), which the
 //! driver reads as a broken ring and closes that connection. No client can
 //! crash a driver by taking its memory back.
 //!
@@ -89,9 +89,6 @@ const GRANT_FIRST_RAMDISK: u64 = 6;
 pub const CLIENTS: u64 = 1 << 32;
 /// Interrupt lines one device gets at most.
 const LINES_PER_DEVICE: u32 = 8;
-/// Pages of zeros given to one run of a driver in place of memory its
-/// clients took back; a driver that needs more is broken.
-const ZERO_PAGES: usize = 64;
 /// How often a driver that failed is started again before its device is
 /// left alone.
 const MAX_RESTARTS: u32 = 3;
@@ -130,8 +127,6 @@ struct Running<'a> {
     child: Child,
     /// The endpoint its clients call it on.
     service: Object,
-    /// Pages of zeros mapped in place of memory clients took back.
-    zero_pages: Vec<Object>,
     /// What clients asked to have signalled when this driver ends.
     gone: Vec<Handle>,
 }
@@ -158,6 +153,8 @@ struct Manager {
 fn class_of(f: &Function) -> Option<manager::Class> {
     match f.class.0 {
         0x01 => Some(manager::Class::Block),
+        0x03 => Some(manager::Class::Display),
+        0x09 => Some(manager::Class::Input),
         _ => None,
     }
 }
@@ -416,8 +413,11 @@ impl Manager {
         grants[silica_driver::grant::SERVICE as usize] = Grant::lend(service.cap(), Rights::READ);
         grants[silica_driver::grant::IDENTITY as usize] =
             Grant::badged(granted(GRANT_DEVICES), Rights::ALL, id as u64 | (id as u64 + 1) << 32);
-        grants[silica_driver::grant::INTERRUPTS as usize] =
-            Grant::badged(granted(GRANT_IRQS), Rights::ALL, first_line as u64 | (first_line as u64 + lines as u64) << 32);
+        // Its interrupt lines (none for a device that raises none).
+        if lines != 0 {
+            grants[silica_driver::grant::INTERRUPTS as usize] =
+                Grant::badged(granted(GRANT_IRQS), Rights::ALL, first_line as u64 | (first_line as u64 + lines as u64) << 32);
+        }
         grants[silica_driver::grant::CONFIG as usize] = Grant::lend(f.config_frame, Rights::READ);
         // What the driver may not change itself: the device answers memory
         // accesses, may do DMA and send message interrupts, and raises
@@ -428,9 +428,20 @@ impl Manager {
             registers.write16(msix.cap + 2, (registers.read16(msix.cap + 2) | 1 << 15) & !(1 << 14));
         }
         self.next_id += 1;
+        // A display: the framebuffer the firmware set up, if it is this
+        // device's (its mode, and the BAR it starts at the first byte of).
+        let mut display = [0u64; 3];
+        let fb = self.info.framebuffer;
+        if class_of(f) == Some(manager::Class::Display) && fb[0] != 0 {
+            let bar = f.bars.iter().position(|b| b.is_some_and(|b| b.base == fb[0]));
+            match bar {
+                Some(bar) => display = [fb[1] | fb[2] << 32, fb[3] | fb[4] << 32, bar as u64],
+                None => return Err("the firmware's framebuffer does not start a BAR of this display"),
+            }
+        }
         let program = Program {
             grants: &grants,
-            args: [id as u64, first_line as u64, lines as u64, self.info.dma_top, f.starts as u64, 0, 0, 0],
+            args: [id as u64, first_line as u64, lines as u64, self.info.dma_top, f.starts as u64, display[0], display[1], display[2]],
             aspace_bits: 18,
             ..Program::new(image, self.next_id)
         };
@@ -444,15 +455,7 @@ impl Manager {
             self.next_line += lines;
         }
         f.starts += 1;
-        self.running.push(Running {
-            name: driver,
-            id: self.next_id,
-            function: index,
-            child,
-            service,
-            zero_pages: Vec::new(),
-            gone: Vec::new(),
-        });
+        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, gone: Vec::new() });
         Ok(())
     }
 }
@@ -472,13 +475,6 @@ impl Manager {
         // Its clients hear of it now, not on their next call.
         for g in r.gone {
             let _ = sys::signal(g.cap());
-        }
-        for page in r.zero_pages {
-            // SAFETY: mapped only in the driver, which is gone.
-            #[allow(unsafe_code)]
-            unsafe {
-                page.destroy()
-            };
         }
         // SAFETY: the endpoint was the ended driver's alone.
         #[allow(unsafe_code)]
@@ -636,22 +632,8 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         let fault = msg.badge & FAULT_BADGE != 0;
         let Some(at) = m.running.iter().position(|r| msg.badge & !FAULT_BADGE == r.id) else { continue };
         let label = msg.info.label();
-        if fault && label == sys::FAULT_LABEL + sys::Fault::Page as u64 && (mem::PEER_BASE..mem::PEER_END).contains(&msg.words[1]) {
-            let r = &mut m.running[at];
-            if r.zero_pages.len() < ZERO_PAGES
-                && let Ok(page) = Object::new(ObjectType::Frame, 12)
-            {
-                let at = msg.words[1] as usize & !0xFFF;
-                if sys::fault_map(r.child.aspace(), page.cap(), at, Rights(Rights::READ.0 | Rights::WRITE.0)).is_ok() {
-                    r.zero_pages.push(page);
-                    continue;
-                }
-                // SAFETY: mapped nowhere.
-                #[allow(unsafe_code)]
-                unsafe {
-                    page.destroy()
-                };
-            }
+        if fault && m.running[at].child.answer_peer_fault(&msg) {
+            continue;
         }
         let r = m.running.remove(at);
         let (driver, function) = (r.name, r.function);

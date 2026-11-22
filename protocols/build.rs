@@ -3,7 +3,11 @@ use std::path::PathBuf;
 
 fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../idl/protocols/silica");
-    let files: Vec<PathBuf> = ["device/manager.idl", "system/manager.idl"].iter().map(|f| root.join(f)).collect();
+    let files: Vec<PathBuf> =
+        ["device/manager.idl", "system/manager.idl", "input/device.idl", "display/device.idl", "console/terminal.idl"]
+            .iter()
+            .map(|f| root.join(f))
+            .collect();
     for f in &files {
         println!("cargo::rerun-if-changed={}", f.display());
     }

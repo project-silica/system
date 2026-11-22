@@ -201,10 +201,12 @@ pub fn clock() -> Clock {
 }
 
 /// The debug console: the kernel's console, through a console capability.
-/// Unbuffered, for bring-up and panics; the logging service (D08) replaces
-/// it for everything else. Each `write_str` is written whole (a few system
-/// calls of 32 bytes), so lines from different programs do not tear within
-/// a call.
+/// For bring-up, panics and the serial line; the logging service (D08)
+/// replaces it for everything else. [`print!`] and [`println!`] format into
+/// a [`Line`] of up to 256 bytes and write it once, so what one call prints
+/// is not split by another program's output unless it is longer than that.
+/// The kernel starts a fresh line for a writer that finds another's line
+/// unfinished, so a line never begins with someone else's text.
 pub struct Debug;
 
 impl fmt::Write for Debug {
@@ -217,16 +219,66 @@ impl fmt::Write for Debug {
     }
 }
 
-/// Write to the debug console.
-#[macro_export]
-macro_rules! print {
-    ($($a:tt)*) => {{ use core::fmt::Write as _; let _ = write!($crate::Debug, $($a)*); }};
+/// Text gathered for [`Debug`] and written in one piece: by [`flush`] or
+/// when dropped, or when full.
+///
+/// [`flush`]: Line::flush
+pub struct Line {
+    buf: [u8; 256],
+    len: usize,
 }
 
-/// Write a line to the debug console.
+impl Line {
+    pub const fn new() -> Line {
+        Line { buf: [0; 256], len: 0 }
+    }
+
+    /// Write out what has been gathered.
+    pub fn flush(&mut self) {
+        if self.len != 0 {
+            // Whole `str`s, written back to back: always UTF-8.
+            let _ = fmt::Write::write_str(&mut Debug, core::str::from_utf8(&self.buf[..self.len]).unwrap_or(""));
+            self.len = 0;
+        }
+    }
+}
+
+impl Default for Line {
+    fn default() -> Line {
+        Line::new()
+    }
+}
+
+impl fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.len + s.len() > self.buf.len() {
+            self.flush();
+            if s.len() > self.buf.len() {
+                return Debug.write_str(s);
+            }
+        }
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
+        Ok(())
+    }
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// Write to the debug console, in one piece.
+#[macro_export]
+macro_rules! print {
+    ($($a:tt)*) => {{ use core::fmt::Write as _; let mut l = $crate::Line::new(); let _ = write!(l, $($a)*); }};
+}
+
+/// Write a line to the debug console, in one piece.
 #[macro_export]
 macro_rules! println {
-    ($($a:tt)*) => {{ use core::fmt::Write as _; let _ = write!($crate::Debug, $($a)*); let _ = $crate::Debug.write_str("\r\n"); }};
+    ($($a:tt)*) => {{ use core::fmt::Write as _; let mut l = $crate::Line::new(); let _ = write!(l, $($a)*); let _ = l.write_str("\r\n"); }};
 }
 
 /// Finish the program: tell the parent the status and stop this thread. The

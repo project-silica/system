@@ -147,11 +147,16 @@ impl Manager {
 
     /// A message on the exit endpoint about a service: it ended (`EXIT_LABEL`)
     /// or faulted (`FAULT_BADGE`). Returns the service and its status
-    /// (`None`: a fault), or `None` for a message about nothing of ours.
+    /// (`None`: a fault), or `None` for a message about nothing of ours or
+    /// a fault on memory a peer took back, which is answered.
     fn ended(&mut self, m: &sys::Message) -> Option<(usize, Option<i64>)> {
         let fault = m.badge & FAULT_BADGE != 0;
         let i = (m.badge & !FAULT_BADGE).checked_sub(SERVICE_IDS)? as usize;
         if i >= self.services.len() || self.running[i].child.is_none() || (!fault && m.info.label() != EXIT_LABEL) {
+            return None;
+        }
+        // Memory a peer lent it and took back: it carries on, on zeros.
+        if fault && self.running[i].child.as_mut().is_some_and(|c| c.answer_peer_fault(m)) {
             return None;
         }
         let child = self.running[i].child.take()?;
