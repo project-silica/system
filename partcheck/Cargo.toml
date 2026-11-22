@@ -1,0 +1,27 @@
+[package]
+name = "partcheck"
+description = "Checks the block server: a partition read through its own capability is its disk's blocks, and nothing beyond them."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+needs = ["silica.device.Manager", "silica.block.Partitions"]
+memory = 23
+start = "check:partitions"
+
+[[bin]]
+name = "partcheck"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-block = { workspace = true }
+
+[lints]
+workspace = true

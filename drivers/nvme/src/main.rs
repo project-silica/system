@@ -664,6 +664,6 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         _admin: ctl.admin,
         _interrupts: (admin_irq, io_irq),
     };
-    let mut service = Service::new(disk, signals.sender(CLIENT)?);
+    let mut service = Service::new(disk, signals.sender(CLIENT)?, silica_driver::granted(silica_driver::grant::SERVICE));
     silica_rt::ipc::serve_events(silica_driver::granted(silica_driver::grant::SERVICE), signals.listen(), &mut service)
 }

@@ -236,6 +236,6 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         if disk.info.write_cache { ", write cache" } else { "" },
         if disk.dma.confined() { "confined by the IOMMU" } else { "not confined" },
     );
-    let mut service = Service::new(disk, signals.sender(CLIENT)?);
+    let mut service = Service::new(disk, signals.sender(CLIENT)?, silica_driver::granted(silica_driver::grant::SERVICE));
     serve_events(granted(grant::SERVICE), signals.listen(), &mut service)
 }

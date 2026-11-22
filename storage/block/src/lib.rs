@@ -31,6 +31,7 @@ pub mod client;
 pub mod service;
 
 include!(concat!(env!("OUT_DIR"), "/silica_block_device.rs"));
+include!(concat!(env!("OUT_DIR"), "/silica_block_partitions.rs"));
 
 pub use silica_queue::{COMPLETION_BYTES, COMPLETIONS_AT, MEMORIES, QUEUE, REQUEST_BYTES, RINGS_BITS};
 

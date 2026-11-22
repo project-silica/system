@@ -109,6 +109,8 @@ pub enum Refused {
     NoRoom = 4,
     /// Requests that use the memory are still in progress.
     InUse = 5,
+    /// Outside what the capability reaches.
+    Outside = 6,
 }
 
 #[cfg(test)]

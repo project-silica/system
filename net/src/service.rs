@@ -116,6 +116,7 @@ fn error(r: Refused) -> Error {
         Refused::BadMemory => Error::BadMemory,
         Refused::NoRoom => Error::NoRoom,
         Refused::InUse => Error::InUse,
+        Refused::Outside => Error::BadMemory,
     }
 }
 
@@ -143,7 +144,7 @@ impl<D: Device> Service<D> {
         let (session, device) = (&mut self.session, &mut self.device);
         let info = device.info();
         let largest = info.mtu.saturating_add(HEADER);
-        let whole = session.take(|raw, ticket, region| {
+        let broken = session.take(|raw, ticket, region, _client| {
             let invalid = provider::Refusal::Fail(Status::Invalid as u32);
             let r = Request::decode(raw).ok_or(invalid)?;
             let m = region.ok_or(invalid)?;
@@ -158,8 +159,8 @@ impl<D: Device> Service<D> {
             device.start(&r, m.address + r.offset as u64, ticket)?;
             Ok(ticket)
         });
-        if !whole {
-            self.session.close(&mut Map(&mut self.device));
+        if broken != 0 {
+            self.session.close(broken, &mut Map(&mut self.device));
         }
         self.device.kick();
     }

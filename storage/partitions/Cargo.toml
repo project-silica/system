@@ -1,0 +1,30 @@
+[package]
+name = "partitions"
+description = "The block server: every disk's GPT partitions, each opened as a disk of its own (silica.block.Partitions)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+provides = "silica.block.Partitions"
+needs = ["silica.device.Manager"]
+memory = 22
+start = "boot"
+restart = "always"
+
+[[bin]]
+name = "partitions"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+silica-block = { workspace = true }
+
+[lints]
+workspace = true

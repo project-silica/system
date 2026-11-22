@@ -81,12 +81,26 @@ impl From<Refused> for Error {
     }
 }
 
+/// Where a client finds its device's provider: the device manager, or
+/// another provider of devices (the partitions of disks).
+pub trait Opener {
+    /// A capability to the provider of device `id`, which signals `gone`
+    /// when it ends.
+    fn open(&mut self, id: u32, gone: Handle) -> Result<Handle, Error>;
+}
+
+impl Opener for manager::Client<Channel, Handle> {
+    fn open(&mut self, id: u32, gone: Handle) -> Result<Handle, Error> {
+        Ok(manager::Client::open(self, id, Some(gone))?.driver)
+    }
+}
+
 /// A class's control protocol, as the queue uses it: normally a thin
 /// wrapper of the generated client of `silica.<class>.Device`.
 pub trait Control: Sized {
-    /// Open the provider of device `id` through the device manager; it
-    /// signals `gone` when it ends. Also learns what the device is.
-    fn open(devices: &mut manager::Client<Channel, Handle>, id: u32, gone: Handle) -> Result<Self, Error>;
+    /// The control protocol through `provider`, the capability an
+    /// [`Opener`] gave; it also learns what the device is.
+    fn open(provider: Handle) -> Result<Self, Error>;
     /// The class's `connect`: returns what wakes the provider.
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<Handle, Error>;
     /// The class's `add_memory`.
@@ -193,7 +207,7 @@ struct Link<C> {
 pub struct Queue<C: Control> {
     // The generated clients carry their message buffers (8 KB each): boxed,
     // so a queue is small to keep and to move.
-    devices: Box<manager::Client<Channel, Handle>>,
+    devices: Box<dyn Opener>,
     id: u32,
     /// The frame of the two rings, reused (cleared) for each driver.
     rings: Memory,
@@ -234,7 +248,12 @@ impl<C: Control> Queue<C> {
     /// `devices` (a capability to its endpoint; the queue keeps it to find
     /// the next driver when this one ends).
     pub fn open(devices: Cap, id: u32) -> Result<Queue<C>, Error> {
-        let devices = Box::new(manager::Client::<Channel, Handle>::from(Channel::new(devices)));
+        Queue::open_with(Box::new(manager::Client::<Channel, Handle>::from(Channel::new(devices))), id)
+    }
+
+    /// Open device `id` through `opener` (which the queue keeps, to find
+    /// the next provider when this one ends).
+    pub fn open_with(devices: Box<dyn Opener>, id: u32) -> Result<Queue<C>, Error> {
         let mut memories = Vec::new();
         memories.try_reserve_exact(MEMORIES as usize).map_err(|_| Error::NoMemory)?;
         memories.resize(MEMORIES as usize, None);
@@ -260,7 +279,7 @@ impl<C: Control> Queue<C> {
     fn connect(&mut self) -> Result<(), Error> {
         self.generation = self.generation.wrapping_add(1);
         let gone = lend(self.note.cap(), Rights::WRITE, gone_bit(self.generation))?;
-        let mut control = C::open(&mut self.devices, self.id, gone)?;
+        let mut control = C::open(self.devices.open(self.id, gone)?)?;
         // The rings start empty: the last driver can no longer touch them.
         let region = self.rings.shared();
         for at in (0..region.len()).step_by(8) {

@@ -6,7 +6,6 @@
 
 use crate::device::{self, Info};
 use crate::{Completion, QUEUE, Request};
-use silica_protocols::device::manager;
 use silica_queue::Refused;
 use silica_queue::client::{self, Control, Queue};
 use silica_rt::ipc::{Channel, Handle};
@@ -36,8 +35,7 @@ pub struct Net {
 }
 
 impl Control for Net {
-    fn open(devices: &mut manager::Client<Channel, Handle>, id: u32, gone: Handle) -> Result<Net, client::Error> {
-        let driver = devices.open(id, Some(gone))?.driver;
+    fn open(driver: Handle) -> Result<Net, client::Error> {
         let mut control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
         let info = control.info()?.info;
         Ok(Net { _endpoint: driver, control, info })

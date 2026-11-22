@@ -10,10 +10,10 @@
 //! blocks may be.)
 
 use crate::device::{self, Info};
+use crate::partitions;
 use crate::{Completion, QUEUE, Request, Status};
-use silica_protocols::device::manager;
 use silica_queue::Refused;
-use silica_queue::client::{self, Control, Queue};
+use silica_queue::client::{self, Control, Opener, Queue};
 use silica_rt::ipc::{Channel, Handle};
 use silica_rt::mem::Memory;
 use silica_rt::sys::Cap;
@@ -48,6 +48,7 @@ impl From<client::Error> for Error {
                 Refused::BadMemory => device::Error::BadMemory,
                 Refused::NoRoom => device::Error::NoRoom,
                 Refused::InUse => device::Error::InUse,
+                Refused::Outside => device::Error::Outside,
             }),
             client::Error::Gone => Error::Gone,
             client::Error::Protocol => Error::Protocol,
@@ -66,6 +67,7 @@ impl From<device::Error> for client::Error {
             device::Error::BadMemory => Refused::BadMemory,
             device::Error::NoRoom => Refused::NoRoom,
             device::Error::InUse => Refused::InUse,
+            device::Error::Outside => Refused::Outside,
             device::Error::Unknown(_) => return client::Error::Protocol,
         })
     }
@@ -80,8 +82,7 @@ pub struct Block {
 }
 
 impl Control for Block {
-    fn open(devices: &mut manager::Client<Channel, Handle>, id: u32, gone: Handle) -> Result<Block, client::Error> {
-        let driver = devices.open(id, Some(gone))?.driver;
+    fn open(driver: Handle) -> Result<Block, client::Error> {
         let mut control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
         let info = control.info()?.info;
         Ok(Block { _endpoint: driver, control, info })
@@ -99,6 +100,19 @@ impl Control for Block {
     fn remove_memory(&mut self, id: u32) -> Result<(), client::Error> {
         self.control.remove_memory(id)?;
         Ok(())
+    }
+}
+
+/// Partitions are opened through the partitions service as disks are
+/// through the device manager.
+impl Opener for partitions::Client<Channel, Handle> {
+    fn open(&mut self, id: u32, gone: Handle) -> Result<Handle, client::Error> {
+        match partitions::Client::open(self, id, Some(gone)) {
+            Ok(r) => Ok(r.device),
+            Err(silica_idl_rt::CallError::Error(partitions::Error::Gone)) => Err(client::Error::Gone),
+            Err(silica_idl_rt::CallError::Error(_)) => Err(client::Error::Refused(Refused::BadMemory)),
+            Err(silica_idl_rt::CallError::Transport(_)) => Err(client::Error::Gone),
+        }
     }
 }
 
@@ -120,6 +134,16 @@ impl Disk {
     /// the next driver when this one ends).
     pub fn open(devices: Cap, id: u32) -> Result<Disk, Error> {
         let mut queue = Queue::<Block>::open(devices, id)?;
+        let info = queue.control()?.info.clone();
+        Ok(Disk { queue, info })
+    }
+
+    /// Open partition `id` through the partitions service behind
+    /// `partitions` (`silica.block.Partitions`): a disk whose blocks are the
+    /// partition's, from 0, that outlives its driver as a whole disk does.
+    pub fn open_partition(partitions: Cap, id: u32) -> Result<Disk, Error> {
+        let opener = silica_rt::alloc::boxed::Box::new(partitions::Client::<Channel, Handle>::from(Channel::new(partitions)));
+        let mut queue = Queue::<Block>::open_with(opener, id)?;
         let info = queue.control()?.info.clone();
         Ok(Disk { queue, info })
     }

@@ -586,7 +586,10 @@ impl Manager {
         }
         let f = &self.functions[index];
         let service = Object::new(ObjectType::Endpoint, 0).map_err(|_| "no memory for its service endpoint")?;
-        grants[silica_driver::grant::SERVICE as usize] = Grant::lend(service.cap(), Rights::READ);
+        // To receive on, and to make capabilities to itself from (a block
+        // driver narrows a client's to a partition).
+        grants[silica_driver::grant::SERVICE as usize] =
+            Grant::lend(service.cap(), Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::GRANT.0));
         grants[silica_driver::grant::IDENTITY as usize] =
             Grant::badged(granted(GRANT_DEVICES), Rights::ALL, id as u64 | (id as u64 + 1) << 32);
         // Its interrupt lines (none for a device that raises none).

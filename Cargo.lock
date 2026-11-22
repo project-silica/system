@@ -147,6 +147,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "partcheck"
+version = "0.0.0"
+dependencies = [
+ "silica-block",
+ "silica-idl-rt",
+ "silica-rt",
+]
+
+[[package]]
+name = "partitions"
+version = "0.0.0"
+dependencies = [
+ "silica-block",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "shell"
 version = "0.0.0"
 dependencies = [

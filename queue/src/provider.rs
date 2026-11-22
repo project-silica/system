@@ -1,7 +1,9 @@
-//! The provider's half: the connection a class's service keeps for its one
-//! client. A [`Session`] owns the rings, the table of the client's
-//! registered memory, the wake-ups and the connection's life; the class's
-//! service decides what a request means and starts it on its device.
+//! The provider's half: the connections a class's service keeps for its
+//! clients (up to [`CONNECTIONS`] at once, each through a capability of its
+//! own: a disk's partitions, say, each a client). A [`Session`] owns each
+//! connection's rings, its table of registered memory, the wake-ups and the
+//! connection's life; the class's service decides what a request means
+//! (and what a client may reach) and starts it on its device.
 //!
 //! The service implements its class protocol's calls by passing them on
 //! ([`Session::connect`], [`Session::add_memory`], [`Session::remove_memory`]),
@@ -30,12 +32,17 @@ pub trait Mapper {
     fn unmap(&mut self, mapping: Self::Mapping);
 }
 
+/// Most clients connected at once.
+pub const CONNECTIONS: usize = 16;
+
 /// A request a service has handed to its device: given back to
 /// [`Session::complete`] when the device has finished it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ticket {
     tag: u64,
     memory: u32,
+    /// The connection's slot, and which connection in it (its generation).
+    slot: u16,
     connection: u32,
 }
 
@@ -43,6 +50,11 @@ impl Ticket {
     /// The client's tag.
     pub fn tag(&self) -> u64 {
         self.tag
+    }
+
+    /// The same ticket for a request that uses no registered memory.
+    pub fn without_memory(self) -> Ticket {
+        Ticket { memory: NO_MEMORY, ..self }
     }
 }
 
@@ -75,6 +87,9 @@ struct Memory<M> {
 }
 
 struct Connection<M> {
+    /// Which connection this is: a late completion is not given to the
+    /// next one in the same slot.
+    generation: u32,
     /// The badge of the capability the client calls through.
     client: u64,
     /// The frame of the rings: gone when the client is.
@@ -90,41 +105,61 @@ struct Connection<M> {
     completed: bool,
 }
 
-/// A service's connection to its client (at most one at a time).
+impl<M> Connection<M> {
+    /// Whether the client is still there: it is while the frame of its
+    /// rings is (a client that ends, or takes the rings back, takes the
+    /// capability with it).
+    fn alive(&self) -> bool {
+        matches!(sys::inspect_slot(slots::SPACE, self.rings.cap().0), Ok(Some(_)))
+    }
+}
+
+/// A service's connections to its clients.
 pub struct Session<M> {
-    connection: Option<Connection<M>>,
-    /// Counts connections, so a late completion is not given to a new client.
+    connections: Vec<Option<Connection<M>>>,
+    /// Counts connections.
     generation: u32,
     /// The capability clients are given to wake the service.
     wake: Cap,
+    /// Where `take` starts, so no client's ring is always looked at last.
+    next: usize,
 }
 
 impl<M> Session<M> {
     /// No connection yet. `wake` signals the notification the service
     /// listens on with its client bit; each client is given a copy.
     pub fn new(wake: Cap) -> Session<M> {
-        Session { connection: None, generation: 0, wake }
+        let mut connections = Vec::new();
+        connections.resize_with(CONNECTIONS, || None);
+        Session { connections, generation: 0, wake, next: 0 }
     }
 
-    /// End the connection: the device loses the client's memory.
-    pub fn close(&mut self, mapper: &mut impl Mapper<Mapping = M>) {
-        if let Some(c) = self.connection.take() {
+    /// End connection `slot`: the device loses the client's memory.
+    fn close_slot(&mut self, slot: usize, mapper: &mut impl Mapper<Mapping = M>) {
+        if let Some(c) = self.connections.get_mut(slot).and_then(Option::take) {
             for m in c.memories.into_iter().flatten() {
                 mapper.unmap(m.mapping);
             }
-            self.generation = self.generation.wrapping_add(1);
         }
     }
 
-    /// Whether the connected client is still there: it is while the frame
-    /// of its rings is (a client that ends, or takes the rings back, takes
-    /// the capability with it).
-    fn alive(&self) -> bool {
-        self.connection.as_ref().is_some_and(|c| matches!(sys::inspect_slot(slots::SPACE, c.rings.cap().0), Ok(Some(_))))
+    /// End every connection whose bit is set in `broken` (from `take`).
+    pub fn close(&mut self, broken: u64, mapper: &mut impl Mapper<Mapping = M>) {
+        for slot in 0..CONNECTIONS {
+            if broken & 1 << slot != 0 {
+                self.close_slot(slot, mapper);
+            }
+        }
+    }
+
+    fn of(&mut self, caller: u64) -> Option<&mut Connection<M>> {
+        self.connections.iter_mut().flatten().find(|c| c.client == caller)
     }
 
     /// The class's `connect` from the client calling with badge `caller`:
-    /// returns the capability the client wakes the service with.
+    /// returns the capability the client wakes the service with. A client
+    /// connects once; another client with a capability of its own connects
+    /// beside it.
     pub fn connect(
         &mut self,
         caller: u64,
@@ -132,21 +167,29 @@ impl<M> Session<M> {
         completions: Handle,
         mapper: &mut impl Mapper<Mapping = M>,
     ) -> Result<Handle, Refused> {
-        if self.connection.is_some() {
-            if self.alive() {
+        if let Some(slot) = self.connections.iter().position(|c| c.as_ref().is_some_and(|c| c.client == caller)) {
+            if self.connections[slot].as_ref().is_some_and(Connection::alive) {
                 return Err(Refused::Busy);
             }
-            self.close(mapper);
+            self.close_slot(slot, mapper);
         }
-        let size = match sys::inspect_slot(slots::SPACE, rings.cap().0) {
-            Ok(Some(s)) if s.bits == RINGS_BITS && s.rights.has(Rights(3)) => 1usize << s.bits,
-            _ => return Err(Refused::BadMemory),
+        // A free slot, or one whose client has gone.
+        let slot = match self.connections.iter().position(Option::is_none) {
+            Some(s) => s,
+            None => {
+                let dead = self.connections.iter().position(|c| c.as_ref().is_some_and(|c| !c.alive())).ok_or(Refused::NoRoom)?;
+                self.close_slot(dead, mapper);
+                dead
+            }
         };
+        match sys::inspect_slot(slots::SPACE, rings.cap().0) {
+            Ok(Some(s)) if s.bits == RINGS_BITS && s.rights.has(Rights(3)) => {}
+            _ => return Err(Refused::BadMemory),
+        }
         // If the client takes it back, the range reads as zeros, which the
         // rings report as a broken ring.
         let region = mem::peer(rings.cap(), RINGS_BITS, Rights(3)).map_err(|_| Refused::NoRoom)?;
-        debug_assert_eq!(region.len(), size);
-        let (Some(req), Some(cpl)) = (region.part(0, COMPLETIONS_AT), region.part(COMPLETIONS_AT, size - COMPLETIONS_AT)) else {
+        let (Some(req), Some(cpl)) = (region.part(0, COMPLETIONS_AT), region.part(COMPLETIONS_AT, region.len() - COMPLETIONS_AT)) else {
             return Err(Refused::BadMemory);
         };
         let (Some(mut requests), Some(completions_ring)) = (Consumer::new(req, QUEUE), Producer::new(cpl, QUEUE)) else {
@@ -163,7 +206,9 @@ impl<M> Session<M> {
             silica_rt::ipc::release_slot(wake);
             return Err(Refused::NoRoom);
         }
-        self.connection = Some(Connection {
+        self.generation = self.generation.wrapping_add(1);
+        self.connections[slot] = Some(Connection {
+            generation: self.generation,
             client: caller,
             rings,
             requests,
@@ -185,7 +230,7 @@ impl<M> Session<M> {
         writable: bool,
         mapper: &mut impl Mapper<Mapping = M>,
     ) -> Result<(), Refused> {
-        let c = self.connection.as_mut().filter(|c| c.client == caller).ok_or(Refused::NotConnected)?;
+        let c = self.of(caller).ok_or(Refused::NotConnected)?;
         let slot = c.memories.get_mut(id as usize).filter(|m| m.is_none()).ok_or(Refused::BadMemory)?;
         let need = Rights(Rights::READ.0 | if writable { Rights::WRITE.0 } else { 0 });
         let bits = match sys::inspect_slot(slots::SPACE, frame.cap().0) {
@@ -199,7 +244,7 @@ impl<M> Session<M> {
 
     /// The class's `remove_memory` from `caller`.
     pub fn remove_memory(&mut self, caller: u64, id: u32, mapper: &mut impl Mapper<Mapping = M>) -> Result<(), Refused> {
-        let c = self.connection.as_mut().filter(|c| c.client == caller).ok_or(Refused::NotConnected)?;
+        let c = self.of(caller).ok_or(Refused::NotConnected)?;
         let slot = c.memories.get_mut(id as usize).filter(|m| m.is_some()).ok_or(Refused::BadMemory)?;
         if slot.as_ref().is_some_and(|m| m.busy != 0) {
             return Err(Refused::InUse);
@@ -211,61 +256,76 @@ impl<M> Session<M> {
         Ok(())
     }
 
-    /// Take requests from the ring and start each with `start`, until the
-    /// ring is empty (and the client has been told this side sleeps) or
-    /// `start` says the device is full. `start` is given the record, its
-    /// ticket, and the registered frame it names (`None`: no such frame, or
-    /// a request with no data); it returns the ticket it handed to the
-    /// device, with its memory dropped (`Ticket::without_memory`) when the
-    /// request does not use it. A refused request is completed here.
-    /// Returns false when the client broke its ring (or took it back): the
-    /// service then closes the session.
+    /// Take requests from every client's ring and start each with `start`,
+    /// until the rings are empty (and their clients told this side sleeps)
+    /// or `start` says the device is full. `start` is given the record,
+    /// its ticket, the registered frame it names (`None`: no such frame,
+    /// or a request with no data) and the badge of the client it came from
+    /// (what the client may reach is the class's to know); it returns the
+    /// ticket it handed to the device, with its memory dropped
+    /// (`Ticket::without_memory`) when the request does not use it. A
+    /// refused request is completed here. Returns the connections whose
+    /// client broke its ring (or took it back), one bit each: the service
+    /// closes them (`close`).
     #[must_use]
-    pub fn take(&mut self, mut start: impl FnMut(&Raw, Ticket, Option<Region>) -> Result<Ticket, Refusal>) -> bool {
-        let generation = self.generation;
-        loop {
-            let Some(c) = self.connection.as_mut() else { return true };
-            let raw = match c.stalled.take() {
-                Some(r) => r,
-                None => match c.requests.pop() {
-                    Ok(Some(raw)) => raw,
-                    Ok(None) => {
-                        if c.requests.sleep() {
-                            return true;
+    pub fn take(&mut self, mut start: impl FnMut(&Raw, Ticket, Option<Region>, u64) -> Result<Ticket, Refusal>) -> u64 {
+        let mut broken = 0u64;
+        let first = self.next;
+        self.next = (self.next + 1) % CONNECTIONS;
+        for k in 0..CONNECTIONS {
+            let slot = (first + k) % CONNECTIONS;
+            let Some(c) = self.connections[slot].as_mut() else { continue };
+            loop {
+                let raw = match c.stalled.take() {
+                    Some(r) => r,
+                    None => match c.requests.pop() {
+                        Ok(Some(raw)) => raw,
+                        Ok(None) => {
+                            if c.requests.sleep() {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
+                        // The ring makes no sense: the client broke the
+                        // protocol, or is gone and its memory with it.
+                        Err(_) => {
+                            broken |= 1 << slot;
+                            break;
+                        }
+                    },
+                };
+                let memory = memory_of(&raw);
+                let ticket = Ticket { tag: tag_of(&raw), memory, slot: slot as u16, connection: c.generation };
+                let region = c.memories.get(memory as usize).and_then(Option::as_ref).map(|m| m.region);
+                match start(&raw, ticket, region, c.client) {
+                    Ok(t) => {
+                        if let Some(m) = c.memories.get_mut(t.memory as usize).and_then(Option::as_mut) {
+                            m.busy += 1;
+                        }
                     }
-                    // The ring makes no sense: the client broke the
-                    // protocol, or is gone and its memory with it.
-                    Err(_) => return false,
-                },
-            };
-            let memory = memory_of(&raw);
-            let ticket = Ticket { tag: tag_of(&raw), memory, connection: generation };
-            let region = c.memories.get(memory as usize).and_then(Option::as_ref).map(|m| m.region);
-            match start(&raw, ticket, region) {
-                Ok(t) => {
-                    if let Some(m) = c.memories.get_mut(t.memory as usize).and_then(Option::as_mut) {
-                        m.busy += 1;
+                    Err(Refusal::Busy) => {
+                        // The device is full: the rest waits for a completion.
+                        c.stalled = Some(raw);
+                        return broken;
                     }
-                }
-                Err(Refusal::Busy) => {
-                    c.stalled = Some(raw);
-                    return true;
-                }
-                Err(Refusal::Fail(status)) => {
-                    let _ = c.completions.push(&Completion { tag: ticket.tag, status, value: 0 }.encode());
-                    c.completed = true;
+                    Err(Refusal::Fail(status)) => {
+                        let _ = c.completions.push(&Completion { tag: ticket.tag, status, value: 0 }.encode());
+                        c.completed = true;
+                    }
                 }
             }
         }
+        broken
     }
 
     /// The device finished the request of `ticket` with `status` (0:
     /// success) and `value`: complete it to the client, if it is still the
     /// client the request came from.
     pub fn complete(&mut self, ticket: Ticket, status: u32, value: u32) {
-        let Some(c) = self.connection.as_mut().filter(|_| ticket.connection == self.generation) else { return };
+        let Some(c) = self.connections.get_mut(ticket.slot as usize).and_then(Option::as_mut).filter(|c| c.generation == ticket.connection)
+        else {
+            return;
+        };
         if let Some(m) = c.memories.get_mut(ticket.memory as usize).and_then(Option::as_mut) {
             m.busy = m.busy.saturating_sub(1);
         }
@@ -276,28 +336,21 @@ impl<M> Session<M> {
     }
 
     /// Add a record that answers no request (a class's event, such as a
-    /// link coming up), with `tag` a value no request uses.
+    /// link coming up) for every client, with `tag` a value no request uses.
     pub fn event(&mut self, tag: u64, status: u32, value: u32) {
-        if let Some(c) = self.connection.as_mut() {
+        for c in self.connections.iter_mut().flatten() {
             let _ = c.completions.push(&Completion { tag, status, value }.encode());
             c.completed = true;
         }
     }
 
-    /// Wake the client if completions were added and it sleeps.
+    /// Wake the clients completions were added for, those that sleep.
     pub fn flush(&mut self) {
-        if let Some(c) = self.connection.as_mut().filter(|c| c.completed) {
+        for c in self.connections.iter_mut().flatten().filter(|c| c.completed) {
             c.completed = false;
             if c.completions.wake_needed() {
                 let _ = sys::signal(c.done.cap());
             }
         }
-    }
-}
-
-impl Ticket {
-    /// The same ticket for a request that uses no registered memory.
-    pub fn without_memory(self) -> Ticket {
-        Ticket { memory: NO_MEMORY, ..self }
     }
 }

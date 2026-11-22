@@ -103,13 +103,15 @@
 //! with status 0 after saying why: ending well is not a failure, and the
 //! device is left alone at once.
 
-use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, RemoveMemoryReply};
+use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, NarrowReply, RemoveMemoryReply};
 use crate::{Op, Request, Status};
 use silica_idl_rt::CapList;
 use silica_queue::Refused;
 use silica_queue::provider::{self, Mapper, Session};
-use silica_rt::ipc::{Events, Handle};
-use silica_rt::sys::Cap;
+use silica_rt::alloc::vec::Vec;
+use silica_rt::ipc::{Events, Handle, free_slot, release_slot};
+use silica_rt::slots;
+use silica_rt::sys::{self, Cap, Rights};
 
 pub use silica_queue::provider::Ticket;
 
@@ -191,6 +193,7 @@ impl<D: Device> Mapper for Map<'_, D> {
             Error::NotConnected => Refused::NotConnected,
             Error::BadMemory => Refused::BadMemory,
             Error::InUse => Refused::InUse,
+            Error::Outside => Refused::Outside,
             Error::NoRoom | Error::Unknown(_) => Refused::NoRoom,
         })
     }
@@ -206,6 +209,7 @@ fn error(r: Refused) -> Error {
         Refused::BadMemory => Error::BadMemory,
         Refused::NoRoom => Error::NoRoom,
         Refused::InUse => Error::InUse,
+        Refused::Outside => Error::Outside,
     }
 }
 
@@ -213,57 +217,83 @@ fn status(s: Result<(), Status>) -> u32 {
     s.map_or_else(|s| s as u32, |()| 0)
 }
 
+/// Badges of the capabilities `narrow` makes start here, above any the
+/// device manager gives clients.
+const NARROWED: u64 = 1 << 48;
+/// Most narrowed capabilities one run of a driver makes.
+const WINDOWS: usize = 256;
+
+/// The blocks a capability reaches.
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    badge: u64,
+    first: u64,
+    blocks: u64,
+}
+
 /// A block device's service: the provider of `silica.block.Device`.
 pub struct Service<D: Device> {
     /// The driver's part.
     pub device: D,
     session: Session<D::Mapping>,
+    /// The endpoint clients call on, from which `narrow` makes capabilities.
+    endpoint: Cap,
+    /// What narrowed capabilities reach; any other reaches the whole device.
+    windows: Vec<Window>,
     /// The badge of the call being served.
     caller: u64,
 }
 
 impl<D: Device> Service<D> {
-    /// A service for `device`. `wake` is a capability that signals the
-    /// notification the driver listens on with the bit [`CLIENT`]; each
-    /// client is given a copy.
-    pub fn new(device: D, wake: Cap) -> Service<D> {
-        Service { device, session: Session::new(wake), caller: 0 }
+    /// A service for `device`, whose clients call it on `endpoint` (the
+    /// driver's grant: it narrows capabilities from it). `wake` is a
+    /// capability that signals the notification the driver listens on with
+    /// the bit [`CLIENT`]; each client is given a copy.
+    pub fn new(device: D, wake: Cap, endpoint: Cap) -> Service<D> {
+        Service { device, session: Session::new(wake), endpoint, windows: Vec::new(), caller: 0 }
     }
 
-    /// Take requests from the ring, check each against the device and the
-    /// memory, and start them, until the ring is empty (and the client has
-    /// been told this side sleeps) or the device is full; then tell the
-    /// device.
+    /// What the capability with `badge` reaches: its first block and how many.
+    fn window(windows: &[Window], badge: u64, info: &Info) -> (u64, u64) {
+        windows.iter().find(|w| w.badge == badge).map_or((0, info.blocks), |w| (w.first, w.blocks))
+    }
+
+    /// Take requests from the rings, check each against the device, the
+    /// memory and what its client may reach, and start them, until the
+    /// rings are empty (and their clients told this side sleeps) or the
+    /// device is full; then tell the device.
     fn pump(&mut self) {
-        let (session, device) = (&mut self.session, &mut self.device);
+        let (session, device, windows) = (&mut self.session, &mut self.device, &self.windows);
         let info = device.info();
-        let whole = session.take(|raw, ticket, region| {
+        let broken = session.take(|raw, ticket, region, client| {
             let invalid = provider::Refusal::Fail(Status::Invalid as u32);
             let r = Request::decode(raw).ok_or(invalid)?;
             if r.op == Op::Flush {
-                // A flush uses no memory.
+                // A flush uses no memory, and reaches the whole device's cache.
                 let ticket = ticket.without_memory();
                 device.start(&r, 0, ticket)?;
                 return Ok(ticket);
             }
             let m = region.ok_or(invalid)?;
+            let (first, blocks) = Service::<D>::window(windows, client, &info);
             let bytes = r.blocks as u64 * info.block_size as u64;
-            let on_device =
-                r.blocks != 0 && r.blocks <= info.max_blocks && r.block.checked_add(r.blocks as u64).is_some_and(|e| e <= info.blocks);
+            let within = r.blocks != 0 && r.blocks <= info.max_blocks && r.block.checked_add(r.blocks as u64).is_some_and(|e| e <= blocks);
             let in_memory = r.offset.is_multiple_of(512) && r.offset as u64 + bytes <= m.bytes;
             let allowed = match r.op {
                 Op::Read => m.writable,
                 _ => !info.read_only,
             };
-            if !(on_device && in_memory && allowed) {
+            if !(within && in_memory && allowed) {
                 return Err(invalid);
             }
-            device.start(&r, m.address + r.offset as u64, ticket)?;
+            // The device's own numbering.
+            let on_device = Request { block: first + r.block, ..r };
+            device.start(&on_device, m.address + r.offset as u64, ticket)?;
             Ok(ticket)
         });
-        if !whole {
-            // The client broke its ring, or is gone and its memory with it.
-            self.session.close(&mut Map(&mut self.device));
+        if broken != 0 {
+            // Clients that broke their rings, or are gone with their memory.
+            self.session.close(broken, &mut Map(&mut self.device));
         }
         self.device.kick();
     }
@@ -282,7 +312,28 @@ impl<D: Device> Service<D> {
 
 impl<D: Device> device::Server<Handle> for Service<D> {
     fn info(&mut self) -> InfoReply {
-        InfoReply { info: self.device.info() }
+        let mut info = self.device.info();
+        info.blocks = Service::<D>::window(&self.windows, self.caller, &info).1;
+        InfoReply { info }
+    }
+
+    fn narrow(&mut self, first: u64, blocks: u64) -> Result<NarrowReply<Handle>, Error> {
+        let info = self.device.info();
+        let (base, reach) = Service::<D>::window(&self.windows, self.caller, &info);
+        if blocks == 0 || first.checked_add(blocks).is_none_or(|end| end > reach) {
+            return Err(Error::Outside);
+        }
+        if self.windows.len() >= WINDOWS {
+            return Err(Error::NoRoom);
+        }
+        let badge = NARROWED + self.windows.len() as u64;
+        let slot = free_slot().ok_or(Error::NoRoom)?;
+        if sys::cap_derive(slots::SPACE, slot, self.endpoint, Rights(Rights::WRITE.0 | Rights::GRANT.0), badge).is_err() {
+            release_slot(slot);
+            return Err(Error::NoRoom);
+        }
+        self.windows.push(Window { badge, first: base + first, blocks });
+        Ok(NarrowReply { device: Handle::new(Cap(slot)) })
     }
 
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<ConnectReply<Handle>, Error> {
