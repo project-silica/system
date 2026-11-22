@@ -25,6 +25,10 @@ pub const F_VERSION_1: u64 = 1 << 32;
 /// Feature: the device reaches memory through the platform's IOMMU, at the
 /// addresses the driver gives it there, instead of bypassing it.
 pub const F_ACCESS_PLATFORM: u64 = 1 << 33;
+/// Event indices (virtio 1.2, 2.7.10): the driver says which completion it
+/// wants an interrupt for, the device which request it wants a doorbell
+/// for. Taken whenever the device offers it; the queue uses it unseen.
+pub const F_RING_EVENT_IDX: u64 = 1 << 29;
 
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
@@ -64,6 +68,8 @@ pub struct Transport {
     notify: Mmio,
     notify_multiplier: u32,
     device: Option<Mmio>,
+    /// Event indices were agreed: the queues made from here on use them.
+    event_idx: core::cell::Cell<bool>,
 }
 
 impl Transport {
@@ -97,6 +103,7 @@ impl Transport {
             notify: notify.ok_or(DeviceError::Missing("the virtio notification structure"))?,
             notify_multiplier: multiplier,
             device: specific,
+            event_idx: core::cell::Cell::new(false),
         })
     }
 
@@ -155,7 +162,8 @@ impl Transport {
                 "a feature the driver requires"
             }));
         }
-        let agreed = offered & (wanted | required | F_ACCESS_PLATFORM);
+        let agreed = offered & (wanted | required | F_ACCESS_PLATFORM | F_RING_EVENT_IDX);
+        self.event_idx.set(agreed & F_RING_EVENT_IDX != 0);
         for half in 0..2 {
             self.common.write32(DRIVER_FEATURE_SELECT, half);
             self.common.write32(DRIVER_FEATURE, (agreed >> (32 * half)) as u32);
@@ -207,7 +215,7 @@ impl Transport {
         let notify =
             self.notify.part(at, 2).ok_or(DeviceError::Protocol("the queue's notification register lies outside its structure"))?;
         self.common.write16(QUEUE_ENABLE, 1);
-        Ok(Queue { notify, index, common: self.common, ..q })
+        Ok(Queue { notify, index, common: self.common, event_idx: self.event_idx.get(), ..q })
     }
 
     /// Changes of the device-specific configuration raise MSI-X entry `vector`.
@@ -271,6 +279,8 @@ pub struct Queue {
     used: u16,
     /// The transport's common configuration: where an injected reset goes.
     common: Mmio,
+    /// Event indices were agreed (`F_RING_EVENT_IDX`).
+    event_idx: bool,
 }
 
 /// The queue has too few free descriptors for the request; take
@@ -305,6 +315,7 @@ impl Queue {
             device_area,
             notify,
             common: notify,
+            event_idx: false,
             free: 0,
             free_count: size,
             next,
@@ -382,16 +393,27 @@ impl Queue {
         if self.pending == 0 {
             return;
         }
+        let added = self.pending;
         self.pending = 0;
         // An injected fault: the device resets itself instead.
         if inject::pending(Fault::Reset) {
             self.common.write8(DEVICE_STATUS, 0);
             return;
         }
-        // The device's "no notification needed" flag is read after the
-        // index it will look at was written.
+        // What the device asked for is read after the index it will look
+        // at was written.
         dma::full_barrier();
-        if self.device_area.shared().read16(0) & 1 == 0 {
+        let wanted = if self.event_idx {
+            // A doorbell only if the requests added since the last one
+            // passed the one the device asked to be told about.
+            let event = self.device_area.shared().read16(4 + 8 * self.size as usize);
+            let (new, old) = (self.avail, self.avail.wrapping_sub(added));
+            new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
+        } else {
+            // The device's "no notification needed" flag.
+            self.device_area.shared().read16(0) & 1 == 0
+        };
+        if wanted {
             self.notify.write16(0, self.index);
         }
     }
@@ -404,7 +426,16 @@ impl Queue {
     pub fn pop(&mut self) -> Result<Option<(u64, u32)>, DeviceError> {
         let u = self.device_area.shared();
         if u.read16(2) == self.used {
-            return Ok(None);
+            if !self.event_idx {
+                return Ok(None);
+            }
+            // Ask for an interrupt for the next completion, then look once
+            // more: one that came while asking would bring none.
+            self.driver_area.shared().write16(16 * self.size as usize + 4 + 2 * self.size as usize, self.used);
+            dma::full_barrier();
+            if u.read16(2) == self.used {
+                return Ok(None);
+            }
         }
         // The entry is read after the index that says it is there.
         dma::read_barrier();
@@ -439,6 +470,11 @@ impl Queue {
     /// [`Queue::pop`] before waiting.
     pub fn suppress_interrupts(&mut self, suppress: bool) {
         self.driver_area.shared().write16(16 * self.size as usize, suppress as u16);
+        if self.event_idx {
+            // The completion asked an interrupt for: one long past, or the next.
+            let at = if suppress { self.used.wrapping_sub(0x8000) } else { self.used };
+            self.driver_area.shared().write16(16 * self.size as usize + 4 + 2 * self.size as usize, at);
+        }
         dma::full_barrier();
     }
 }
