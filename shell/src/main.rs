@@ -103,13 +103,29 @@ impl Shell {
                 }
             }
             "log" if !arg.is_empty() => {
-                // From the oldest text kept, part by part, each line
-                // indented as the shell's other listings are.
+                // Stop at the writer's current position. In particular,
+                // displaying the console's own log writes more of that log.
+                let end = match self.log.sources() {
+                    Ok(r) => r.sources.iter().find(|s| s.name == arg).map(|s| s.written),
+                    Err(e) => {
+                        let _ = writeln!(self.out, "log: {arg}: {e:?}");
+                        self.say();
+                        return;
+                    }
+                };
+                let Some(end) = end else {
+                    let _ = writeln!(self.out, "log: {arg}: no such log source");
+                    self.say();
+                    return;
+                };
                 let (mut from, mut fresh) = (0, true);
-                loop {
+                while from < end {
                     match self.log.read(arg, from) {
                         Ok(r) if !r.text.is_empty() => {
-                            for c in r.text.chars() {
+                            // read can start later than requested after eviction.
+                            let start = r.next.saturating_sub(r.text.len() as u64);
+                            let len = end.saturating_sub(start).min(r.text.len() as u64) as usize;
+                            for c in r.text[..r.text.floor_char_boundary(len)].chars() {
                                 if fresh {
                                     self.out.push_str("  ");
                                 }
