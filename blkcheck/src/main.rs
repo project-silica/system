@@ -31,6 +31,17 @@ silica_rt::main!(main);
 
 const SECOND: u64 = 1_000_000_000;
 
+/// How long after boot the measurements start (monotonic nanoseconds).
+const SETTLED: u64 = 500_000_000;
+
+/// Wait until [`SETTLED`].
+fn settle() {
+    let Ok(n) = silica_rt::mem::Object::new(silica_rt::sys::ObjectType::Notification, 0) else { return };
+    while silica_rt::clock().now() < SETTLED {
+        let _ = silica_rt::sys::recv(n.cap(), silica_rt::sys::Wait::Until(SETTLED));
+    }
+}
+
 fn main(_info: &'static ProcessInfo) -> i64 {
     match run() {
         Ok(()) => 0,
@@ -227,7 +238,13 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
 
     // Measurements: 4 KiB reads spread over the first 4 MiB of the disk by
     // the sequence the Linux baseline uses (os/bench/linux/init.c), so both
-    // read the same places of disks of different sizes.
+    // read the same places of disks of different sizes. They start once the
+    // system is up (SETTLED after boot), as Linux's do (its benchmark is
+    // all there is once it runs): measured during the boot, the reads share
+    // processor 0 with the services and drivers still starting there, and a
+    // tenth of a run's reads waited behind them (spec/ARCHITECTURE.md
+    // section 7).
+    settle();
     let blocks4k = (4096 / bs) as u32;
     let span = ((4u64 << 20) / bs as u64).min(info.blocks).saturating_sub(blocks4k as u64).max(1);
     let mut lat = Vec::new();
@@ -253,8 +270,7 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
                 .map_err(|e| why(e, "the request ring is full"))?;
             sent += 1;
         }
-        disk.kick();
-        let c = disk.wait(deadline()).map_err(|e| why(e, "a measured read did not complete"))?;
+        let c = disk.kick_wait(deadline()).map_err(|e| why(e, "a measured read did not complete"))?;
         if c.status.is_err() {
             return Err("a measured read failed");
         }

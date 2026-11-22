@@ -102,6 +102,12 @@ impl Interface {
         self.queue.kick()
     }
 
+    /// [`Interface::kick`] and [`Interface::wait`] in one system call when
+    /// the client must sleep (`silica_queue::client::Queue::kick_wait`).
+    pub fn kick_wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
+        Ok(self.queue.kick_wait(deadline)?.into())
+    }
+
     /// The next completion or link record, if one is there.
     pub fn poll(&mut self) -> Result<Option<Completion>, Error> {
         Ok(self.queue.poll()?.map(Completion::from))

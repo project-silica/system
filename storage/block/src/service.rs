@@ -262,6 +262,8 @@ pub struct Service<D: Device> {
     next_trace: usize,
     /// The badge of the call being served.
     caller: u64,
+    /// A client to wake as the driver next waits (`Session::flush`).
+    wake: Option<Cap>,
 }
 
 impl<D: Device> Service<D> {
@@ -278,6 +280,7 @@ impl<D: Device> Service<D> {
             traces: [Trace::default(); TRACES],
             next_trace: 0,
             caller: 0,
+            wake: None,
         }
     }
 
@@ -433,16 +436,20 @@ impl<D: Device> Events for Service<D> {
             self.device_event(Some(bits & !CLIENT));
         }
         self.pump();
-        self.session.flush();
+        self.wake = self.session.flush();
     }
 
     fn deadline(&self) -> Option<u64> {
         self.device.deadline()
     }
 
+    fn take_wake(&mut self) -> Option<Cap> {
+        self.wake.take()
+    }
+
     fn timer(&mut self) {
         self.device_event(None);
         self.pump();
-        self.session.flush();
+        self.wake = self.session.flush();
     }
 }

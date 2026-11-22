@@ -191,6 +191,12 @@ impl Disk {
         self.queue.kick()
     }
 
+    /// [`Disk::kick`] and [`Disk::wait`] in one system call when the client
+    /// must sleep (`silica_queue::client::Queue::kick_wait`).
+    pub fn kick_wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
+        Ok(self.queue.kick_wait(deadline)?.into())
+    }
+
     /// The next completion, if one is there.
     pub fn poll(&mut self) -> Result<Option<Completion>, Error> {
         Ok(self.queue.poll()?.map(Completion::from))
@@ -214,8 +220,7 @@ impl Disk {
     /// that does one thing at a time; nothing else may be in progress.
     pub fn run(&mut self, request: &Request, deadline: Option<u64>) -> Result<(), Error> {
         self.submit(request)?;
-        self.kick();
-        let c = self.wait(deadline)?;
+        let c: Completion = self.queue.kick_wait(deadline)?.into();
         if c.tag != request.tag {
             return Err(Error::Protocol);
         }

@@ -450,6 +450,39 @@ impl<C: Control> Queue<C> {
         }
     }
 
+    /// [`Queue::kick`] and [`Queue::wait`] together: when the client has
+    /// to sleep, the driver's wake-up and the client's wait are one system
+    /// call (`libsys::signal_recv`), so a driver on the same processor runs
+    /// at once, and the processor is not shared with a client about to
+    /// wait. What a request and its answer cost the processor.
+    pub fn kick_wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
+        let mut wake = self.link.as_mut().filter(|l| l.requests.wake_needed()).map(|l| l.wake.cap());
+        loop {
+            if let Some(c) = self.poll()? {
+                if let Some(w) = wake
+                    && sys::signal(w).is_err()
+                {
+                    self.link = None;
+                }
+                return Ok(c);
+            }
+            let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
+            if !asleep {
+                continue;
+            }
+            let w = wake.take().unwrap_or(Cap::NONE);
+            match sys::signal_recv(w, self.note.cap(), Cap::NONE, deadline.map_or(Wait::Forever, Wait::Until)) {
+                Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.link = None,
+                Ok(_) => {}
+                // The wake-up failed, and nothing was received: the
+                // driver's notification is gone with it (its death notice
+                // follows).
+                Err(e) if w != Cap::NONE && e != sys::Error::Timeout && sys::signal(w).is_err() => self.link = None,
+                Err(_) => return Err(Error::Timeout),
+            }
+        }
+    }
+
     /// The next completion, waiting for it until the monotonic time
     /// `deadline` (nanoseconds; `None`: for ever).
     pub fn wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {

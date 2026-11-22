@@ -126,13 +126,15 @@ pub struct Service<D: Device> {
     pub device: D,
     session: Session<D::Mapping>,
     caller: u64,
+    /// A client to wake as the driver next waits (`Session::flush`).
+    wake: Option<Cap>,
 }
 
 impl<D: Device> Service<D> {
     /// A service for `device`; `wake` signals the driver's notification
     /// with [`CLIENT`].
     pub fn new(device: D, wake: Cap) -> Service<D> {
-        Service { device, session: Session::new(wake), caller: 0 }
+        Service { device, session: Session::new(wake), caller: 0, wake: None }
     }
 
     /// Tell the client the link went up or down.
@@ -216,16 +218,20 @@ impl<D: Device> Events for Service<D> {
             self.device_event(Some(bits & !CLIENT));
         }
         self.pump();
-        self.session.flush();
+        self.wake = self.session.flush();
     }
 
     fn deadline(&self) -> Option<u64> {
         self.device.deadline()
     }
 
+    fn take_wake(&mut self) -> Option<Cap> {
+        self.wake.take()
+    }
+
     fn timer(&mut self) {
         self.device_event(None);
         self.pump();
-        self.session.flush();
+        self.wake = self.session.flush();
     }
 }

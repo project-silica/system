@@ -123,12 +123,12 @@ impl Check {
         self.nic.submit(&r).map_err(|e| why(e, "cannot offer a receive buffer"))
     }
 
-    /// Send the `len` bytes built at `OUT`.
+    /// Send the `len` bytes built at `OUT` (the driver is told as
+    /// `receive` waits).
     fn send(&mut self, len: u32) -> Result<(), &'static str> {
         self.sent += 1;
         let r = Request { op: Op::Transmit, memory: 0, offset: OUT, length: len.max(60), tag: SENT + self.sent };
         self.nic.submit(&r).map_err(|e| why(e, "cannot send"))?;
-        self.nic.kick();
         Ok(())
     }
 
@@ -136,7 +136,8 @@ impl Check {
     /// offset and length), offering every buffer again; until `deadline`.
     fn receive(&mut self, deadline: u64, wanted: &mut dyn FnMut(&Check, usize, usize) -> bool) -> Result<(), &'static str> {
         loop {
-            let c: Completion = self.nic.wait(Some(deadline)).map_err(|e| why(e, "nothing arrived in time"))?;
+            // What was sent and offered goes to the driver as this waits.
+            let c: Completion = self.nic.kick_wait(Some(deadline)).map_err(|e| why(e, "nothing arrived in time"))?;
             if c.tag == LINK || c.tag >= SENT {
                 if let Err(e) = c.result {
                     return Err(why(e, "a frame could not be sent"));
@@ -147,7 +148,6 @@ impl Check {
             let at = (c.tag as usize - 1) * BUFFER as usize;
             let ok = wanted(self, at, n);
             self.offer(c.tag)?;
-            self.nic.kick();
             if ok {
                 return Ok(());
             }
@@ -291,8 +291,7 @@ fn bench(c: &mut Check, driver: &str) -> Result<(), &'static str> {
             let r = Request { op: Op::Transmit, memory: 0, offset: OUT, length: 1514, tag: SENT + c.sent + sent };
             c.nic.submit(&r).map_err(|e| why(e, "cannot send"))?;
         }
-        c.nic.kick();
-        let got = c.nic.wait(Some(end + SECOND)).map_err(|e| why(e, "a frame was not sent in time"))?;
+        let got = c.nic.kick_wait(Some(end + SECOND)).map_err(|e| why(e, "a frame was not sent in time"))?;
         if got.tag > SENT + c.sent {
             got.result.map_err(|e| why(e, "a frame could not be sent"))?;
             done += 1;

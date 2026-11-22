@@ -344,13 +344,21 @@ impl<M> Session<M> {
         }
     }
 
-    /// Wake the clients completions were added for, those that sleep.
-    pub fn flush(&mut self) {
+    /// Wake the clients completions were added for, those that sleep: all
+    /// but one, whose notification is returned for the caller to signal as
+    /// it waits (`silica_rt::ipc::Events::take_wake`), in one system call
+    /// with its wait. The caller must signal what it is given.
+    #[must_use]
+    pub fn flush(&mut self) -> Option<Cap> {
+        let mut last = None;
         for c in self.connections.iter_mut().flatten().filter(|c| c.completed) {
             c.completed = false;
-            if c.completions.wake_needed() {
-                let _ = sys::signal(c.done.cap());
+            if c.completions.wake_needed()
+                && let Some(w) = last.replace(c.done.cap())
+            {
+                let _ = sys::signal(w);
             }
         }
+        last
     }
 }
