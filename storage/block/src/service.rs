@@ -13,10 +13,12 @@
 //!
 //! ```text
 //! use silica_block::device::{Error, Info};
-//! use silica_block::service::{Busy, CLIENT, Completions, Device, Service, Ticket};
+//! use silica_block::service::{CLIENT, Completions, Device, Refusal, Service, Ticket};
 //! use silica_block::{Request, Status};
 //! use silica_driver::dma::{Dma, Shared};
 //! use silica_driver::irq::{Interrupt, Signals};
+//! use silica_driver::DeviceError;
+//! use silica_rt::sys::Cap;
 //!
 //! struct Disk { dma: Dma, info: Info, /* the device's queues, its registers */ }
 //!
@@ -30,12 +32,23 @@
 //!     }
 //!     fn unmap(&mut self, m: Shared) { self.dma.unshare(m) }
 //!     // Put the request on the device's queue; keep `ticket` until it is done.
-//!     fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Busy> { /* ... */ }
+//!     fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Refusal> { /* ... */ }
 //!     // Tell the device about requests started since the last call.
 //!     fn kick(&mut self) { /* ring the doorbell once */ }
 //!     // An interrupt (the bits its Signals sender carries): report every finished request.
 //!     fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
 //!         /* for each completion the device reports: */ done(ticket, Ok(()));
+//!     }
+//! }
+//!
+//! silica_rt::main!(main);
+//!
+//! fn main(info: &'static silica_rt::ProcessInfo) -> i64 {
+//!     match run(info) {
+//!         Ok(never) => match never {},
+//!         // A failure: the device manager starts the driver again (section
+//!         // "Ending" below).
+//!         Err(e) => { silica_rt::println!("mydisk: {e:?}"); 1 }
 //!     }
 //! }
 //!
@@ -52,12 +65,43 @@
 //! }
 //! ```
 //!
-//! `start` is called with a request the device can do; return [`Busy`] when
-//! the device's queue is full (the request is offered again after the next
-//! completion). Every ticket `start` accepted must reach `done` exactly
-//! once: with `Ok`, or an error [`Status`] (`Io` for a device error,
-//! `Aborted` when the driver gives up on the device). Keep the interrupt
-//! objects alive for as long as the driver runs.
+//! `start` is called only with a request the service has checked: `blocks`
+//! is at least 1 and at most [`Info::max_blocks`](crate::device::Info),
+//! the blocks lie on the device, the data (`blocks` times the block size,
+//! from `offset`, a multiple of 512) lies inside a registered frame, and
+//! the frame may be used that way (written by the device for a read; no
+//! write or flush to a read-only device). `address` is the device address
+//! of the data's first byte: the frame's address plus `offset`, so the
+//! data lies at consecutive device addresses. A flush has no data: its
+//! `address` is 0, and its other fields are whatever the client wrote.
+//!
+//! Return [`Refusal::Busy`] when the device's queue is full (the request is
+//! offered again after the next completion), or [`Refusal::Fail`] for a
+//! request this device cannot do (it completes at once with that status).
+//! Every ticket `start` accepted must reach `done` exactly once: with `Ok`,
+//! or an error [`Status`] (`Io` for a device error, `Aborted` when the
+//! driver gives up on the device). Keep the interrupt objects alive for as
+//! long as the driver runs.
+//!
+//! # Timeouts
+//!
+//! A device can accept a request and never finish it. A driver that returns
+//! a time from [`Device::deadline`] (the monotonic clock, `silica_rt::clock`)
+//! has [`Device::timeout`] called when it passes with nothing else
+//! happening: complete what the device has not finished (normally by
+//! resetting it, or by ending the driver), or move the deadline on.
+//!
+//! # Ending
+//!
+//! A driver that cannot go on (a device that answers nonsense or reports a
+//! fatal error) ends with a nonzero status from `main`, or with
+//! `silica_rt::exit` from anywhere, `signals` included: the device manager
+//! silences the device and starts the driver again, which resets it, and
+//! each client sends again what was in flight. After three such failures
+//! the device is left alone and its owner told. A driver for a device it
+//! will never support (a namespace format it does not know) should end
+//! with status 0 after saying why: ending well is not a failure, and the
+//! device is left alone at once.
 
 use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, RemoveMemoryReply};
 use crate::{COMPLETION_BYTES, COMPLETIONS_AT, Completion, MEMORIES, Op, QUEUE, REQUEST_BYTES, RINGS_BITS, Request, Status};
@@ -73,9 +117,14 @@ use silica_rt::{mem, slots};
 /// request ring".
 pub const CLIENT: u64 = 1;
 
-/// The device's queue is full: offer the request again after a completion.
+/// Why a driver did not start a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Busy;
+pub enum Refusal {
+    /// The device's queue is full: offer the request again after a completion.
+    Busy,
+    /// The device cannot do this request: complete it now with this status.
+    Fail(Status),
+}
 
 /// A request the service has handed to the driver: given back through the
 /// `done` of [`Device::signals`] when the device has finished it.
@@ -102,11 +151,11 @@ pub trait Device {
     /// The device no longer reaches that frame.
     fn unmap(&mut self, mapping: Self::Mapping);
 
-    /// Start `request` (already checked: its blocks are on the device, its
-    /// data inside a registered frame the device may use that way), whose
-    /// data the device finds at `address`. `ticket` is handed to the
-    /// `done` of [`Device::signals`] when the device has finished it.
-    fn start(&mut self, request: &Request, address: u64, ticket: Ticket) -> Result<(), Busy>;
+    /// Start `request` (already checked, as the module says), whose data
+    /// the device finds at `address` (the first byte's device address,
+    /// `offset` included). `ticket` is handed to the `done` of
+    /// [`Device::signals`] when the device has finished it.
+    fn start(&mut self, request: &Request, address: u64, ticket: Ticket) -> Result<(), Refusal>;
 
     /// The driver's notification was signalled with `bits` (other than
     /// [`CLIENT`]): report every request the device has finished.
@@ -114,6 +163,17 @@ pub trait Device {
 
     /// Requests were started since the last call: tell the device, once.
     fn kick(&mut self);
+
+    /// When [`Device::timeout`] is to be called if nothing else happens
+    /// first (monotonic nanoseconds); `None` (the default): never. Asked
+    /// before every wait, so it can follow the oldest request in flight.
+    fn deadline(&self) -> Option<u64> {
+        None
+    }
+
+    /// The deadline passed: report what the device has finished, and deal
+    /// with what it has not (see the module's "Timeouts").
+    fn timeout(&mut self, _done: &mut Completions<'_>) {}
 }
 
 /// Where a driver reports a finished request: the ticket it was started
@@ -186,16 +246,16 @@ impl<D: Device> Service<D> {
     }
 
     /// Check `r` against the device and the memory, and start it.
-    fn start(&mut self, r: Request) -> Result<(), Result<Busy, Status>> {
+    fn start(&mut self, r: Request) -> Result<(), Refusal> {
         let info = self.device.info();
-        let Some(c) = self.connection.as_mut() else { return Err(Err(Status::Aborted)) };
+        let Some(c) = self.connection.as_mut() else { return Err(Refusal::Fail(Status::Aborted)) };
         // A flush uses no memory.
         let ticket = Ticket { tag: r.tag, memory: if r.op == Op::Flush { u32::MAX } else { r.memory }, connection: self.generation };
         let address = if r.op == Op::Flush {
             0
         } else {
             let bytes = r.blocks as u64 * info.block_size as u64;
-            let m = c.memories.get(r.memory as usize).and_then(Option::as_ref).ok_or(Err(Status::Invalid))?;
+            let m = c.memories.get(r.memory as usize).and_then(Option::as_ref).ok_or(Refusal::Fail(Status::Invalid))?;
             let on_device =
                 r.blocks != 0 && r.blocks <= info.max_blocks && r.block.checked_add(r.blocks as u64).is_some_and(|e| e <= info.blocks);
             let in_memory = r.offset.is_multiple_of(512) && r.offset as u64 + bytes <= m.bytes;
@@ -204,11 +264,11 @@ impl<D: Device> Service<D> {
                 _ => !info.read_only,
             };
             if !(on_device && in_memory && allowed) {
-                return Err(Err(Status::Invalid));
+                return Err(Refusal::Fail(Status::Invalid));
             }
             m.address + r.offset as u64
         };
-        self.device.start(&r, address, ticket).map_err(Ok)?;
+        self.device.start(&r, address, ticket)?;
         if let Some(m) = c.memories.get_mut(r.memory as usize).and_then(Option::as_mut).filter(|_| r.op != Op::Flush) {
             m.busy += 1;
         }
@@ -239,13 +299,13 @@ impl<D: Device> Service<D> {
             match next {
                 Some(Ok(r)) => match self.start(r) {
                     Ok(()) => {}
-                    Err(Ok(Busy)) => {
+                    Err(Refusal::Busy) => {
                         if let Some(c) = self.connection.as_mut() {
                             c.stalled = Some(r);
                         }
                         return;
                     }
-                    Err(Err(status)) => self.refuse(r.tag, status),
+                    Err(Refusal::Fail(status)) => self.refuse(r.tag, status),
                 },
                 // Not a request at all: its tag is still where a tag is.
                 Some(Err(raw)) => self
@@ -370,8 +430,30 @@ impl<D: Device> Events for Service<D> {
 
     fn signals(&mut self, bits: u64) {
         if bits & !CLIENT != 0 {
+            self.device_event(Some(bits & !CLIENT));
+        }
+        self.pump();
+        self.flush();
+    }
+
+    fn deadline(&self) -> Option<u64> {
+        self.device.deadline()
+    }
+
+    fn timer(&mut self) {
+        self.device_event(None);
+        self.pump();
+        self.flush();
+    }
+}
+
+impl<D: Device> Service<D> {
+    /// The device's signals (`Some`), or its deadline passing (`None`):
+    /// what it reports finished goes to the client.
+    fn device_event(&mut self, bits: Option<u64>) {
+        {
             let (connection, generation) = (&mut self.connection, self.generation);
-            self.device.signals(bits & !CLIENT, &mut |ticket: Ticket, status| {
+            let mut done = |ticket: Ticket, status| {
                 // A request of a connection that has ended has nobody to tell.
                 let Some(c) = connection.as_mut().filter(|_| ticket.connection == generation) else { return };
                 if let Some(m) = c.memories.get_mut(ticket.memory as usize).and_then(Option::as_mut) {
@@ -382,9 +464,11 @@ impl<D: Device> Events for Service<D> {
                 // holds; one that does loses the completions that do not fit.
                 let _ = c.completions.push(&Completion { tag: ticket.tag, status }.encode());
                 c.completed = true;
-            });
+            };
+            match bits {
+                Some(bits) => self.device.signals(bits, &mut done),
+                None => self.device.timeout(&mut done),
+            }
         }
-        self.pump();
-        self.flush();
     }
 }

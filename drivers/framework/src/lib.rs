@@ -18,6 +18,11 @@
 //! a device can be given on this machine (0: the machine cannot confine
 //! DMA), 4 how many times a driver was started for this device before.
 //!
+//! A device gets one interrupt line per MSI-X table entry it has, up to 8
+//! ([`Device::lines`]); [`irq`] binds them. A 64-bit BAR is the BAR of its
+//! lower number (`bar(0)` for BARs 0 and 1 together; `bar(1)` is then
+//! empty).
+//!
 //! [`Device::take`] turns that into a [`Device`]: registers mapped, ready to
 //! use. The device manager has already switched on the device's memory
 //! decoding, bus mastering and MSI-X; the driver never writes configuration
@@ -59,6 +64,50 @@
 //! see `peer_gone` and open the new one. A driver that exits with 0 is not
 //! started again. Reading memory a client lent it (`silica_rt::mem::map_peer`)
 //! never faults: memory the client took back reads as zeros.
+//!
+//! A driver that cannot go on ends with a nonzero status (or
+//! `silica_rt::exit`, from anywhere) and is restarted, which resets its
+//! device. One that finds a device it will never support (a format it does
+//! not know) says why and ends with status 0: it is not restarted, and the
+//! device is left alone.
+//!
+//! Not yet: a driver is not told the system is shutting down before it is
+//! ended, so it cannot put its device in a clean state first (an NVMe
+//! controller's shutdown notification). Data is safe regardless: what a
+//! client was told is flushed is on the medium.
+//!
+//! A driver's `Cargo.toml` needs only the runtime, this crate, and its
+//! class's crate:
+//!
+//! ```text
+//! [package]
+//! name = "mydisk"
+//! version.workspace = true
+//! edition.workspace = true
+//! license.workspace = true
+//! publish.workspace = true
+//!
+//! [package.metadata.silica]
+//! drivers = ["pci 1234:5678"]
+//!
+//! [[bin]]
+//! name = "mydisk"
+//! path = "src/main.rs"
+//! test = false
+//! bench = false
+//!
+//! [dependencies]
+//! silica-rt = { workspace = true }
+//! silica-driver = { workspace = true }
+//! silica-block = { workspace = true }
+//!
+//! [lints]
+//! workspace = true
+//! ```
+//!
+//! and a line in the workspace's `members`. What it prints goes to the
+//! console prefixed by nothing: begin lines with the driver's name. Test
+//! results a harness reads are `TEST <driver>.<name> PASS` lines.
 //!
 //! A device is not trusted. Every offset and length read from one is
 //! checked before use ([`Mmio::part`](silica_rt::mmio::Mmio::part)), and a
@@ -106,6 +155,9 @@ pub enum DeviceError {
     Protocol(&'static str),
     /// The device did not answer in the time its specification gives it.
     Timeout(&'static str),
+    /// The device refused a command (what the string says) with this
+    /// status, in the device's own terms.
+    Refused(&'static str, u64),
     /// A kernel operation failed (most often `NoMemory`).
     Kernel(sys::Error),
 }

@@ -171,6 +171,63 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
     }
     pass("block_in_flight");
 
+    // Requests of many pages, starting part-way into a page: one write of
+    // a pattern, read back a block at a time; one read of it, compared,
+    // with the bytes after it untouched. Then the old contents go back, a
+    // block at a time. (Single pages only would pass a driver whose
+    // scatter lists are wrong.)
+    let quarter = memory.len() / 4;
+    let most = (info.max_blocks as usize).min((128 << 10) / bs);
+    let target = info.blocks / 2 + 64;
+    for (blocks, offset) in [(9usize.min(most), 3584usize), (most, 512)] {
+        if blocks < 2 || target + blocks as u64 > info.blocks {
+            continue;
+        }
+        let (save, pattern, back, single) = (0, quarter, 2 * quarter, 3 * quarter);
+        let word = |j: usize, i: usize| 0xB10C_0000_0000_0000 | (blocks as u64) << 32 | (j * bs + i) as u64;
+        // One block to or from `at`.
+        let one = |disk: &mut Disk, op, block: u64, at: usize| disk.run(&req(op, block, at as u32, 1, 4000), deadline());
+        for j in 0..blocks {
+            one(&mut disk, Op::Read, target + j as u64, save + j * bs).map_err(|e| why(e, "saving a block failed"))?;
+        }
+        for j in 0..blocks {
+            for i in (0..bs).step_by(8) {
+                m.write64(pattern + offset + j * bs + i, word(j, i));
+            }
+        }
+        disk.run(&req(Op::Write, target, (pattern + offset) as u32, blocks as u32, 4100), deadline())
+            .map_err(|e| why(e, "a write of many pages failed"))?;
+        if info.write_cache {
+            disk.run(&req(Op::Flush, 0, 0, 0, 4101), deadline()).map_err(|e| why(e, "a flush failed"))?;
+        }
+        for j in 0..blocks {
+            one(&mut disk, Op::Read, target + j as u64, single + j * bs).map_err(|e| why(e, "reading a block back failed"))?;
+            if (0..bs).step_by(8).any(|i| m.read64(single + j * bs + i) != word(j, i)) {
+                println!("blkcheck: {blocks} blocks from memory offset {offset}: block {j} reads back wrong");
+                return Err("a write of many pages wrote the wrong data");
+            }
+        }
+        let end = back + offset + blocks * bs;
+        for i in (back..end + 512).step_by(8) {
+            m.write64(i, 0xA5A5_A5A5_A5A5_A5A5);
+        }
+        disk.run(&req(Op::Read, target, (back + offset) as u32, blocks as u32, 4102), deadline())
+            .map_err(|e| why(e, "a read of many pages failed"))?;
+        for j in 0..blocks {
+            if (0..bs).step_by(8).any(|i| m.read64(back + offset + j * bs + i) != word(j, i)) {
+                println!("blkcheck: {blocks} blocks into memory offset {offset}: block {j} arrived wrong");
+                return Err("a read of many pages brought back the wrong data");
+            }
+        }
+        if (end..end + 512).step_by(8).any(|i| m.read64(i) != 0xA5A5_A5A5_A5A5_A5A5) {
+            return Err("a read of many pages wrote past its end");
+        }
+        for j in 0..blocks {
+            one(&mut disk, Op::Write, target + j as u64, save + j * bs).map_err(|e| why(e, "putting a block back failed"))?;
+        }
+    }
+    pass("block_many_pages");
+
     // Measurements: 4 KiB reads spread over the first 4 MiB of the disk by
     // the sequence the Linux baseline uses (os/bench/linux/init.c), so both
     // read the same places of disks of different sizes.

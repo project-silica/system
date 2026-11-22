@@ -11,6 +11,75 @@
 //! device: the same calls return physical addresses, and the device
 //! manager's decision to start the driver at all was a decision to trust
 //! it with the machine. A driver is written once for both.
+//!
+//! Memory from [`Dma::memory`] is one frame: its `2^bits` bytes lie
+//! together at consecutive device addresses (and, without an IOMMU, at
+//! consecutive physical addresses), and its device address is a multiple
+//! of `2^bits` up to 2 MiB (so a page-sized queue is page-aligned). The
+//! same holds for [`Dma::share`]. Dropping a [`DmaMemory`] does not take
+//! it from the device; keep it for as long as the device may use it.
+//!
+//! # Ordering
+//!
+//! The processor may reorder accesses to DMA memory against each other and
+//! against registers, as the device sees them. Three barriers say what the
+//! device must see in order, and are all a driver needs:
+//!
+//! - [`write_barrier`] between writing a command, descriptor or index in
+//!   DMA memory and telling the device (a doorbell register, or another
+//!   index the device reads first);
+//! - [`read_barrier`] between reading what says an entry is complete (a
+//!   phase bit, a used index) and reading the rest of the entry;
+//! - [`full_barrier`] between writing something the device reads and
+//!   reading something the device writes when the read decides whether to
+//!   tell it (virtio's "notification needed" flag).
+//!
+//! On x86 the first two only keep the compiler from moving accesses; on Arm
+//! they are `dmb oshst` and `dmb oshld`, and the third is `dmb osh` (the
+//! outer shareable domain, where devices are).
+
+/// Writes to DMA memory before this are seen by the device before any
+/// write after it (to DMA memory or a register). See the module's
+/// ordering rules.
+#[inline(always)]
+pub fn write_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a barrier: no memory is touched.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::arch::asm!("dmb oshst", options(nostack, preserves_flags))
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Reads of DMA memory after this see what the device wrote no earlier
+/// than reads before it did. See the module's ordering rules.
+#[inline(always)]
+pub fn read_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a barrier: no memory is touched.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::arch::asm!("dmb oshld", options(nostack, preserves_flags))
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Every access before this is seen by the device before every access
+/// after it, writes before reads included. See the module's ordering rules.
+#[inline(always)]
+pub fn full_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a barrier: no memory is touched.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::arch::asm!("dmb osh", options(nostack, preserves_flags))
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
 
 use crate::{Device, DeviceError, grant, granted};
 use silica_rt::ipc::{free_slot, release_slot};

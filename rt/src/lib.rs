@@ -219,7 +219,7 @@ impl fmt::Write for Debug {
     }
 }
 
-/// Text gathered for [`Debug`] and written in one piece: by [`flush`] or
+/// Text gathered for [`Debug`](struct@Debug) and written in one piece: by [`flush`] or
 /// when dropped, or when full.
 ///
 /// [`flush`]: Line::flush

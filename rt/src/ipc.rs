@@ -277,6 +277,14 @@ pub trait Events {
     /// capabilities it was signalled through, ORed together (an interrupt's
     /// line, a client's wake-up).
     fn signals(&mut self, signals: u64);
+    /// The monotonic time (nanoseconds, `silica_rt::clock`) at which
+    /// [`Events::timer`] is to be called if nothing else happens first;
+    /// `None` (the default): no timer. Asked before every wait.
+    fn deadline(&self) -> Option<u64> {
+        None
+    }
+    /// The deadline passed with nothing else to do.
+    fn timer(&mut self) {}
 }
 
 /// Provide a protocol on `endpoint` and listen on `notification`, for ever,
@@ -285,6 +293,10 @@ pub trait Events {
 /// of a driver (its clients' calls, its device's interrupts, its clients'
 /// wake-ups) and of any server with something to hear besides calls.
 ///
+/// Between them, a handler with a [`Events::deadline`] has its
+/// [`Events::timer`] called when the deadline passes: the timeouts of a
+/// driver's requests, a device's watchdog.
+///
 /// As for [`serve`], a caller that has gone is not an error, and the loop
 /// ends (the program exits with status -3) only when the endpoint or the
 /// notification is taken away.
@@ -292,15 +304,21 @@ pub fn serve_events(endpoint: Cap, notification: Cap, handler: &mut impl Events)
     let buf = buffer();
     let mut request = [0u8; MAX_MESSAGE];
     let mut reply = [0u8; MAX_MESSAGE];
-    let mut next = sys::recv_listening(endpoint, notification, Wait::Forever);
+    let wait = |d: Option<u64>| d.map_or(Wait::Forever, Wait::Until);
+    let mut next = sys::recv_listening(endpoint, notification, wait(handler.deadline()));
     loop {
         let m = match next {
             Ok(m) => m,
+            Err(Error::Timeout) => {
+                handler.timer();
+                next = sys::recv_listening(endpoint, notification, wait(handler.deadline()));
+                continue;
+            }
             Err(_) => crate::exit(-3),
         };
         if let Some(signals) = m.signals() {
             handler.signals(signals);
-            next = sys::recv_listening(endpoint, notification, Wait::Forever);
+            next = sys::recv_listening(endpoint, notification, wait(handler.deadline()));
             continue;
         }
         let mut caps = CapList::new();
@@ -310,7 +328,15 @@ pub fn serve_events(endpoint: Cap, notification: Cap, handler: &mut impl Events)
         let n = handler.call(m.badge, &request[..len], caps, &mut reply, &mut reply_caps).min(MAX_MESSAGE);
         let (slots, sent) = give(&buf, &mut reply_caps);
         let words = pack(&buf, &reply[..n]);
-        next = sys::reply_recv_listening(endpoint, notification, info(n, sent), words);
+        // A receive with a deadline does not fit beside a reply in one
+        // system call: with a deadline pending, two.
+        next = match handler.deadline() {
+            None => sys::reply_recv_listening(endpoint, notification, info(n, sent), words),
+            Some(t) => {
+                let _ = sys::reply(info(n, sent), words);
+                sys::recv_listening(endpoint, notification, Wait::Until(t))
+            }
+        };
         given(slots, sent);
     }
 }

@@ -20,6 +20,7 @@ members = [
     "drivers/framework",
     "drivers/virtio-blk",
     "drivers/virtio-rogue",
+    "drivers/nvme",
     "drivers/virtio-input",
     "drivers/fbdisplay",
     "console",

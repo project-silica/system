@@ -29,7 +29,7 @@ const SPENT: u64 = 1 << 62;
 /// Empty blocks: `slot | bits << 56` (0: none).
 static FREE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 
-/// Add `untyped`, of `2^bits` bytes, to what [`alloc`] makes blocks from.
+/// Add `untyped`, of `2^bits` bytes, to what [`alloc()`] makes blocks from.
 /// A request is served from the smallest source that has room, so the
 /// large ones stay whole for large requests. When there are more sources
 /// than this module keeps, the smallest are left out. Call it while the
@@ -99,7 +99,7 @@ pub fn alloc(bits: u8) -> Result<Cap, Error> {
     Err(Error::NoMemory)
 }
 
-/// Give back the block `block` of `2^bits` bytes from [`alloc`]: everything
+/// Give back the block `block` of `2^bits` bytes from [`alloc()`]: everything
 /// made from it is destroyed, in whatever CapSpace its capabilities are.
 ///
 /// # Safety

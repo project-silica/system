@@ -1,5 +1,19 @@
 //! A device's interrupts: message-signalled (MSI-X), each one a
 //! notification the driver waits on.
+//!
+//! Interrupt `index` is the device's MSI-X table entry `index`, carried by
+//! the driver's line `Device::lines.start + index`; it exists when `index`
+//! is below both the table's size (`Config::msix`) and the number of lines
+//! the driver was given. The table belongs to this module: it writes the
+//! entries it binds and masks, and a driver never writes the table itself,
+//! even where it lies in a BAR the driver holds.
+//!
+//! A driver that serves (`silica_rt::ipc::serve_events`) hears every
+//! interrupt on one [`Signals`], each with its own bit; a notification has
+//! 64 bits, so give interrupts bits that leave room for the others (a block
+//! driver's `CLIENT` is bit 0). During bring-up, before it serves, it waits
+//! for one with [`Signals::wait`] (or [`Interrupt::wait`] on an interrupt
+//! bound alone), with a deadline.
 
 use crate::pci::Msix;
 use crate::{Device, DeviceError, grant, granted};
@@ -35,6 +49,14 @@ impl Signals {
     /// The notification itself: what the driver listens on.
     pub fn listen(&self) -> Cap {
         self.notification.cap()
+    }
+
+    /// Wait until it is signalled (it may have been before the call), or
+    /// until the monotonic time `deadline` (nanoseconds; `None`: for ever).
+    /// Returns the bits it was signalled with, cleared by the wait, or
+    /// `None` when the deadline passed first. Also how a driver sleeps.
+    pub fn wait(&self, deadline: Option<u64>) -> Option<u64> {
+        sys::recv(self.listen(), deadline.map_or(Wait::Forever, Wait::Until)).ok().map(|m| m.badge)
     }
 
     /// A capability that signals it with the bits `bits` and can do nothing

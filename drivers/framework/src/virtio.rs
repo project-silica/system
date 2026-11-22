@@ -13,10 +13,9 @@
 //! in use and never reads one back; a completion that names a descriptor
 //! the driver did not offer is a protocol error, reported, not followed.
 
-use crate::dma::{Dma, DmaMemory};
+use crate::dma::{self, Dma, DmaMemory};
 use crate::pci::CAP_VENDOR;
 use crate::{Device, DeviceError};
-use core::sync::atomic::{Ordering, fence};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::mmio::Mmio;
 
@@ -363,7 +362,7 @@ impl Queue {
         let ring = 16 * self.size as usize + 4;
         d.write16(ring + 2 * (self.avail & (self.size - 1)) as usize, head);
         self.avail = self.avail.wrapping_add(1);
-        fence(Ordering::Release);
+        dma::write_barrier();
         d.write16(16 * self.size as usize + 2, self.avail);
         self.pending = self.pending.wrapping_add(1);
         Ok(())
@@ -378,7 +377,7 @@ impl Queue {
         self.pending = 0;
         // The device's "no notification needed" flag is read after the
         // index it will look at was written.
-        fence(Ordering::SeqCst);
+        dma::full_barrier();
         if self.device_area.shared().read16(0) & 1 == 0 {
             self.notify.write16(0, self.index);
         }
@@ -394,6 +393,8 @@ impl Queue {
         if u.read16(2) == self.used {
             return Ok(None);
         }
+        // The entry is read after the index that says it is there.
+        dma::read_barrier();
         let o = 4 + 8 * (self.used & (self.size - 1)) as usize;
         let (id, written) = (u.read32(o), u.read32(o + 4));
         let Some((token, count)) = self.offered.get_mut(id as usize).and_then(Option::take) else {
@@ -417,6 +418,6 @@ impl Queue {
     /// [`Queue::pop`] before waiting.
     pub fn suppress_interrupts(&mut self, suppress: bool) {
         self.driver_area.shared().write16(16 * self.size as usize, suppress as u16);
-        fence(Ordering::SeqCst);
+        dma::full_barrier();
     }
 }

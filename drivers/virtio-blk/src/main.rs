@@ -18,7 +18,7 @@
 #![no_main]
 
 use silica_block::device::{Error, Info};
-use silica_block::service::{Busy, CLIENT, Completions, Service, Ticket};
+use silica_block::service::{CLIENT, Completions, Refusal, Service, Ticket};
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::irq::{Interrupt, Signals};
@@ -77,11 +77,11 @@ impl silica_block::service::Device for Disk {
         self.dma.unshare(mapping);
     }
 
-    fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Busy> {
+    fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Refusal> {
         if self.queue.room() < 3 {
-            return Err(Busy);
+            return Err(Refusal::Busy);
         }
-        let Some(slot) = self.free.pop() else { return Err(Busy) };
+        let Some(slot) = self.free.pop() else { return Err(Refusal::Busy) };
         let at = slot as usize;
         let (header, status) = (self.headers.shared(), self.status.shared());
         header.write32(
@@ -102,7 +102,7 @@ impl silica_block::service::Device for Disk {
             if r.op == Op::Flush { self.queue.add(&[head, tail], slot as u64) } else { self.queue.add(&[head, data, tail], slot as u64) };
         if added.is_err() {
             self.free.push(slot);
-            return Err(Busy);
+            return Err(Refusal::Busy);
         }
         self.slots[at] = Some(ticket);
         Ok(())

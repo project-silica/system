@@ -1,0 +1,648 @@
+//! The NVMe controller driver: the first active namespace of an NVMe
+//! controller (PCI class 01.08.02) as a `silica.block.Device`.
+//!
+//! Written against the NVM Express Base Specification 2.0 (sections 3.1
+//! registers, 3.5 controller initialization, 4.1 queues, 4.3 PRPs, 5 admin
+//! commands) and the NVM Command Set Specification 1.0 (I/O commands,
+//! Identify Namespace). One admin queue pair and one I/O queue pair, MSI-X
+//! entry 0 for the admin queue and entry 1 for the I/O queue (both on entry
+//! 0 when the device or the driver has only one), PRPs for data.
+//!
+//! The device is not trusted: every completion's phase, queue, submission
+//! queue head and command identifier is checked against what the driver
+//! submitted before anything is done with it. A controller that answers
+//! nonsense, reports fatal status or stops answering ends the driver with a
+//! failure; the device manager then starts it again, which resets the
+//! controller, and the block client sends its requests again.
+//!
+//! Not handled yet: a command the controller accepts and never completes
+//! while the driver is serving (the block service has no timer to give a
+//! request a deadline), namespaces with metadata or protection information,
+//! more than one namespace, more than one I/O queue, the shutdown
+//! notification (`CC.SHN`) before the driver ends.
+
+#![no_std]
+#![no_main]
+
+use core::convert::Infallible;
+
+use silica_block::device::{Error, Info};
+use silica_block::service::{CLIENT, Completions, Device as BlockDevice, Refusal, Service, Ticket};
+use silica_block::{Op, Request, Status};
+use silica_driver::dma::{self, Dma, DmaMemory, Shared};
+use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::{Device, DeviceError};
+use silica_rt::alloc::vec::Vec;
+use silica_rt::mmio::Mmio;
+use silica_rt::println;
+use silica_rt::sys::{self, Cap, Wait};
+
+silica_rt::main!(main);
+
+// Controller registers (base specification, section 3.1.4).
+const CAP: usize = 0x00;
+const VS: usize = 0x08;
+const CC: usize = 0x14;
+const CSTS: usize = 0x1C;
+const AQA: usize = 0x24;
+const ASQ: usize = 0x28;
+const ACQ: usize = 0x30;
+const DOORBELLS: usize = 0x1000;
+
+const CC_EN: u32 = 1;
+/// I/O submission entries of 64 bytes (2^6), completion entries of 16 (2^4);
+/// NVM command set, 4 KiB pages, round robin: all zero.
+const CC_ENTRY_SIZES: u32 = (6 << 16) | (4 << 20);
+const CSTS_RDY: u32 = 1;
+const CSTS_CFS: u32 = 2;
+
+const ADMIN_CREATE_SQ: u32 = 0x01;
+const ADMIN_CREATE_CQ: u32 = 0x05;
+const ADMIN_IDENTIFY: u32 = 0x06;
+const ADMIN_SET_FEATURES: u32 = 0x09;
+const FEATURE_QUEUES: u32 = 0x07;
+const IO_FLUSH: u32 = 0x00;
+const IO_WRITE: u32 = 0x01;
+const IO_READ: u32 = 0x02;
+
+const PAGE: u64 = 4096;
+const ADMIN_ENTRIES: u16 = 32;
+const IO_ENTRIES: u16 = 256;
+/// The most one request moves. Its pages after the first fit a PRP list
+/// of `PRP_LIST_BYTES`, one per command identifier.
+const MAX_TRANSFER: u64 = 128 * 1024;
+const PRP_LIST_BYTES: usize = (MAX_TRANSFER / PAGE) as usize * 8;
+/// How long an admin command may take (the specification gives none).
+const ADMIN_TIMEOUT_NS: u64 = 5_000_000_000;
+/// How often a register is read while waiting for the controller.
+const POLL_NS: u64 = 50_000;
+
+// The bits of the driver's notification: interrupt n signals 2 << n.
+const ADMIN_BIT: u64 = 2;
+const IO_BIT: u64 = 4;
+/// How long the controller may take over an I/O command before the driver
+/// gives up on it (Linux's default too): it ends, and the device manager
+/// starts it again, which resets the controller.
+const IO_TIMEOUT_NS: u64 = 30_000_000_000;
+
+fn main(info: &'static silica_rt::ProcessInfo) -> i64 {
+    match run(info) {
+        Ok(never) => match never {},
+        Err(e) => {
+            println!("nvme: giving up on the controller: {:?}", e);
+            1
+        }
+    }
+}
+
+fn now() -> u64 {
+    silica_rt::clock().now()
+}
+
+/// The smallest power of two (at least a page) holding `bytes`, in bits.
+fn bits_for(bytes: usize) -> u8 {
+    bytes.next_power_of_two().trailing_zeros().max(12) as u8
+}
+
+/// A 64-bit register as two 32-bit accesses, low half first: what every
+/// controller accepts.
+fn read64(regs: &Mmio, at: usize) -> u64 {
+    regs.read32(at) as u64 | (regs.read32(at + 4) as u64) << 32
+}
+
+fn write64(regs: &Mmio, at: usize, value: u64) {
+    regs.write32(at, value as u32);
+    regs.write32(at + 4, (value >> 32) as u32);
+}
+
+/// One completion queue entry, checked against its queue.
+struct Completion {
+    result: u32,
+    cid: u16,
+    /// Status field without the phase: SC bits 0..8, SCT 8..11, CRD, M, DNR.
+    status: u16,
+}
+
+/// A submission queue and the completion queue it reports to, of the same size.
+struct Queue {
+    id: u16,
+    entries: u16,
+    sq: DmaMemory,
+    cq: DmaMemory,
+    sq_mem: Mmio,
+    cq_mem: Mmio,
+    sq_bell: Mmio,
+    cq_bell: Mmio,
+    /// Where the next command goes.
+    tail: u16,
+    /// The oldest command the controller has not yet taken, as it last said.
+    head: u16,
+    cq_head: u16,
+    phase: bool,
+}
+
+impl Queue {
+    fn new(dma: &Dma, regs: &Mmio, stride: usize, id: u16, entries: u16) -> Result<Queue, DeviceError> {
+        let bell = |n: usize| regs.part(DOORBELLS + n * stride, 4).ok_or(DeviceError::Missing("a doorbell inside BAR 0"));
+        // The device only reads its submissions; only completions are its to write.
+        let sq = dma.memory(bits_for(entries as usize * 64), false)?;
+        let cq = dma.memory(bits_for(entries as usize * 16), true)?;
+        Ok(Queue {
+            id,
+            entries,
+            sq_mem: sq.shared(),
+            cq_mem: cq.shared(),
+            sq,
+            cq,
+            sq_bell: bell(2 * id as usize)?,
+            cq_bell: bell(2 * id as usize + 1)?,
+            tail: 0,
+            head: 0,
+            cq_head: 0,
+            phase: true,
+        })
+    }
+
+    fn submitted(&self) -> u16 {
+        (self.tail + self.entries - self.head) % self.entries
+    }
+
+    fn full(&self) -> bool {
+        self.submitted() == self.entries - 1
+    }
+
+    /// Put `command` in the next free entry (the caller checked `full`).
+    fn push(&mut self, command: &[u32; 16]) {
+        let at = self.tail as usize * 64;
+        for (i, word) in command.iter().enumerate() {
+            self.sq_mem.write32(at + 4 * i, *word);
+        }
+        self.tail = (self.tail + 1) % self.entries;
+    }
+
+    /// Tell the controller about every command pushed so far.
+    fn ring(&self) {
+        // The entries must be in memory before the controller hears of them.
+        dma::write_barrier();
+        self.sq_bell.write32(0, self.tail as u32);
+    }
+
+    /// The next completion, if the controller has posted one.
+    fn pop(&mut self) -> Result<Option<Completion>, DeviceError> {
+        let at = self.cq_head as usize * 16;
+        let dw3 = self.cq_mem.read32(at + 12);
+        if (dw3 & 1 << 16 != 0) != self.phase {
+            return Ok(None);
+        }
+        dma::read_barrier();
+        let result = self.cq_mem.read32(at);
+        let dw2 = self.cq_mem.read32(at + 8);
+        self.cq_head += 1;
+        if self.cq_head == self.entries {
+            self.cq_head = 0;
+            self.phase = !self.phase;
+        }
+        let (sq_head, sq_id) = (dw2 as u16, (dw2 >> 16) as u16);
+        if sq_id != self.id {
+            return Err(DeviceError::Protocol("a completion names another submission queue"));
+        }
+        let moved = (sq_head as u32 + self.entries as u32 - self.head as u32) % self.entries as u32;
+        if sq_head >= self.entries || moved > self.submitted() as u32 {
+            return Err(DeviceError::Protocol("a completion moves the submission queue head past its tail"));
+        }
+        self.head = sq_head;
+        Ok(Some(Completion { result, cid: dw3 as u16, status: (dw3 >> 17) as u16 }))
+    }
+
+    /// Give the completions taken so far back to the controller.
+    fn release(&self) {
+        self.cq_bell.write32(0, self.cq_head as u32);
+    }
+}
+
+/// The controller during bring-up, when the driver waits for one thing at a time.
+struct Controller {
+    regs: Mmio,
+    /// CAP.TO: the longest CSTS.RDY may take to follow CC.EN.
+    ready_ns: u64,
+    /// The driver's notification, where the admin queue's interrupt arrives.
+    listen: Cap,
+    admin: Queue,
+    cid: u16,
+}
+
+impl Controller {
+    fn status(&self) -> Result<u32, DeviceError> {
+        match self.regs.read32(CSTS) {
+            u32::MAX => Err(DeviceError::Protocol("the registers read as all ones: the controller is gone")),
+            s => Ok(s),
+        }
+    }
+
+    /// Wait until the notification is signalled or `until` (a sleep when
+    /// nothing will signal it).
+    fn sleep(&self, until: u64) {
+        // A timeout is the expected end; anything else (an interrupt) is a wake-up.
+        let _ = sys::recv(self.listen, Wait::Until(until));
+    }
+
+    /// Wait for CSTS.RDY to read `ready`, as long as CAP.TO allows.
+    fn wait_ready(&self, ready: bool) -> Result<(), DeviceError> {
+        let deadline = now() + self.ready_ns;
+        loop {
+            let status = self.status()?;
+            if ready && status & CSTS_CFS != 0 {
+                return Err(DeviceError::Protocol("the controller reports fatal status"));
+            }
+            if (status & CSTS_RDY != 0) == ready {
+                return Ok(());
+            }
+            let t = now();
+            if t >= deadline {
+                return Err(DeviceError::Timeout(if ready { "CSTS.RDY to set" } else { "CSTS.RDY to clear" }));
+            }
+            self.sleep((t + POLL_NS).min(deadline));
+        }
+    }
+
+    /// Run one admin command to completion: its completion's first word.
+    fn admin(&mut self, mut command: [u32; 16], what: &'static str) -> Result<u32, DeviceError> {
+        self.cid = (self.cid + 1) & 0x7FFF;
+        command[0] |= (self.cid as u32) << 16;
+        self.admin.push(&command);
+        self.admin.ring();
+        let deadline = now() + ADMIN_TIMEOUT_NS;
+        loop {
+            if let Some(c) = self.admin.pop()? {
+                self.admin.release();
+                if c.cid != self.cid {
+                    return Err(DeviceError::Protocol("an admin completion names a command not in progress"));
+                }
+                if c.status & 0x7FF != 0 {
+                    println!("nvme: {} failed: status type {}, code {:#x}", what, c.status >> 8 & 7, c.status & 0xFF);
+                    return Err(DeviceError::Missing(what));
+                }
+                return Ok(c.result);
+            }
+            if self.status()? & CSTS_CFS != 0 {
+                return Err(DeviceError::Protocol("the controller reports fatal status"));
+            }
+            if now() >= deadline {
+                return Err(DeviceError::Timeout(what));
+            }
+            self.sleep(deadline);
+        }
+    }
+
+    fn identify(&mut self, buffer: &DmaMemory, cns: u32, nsid: u32, what: &'static str) -> Result<(), DeviceError> {
+        let mut c = [0u32; 16];
+        c[0] = ADMIN_IDENTIFY;
+        c[1] = nsid;
+        c[6] = buffer.device_address() as u32;
+        c[7] = (buffer.device_address() >> 32) as u32;
+        c[10] = cns;
+        self.admin(c, what).map(|_| ())
+    }
+
+    fn create_queue(&mut self, opcode: u32, q: &Queue, memory: &DmaMemory, cdw11: u32, what: &'static str) -> Result<(), DeviceError> {
+        let mut c = [0u32; 16];
+        c[0] = opcode;
+        c[6] = memory.device_address() as u32;
+        c[7] = (memory.device_address() >> 32) as u32;
+        c[10] = (q.entries as u32 - 1) << 16 | q.id as u32;
+        c[11] = cdw11;
+        self.admin(c, what).map(|_| ())
+    }
+}
+
+/// The namespace being served, as Identify describes it.
+struct Namespace {
+    id: u32,
+    block_bits: u32,
+    blocks: u64,
+    read_only: bool,
+}
+
+fn namespace(ctl: &mut Controller, buffer: &DmaMemory, nsid: u32) -> Result<Namespace, DeviceError> {
+    ctl.identify(buffer, 0, nsid, "Identify Namespace")?;
+    let m = buffer.shared();
+    let blocks = read64(&m, 0);
+    let formats = m.read8(25) as u32; // NLBAF, zero-based
+    let flbas = m.read8(26) as u32;
+    let format = (flbas & 0xF) | (flbas >> 5 & 3) << 4;
+    if format > formats {
+        return Err(DeviceError::Protocol("the namespace's format index names no format"));
+    }
+    let lbaf = m.read32(128 + 4 * format as usize);
+    if lbaf & 0xFFFF != 0 {
+        return Err(DeviceError::Missing("a namespace format without metadata"));
+    }
+    let block_bits = lbaf >> 16 & 0xFF;
+    if !(9..=16).contains(&block_bits) {
+        return Err(DeviceError::Missing("a block size from 512 bytes to 64 KiB"));
+    }
+    if blocks == 0 {
+        return Err(DeviceError::Missing("a namespace with blocks"));
+    }
+    Ok(Namespace { id: nsid, block_bits, blocks, read_only: m.read8(99) & 1 != 0 })
+}
+
+/// The driver's part of the block service: the I/O queue pair.
+struct Disk {
+    dma: Dma,
+    info: Info,
+    regs: Mmio,
+    nsid: u32,
+    block_bits: u32,
+    io: Queue,
+    /// One PRP list per command identifier, read by the device.
+    prp: DmaMemory,
+    prp_mem: Mmio,
+    /// The request each command identifier carries, while the device has
+    /// it, and when it was started.
+    tickets: Vec<Option<(Ticket, u64)>>,
+    free: Vec<u16>,
+    /// Commands pushed since the doorbell was last rung.
+    unrung: bool,
+    // Kept alive for as long as the controller may use them.
+    _admin: Queue,
+    _interrupts: (Interrupt, Option<Interrupt>),
+}
+
+impl Disk {
+    /// The PRP entries of `blocks` blocks at device address `address`, the
+    /// list (if one is needed) written in command `cid`'s place.
+    fn prps(&self, cid: u16, address: u64, blocks: u32) -> Option<(u64, u64)> {
+        if blocks == 0 || blocks > self.info.max_blocks || address & 3 != 0 {
+            return None;
+        }
+        let end = address.checked_add((blocks as u64) << self.block_bits)?;
+        let second = (address | (PAGE - 1)).checked_add(1)?;
+        if end <= second {
+            return Some((address, 0));
+        }
+        if end <= second + PAGE {
+            return Some((address, second));
+        }
+        let list = cid as usize * PRP_LIST_BYTES;
+        let mut page = second;
+        let mut i = 0;
+        while page < end && i < PRP_LIST_BYTES {
+            self.prp_mem.write64(list + i, page);
+            page += PAGE;
+            i += 8;
+        }
+        Some((address, self.prp.device_address() + list as u64))
+    }
+}
+
+/// The controller cannot be relied on: end, so that the device manager
+/// resets it by starting the driver again and the client sends again what
+/// was in progress.
+fn give_up(why: DeviceError) -> ! {
+    println!("nvme: giving up on the controller: {:?}", why);
+    silica_rt::exit(2)
+}
+
+/// A completion's status as the block protocol says it.
+fn status(s: u16) -> Result<(), Status> {
+    let (code, kind) = (s & 0xFF, s >> 8 & 7);
+    match (kind, code) {
+        (0, 0) => Ok(()),
+        // Invalid opcode, invalid field, LBA out of range.
+        (0, 0x01 | 0x02 | 0x80) => Err(Status::Invalid),
+        _ => Err(Status::Io),
+    }
+}
+
+impl BlockDevice for Disk {
+    type Mapping = Shared;
+
+    fn info(&self) -> Info {
+        self.info.clone()
+    }
+
+    fn map(&mut self, frame: Cap, bits: u8, writable: bool) -> Result<(u64, Shared), Error> {
+        let s = self.dma.share(frame, bits, writable).map_err(|_| Error::NoRoom)?;
+        Ok((s.address, s))
+    }
+
+    fn unmap(&mut self, mapping: Shared) {
+        self.dma.unshare(mapping)
+    }
+
+    fn start(&mut self, request: &Request, address: u64, ticket: Ticket) -> Result<(), Refusal> {
+        if self.io.full() {
+            return Err(Refusal::Busy);
+        }
+        let Some(cid) = self.free.pop() else { return Err(Refusal::Busy) };
+        let (opcode, prp1, prp2) = match request.op {
+            Op::Flush => (IO_FLUSH, 0, 0),
+            Op::Read | Op::Write => match self.prps(cid, address, request.blocks) {
+                Some((a, b)) => (if matches!(request.op, Op::Read) { IO_READ } else { IO_WRITE }, a, b),
+                None => {
+                    self.free.push(cid);
+                    return Err(Refusal::Fail(Status::Invalid));
+                }
+            },
+        };
+        let mut c = [0u32; 16];
+        c[0] = opcode | (cid as u32) << 16;
+        c[1] = self.nsid;
+        c[6] = prp1 as u32;
+        c[7] = (prp1 >> 32) as u32;
+        c[8] = prp2 as u32;
+        c[9] = (prp2 >> 32) as u32;
+        if opcode != IO_FLUSH {
+            c[10] = request.block as u32;
+            c[11] = (request.block >> 32) as u32;
+            c[12] = request.blocks - 1;
+        }
+        self.io.push(&c);
+        self.tickets[cid as usize] = Some((ticket, now()));
+        self.unrung = true;
+        Ok(())
+    }
+
+    fn kick(&mut self) {
+        if self.unrung {
+            self.io.ring();
+            self.unrung = false;
+        }
+    }
+
+    fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
+        let mut taken = 0;
+        loop {
+            let c = match self.io.pop() {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(e) => give_up(e),
+            };
+            taken += 1;
+            let Some((ticket, _)) = self.tickets.get_mut(c.cid as usize).and_then(Option::take) else {
+                give_up(DeviceError::Protocol("a completion names a command not in progress"));
+            };
+            self.free.push(c.cid);
+            done(ticket, status(c.status));
+        }
+        if taken > 0 {
+            self.io.release();
+        } else if bits & (ADMIN_BIT | IO_BIT) != 0 {
+            // An interrupt with nothing to show for it: is the controller still well?
+            match self.regs.read32(CSTS) {
+                u32::MAX => give_up(DeviceError::Protocol("the registers read as all ones: the controller is gone")),
+                s if s & CSTS_CFS != 0 => give_up(DeviceError::Protocol("the controller reports fatal status")),
+                _ => {}
+            }
+        }
+    }
+
+    fn deadline(&self) -> Option<u64> {
+        self.tickets.iter().flatten().map(|(_, t)| t + IO_TIMEOUT_NS).min()
+    }
+
+    fn timeout(&mut self, done: &mut Completions<'_>) {
+        // What finished without an interrupt first, then the verdict.
+        self.signals(IO_BIT, done);
+        if self.deadline().is_some_and(|d| d <= now()) {
+            give_up(DeviceError::Timeout("an I/O command the controller never completed"));
+        }
+    }
+}
+
+fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
+    let device = Device::take(info)?;
+    let regs = device.bar(0).ok_or(DeviceError::Missing("BAR 0, the controller's registers"))?;
+    if regs.len() < DOORBELLS + 8 {
+        return Err(DeviceError::Missing("BAR 0 large enough for the admin doorbells"));
+    }
+    let vectors = device.config().msix().ok_or(DeviceError::Missing("MSI-X"))?.vectors;
+    let lines = device.lines.end.saturating_sub(device.lines.start);
+    if vectors == 0 || lines == 0 {
+        return Err(DeviceError::Missing("an interrupt"));
+    }
+    let dma = Dma::new(&device)?;
+    let signals = Signals::new()?;
+    let admin_irq = Interrupt::bind_to(&device, 0, signals.sender(ADMIN_BIT)?)?;
+    // The I/O queue gets an interrupt of its own where there are two.
+    let io_irq = if vectors >= 2 && lines >= 2 { Some(Interrupt::bind_to(&device, 1, signals.sender(IO_BIT)?)?) } else { None };
+
+    let cap = read64(&regs, CAP);
+    if cap == u64::MAX {
+        return Err(DeviceError::Protocol("the registers read as all ones: the controller is gone"));
+    }
+    if cap >> 37 & 1 == 0 {
+        return Err(DeviceError::Missing("the NVM command set"));
+    }
+    if cap >> 48 & 0xF != 0 {
+        return Err(DeviceError::Missing("4 KiB memory pages"));
+    }
+    let io_entries = IO_ENTRIES.min((cap & 0xFFFF) as u16 + 1).max(2);
+    let stride = 4usize << (cap >> 32 & 0xF);
+    let version = regs.read32(VS);
+
+    let admin = Queue::new(&dma, &regs, stride, 0, ADMIN_ENTRIES)?;
+    let mut ctl = Controller {
+        regs: regs.part(0, regs.len()).ok_or(DeviceError::Missing("BAR 0"))?,
+        ready_ns: (cap >> 24 & 0xFF).max(1) * 500_000_000,
+        listen: signals.listen(),
+        admin,
+        cid: 0,
+    };
+
+    // Reset: a driver started again finds the controller as the last one left it.
+    let cc = regs.read32(CC);
+    if cc & CC_EN != 0 {
+        // Let an enable in progress finish first; a controller in fatal state never will.
+        let _ = ctl.wait_ready(true);
+        regs.write32(CC, cc & !CC_EN);
+    }
+    ctl.wait_ready(false)?;
+    let a = ADMIN_ENTRIES as u32 - 1;
+    regs.write32(AQA, a << 16 | a);
+    write64(&regs, ASQ, ctl.admin.sq.device_address());
+    write64(&regs, ACQ, ctl.admin.cq.device_address());
+    regs.write32(CC, CC_ENTRY_SIZES | CC_EN);
+    ctl.wait_ready(true)?;
+
+    let buffer = dma.memory(12, true)?;
+    let m = buffer.shared();
+    ctl.identify(&buffer, 1, 0, "Identify Controller")?;
+    let mdts = m.read8(77) as u32;
+    let (sqes, cqes) = (m.read8(512), m.read8(513));
+    if sqes & 0xF > 6 || sqes >> 4 < 6 || cqes & 0xF > 4 || cqes >> 4 < 4 {
+        return Err(DeviceError::Missing("64-byte submission and 16-byte completion entries"));
+    }
+    let namespaces = m.read32(516);
+    let write_cache = m.read8(525) & 1 != 0;
+    let mut model = [0u8; 40];
+    for (i, b) in model.iter_mut().enumerate() {
+        *b = match m.read8(24 + i) {
+            c @ 0x20..=0x7E => c,
+            _ => b'?',
+        };
+    }
+
+    // The first active namespace (the list is NVMe 1.1; before it, namespace 1).
+    let nsid = if version >= 0x0001_0100 {
+        ctl.identify(&buffer, 2, 0, "Identify Active Namespace List")?;
+        m.read32(0)
+    } else {
+        1
+    };
+    if nsid == 0 || nsid == u32::MAX || (namespaces != 0 && nsid > namespaces) {
+        return Err(DeviceError::Missing("an active namespace"));
+    }
+    let ns = namespace(&mut ctl, &buffer, nsid)?;
+
+    // One I/O queue pair (zero-based counts of submission and completion queues).
+    let mut c = [0u32; 16];
+    c[0] = ADMIN_SET_FEATURES;
+    c[10] = FEATURE_QUEUES;
+    ctl.admin(c, "Set Features (Number of Queues)")?;
+    let io = Queue::new(&dma, &regs, stride, 1, io_entries)?;
+    let vector = io_irq.is_some() as u32;
+    // Physically contiguous, interrupts on, on `vector`.
+    ctl.create_queue(ADMIN_CREATE_CQ, &io, &io.cq, vector << 16 | 3, "Create I/O Completion Queue")?;
+    ctl.create_queue(ADMIN_CREATE_SQ, &io, &io.sq, (io.id as u32) << 16 | 1, "Create I/O Submission Queue")?;
+
+    let mut max_bytes = MAX_TRANSFER;
+    if mdts != 0 && mdts < 32 {
+        max_bytes = max_bytes.min(PAGE << mdts);
+    }
+    let max_blocks = (max_bytes >> ns.block_bits) as u32;
+    if max_blocks == 0 {
+        return Err(DeviceError::Missing("transfers of at least one block"));
+    }
+    let info_out = Info { block_size: 1 << ns.block_bits, blocks: ns.blocks, read_only: ns.read_only, write_cache, max_blocks };
+    println!(
+        "nvme: {}: namespace {}, {} blocks of {} bytes, {} I/O entries, MSI-X {}, write cache {}",
+        core::str::from_utf8(&model).unwrap_or("?").trim_end(),
+        ns.id,
+        info_out.blocks,
+        info_out.block_size,
+        io_entries,
+        if io_irq.is_some() { "0 and 1" } else { "0 only" },
+        if write_cache { "on" } else { "off" },
+    );
+
+    let prp = dma.memory(bits_for(io_entries as usize * PRP_LIST_BYTES), false)?;
+    let disk = Disk {
+        dma,
+        info: info_out,
+        regs,
+        nsid: ns.id,
+        block_bits: ns.block_bits,
+        prp_mem: prp.shared(),
+        prp,
+        tickets: (0..io_entries).map(|_| None).collect(),
+        free: (0..io_entries).rev().collect(),
+        unrung: false,
+        io,
+        _admin: ctl.admin,
+        _interrupts: (admin_irq, io_irq),
+    };
+    let mut service = Service::new(disk, signals.sender(CLIENT)?);
+    silica_rt::ipc::serve_events(silica_driver::granted(silica_driver::grant::SERVICE), signals.listen(), &mut service)
+}

@@ -99,6 +99,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvme"
+version = "0.0.0"
+dependencies = [
+ "silica-block",
+ "silica-driver",
+ "silica-rt",
+]
+
+[[package]]
 name = "shell"
 version = "0.0.0"
 dependencies = [
