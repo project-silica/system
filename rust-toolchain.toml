@@ -1,6 +1,6 @@
 # Pinned toolchain (spec/ARCHITECTURE.md section 12). tools/init.sh checks it.
 # rust-src: -Zbuild-std for the custom kernel targets. miri: T2.
 [toolchain]
-channel = "nightly-2026-10-01"
+channel = "nightly-2026-11-11"
 components = ["rust-src", "miri", "clippy", "rustfmt"]
 profile = "minimal"

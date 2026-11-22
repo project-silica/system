@@ -7,3 +7,15 @@ directory = "vendor"
 
 [net]
 offline = true
+
+# libsys, the IDL runtime and the generated bindings are path dependencies
+# outside this workspace (../kernel, ../idl). Without trim-paths Cargo hashes
+# their absolute paths into each crate's -Cmetadata, so every symbol of every
+# program changes with the checkout's directory and system.img is not
+# reproducible (tools/repro.sh --system). With it (Cargo since 2026-10-24,
+# hence the pinned nightly) only their kind is hashed.
+[unstable]
+trim-paths = true
+
+[profile.release]
+trim-paths = "object"
