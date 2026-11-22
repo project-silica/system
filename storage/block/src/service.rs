@@ -103,7 +103,7 @@
 //! with status 0 after saying why: ending well is not a failure, and the
 //! device is left alone at once.
 
-use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, NarrowReply, RemoveMemoryReply};
+use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, NarrowReply, RemoveMemoryReply, TraceReply};
 use crate::{Op, Request, Status};
 use silica_idl_rt::CapList;
 use silica_queue::Refused;
@@ -194,7 +194,7 @@ impl<D: Device> Mapper for Map<'_, D> {
             Error::BadMemory => Refused::BadMemory,
             Error::InUse => Refused::InUse,
             Error::Outside => Refused::Outside,
-            Error::NoRoom | Error::Unknown(_) => Refused::NoRoom,
+            Error::NoRoom | Error::NoSuchRequest | Error::Unknown(_) => Refused::NoRoom,
         })
     }
     fn unmap(&mut self, mapping: D::Mapping) {
@@ -223,6 +223,23 @@ const NARROWED: u64 = 1 << 48;
 /// Most narrowed capabilities one run of a driver makes.
 const WINDOWS: usize = 256;
 
+/// A request's tag with this bit set asks for its way through the provider
+/// to be kept (`trace`).
+pub const TRACED: u64 = 1 << 62;
+/// Traced requests kept.
+const TRACES: usize = 16;
+
+/// Where a traced request went: when it was taken from the ring, when the
+/// device accepted it, when it completed (monotonic ns; 0: not yet).
+#[derive(Clone, Copy, Debug, Default)]
+struct Trace {
+    client: u64,
+    tag: u64,
+    taken: u64,
+    started: u64,
+    done: u64,
+}
+
 /// The blocks a capability reaches.
 #[derive(Clone, Copy, Debug)]
 struct Window {
@@ -240,6 +257,9 @@ pub struct Service<D: Device> {
     endpoint: Cap,
     /// What narrowed capabilities reach; any other reaches the whole device.
     windows: Vec<Window>,
+    /// The most recent traced requests, the next to be replaced at `next_trace`.
+    traces: [Trace; TRACES],
+    next_trace: usize,
     /// The badge of the call being served.
     caller: u64,
 }
@@ -250,7 +270,15 @@ impl<D: Device> Service<D> {
     /// capability that signals the notification the driver listens on with
     /// the bit [`CLIENT`]; each client is given a copy.
     pub fn new(device: D, wake: Cap, endpoint: Cap) -> Service<D> {
-        Service { device, session: Session::new(wake), endpoint, windows: Vec::new(), caller: 0 }
+        Service {
+            device,
+            session: Session::new(wake),
+            endpoint,
+            windows: Vec::new(),
+            traces: [Trace::default(); TRACES],
+            next_trace: 0,
+            caller: 0,
+        }
     }
 
     /// What the capability with `badge` reaches: its first block and how many.
@@ -264,8 +292,42 @@ impl<D: Device> Service<D> {
     /// device is full; then tell the device.
     fn pump(&mut self) {
         let (session, device, windows) = (&mut self.session, &mut self.device, &self.windows);
+        let (traces, next_trace) = (&mut self.traces, &mut self.next_trace);
         let info = device.info();
+        let clock = silica_rt::clock();
         let broken = session.take(|raw, ticket, region, client| {
+            let traced = ticket.tag() & TRACED != 0;
+            if traced {
+                traces[*next_trace] = Trace { client, tag: ticket.tag(), taken: clock.now(), started: 0, done: 0 };
+            }
+            let r = Service::<D>::check_and_start(device, windows, &info, raw, ticket, region, client);
+            if traced {
+                if r.is_ok() {
+                    traces[*next_trace].started = clock.now();
+                }
+                *next_trace = (*next_trace + 1) % TRACES;
+            }
+            r
+        });
+        if broken != 0 {
+            // Clients that broke their rings, or are gone with their memory.
+            self.session.close(broken, &mut Map(&mut self.device));
+        }
+        self.device.kick();
+    }
+
+    /// Check one request against the device, the memory and what its
+    /// client may reach, and start it.
+    fn check_and_start(
+        device: &mut D,
+        windows: &[Window],
+        info: &Info,
+        raw: &silica_queue::Raw,
+        ticket: Ticket,
+        region: Option<provider::Region>,
+        client: u64,
+    ) -> Result<Ticket, provider::Refusal> {
+        {
             let invalid = provider::Refusal::Fail(Status::Invalid as u32);
             let r = Request::decode(raw).ok_or(invalid)?;
             if r.op == Op::Flush {
@@ -275,7 +337,7 @@ impl<D: Device> Service<D> {
                 return Ok(ticket);
             }
             let m = region.ok_or(invalid)?;
-            let (first, blocks) = Service::<D>::window(windows, client, &info);
+            let (first, blocks) = Service::<D>::window(windows, client, info);
             let bytes = r.blocks as u64 * info.block_size as u64;
             let within = r.blocks != 0 && r.blocks <= info.max_blocks && r.block.checked_add(r.blocks as u64).is_some_and(|e| e <= blocks);
             let in_memory = r.offset.is_multiple_of(512) && r.offset as u64 + bytes <= m.bytes;
@@ -290,19 +352,22 @@ impl<D: Device> Service<D> {
             let on_device = Request { block: first + r.block, ..r };
             device.start(&on_device, m.address + r.offset as u64, ticket)?;
             Ok(ticket)
-        });
-        if broken != 0 {
-            // Clients that broke their rings, or are gone with their memory.
-            self.session.close(broken, &mut Map(&mut self.device));
         }
-        self.device.kick();
     }
 
     /// The device's signals (`Some`), or its deadline passing (`None`):
     /// what it reports finished goes to the client.
     fn device_event(&mut self, bits: Option<u64>) {
-        let session = &mut self.session;
-        let mut done = |ticket: Ticket, s: Result<(), Status>| session.complete(ticket, status(s), 0);
+        let (session, traces) = (&mut self.session, &mut self.traces);
+        let clock = silica_rt::clock();
+        let mut done = |ticket: Ticket, s: Result<(), Status>| {
+            if ticket.tag() & TRACED != 0
+                && let Some(t) = traces.iter_mut().find(|t| t.tag == ticket.tag() && t.done == 0 && t.taken != 0)
+            {
+                t.done = clock.now();
+            }
+            session.complete(ticket, status(s), 0)
+        };
         match bits {
             Some(bits) => self.device.signals(bits, &mut done),
             None => self.device.timeout(&mut done),
@@ -315,6 +380,11 @@ impl<D: Device> device::Server<Handle> for Service<D> {
         let mut info = self.device.info();
         info.blocks = Service::<D>::window(&self.windows, self.caller, &info).1;
         InfoReply { info }
+    }
+
+    fn trace(&mut self, tag: u64) -> Result<TraceReply, Error> {
+        let t = self.traces.iter().find(|t| t.tag == tag && t.client == self.caller && t.taken != 0).ok_or(Error::NoSuchRequest)?;
+        Ok(TraceReply { taken: t.taken, started: t.started, done: t.done })
     }
 
     fn narrow(&mut self, first: u64, blocks: u64) -> Result<NarrowReply<Handle>, Error> {

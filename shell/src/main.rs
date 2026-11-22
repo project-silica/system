@@ -8,6 +8,8 @@
 //! - `restart-driver <device>`: end a device's driver and start it again;
 //! - `caps <service>`: what a running service holds and what its threads do;
 //! - `log <service>`: what a service printed (the last 32 KiB);
+//! - `trace`: one read of the first partition's block 0, traced through the
+//!   block server, the client and the driver;
 //! - `shutdown`, `reboot`;
 //! - `echo <text>`, `help`.
 //!
@@ -36,7 +38,7 @@ struct Shell {
     out: String,
 }
 
-const HELP: &str = "commands: services, stop <service>, start <service>, caps <service>, log <service>, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
+const HELP: &str = "commands: services, stop <service>, start <service>, caps <service>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
 
 impl Shell {
     fn say(&mut self) {
@@ -127,6 +129,11 @@ impl Shell {
                     }
                 }
             }
+            "trace" => {
+                if let Err(e) = self.trace() {
+                    let _ = writeln!(self.out, "trace: {e}");
+                }
+            }
             "devices" => {
                 for (class, name) in [
                     (devices::Class::Block, "block"),
@@ -173,6 +180,42 @@ impl Shell {
             }
         }
         self.say();
+    }
+}
+
+impl Shell {
+    /// Read block 0 of the first partition with a traced request (its tag's
+    /// bit 62 set), and say where it went: opened through the block server,
+    /// taken, accepted and finished by the disk's driver, seen by this client.
+    fn trace(&mut self) -> Result<(), &'static str> {
+        let server = Cap(slots::FIRST_GRANT + 4);
+        let mut parts = silica_block::partitions::Client::<Channel, Handle>::from(Channel::new(server));
+        let listed = parts.list().map_err(|_| "the block server does not answer")?;
+        let p = listed.partitions.iter().next().ok_or("the block server lists no partition")?;
+        let (id, name) = (p.id, String::from(p.name));
+        let clock = silica_rt::clock();
+        let opening = clock.now();
+        let mut disk = silica_block::client::Disk::open_partition(server, id).map_err(|_| "the partition cannot be opened")?;
+        let opened = clock.now();
+        let memory = silica_rt::mem::Memory::new(12).map_err(|_| "no memory")?;
+        disk.add_memory(0, &memory, true).map_err(|_| "the driver takes no memory")?;
+        let tag = silica_block::service::TRACED | 1;
+        let r = silica_block::Request { op: silica_block::Op::Read, memory: 0, block: 0, offset: 0, blocks: 1, tag };
+        let t0 = clock.now();
+        disk.submit(&r).map_err(|_| "the request cannot be sent")?;
+        disk.kick();
+        let c = disk.wait(Some(t0 + 5_000_000_000)).map_err(|_| "no answer within 5 s")?;
+        let seen = clock.now();
+        c.status.map_err(|_| "the read failed")?;
+        let (taken, started, done) = disk.trace(tag).map_err(|_| "the driver kept no trace of it")?;
+        let at = |t: u64| t.saturating_sub(t0);
+        let _ = writeln!(self.out, "  partition {id:#x} ({name}) opened through the block server in {} ns", opened - opening);
+        let _ = writeln!(self.out, "  block 0: sent by this client      0 ns");
+        let _ = writeln!(self.out, "           taken by the driver      {} ns", at(taken));
+        let _ = writeln!(self.out, "           accepted by the device   {} ns", at(started));
+        let _ = writeln!(self.out, "           finished                 {} ns", at(done));
+        let _ = writeln!(self.out, "           seen by this client      {} ns", at(seen));
+        Ok(())
     }
 }
 

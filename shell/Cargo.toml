@@ -8,7 +8,7 @@ publish.workspace = true
 
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
-needs = ["silica.console.Terminal", "silica.system.Manager", "silica.device.Manager", "silica.log.Reader"]
+needs = ["silica.console.Terminal", "silica.system.Manager", "silica.device.Manager", "silica.log.Reader", "silica.block.Partitions"]
 memory = 22
 start = "boot"
 restart = "always"
@@ -23,6 +23,7 @@ bench = false
 silica-rt = { workspace = true }
 silica-idl-rt = { workspace = true }
 silica-protocols = { workspace = true }
+silica-block = { workspace = true }
 
 [lints]
 workspace = true

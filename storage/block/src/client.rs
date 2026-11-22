@@ -68,7 +68,7 @@ impl From<device::Error> for client::Error {
             device::Error::NoRoom => Refused::NoRoom,
             device::Error::InUse => Refused::InUse,
             device::Error::Outside => Refused::Outside,
-            device::Error::Unknown(_) => return client::Error::Protocol,
+            device::Error::NoSuchRequest | device::Error::Unknown(_) => return client::Error::Protocol,
         })
     }
 }
@@ -200,6 +200,14 @@ impl Disk {
     /// `deadline` (nanoseconds; `None`: for ever).
     pub fn wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
         Ok(self.queue.wait(deadline)?.into())
+    }
+
+    /// Where the traced request `tag` (bit [`crate::service::TRACED`] set)
+    /// went in the driver: when it was taken, when the device accepted it,
+    /// when it completed (monotonic ns; 0: not yet).
+    pub fn trace(&mut self, tag: u64) -> Result<(u64, u64, u64), Error> {
+        let r = self.queue.control()?.control.trace(tag).map_err(client::Error::from)?;
+        Ok((r.taken, r.started, r.done))
     }
 
     /// One request, start to finish: submit, kick, wait. For a program
