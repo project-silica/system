@@ -4,12 +4,14 @@
 //! are switched off here, so the shared interrupt line stays quiet.
 
 use crate::Manager;
-use libsys::{self as sys, Cap, ObjectType, Rights};
+use libsys::{self as sys, Cap, Rights};
 use silica_formats::acpi;
-use silica_rt::mem::Object;
 
 /// PM1 status and enable bit of the fixed power button.
 const PWRBTN: u16 = 1 << 8;
+
+/// The bit of the device manager's notification the button sets.
+pub const BUTTON: u64 = 1;
 
 /// The power button, its interrupt bound to a notification.
 pub struct Button {
@@ -17,13 +19,13 @@ pub struct Button {
     lines: Cap,
     status: u16,
     sci: u32,
-    note: Object,
 }
 
 impl Button {
     /// Find the button in the FADT, quiet every other ACPI event, and let
     /// the button interrupt.
-    pub fn new(m: &mut Manager, ports: Cap, lines: Cap) -> Result<Button, &'static str> {
+    /// Its interrupt signals `sender` (the bit [`BUTTON`]).
+    pub fn new(m: &mut Manager, ports: Cap, lines: Cap, sender: Cap) -> Result<Button, &'static str> {
         if !matches!(sys::inspect_slot(silica_rt::slots::SPACE, ports.0), Ok(Some(_))) {
             return Err("this machine has no I/O ports");
         }
@@ -54,17 +56,12 @@ impl Button {
         // The SCI: level-triggered, active low, unless the MADT says otherwise.
         let sci = p.sci as u32;
         let flags = interrupt_flags(m, sci).unwrap_or(sys::IRQ_LEVEL | sys::IRQ_ACTIVE_LOW);
-        let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory")?;
-        sys::irq_bind(lines, sci, note.cap(), flags).map_err(|_| "the SCI cannot be bound")?;
+        sys::irq_bind(lines, sci, sender, flags).map_err(|_| "the SCI cannot be bound")?;
         let _ = Rights::READ;
-        Ok(Button { ports, lines, status, sci, note })
+        Ok(Button { ports, lines, status, sci })
     }
 
     /// The notification the button's interrupt signals.
-    pub fn notification(&self) -> Cap {
-        self.note.cap()
-    }
-
     /// The interrupt came: whether it was the button (its status is
     /// cleared, and the line let go either way).
     pub fn pressed(&self) -> bool {

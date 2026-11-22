@@ -135,26 +135,60 @@ impl Config {
     /// space mapped writable; only the device manager calls it, before any
     /// driver runs. `None` where there is no memory BAR or it is not set.
     pub fn probe_bar(&self, index: usize) -> Option<Bar> {
-        let (base, wide) = self.bar_address(index)?;
+        let (base, _) = self.bar_address(index)?;
+        let (bits, _) = self.bar_size(index)?;
+        // A BAR nobody assigned, or one whose address is not aligned to its size.
+        if base == 0 || base & ((1 << bits) - 1) != 0 {
+            return None;
+        }
+        Some(Bar { base, bits })
+    }
+
+    /// The size of memory BAR `index` in bits, whatever its address, and
+    /// whether it is prefetchable; as [`Config::probe_bar`] finds it (and
+    /// with the same needs). `None` where there is no memory BAR or its
+    /// answer makes no sense.
+    pub fn bar_size(&self, index: usize) -> Option<(u8, bool)> {
+        let (_, wide) = self.bar_address(index)?;
         let (lo_at, hi_at) = (0x10 + index * 4, 0x14 + index * 4);
         let command = self.0.read16(4);
         self.0.write16(4, command & !(COMMAND_MEMORY | 1));
         let lo = self.0.read32(lo_at);
         self.0.write32(lo_at, !0);
-        let mut mask = (self.0.read32(lo_at) & !0xF) as u64 | 0xFFFF_FFFF_0000_0000;
+        let low = self.0.read32(lo_at) & !0xF;
+        let mut mask = low as u64 | 0xFFFF_FFFF_0000_0000;
         self.0.write32(lo_at, lo);
+        let mut high = 0;
         if wide {
             let hi = self.0.read32(hi_at);
             self.0.write32(hi_at, !0);
-            mask = (mask & 0xFFFF_FFFF) | (self.0.read32(hi_at) as u64) << 32;
+            high = self.0.read32(hi_at);
+            mask = (mask & 0xFFFF_FFFF) | (high as u64) << 32;
             self.0.write32(hi_at, hi);
         }
         self.0.write16(4, command);
-        let bits = mask.trailing_zeros() as u8;
-        // A BAR nobody assigned, or one whose answer makes no sense.
-        if base == 0 || mask == 0 || bits >= 48 || mask != !0u64 << bits || base & ((1 << bits) - 1) != 0 {
+        // A BAR the function does not implement keeps no bit of the ones.
+        if low == 0 && high == 0 {
             return None;
         }
-        Some(Bar { base, bits })
+        let bits = mask.trailing_zeros() as u8;
+        if bits >= 48 || mask != !0u64 << bits {
+            return None;
+        }
+        Some((bits, lo & 1 << 3 != 0))
+    }
+
+    /// Put memory BAR `index` at `base` (a multiple of its size; the
+    /// function's decoding off while it moves). Only the device manager.
+    pub fn set_bar(&self, index: usize, base: u64) {
+        let Some((_, wide)) = self.bar_address(index) else { return };
+        let command = self.0.read16(4);
+        self.0.write16(4, command & !(COMMAND_MEMORY | 1));
+        let lo_at = 0x10 + index * 4;
+        self.0.write32(lo_at, base as u32 | (self.0.read32(lo_at) & 0xF));
+        if wide {
+            self.0.write32(lo_at + 4, (base >> 32) as u32);
+        }
+        self.0.write16(4, command);
     }
 }

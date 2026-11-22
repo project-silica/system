@@ -58,6 +58,7 @@
 #![no_std]
 #![no_main]
 
+mod hotplug;
 mod phys;
 mod power;
 
@@ -152,6 +153,37 @@ struct Manager {
     /// The kernel command line: `inject=<driver>:<fault>@<n>`
     /// (`silica_driver::inject`) is read at each driver's first start.
     cmdline: &'static [u8],
+    /// Hot-plug capable ports, with the configuration space base (ECAM)
+    /// and segment of the buses behind them.
+    ports: Vec<(hotplug::Port, u64, u16)>,
+    /// The archive's drivers, by what they drive.
+    table: Vec<(Match, &'static str)>,
+    /// Every configuration space mapped, by function identity.
+    configs: BTreeMap<u32, (Config, Cap)>,
+}
+
+/// A function as found, its BARs probed.
+fn function_of(id: u32, config: Config, config_frame: Cap) -> Function {
+    let mut bars = [None; 6];
+    let mut i = 0;
+    while i < 6 {
+        let wide = config.bar_address(i).is_some_and(|(_, wide)| wide);
+        bars[i] = config.probe_bar(i);
+        i += if wide { 2 } else { 1 };
+    }
+    Function {
+        id,
+        config,
+        config_frame,
+        vendor: config.vendor(),
+        device: config.device(),
+        class: config.class(),
+        bars,
+        vectors: config.msix().map_or(0, |m| m.vectors),
+        lines: None,
+        starts: 0,
+        failures: 0,
+    }
 }
 
 /// The class of a function, from its PCI class code.
@@ -330,13 +362,148 @@ impl Manager {
     /// The configuration space of the function `id`, mapped writable, with
     /// its frame; `None` when the page cannot be had.
     fn config_space(&mut self, ecam: u64, id: u32) -> Option<(Config, Cap)> {
+        // Mapped once: a frame maps in one place, and a slot is looked at
+        // again when a device arrives in it.
+        if let Some(c) = self.configs.get(&id) {
+            return Some(*c);
+        }
         let frame = self.memory.frame(ecam + ((id as u64 & 0xFFFF) << 12), 12).ok()?;
         let at = mem::map(frame, 12, RW).ok()?;
         // SAFETY: the function's configuration space, just mapped, for as
         // long as the device manager runs.
         #[allow(unsafe_code)]
         let space = unsafe { Mmio::new(at, 4096) };
+        self.configs.insert(id, (Config::new(space), frame));
         Some((Config::new(space), frame))
+    }
+
+    /// Let every hot-plug port interrupt: its MSI-X entry 0 signals `sender`.
+    fn arm_ports(&mut self, sender: Cap) {
+        for k in 0..self.ports.len() {
+            let (id, config) = (self.ports[k].0.id, self.ports[k].0.config);
+            let armed = (|| {
+                let msix = config.msix().ok_or("it has no MSI-X")?;
+                let bar = config.probe_bar(msix.bar as usize).ok_or("its MSI-X table is in no BAR")?;
+                let frame = self.memory.frame(bar.base, bar.bits.max(12)).map_err(|_| "its MSI-X table is not in device memory")?;
+                let at = mem::map(frame, bar.bits.max(12), RW).map_err(|_| "its MSI-X table cannot be mapped")?;
+                // SAFETY: the port's own BAR, just mapped, for as long as the
+                // device manager runs; nothing else uses it (ports have no driver).
+                #[allow(unsafe_code)]
+                let table = unsafe { Mmio::new(at, 1 << bar.bits.max(12)) };
+                let entry = table.part(msix.offset as usize, 16).ok_or("its MSI-X table lies outside its BAR")?;
+                if self.next_line as u64 >= sys::IRQ_LINES {
+                    return Err("no interrupt lines are left");
+                }
+                let line = self.next_line;
+                let (address, data) = sys::irq_bind_msi(granted(GRANT_IRQS), line, sender, granted(GRANT_DEVICES), id)
+                    .map_err(|_| "its interrupt cannot be bound")?;
+                self.next_line += 1;
+                entry.write32(12, 1);
+                entry.write32(0, address as u32);
+                entry.write32(4, (address >> 32) as u32);
+                entry.write32(8, data as u32);
+                entry.write32(12, 0);
+                self.ports[k].0.arm();
+                Ok(())
+            })();
+            match armed {
+                Ok(()) => println!("devmgr: {} takes devices while the system runs", name(id)),
+                Err(e) => println!("devmgr: {} could take devices while the system runs, but {e}", name(id)),
+            }
+        }
+    }
+
+    /// A slot's interrupt: devices that arrived get addresses and drivers,
+    /// devices taken out lose theirs.
+    fn slots_changed(&mut self) {
+        for k in 0..self.ports.len() {
+            match self.ports[k].0.changed() {
+                Some(hotplug::Change::Arrived) => self.arrived(k),
+                Some(hotplug::Change::Leaving | hotplug::Change::Left) => self.left(k),
+                None => {}
+            }
+        }
+    }
+
+    fn arrived(&mut self, k: usize) {
+        if !self.ports[k].0.power(true) {
+            println!("devmgr: {}: a device arrived, but its link never came up", name(self.ports[k].0.id));
+            return;
+        }
+        // PCI Express gives a device 100 ms after its link comes up
+        // before it must answer configuration requests.
+        let clock = silica_rt::clock();
+        let until = clock.now() + 100_000_000;
+        while clock.now() < until {
+            sys::yield_now();
+        }
+        let (bus, ecam, segment) = (self.ports[k].0.secondary, self.ports[k].1, self.ports[k].2);
+        for dev in 0..32u32 {
+            let mut functions = 1;
+            let mut function = 0;
+            while function < functions {
+                let id = (segment as u32) << 16 | (bus as u32) << 8 | dev << 3 | function;
+                function += 1;
+                let Some((config, frame)) = self.config_space(ecam, id) else { continue };
+                if config.vendor() == pci::NO_DEVICE {
+                    continue;
+                }
+                if function == 1 && config.multifunction() {
+                    functions = 8;
+                }
+                if let Err((bar, bits, memory, prefetchable)) = self.ports[k].0.place(&config) {
+                    println!(
+                        "devmgr: {}: its BAR {bar} (2^{bits} bytes) does not fit the port's windows (memory {memory:x?}, prefetchable {prefetchable:x?}); left alone",
+                        name(id)
+                    );
+                    continue;
+                }
+                let f = function_of(id, config, frame);
+                let index = match self.functions.iter().position(|g| g.id == id) {
+                    Some(i) => {
+                        self.functions[i] = f;
+                        i
+                    }
+                    None => {
+                        self.functions.push(f);
+                        self.functions.len() - 1
+                    }
+                };
+                let f = &self.functions[index];
+                let driver = driver_for(f, self.cmdline, &self.table);
+                println!(
+                    "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x} arrived: {}",
+                    name(id),
+                    f.vendor,
+                    f.device,
+                    f.class.0,
+                    f.class.1,
+                    f.class.2,
+                    driver.unwrap_or("no driver")
+                );
+                if let Some(d) = driver
+                    && let Err(e) = self.start(index, d)
+                {
+                    println!("ERROR: devmgr: {} is not driven: {e}", name(id));
+                }
+            }
+        }
+    }
+
+    fn left(&mut self, k: usize) {
+        let (first, last) = (self.ports[k].0.secondary, self.ports[k].0.subordinate);
+        while let Some(at) = self.running.iter().position(|r| {
+            let bus = (self.functions[r.function].id >> 8 & 0xFF) as u8;
+            (first..=last).contains(&bus)
+        }) {
+            let r = self.running.remove(at);
+            let (driver, id) = (r.name, self.functions[r.function].id);
+            if !self.stop(r) {
+                println!("ERROR: devmgr: cannot take back the memory of {driver}");
+            }
+            println!("devmgr: {} was taken out; {driver} ended", name(id));
+        }
+        self.ports[k].0.power(false);
     }
 
     /// Find every function on `bus` and behind its bridges.
@@ -360,29 +527,11 @@ impl Manager {
                     if behind > bus && behind <= last_bus && depth < 16 {
                         self.scan(ecam, segment, behind, last_bus, depth + 1);
                     }
+                    if let Some(port) = hotplug::Port::of(id, config) {
+                        self.ports.push((port, ecam, segment));
+                    }
                 }
-                let mut bars = [None; 6];
-                let mut i = 0;
-                while i < 6 {
-                    let wide = config.bar_address(i).is_some_and(|(_, wide)| wide);
-                    bars[i] = config.probe_bar(i);
-                    i += if wide { 2 } else { 1 };
-                }
-                let vectors = config.msix().map_or(0, |m| m.vectors);
-                let f = Function {
-                    id,
-                    config,
-                    config_frame,
-                    vendor: config.vendor(),
-                    device: config.device(),
-                    class: config.class(),
-                    bars,
-                    vectors,
-                    lines: None,
-                    starts: 0,
-                    failures: 0,
-                };
-                self.functions.push(f);
+                self.functions.push(function_of(id, config, config_frame));
             }
         }
     }
@@ -597,10 +746,13 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         listing: Vec::new(),
         next_client: CLIENTS,
         cmdline: &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())],
+        ports: Vec::new(),
+        table: drivers(archive),
+        configs: BTreeMap::new(),
     };
     m.enumerate()?;
     let cmdline = m.cmdline;
-    let table = drivers(archive);
+    let table = m.table.clone();
     if table.is_empty() {
         println!("devmgr: the boot archive lists no drivers");
     }
@@ -634,24 +786,37 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     if failed {
         println!("ERROR: devmgr: not every device has its driver");
     }
-    // The power button.
-    let button = match power::Button::new(&mut m, granted(GRANT_PORTS), granted(GRANT_IRQS)) {
+    // What happens to the machine: the power button and the hot-plug slots,
+    // each a bit of one notification.
+    let happened = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for its notification")?;
+    let sender = |bits: u64| -> Result<Cap, &'static str> {
+        let slot = free_slot().ok_or("no capability slots left")?;
+        sys::cap_derive(slots::SPACE, slot, happened.cap(), Rights::WRITE, bits).map_err(|_| "cannot make a notification sender")?;
+        Ok(Cap(slot))
+    };
+    let button = match power::Button::new(&mut m, granted(GRANT_PORTS), granted(GRANT_IRQS), sender(power::BUTTON)?) {
         Ok(b) => Some(b),
         Err(e) => {
             println!("devmgr: no power button: {e}");
             None
         }
     };
-    // From here on: clients' calls, drivers that end, and the button.
+    m.arm_ports(sender(hotplug::HOTPLUG)?);
+    // A device that arrived before the slots could tell.
+    m.slots_changed();
+    // From here on: clients' calls, drivers that end, the button and the slots.
     let mut listener = Listener::new(events);
     loop {
-        let got = match &button {
-            Some(b) => listener.recv_listening(b.notification(), Wait::Forever),
-            None => listener.recv(Wait::Forever),
-        };
+        let got = listener.recv_listening(happened.cap(), Wait::Forever);
         let Ok(msg) = got else { return Err("its endpoint was taken away") };
-        if let (Some(_), Some(b)) = (msg.signals(), &button) {
-            if b.pressed() {
+        if let Some(bits) = msg.signals() {
+            if bits & hotplug::HOTPLUG != 0 {
+                m.slots_changed();
+            }
+            if bits & power::BUTTON != 0
+                && let Some(b) = &button
+                && b.pressed()
+            {
                 println!("devmgr: the power button was pressed: shutting down");
                 let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
                 if let Err(e) = system.shutdown(false) {
