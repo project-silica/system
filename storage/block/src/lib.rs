@@ -3,16 +3,10 @@
 //!
 //! # The data path
 //!
-//! After `connect`, requests and completions travel through two rings
-//! (`silica_ring`) in the 16 KiB frame the client shared:
-//!
-//! | bytes | what |
-//! | --- | --- |
-//! | 0 to 8255 | the request ring: [`QUEUE`] records of 32 bytes, client to provider |
-//! | 8256 to 8319 | unused |
-//! | 8320 to 12479 | the completion ring: [`QUEUE`] records of 16 bytes, provider to client |
-//!
-//! A request ([`Request`], little-endian):
+//! After `connect`, requests and completions travel through the two rings
+//! every device class shares (`silica_queue` documents them: their frame,
+//! the wake-up rule, where the memory number and the tag sit). A block
+//! request ([`Request`], little-endian):
 //!
 //! | offset | type | field |
 //! | --- | --- | --- |
@@ -23,18 +17,13 @@
 //! | 20 | u32 | number of blocks |
 //! | 24 | u64 | tag: the client's own, returned in the completion |
 //!
-//! A completion ([`Completion`]): the tag (u64), then a status (u32; 0 is
-//! success, otherwise a [`Status`]), then four unused bytes.
+//! A completion ([`Completion`]): the tag, then a status (0 is success,
+//! otherwise a [`Status`]); its value is 0.
 //!
-//! Every request gets exactly one completion, in any order. The client
-//! keeps at most [`QUEUE`] requests in progress, so the completion ring
-//! cannot overflow. Either side signals the other's notification after
-//! adding records only when the other said it was going to sleep
-//! (`silica_ring`'s wake-up rule).
-//!
-//! Data is never copied: a read is written by the device straight into the
-//! client's frame, a write is read from it. The client must leave the bytes
-//! of a request alone until its completion arrives.
+//! Every request gets exactly one completion, in any order. Data is never
+//! copied: a read is written by the device straight into the client's
+//! frame, a write is read from it. The client must leave the bytes of a
+//! request alone until its completion arrives.
 #![no_std]
 #![deny(unsafe_code)]
 
@@ -43,18 +32,7 @@ pub mod service;
 
 include!(concat!(env!("OUT_DIR"), "/silica_block_device.rs"));
 
-/// Records in each ring, and so the most requests in progress.
-pub const QUEUE: u32 = 256;
-/// Size in bits of the frame holding both rings.
-pub const RINGS_BITS: u8 = 14;
-/// Where the completion ring starts in that frame.
-pub const COMPLETIONS_AT: usize = 8320;
-/// Bytes of a request record.
-pub const REQUEST_BYTES: usize = 32;
-/// Bytes of a completion record.
-pub const COMPLETION_BYTES: usize = 16;
-/// Most frames a client registers (`add_memory` numbers are below this).
-pub const MEMORIES: u32 = 64;
+pub use silica_queue::{COMPLETION_BYTES, COMPLETIONS_AT, MEMORIES, QUEUE, REQUEST_BYTES, RINGS_BITS};
 
 /// What a request asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,23 +118,25 @@ pub struct Completion {
 impl Completion {
     /// The record for the ring.
     pub fn encode(&self) -> [u8; COMPLETION_BYTES] {
-        let mut r = [0u8; COMPLETION_BYTES];
-        r[..8].copy_from_slice(&self.tag.to_le_bytes());
-        r[8..12].copy_from_slice(&self.status.map_or_else(|s| s as u32, |()| 0).to_le_bytes());
-        r
+        silica_queue::Completion { tag: self.tag, status: self.status.map_or_else(|s| s as u32, |()| 0), value: 0 }.encode()
     }
 
     /// A record from the ring. A status this version does not know reads as
     /// [`Status::Aborted`].
     pub fn decode(r: &[u8; COMPLETION_BYTES]) -> Completion {
-        let tag = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]);
-        let status = match u32::from_le_bytes([r[8], r[9], r[10], r[11]]) {
+        Completion::from(silica_queue::Completion::decode(r))
+    }
+}
+
+impl From<silica_queue::Completion> for Completion {
+    fn from(c: silica_queue::Completion) -> Completion {
+        let status = match c.status {
             0 => Ok(()),
             1 => Err(Status::Io),
             2 => Err(Status::Invalid),
             _ => Err(Status::Aborted),
         };
-        Completion { tag, status }
+        Completion { tag: c.tag, status }
     }
 }
 

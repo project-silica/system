@@ -69,10 +69,8 @@ fn scratch(devices: &mut manager::Client<Channel, Handle>, buffer: &Memory, m: M
 fn run() -> Result<(), &'static str> {
     let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT)));
     let buffer = Memory::new(20).map_err(|_| "no memory")?;
-    // SAFETY: the memory just made, this program's own, mapped for as long
-    // as it runs; the device reads and writes it, so it is used as registers are.
-    #[allow(unsafe_code)]
-    let m = unsafe { Mmio::new(buffer.addr(), buffer.len()) };
+    // The device reads and writes it, so it is used as registers are.
+    let m = buffer.shared();
     let (id, mut disk) = scratch(&mut devices, &buffer, m)?;
     println!("blkload: scratch disk {id:#x}, {} blocks", disk.info().blocks);
     // Each slot of the buffer holds one write's data while it is in flight.

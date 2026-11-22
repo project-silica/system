@@ -127,6 +127,7 @@ dependencies = [
  "silica-idl-rt",
  "silica-idlc",
  "silica-protocols",
+ "silica-queue",
  "silica-ring",
  "silica-rt",
 ]
@@ -165,6 +166,16 @@ version = "0.0.0"
 dependencies = [
  "silica-idl-rt",
  "silica-idlc",
+]
+
+[[package]]
+name = "silica-queue"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-ring",
+ "silica-rt",
 ]
 
 [[package]]

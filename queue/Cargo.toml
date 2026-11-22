@@ -1,0 +1,16 @@
+[package]
+name = "silica-queue"
+description = "The data path every device class shares: two rings in a client's frame, the client's registered memory, the wake-up rule, and a client that survives its provider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-ring = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+
+[lints]
+workspace = true

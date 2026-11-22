@@ -45,12 +45,8 @@ impl device::Server<Handle> for Display {
             Ok(Some(s)) if s.ty == sys::ObjectType::Frame => s.bits,
             _ => return Err(Error::BadMemory),
         };
-        let at = mem::map_peer(pixels.cap(), bits, Rights::READ).map_err(|_| Error::BadMemory)?;
-        // SAFETY: the client's frame, mapped here until it is replaced; in
-        // the range of lent memory, so taking it back cannot fault this
-        // driver. Read only, as device memory is: with single accesses.
-        #[allow(unsafe_code)]
-        let region = unsafe { Mmio::new(at, 1 << bits) };
+        // Among lent memory: taking it back leaves zeros, never a fault.
+        let region = mem::peer(pixels.cap(), bits, Rights::READ).map_err(|_| Error::BadMemory)?;
         self.attached = Some((pixels, region));
         Ok(AttachReply {})
     }

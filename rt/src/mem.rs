@@ -14,6 +14,7 @@
 //! root task's are all the memory of the machine.
 
 use crate::ipc::{free_slot, release_slot};
+use crate::mmio::Mmio;
 use crate::slots;
 use crate::sys::{self, Cap, Error, ObjectType};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -243,6 +244,18 @@ pub fn map_peer(frame: Cap, bits: u8, rights: sys::Rights) -> Result<usize, Erro
     Ok(start as usize)
 }
 
+/// [`map_peer`], as shared memory: the frame read and written one access
+/// at a time, because its lender may be writing it too. Safe to use for as
+/// long as the program likes: when the lender takes it back the range reads
+/// as zeros, and its addresses are never given to anything else.
+pub fn peer(frame: Cap, bits: u8, rights: sys::Rights) -> Result<Mmio, Error> {
+    let at = map_peer(frame, bits, rights)?;
+    // SAFETY: just mapped among lent memory (see above), whose addresses no
+    // other mapping ever takes: accesses there reach this frame, or zeros.
+    #[allow(unsafe_code)]
+    Ok(unsafe { Mmio::new(at, 1 << bits) })
+}
+
 /// Map `frame`, of `2^bits` bytes, somewhere in this program with `rights`,
 /// and say where. The mapping lasts until the capability is deleted or
 /// unmapped.
@@ -297,6 +310,19 @@ impl Memory {
     /// Its size in bits.
     pub fn bits(&self) -> u8 {
         self.bits
+    }
+
+    /// The memory as shared memory: read and written one access at a time
+    /// (as device registers are), because another program or a device may
+    /// be writing it too. Accesses after the memory is freed fault: its
+    /// addresses are never given to anything else.
+    pub fn shared(&self) -> Mmio {
+        // SAFETY: this frame's own mapping, for as long as it lives; after
+        // that the range is mapped to nothing, ever (`reserve`).
+        #[allow(unsafe_code)]
+        unsafe {
+            Mmio::new(self.addr, self.len())
+        }
     }
 
     /// The frame capability: the original, to derive what others are given

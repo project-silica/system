@@ -22,7 +22,6 @@ use silica_block::{Op, Request, Status};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle};
 use silica_rt::mem::Memory;
-use silica_rt::mmio::Mmio;
 use silica_rt::sys::Cap;
 use silica_rt::{ProcessInfo, println, slots};
 
@@ -88,10 +87,8 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
     // One megabyte the device reads and writes.
     let memory = Memory::new(20).map_err(|e| why(e, "no memory"))?;
     disk.add_memory(0, &memory, true).map_err(|e| why(e, "cannot register memory with the driver"))?;
-    // SAFETY: the memory just made, this program's own and mapped for as
-    // long as it runs; the device writes it, so it is read as registers are.
-    #[allow(unsafe_code)]
-    let m = unsafe { Mmio::new(memory.addr(), memory.len()) };
+    // The device writes it, so it is read as registers are.
+    let m = memory.shared();
     let deadline = || Some(silica_rt::clock().now() + 5 * SECOND);
     let req = |op, block, offset, blocks, tag| Request { op, memory: 0, block, offset, blocks, tag };
 

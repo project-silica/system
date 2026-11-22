@@ -104,14 +104,14 @@
 //! device is left alone at once.
 
 use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, RemoveMemoryReply};
-use crate::{COMPLETION_BYTES, COMPLETIONS_AT, Completion, MEMORIES, Op, QUEUE, REQUEST_BYTES, RINGS_BITS, Request, Status};
+use crate::{Op, Request, Status};
 use silica_idl_rt::CapList;
-use silica_ring::{Consumer, Producer};
-use silica_rt::alloc::vec::Vec;
+use silica_queue::Refused;
+use silica_queue::provider::{self, Mapper, Session};
 use silica_rt::ipc::{Events, Handle};
-use silica_rt::mmio::Mmio;
-use silica_rt::sys::{self, Cap, ObjectType, Rights};
-use silica_rt::{mem, slots};
+use silica_rt::sys::Cap;
+
+pub use silica_queue::provider::Ticket;
 
 /// The bit of the driver's notification that clients signal: "look at the
 /// request ring".
@@ -126,13 +126,13 @@ pub enum Refusal {
     Fail(Status),
 }
 
-/// A request the service has handed to the driver: given back through the
-/// `done` of [`Device::signals`] when the device has finished it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ticket {
-    tag: u64,
-    memory: u32,
-    connection: u32,
+impl From<Refusal> for provider::Refusal {
+    fn from(r: Refusal) -> provider::Refusal {
+        match r {
+            Refusal::Busy => provider::Refusal::Busy,
+            Refusal::Fail(s) => provider::Refusal::Fail(s as u32),
+        }
+    }
 }
 
 /// What a block driver supplies.
@@ -180,42 +180,44 @@ pub trait Device {
 /// with, and how it ended.
 pub type Completions<'a> = dyn FnMut(Ticket, Result<(), Status>) + 'a;
 
-struct Memory<M> {
-    frame: Handle,
-    bytes: u64,
-    writable: bool,
-    address: u64,
-    /// Requests in progress that use it.
-    busy: u32,
-    mapping: M,
+/// The driver's mapping, as the session asks for it.
+struct Map<'a, D>(&'a mut D);
+
+impl<D: Device> Mapper for Map<'_, D> {
+    type Mapping = D::Mapping;
+    fn map(&mut self, frame: Cap, bits: u8, writable: bool) -> Result<(u64, D::Mapping), Refused> {
+        self.0.map(frame, bits, writable).map_err(|e| match e {
+            Error::Busy => Refused::Busy,
+            Error::NotConnected => Refused::NotConnected,
+            Error::BadMemory => Refused::BadMemory,
+            Error::InUse => Refused::InUse,
+            Error::NoRoom | Error::Unknown(_) => Refused::NoRoom,
+        })
+    }
+    fn unmap(&mut self, mapping: D::Mapping) {
+        self.0.unmap(mapping)
+    }
 }
 
-struct Connection<M> {
-    /// The badge of the capability the client calls through.
-    client: u64,
-    /// The frame of the rings: gone when the client is.
-    rings: Handle,
-    requests: Consumer<REQUEST_BYTES>,
-    completions: Producer<COMPLETION_BYTES>,
-    /// What to signal when completions were added and the client sleeps.
-    done: Handle,
-    memories: Vec<Option<Memory<M>>>,
-    /// A request the device had no room for yet.
-    stalled: Option<Request>,
-    in_progress: u32,
-    /// Completions were added since the client was last told.
-    completed: bool,
+fn error(r: Refused) -> Error {
+    match r {
+        Refused::Busy => Error::Busy,
+        Refused::NotConnected => Error::NotConnected,
+        Refused::BadMemory => Error::BadMemory,
+        Refused::NoRoom => Error::NoRoom,
+        Refused::InUse => Error::InUse,
+    }
+}
+
+fn status(s: Result<(), Status>) -> u32 {
+    s.map_or_else(|s| s as u32, |()| 0)
 }
 
 /// A block device's service: the provider of `silica.block.Device`.
 pub struct Service<D: Device> {
     /// The driver's part.
     pub device: D,
-    connection: Option<Connection<D::Mapping>>,
-    /// Counts connections, so a late completion is not given to a new client.
-    generation: u32,
-    /// The capability clients are given to wake the driver with.
-    wake: Cap,
+    session: Session<D::Mapping>,
     /// The badge of the call being served.
     caller: u64,
 }
@@ -225,37 +227,27 @@ impl<D: Device> Service<D> {
     /// notification the driver listens on with the bit [`CLIENT`]; each
     /// client is given a copy.
     pub fn new(device: D, wake: Cap) -> Service<D> {
-        Service { device, connection: None, generation: 0, wake, caller: 0 }
+        Service { device, session: Session::new(wake), caller: 0 }
     }
 
-    /// End the connection: the device loses the client's memory.
-    fn close(&mut self) {
-        if let Some(c) = self.connection.take() {
-            for m in c.memories.into_iter().flatten() {
-                self.device.unmap(m.mapping);
+    /// Take requests from the ring, check each against the device and the
+    /// memory, and start them, until the ring is empty (and the client has
+    /// been told this side sleeps) or the device is full; then tell the
+    /// device.
+    fn pump(&mut self) {
+        let (session, device) = (&mut self.session, &mut self.device);
+        let info = device.info();
+        let whole = session.take(|raw, ticket, region| {
+            let invalid = provider::Refusal::Fail(Status::Invalid as u32);
+            let r = Request::decode(raw).ok_or(invalid)?;
+            if r.op == Op::Flush {
+                // A flush uses no memory.
+                let ticket = ticket.without_memory();
+                device.start(&r, 0, ticket)?;
+                return Ok(ticket);
             }
-            self.generation = self.generation.wrapping_add(1);
-        }
-    }
-
-    /// Whether the connected client is still there: it is while the frame
-    /// of its rings is (a client that ends, or takes the rings back, takes
-    /// the capability with it).
-    fn alive(&self) -> bool {
-        self.connection.as_ref().is_some_and(|c| matches!(sys::inspect_slot(slots::SPACE, c.rings.cap().0), Ok(Some(_))))
-    }
-
-    /// Check `r` against the device and the memory, and start it.
-    fn start(&mut self, r: Request) -> Result<(), Refusal> {
-        let info = self.device.info();
-        let Some(c) = self.connection.as_mut() else { return Err(Refusal::Fail(Status::Aborted)) };
-        // A flush uses no memory.
-        let ticket = Ticket { tag: r.tag, memory: if r.op == Op::Flush { u32::MAX } else { r.memory }, connection: self.generation };
-        let address = if r.op == Op::Flush {
-            0
-        } else {
+            let m = region.ok_or(invalid)?;
             let bytes = r.blocks as u64 * info.block_size as u64;
-            let m = c.memories.get(r.memory as usize).and_then(Option::as_ref).ok_or(Refusal::Fail(Status::Invalid))?;
             let on_device =
                 r.blocks != 0 && r.blocks <= info.max_blocks && r.block.checked_add(r.blocks as u64).is_some_and(|e| e <= info.blocks);
             let in_memory = r.offset.is_multiple_of(512) && r.offset as u64 + bytes <= m.bytes;
@@ -264,76 +256,26 @@ impl<D: Device> Service<D> {
                 _ => !info.read_only,
             };
             if !(on_device && in_memory && allowed) {
-                return Err(Refusal::Fail(Status::Invalid));
+                return Err(invalid);
             }
-            m.address + r.offset as u64
-        };
-        self.device.start(&r, address, ticket)?;
-        if let Some(m) = c.memories.get_mut(r.memory as usize).and_then(Option::as_mut).filter(|_| r.op != Op::Flush) {
-            m.busy += 1;
+            device.start(&r, m.address + r.offset as u64, ticket)?;
+            Ok(ticket)
+        });
+        if !whole {
+            // The client broke its ring, or is gone and its memory with it.
+            self.session.close(&mut Map(&mut self.device));
         }
-        c.in_progress += 1;
-        Ok(())
-    }
-
-    /// Take requests from the ring and start them, until the ring is empty
-    /// (and the client has been told this side sleeps) or the device is full.
-    fn pump(&mut self) {
-        self.take_requests();
         self.device.kick();
     }
 
-    fn take_requests(&mut self) {
-        loop {
-            let Some(c) = self.connection.as_mut() else { return };
-            let next = match c.stalled.take() {
-                Some(r) => Some(Ok(r)),
-                None => match c.requests.pop() {
-                    Ok(Some(raw)) => Some(Request::decode(&raw).ok_or(raw)),
-                    Ok(None) => None,
-                    // The ring makes no sense: the client broke the
-                    // protocol, or is gone and its memory with it.
-                    Err(_) => return self.close(),
-                },
-            };
-            match next {
-                Some(Ok(r)) => match self.start(r) {
-                    Ok(()) => {}
-                    Err(Refusal::Busy) => {
-                        if let Some(c) = self.connection.as_mut() {
-                            c.stalled = Some(r);
-                        }
-                        return;
-                    }
-                    Err(Refusal::Fail(status)) => self.refuse(r.tag, status),
-                },
-                // Not a request at all: its tag is still where a tag is.
-                Some(Err(raw)) => self
-                    .refuse(u64::from_le_bytes([raw[24], raw[25], raw[26], raw[27], raw[28], raw[29], raw[30], raw[31]]), Status::Invalid),
-                None => {
-                    if self.connection.as_mut().is_none_or(|c| c.requests.sleep()) {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Complete a request that was never started.
-    fn refuse(&mut self, tag: u64, status: Status) {
-        if let Some(c) = self.connection.as_mut() {
-            let _ = c.completions.push(&Completion { tag, status: Err(status) }.encode());
-            c.completed = true;
-        }
-    }
-
-    /// Wake the client if completions were added and it sleeps.
-    fn flush(&mut self) {
-        if let Some(c) = self.connection.as_mut().filter(|c| c.completed) {
-            c.completed = false;
-            if c.completions.wake_needed() {
-                let _ = sys::signal(c.done.cap());
-            }
+    /// The device's signals (`Some`), or its deadline passing (`None`):
+    /// what it reports finished goes to the client.
+    fn device_event(&mut self, bits: Option<u64>) {
+        let session = &mut self.session;
+        let mut done = |ticket: Ticket, s: Result<(), Status>| session.complete(ticket, status(s), 0);
+        match bits {
+            Some(bits) => self.device.signals(bits, &mut done),
+            None => self.device.timeout(&mut done),
         }
     }
 }
@@ -344,80 +286,17 @@ impl<D: Device> device::Server<Handle> for Service<D> {
     }
 
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<ConnectReply<Handle>, Error> {
-        if self.connection.is_some() {
-            if self.alive() {
-                return Err(Error::Busy);
-            }
-            self.close();
-        }
-        let size = match sys::inspect_slot(slots::SPACE, rings.cap().0) {
-            Ok(Some(s)) if s.bits == RINGS_BITS && s.rights.has(Rights(3)) => 1usize << s.bits,
-            _ => return Err(Error::BadMemory),
-        };
-        let at = mem::map_peer(rings.cap(), RINGS_BITS, Rights(3)).map_err(|_| Error::NoRoom)?;
-        // SAFETY: the client's frame, just mapped where lent memory goes:
-        // if the client takes it back, the range reads as zeros (the
-        // supervisor's answer to a fault there), and the rings report that
-        // as a broken ring.
-        #[allow(unsafe_code)]
-        let region = unsafe { Mmio::new(at, size) };
-        let (Some(req), Some(cpl)) = (region.part(0, COMPLETIONS_AT), region.part(COMPLETIONS_AT, size - COMPLETIONS_AT)) else {
-            return Err(Error::BadMemory);
-        };
-        let (Some(mut requests), Some(completions_ring)) = (Consumer::new(req, QUEUE), Producer::new(cpl, QUEUE)) else {
-            return Err(Error::BadMemory);
-        };
-        // Until it is signalled the provider is asleep, and says so: the
-        // client's first requests must wake it.
-        let _ = requests.sleep();
-        let mut memories = Vec::new();
-        memories.try_reserve_exact(MEMORIES as usize).map_err(|_| Error::NoRoom)?;
-        memories.resize_with(MEMORIES as usize, || None);
-        // The client's own capability to wake the driver.
-        let wake = silica_rt::ipc::free_slot().ok_or(Error::NoRoom)?;
-        if sys::cap_derive(slots::SPACE, wake, self.wake, Rights::WRITE, 0).is_err() {
-            silica_rt::ipc::release_slot(wake);
-            return Err(Error::NoRoom);
-        }
-        self.connection = Some(Connection {
-            client: self.caller,
-            rings,
-            requests,
-            completions: completions_ring,
-            done: completions,
-            memories,
-            stalled: None,
-            in_progress: 0,
-            completed: false,
-        });
-        Ok(ConnectReply { requests: Handle::new(Cap(wake)) })
+        let requests = self.session.connect(self.caller, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
+        Ok(ConnectReply { requests })
     }
 
     fn add_memory(&mut self, id: u32, frame: Handle, writable: bool) -> Result<AddMemoryReply, Error> {
-        let caller = self.caller;
-        let c = self.connection.as_mut().filter(|c| c.client == caller).ok_or(Error::NotConnected)?;
-        let slot = c.memories.get_mut(id as usize).filter(|m| m.is_none()).ok_or(Error::BadMemory)?;
-        let need = Rights(Rights::READ.0 | if writable { Rights::WRITE.0 } else { 0 });
-        let bits = match sys::inspect_slot(slots::SPACE, frame.cap().0) {
-            Ok(Some(s)) if s.ty == ObjectType::Frame && s.rights.has(need) && s.bits <= 32 => s.bits,
-            _ => return Err(Error::BadMemory),
-        };
-        let (address, mapping) = self.device.map(frame.cap(), bits, writable)?;
-        *slot = Some(Memory { frame, bytes: 1 << bits, writable, address, busy: 0, mapping });
+        self.session.add_memory(self.caller, id, frame, writable, &mut Map(&mut self.device)).map_err(error)?;
         Ok(AddMemoryReply {})
     }
 
     fn remove_memory(&mut self, id: u32) -> Result<RemoveMemoryReply, Error> {
-        let caller = self.caller;
-        let c = self.connection.as_mut().filter(|c| c.client == caller).ok_or(Error::NotConnected)?;
-        let slot = c.memories.get_mut(id as usize).filter(|m| m.is_some()).ok_or(Error::BadMemory)?;
-        if slot.as_ref().is_some_and(|m| m.busy != 0) {
-            return Err(Error::InUse);
-        }
-        if let Some(m) = slot.take() {
-            self.device.unmap(m.mapping);
-            drop(m.frame);
-        }
+        self.session.remove_memory(self.caller, id, &mut Map(&mut self.device)).map_err(error)?;
         Ok(RemoveMemoryReply {})
     }
 }
@@ -433,7 +312,7 @@ impl<D: Device> Events for Service<D> {
             self.device_event(Some(bits & !CLIENT));
         }
         self.pump();
-        self.flush();
+        self.session.flush();
     }
 
     fn deadline(&self) -> Option<u64> {
@@ -443,32 +322,6 @@ impl<D: Device> Events for Service<D> {
     fn timer(&mut self) {
         self.device_event(None);
         self.pump();
-        self.flush();
-    }
-}
-
-impl<D: Device> Service<D> {
-    /// The device's signals (`Some`), or its deadline passing (`None`):
-    /// what it reports finished goes to the client.
-    fn device_event(&mut self, bits: Option<u64>) {
-        {
-            let (connection, generation) = (&mut self.connection, self.generation);
-            let mut done = |ticket: Ticket, status| {
-                // A request of a connection that has ended has nobody to tell.
-                let Some(c) = connection.as_mut().filter(|_| ticket.connection == generation) else { return };
-                if let Some(m) = c.memories.get_mut(ticket.memory as usize).and_then(Option::as_mut) {
-                    m.busy = m.busy.saturating_sub(1);
-                }
-                c.in_progress = c.in_progress.saturating_sub(1);
-                // The client keeps no more in progress than the ring
-                // holds; one that does loses the completions that do not fit.
-                let _ = c.completions.push(&Completion { tag: ticket.tag, status }.encode());
-                c.completed = true;
-            };
-            match bits {
-                Some(bits) => self.device.signals(bits, &mut done),
-                None => self.device.timeout(&mut done),
-            }
-        }
+        self.session.flush();
     }
 }

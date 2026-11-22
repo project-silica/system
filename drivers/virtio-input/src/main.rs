@@ -18,7 +18,6 @@ use silica_idl_rt::CapList;
 use silica_protocols::input::device::{self, ConnectReply, DescribeReply, Error, Kind};
 use silica_ring::Producer;
 use silica_rt::ipc::{Events, Handle, serve_events};
-use silica_rt::mmio::Mmio;
 use silica_rt::sys::{self, ObjectType, Rights};
 use silica_rt::{ProcessInfo, mem, println, slots};
 
@@ -53,11 +52,8 @@ impl device::Server<Handle> for Keyboard {
             Ok(Some(s)) if s.ty == ObjectType::Frame && s.bits == 12 && s.rights.has(Rights(3)) => {}
             _ => return Err(Error::BadMemory),
         }
-        let at = mem::map_peer(ring.cap(), 12, Rights(3)).map_err(|_| Error::BadMemory)?;
-        // SAFETY: the client's frame, mapped where lent memory goes (memory
-        // the client takes back reads as zeros there).
-        #[allow(unsafe_code)]
-        let region = unsafe { Mmio::new(at, 4096) };
+        // Where lent memory goes: memory the client takes back reads as zeros.
+        let region = mem::peer(ring.cap(), 12, Rights(3)).map_err(|_| Error::BadMemory)?;
         let producer = Producer::new(region, RING).ok_or(Error::BadMemory)?;
         self.client = Some((ring, producer, events));
         Ok(ConnectReply {})

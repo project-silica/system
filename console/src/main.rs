@@ -27,7 +27,6 @@ use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::string::String;
 use silica_rt::ipc::{Channel, Handle, Parked, Waiting, serve_parked};
 use silica_rt::mem::{Memory, Object};
-use silica_rt::mmio::Mmio;
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{ProcessInfo, print, println, slots};
 
@@ -227,9 +226,7 @@ fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option
     let mut kb = input::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
     let ring = Memory::new(12).ok()?;
     kb.connect(lend(ring.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, KEYS)?).ok()?;
-    // SAFETY: the ring's frame, this program's own memory, for good.
-    #[allow(unsafe_code)]
-    let region = unsafe { Mmio::new(ring.addr(), ring.len()) };
+    let region = ring.shared();
     let mut consumer = Consumer::new(region, 256)?;
     let _ = consumer.sleep();
     Some((consumer, ring, driver))

@@ -12,6 +12,7 @@ members = [
     "stress",
     "systest",
     "ring",
+    "queue",
     "protocols",
     "storage/block",
     "devmgr",
@@ -27,7 +28,7 @@ members = [
     "shell",
 ]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
-default-members = ["rt", "proc", "ring", "protocols", "storage/block", "drivers/framework"]
+default-members = ["rt", "proc", "ring", "queue", "protocols", "storage/block", "drivers/framework"]
 
 [workspace.package]
 version = "0.0.0"
@@ -53,6 +54,7 @@ silica-rt = { path = "rt" }
 silica-proc = { path = "proc" }
 silica-driver = { path = "drivers/framework" }
 silica-ring = { path = "ring" }
+silica-queue = { path = "queue" }
 silica-protocols = { path = "protocols" }
 silica-block = { path = "storage/block" }
 

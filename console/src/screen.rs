@@ -11,7 +11,6 @@ use silica_rt::alloc::vec;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle};
 use silica_rt::mem::Memory;
-use silica_rt::mmio::Mmio;
 
 /// Light grey text on a near-black background, as 0x00RRGGBB.
 const FOREGROUND: u32 = 0x00D8_D8D8;
@@ -118,10 +117,7 @@ impl Display {
             return false;
         }
         let c = grid.columns as usize;
-        // SAFETY: the strip, this program's own memory, mapped as long as
-        // `self.strip` lives; written with single accesses.
-        #[allow(unsafe_code)]
-        let strip = unsafe { Mmio::new(self.strip.addr(), self.strip.len()) };
+        let strip = self.strip.shared();
         let (fg, bg) = (self.pixel(FOREGROUND), self.pixel(BACKGROUND));
         for row in 0..grid.rows as usize {
             let line = &grid.cells[row * c..row * c + c];
