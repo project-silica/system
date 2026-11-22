@@ -17,7 +17,7 @@
 
 use core::fmt::Write;
 use silica_protocols::console::terminal;
-use silica_protocols::device::manager as devices;
+use silica_protocols::device::{PciAddress, manager as devices};
 use silica_protocols::log::reader as log;
 use silica_protocols::system::manager as system;
 use silica_rt::alloc::string::String;
@@ -152,32 +152,20 @@ impl Shell {
                 ] {
                     if let Ok(r) = self.devices.list(class) {
                         for d in r.devices.iter() {
-                            let _ = writeln!(
-                                self.out,
-                                "  {:02x}:{:02x}.{} {:<8} {}",
-                                d.id >> 8 & 0xFF,
-                                d.id >> 3 & 31,
-                                d.id & 7,
-                                name,
-                                d.driver
-                            );
+                            let _ = writeln!(self.out, "  {} {name:<8} {}", PciAddress(d.id), d.driver);
                         }
                     }
                 }
             }
-            "restart-driver" if !arg.is_empty() => {
-                // A device as `bus:device.function`, hexadecimal.
-                let id = parse_bdf(arg);
-                match id.map(|id| self.devices.restart(id)) {
-                    Some(Ok(_)) => {
-                        let _ = writeln!(self.out, "restart-driver: {arg}: done");
-                    }
-                    Some(Err(e)) => {
-                        let _ = writeln!(self.out, "restart-driver: {arg}: {e:?}");
-                    }
-                    None => self.out.push_str("restart-driver: name a device as bus:device.function\n"),
+            "restart-driver" if !arg.is_empty() => match arg.parse::<PciAddress>().ok().map(|id| self.devices.restart(id.0)) {
+                Some(Ok(_)) => {
+                    let _ = writeln!(self.out, "restart-driver: {arg}: done");
                 }
-            }
+                Some(Err(e)) => {
+                    let _ = writeln!(self.out, "restart-driver: {arg}: {e:?}");
+                }
+                None => self.out.push_str("restart-driver: name a device as [segment:]bus:device.function\n"),
+            },
             "shutdown" | "reboot" => {
                 let _ = self.term.write("shutting down\n");
                 if let Err(e) = self.system.shutdown(command == "reboot") {
@@ -190,13 +178,6 @@ impl Shell {
         }
         self.say();
     }
-}
-
-fn parse_bdf(s: &str) -> Option<u32> {
-    let (bus, rest) = s.split_once(':')?;
-    let (dev, func) = rest.split_once('.')?;
-    let (b, d, f) = (u32::from_str_radix(bus, 16).ok()?, u32::from_str_radix(dev, 16).ok()?, u32::from_str_radix(func, 16).ok()?);
-    (b < 256 && d < 32 && f < 8).then_some(b << 8 | d << 3 | f)
 }
 
 fn main(_info: &'static ProcessInfo) -> i64 {

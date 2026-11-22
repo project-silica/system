@@ -18,6 +18,8 @@
 /// `silica.device.Manager`.
 pub mod device {
     include!(concat!(env!("OUT_DIR"), "/silica_device_manager.rs"));
+    mod address;
+    pub use address::PciAddress;
 }
 
 /// `silica.system.Manager`.

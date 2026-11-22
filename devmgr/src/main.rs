@@ -75,7 +75,7 @@ use silica_rt::mem::{self, Object};
 use silica_rt::mmio::Mmio;
 use silica_rt::{EXIT_LABEL, ProcessInfo, println, slots};
 
-use silica_protocols::device::manager;
+use silica_protocols::device::{PciAddress, manager};
 
 silica_rt::main!(main);
 
@@ -230,26 +230,16 @@ impl manager::Server<Handle> for Manager {
         let at = self.running.iter().position(|r| self.functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
         let r = self.running.remove(at);
         let (driver, function) = (r.name, r.function);
-        println!("devmgr: restarting {driver} for {}, as asked", name(id));
+        println!("devmgr: restarting {driver} for {}, as asked", PciAddress(id));
         if !self.stop(r) {
             println!("ERROR: devmgr: cannot take back the memory of {driver}");
         }
         self.start(function, driver).map_err(|e| {
-            println!("ERROR: devmgr: {} is not driven: {e}", name(id));
+            println!("ERROR: devmgr: {} is not driven: {e}", PciAddress(id));
             manager::Error::NoSuchDevice
         })?;
         Ok(manager::RestartReply {})
     }
-}
-
-fn name(id: u32) -> impl core::fmt::Display {
-    struct Bdf(u32);
-    impl core::fmt::Display for Bdf {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(f, "{:02x}:{:02x}.{}", self.0 >> 8 & 0xFF, self.0 >> 3 & 31, self.0 & 7)
-        }
-    }
-    Bdf(id)
 }
 
 /// The value of `key` on a command line of space-separated `key=value` words.
@@ -407,8 +397,8 @@ impl Manager {
                 Ok(())
             })();
             match armed {
-                Ok(()) => println!("devmgr: {} takes devices while the system runs", name(id)),
-                Err(e) => println!("devmgr: {} could take devices while the system runs, but {e}", name(id)),
+                Ok(()) => println!("devmgr: {} takes devices while the system runs", PciAddress(id)),
+                Err(e) => println!("devmgr: {} could take devices while the system runs, but {e}", PciAddress(id)),
             }
         }
     }
@@ -427,7 +417,7 @@ impl Manager {
 
     fn arrived(&mut self, k: usize) {
         if !self.ports[k].0.power(true) {
-            println!("devmgr: {}: a device arrived, but its link never came up", name(self.ports[k].0.id));
+            println!("devmgr: {}: a device arrived, but its link never came up", PciAddress(self.ports[k].0.id));
             return;
         }
         // PCI Express gives a device 100 ms after its link comes up
@@ -454,7 +444,7 @@ impl Manager {
                 if let Err((bar, bits, memory, prefetchable)) = self.ports[k].0.place(&config) {
                     println!(
                         "devmgr: {}: its BAR {bar} (2^{bits} bytes) does not fit the port's windows (memory {memory:x?}, prefetchable {prefetchable:x?}); left alone",
-                        name(id)
+                        PciAddress(id)
                     );
                     continue;
                 }
@@ -473,7 +463,7 @@ impl Manager {
                 let driver = driver_for(f, self.cmdline, &self.table);
                 println!(
                     "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x} arrived: {}",
-                    name(id),
+                    PciAddress(id),
                     f.vendor,
                     f.device,
                     f.class.0,
@@ -484,7 +474,7 @@ impl Manager {
                 if let Some(d) = driver
                     && let Err(e) = self.start(index, d)
                 {
-                    println!("ERROR: devmgr: {} is not driven: {e}", name(id));
+                    println!("ERROR: devmgr: {} is not driven: {e}", PciAddress(id));
                 }
             }
         }
@@ -492,16 +482,14 @@ impl Manager {
 
     fn left(&mut self, k: usize) {
         let (first, last) = (self.ports[k].0.secondary, self.ports[k].0.subordinate);
-        while let Some(at) = self.running.iter().position(|r| {
-            let bus = (self.functions[r.function].id >> 8 & 0xFF) as u8;
-            (first..=last).contains(&bus)
-        }) {
+        let segment = self.ports[k].2;
+        while let Some(at) = self.running.iter().position(|r| PciAddress(self.functions[r.function].id).on_buses(segment, first..=last)) {
             let r = self.running.remove(at);
             let (driver, id) = (r.name, self.functions[r.function].id);
             if !self.stop(r) {
                 println!("ERROR: devmgr: cannot take back the memory of {driver}");
             }
-            println!("devmgr: {} was taken out; {driver} ended", name(id));
+            println!("devmgr: {} was taken out; {driver} ended", PciAddress(id));
         }
         self.ports[k].0.power(false);
     }
@@ -766,7 +754,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         let driver = driver_for(f, cmdline, &table);
         println!(
             "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x}, {} interrupts: {}",
-            name(f.id),
+            PciAddress(f.id),
             f.vendor,
             f.device,
             f.class.0,
@@ -779,7 +767,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     }
     for (i, driver) in wanted {
         if let Err(e) = m.start(i, driver) {
-            println!("ERROR: devmgr: {} is not driven: {e}", name(m.functions[i].id));
+            println!("ERROR: devmgr: {} is not driven: {e}", PciAddress(m.functions[i].id));
             failed = true;
         }
     }
@@ -841,7 +829,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         }
         let r = m.running.remove(at);
         let (driver, function) = (r.name, r.function);
-        let device = name(m.functions[function].id);
+        let device = PciAddress(m.functions[function].id);
         let ended_well = if label == EXIT_LABEL && !fault {
             let status = msg.words[0] as i64;
             println!("devmgr: {driver} for {device} ended with status {status}");
