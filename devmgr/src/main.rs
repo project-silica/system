@@ -659,7 +659,7 @@ impl Manager {
                 release_slot(slot);
                 return None;
             }
-            let name = silica_rt::alloc::format!("{driver}@{}", name(self.functions[index].id));
+            let name = silica_rt::alloc::format!("{driver}@{}", PciAddress(self.functions[index].id));
             let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
             let wake = system.add_log(&name, Handle::new(Cap(slot))).ok()?.wake;
             self.functions[index].log = Some((ring, wake));
