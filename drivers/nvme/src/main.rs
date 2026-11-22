@@ -30,6 +30,7 @@ use silica_block::device::{Error, Info};
 use silica_block::service::{CLIENT, Completions, Device as BlockDevice, Refusal, Service, Ticket};
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{self, Dma, DmaMemory, Shared};
+use silica_driver::inject::{self, Fault};
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::{Device, DeviceError};
 use silica_rt::alloc::vec::Vec;
@@ -458,13 +459,24 @@ impl BlockDevice for Disk {
             c[11] = (request.block >> 32) as u32;
             c[12] = request.blocks - 1;
         }
-        self.io.push(&c);
         self.tickets[cid as usize] = Some((ticket, now()));
+        // An injected fault (`silica_driver::inject`): the controller never
+        // sees this command.
+        if inject::due() == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
+            return Ok(());
+        }
+        self.io.push(&c);
         self.unrung = true;
         Ok(())
     }
 
     fn kick(&mut self) {
+        // An injected fault: the controller resets itself instead.
+        if inject::pending(Fault::Reset) {
+            self.regs.write32(CC, self.regs.read32(CC) & !CC_EN);
+            self.unrung = false;
+            return;
+        }
         if self.unrung {
             self.io.ring();
             self.unrung = false;
@@ -472,6 +484,11 @@ impl BlockDevice for Disk {
     }
 
     fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
+        // An injected fault: this interrupt never came (what it brought
+        // waits for the next look).
+        if bits & IO_BIT != 0 && inject::pending(Fault::Missed) {
+            return;
+        }
         let mut taken = 0;
         loop {
             let c = match self.io.pop() {
@@ -480,7 +497,9 @@ impl BlockDevice for Disk {
                 Err(e) => give_up(e),
             };
             taken += 1;
-            let Some((ticket, _)) = self.tickets.get_mut(c.cid as usize).and_then(Option::take) else {
+            // An injected fault: the controller wrote nonsense in it.
+            let cid = if inject::pending(Fault::Garbage) { u16::MAX } else { c.cid };
+            let Some((ticket, _)) = self.tickets.get_mut(cid as usize).and_then(Option::take) else {
                 give_up(DeviceError::Protocol("a completion names a command not in progress"));
             };
             self.free.push(c.cid);
@@ -499,12 +518,13 @@ impl BlockDevice for Disk {
     }
 
     fn deadline(&self) -> Option<u64> {
-        self.tickets.iter().flatten().map(|(_, t)| t + IO_TIMEOUT_NS).min()
+        let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { IO_TIMEOUT_NS };
+        self.tickets.iter().flatten().map(|(_, t)| t + limit).min()
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
         // What finished without an interrupt first, then the verdict.
-        self.signals(IO_BIT, done);
+        self.signals(0, done);
         if self.deadline().is_some_and(|d| d <= now()) {
             give_up(DeviceError::Timeout("an I/O command the controller never completed"));
         }
@@ -527,6 +547,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     let admin_irq = Interrupt::bind_to(&device, 0, signals.sender(ADMIN_BIT)?)?;
     // The I/O queue gets an interrupt of its own where there are two.
     let io_irq = if vectors >= 2 && lines >= 2 { Some(Interrupt::bind_to(&device, 1, signals.sender(IO_BIT)?)?) } else { None };
+    inject::interrupts(signals.sender(IO_BIT)?);
 
     let cap = read64(&regs, CAP);
     if cap == u64::MAX {

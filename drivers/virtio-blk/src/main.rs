@@ -14,6 +14,13 @@
 //! have one data buffer, so the device's segment limits never apply, and
 //! at most 1 MiB, the largest a request of this protocol may be here.
 //! Verified against QEMU's virtio-blk-pci device model only.
+//!
+//! A request the device has not finished in [`IO_TIMEOUT_NS`] (Linux's
+//! default too) is looked for once more (its interrupt may have been lost);
+//! if it is still not done, the driver ends and the device manager starts
+//! it again, which resets the device. A device that breaks the protocol
+//! ends it the same way. Either way the requests in flight are left to the
+//! client, which sends them again to the next driver.
 #![no_std]
 #![no_main]
 
@@ -21,6 +28,7 @@ use silica_block::device::{Error, Info};
 use silica_block::service::{CLIENT, Completions, Refusal, Service, Ticket};
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
+use silica_driver::inject;
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
@@ -43,6 +51,8 @@ const INTERRUPT: u64 = 2;
 const QUEUE_SIZE: u16 = 256;
 /// Most bytes in one request.
 const MAX_BYTES: u32 = 1 << 20;
+/// How long the device may take over a request.
+const IO_TIMEOUT_NS: u64 = 30_000_000_000;
 
 struct Disk {
     transport: Transport,
@@ -53,12 +63,28 @@ struct Disk {
     headers: DmaMemory,
     /// A status byte per request slot: the device writes them.
     status: DmaMemory,
-    /// The request in each slot while the device has it.
-    slots: Vec<Option<Ticket>>,
+    /// The request in each slot while the device has it, and when it was
+    /// started.
+    slots: Vec<Option<(Ticket, u64)>>,
     free: Vec<u16>,
     info: Info,
     /// 512-byte sectors in a block.
     sectors_per_block: u64,
+}
+
+impl Disk {
+    /// The device cannot be relied on: end, so that the device manager
+    /// resets it by starting the driver again. Nothing in flight is
+    /// completed: the client sends it again to the next driver.
+    fn give_up(&self, why: DeviceError) -> ! {
+        println!("ERROR: virtio-blk: {why:?}; giving up on the device");
+        self.transport.fail();
+        silica_rt::exit(2)
+    }
+
+    fn timeout_ns() -> u64 {
+        if inject::armed() { inject::ARMED_TIMEOUT_NS } else { IO_TIMEOUT_NS }
+    }
 }
 
 impl silica_block::service::Device for Disk {
@@ -104,7 +130,7 @@ impl silica_block::service::Device for Disk {
             self.free.push(slot);
             return Err(Refusal::Busy);
         }
-        self.slots[at] = Some(ticket);
+        self.slots[at] = Some((ticket, silica_rt::clock().now()));
         Ok(())
     }
 
@@ -112,11 +138,23 @@ impl silica_block::service::Device for Disk {
         self.queue.notify();
     }
 
+    fn deadline(&self) -> Option<u64> {
+        self.slots.iter().flatten().map(|(_, t)| t + Disk::timeout_ns()).min()
+    }
+
+    fn timeout(&mut self, done: &mut Completions<'_>) {
+        // What the device finished without an interrupt, then the verdict.
+        self.signals(INTERRUPT, done);
+        if self.deadline().is_some_and(|d| d <= silica_rt::clock().now()) {
+            self.give_up(DeviceError::Timeout("a request the device never finished"));
+        }
+    }
+
     fn signals(&mut self, _bits: u64, done: &mut Completions<'_>) {
         loop {
             match self.queue.pop() {
                 Ok(Some((token, _))) => {
-                    let Some(ticket) = self.slots.get_mut(token as usize).and_then(Option::take) else { continue };
+                    let Some((ticket, _)) = self.slots.get_mut(token as usize).and_then(Option::take) else { continue };
                     self.free.push(token as u16);
                     done(
                         ticket,
@@ -128,18 +166,7 @@ impl silica_block::service::Device for Disk {
                     );
                 }
                 Ok(None) => return,
-                Err(e) => {
-                    // The device broke the protocol: nothing it says can be
-                    // relied on. Everything in flight is given up, and the
-                    // driver ends; the device manager starts a new one,
-                    // which resets the device.
-                    println!("ERROR: virtio-blk: {e:?}; giving up on the device");
-                    for ticket in self.slots.iter_mut().filter_map(Option::take) {
-                        done(ticket, Err(Status::Aborted));
-                    }
-                    self.transport.fail();
-                    silica_rt::exit(2);
-                }
+                Err(e) => self.give_up(e),
             }
         }
     }
@@ -162,6 +189,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let features = transport.negotiate(&dma, F_RO | F_BLK_SIZE | F_FLUSH, 0)?;
     let signals = Signals::new()?;
     let interrupt = Interrupt::bind_to(&device, 0, signals.sender(INTERRUPT)?)?;
+    inject::interrupts(signals.sender(INTERRUPT)?);
     let queue = transport.queue(&dma, 0, QUEUE_SIZE, Some(0))?;
     let config = transport.device_config().ok_or(DeviceError::Missing("the block device's configuration"))?;
     if config.len() < 24 {

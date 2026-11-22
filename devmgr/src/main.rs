@@ -28,6 +28,8 @@
 //! `driver=<vendor>:<device>=<program>` on the kernel command line (four
 //! hexadecimal digits each) starts `<program>` from the boot archive for
 //! that kind of device instead of the driver the device manager would pick.
+//! `inject=<driver>:<fault>@<n>` has the first run of `<driver>` commit a
+//! device's fault at its `n`th request (`silica_driver::inject`).
 //!
 //! It provides `silica.device.Manager`: a program that uses devices (the
 //! block server, a filesystem, the network stack) lists the devices of a
@@ -147,6 +149,9 @@ struct Manager {
     listing: Vec<manager::Device<'static>>,
     /// Badges of driver capabilities handed out, so each client is told apart.
     next_client: u64,
+    /// The kernel command line: `inject=<driver>:<fault>@<n>`
+    /// (`silica_driver::inject`) is read at each driver's first start.
+    cmdline: &'static [u8],
 }
 
 /// The class of a function, from its PCI class code.
@@ -215,6 +220,27 @@ fn name(id: u32) -> impl core::fmt::Display {
 }
 
 /// The value of `key` on a command line of space-separated `key=value` words.
+/// The fault `inject=<driver>:<fault>@<n>` asks `driver` to commit, as
+/// `silica_driver::inject::Fault::plan` makes it (0: none).
+fn inject_plan(cmdline: &[u8], driver: &str) -> u32 {
+    for choice in option(cmdline, "inject") {
+        let Some(colon) = choice.iter().position(|&b| b == b':') else { continue };
+        if &choice[..colon] != driver.as_bytes() {
+            continue;
+        }
+        let rest = &choice[colon + 1..];
+        let (fault, n) = match rest.iter().position(|&b| b == b'@') {
+            Some(at) => (&rest[..at], core::str::from_utf8(&rest[at + 1..]).ok().and_then(|n| n.parse().ok()).unwrap_or(1)),
+            None => (rest, 1),
+        };
+        match silica_driver::inject::Fault::named(fault) {
+            Some(f) => return f.plan(n),
+            None => println!("devmgr: inject: no fault named {}", core::str::from_utf8(fault).unwrap_or("?")),
+        }
+    }
+    0
+}
+
 fn option<'a>(cmdline: &'a [u8], key: &str) -> impl Iterator<Item = &'a [u8]> {
     cmdline.split(|b| b.is_ascii_whitespace()).filter_map(move |w| w.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
 }
@@ -439,9 +465,20 @@ impl Manager {
                 None => return Err("the firmware's framebuffer does not start a BAR of this display"),
             }
         }
+        // A fault to commit on purpose, in the driver's first run only.
+        let inject = if f.starts == 0 { inject_plan(self.cmdline, driver) } else { 0 };
         let program = Program {
             grants: &grants,
-            args: [id as u64, first_line as u64, lines as u64, self.info.dma_top, f.starts as u64, display[0], display[1], display[2]],
+            args: [
+                id as u64,
+                first_line as u64,
+                lines as u64,
+                self.info.dma_top,
+                f.starts as u64 | (inject as u64) << 32,
+                display[0],
+                display[1],
+                display[2],
+            ],
             aspace_bits: 18,
             ..Program::new(image, self.next_id)
         };
@@ -558,9 +595,10 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         next_id: 0,
         listing: Vec::new(),
         next_client: CLIENTS,
+        cmdline: &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())],
     };
     m.enumerate()?;
-    let cmdline: &'static [u8] = &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())];
+    let cmdline = m.cmdline;
     let table = drivers(archive);
     if table.is_empty() {
         println!("devmgr: the boot archive lists no drivers");

@@ -16,7 +16,8 @@
 //! device, function, as `Syscall::DeviceAttach` takes it), 1 its first
 //! interrupt line, 2 how many lines it has, 3 one past the highest address
 //! a device can be given on this machine (0: the machine cannot confine
-//! DMA), 4 how many times a driver was started for this device before.
+//! DMA), 4 how many times a driver was started for this device before (low
+//! half; the high half is a fault to inject, [`inject`]).
 //!
 //! A device gets one interrupt line per MSI-X table entry it has, up to 8
 //! ([`Device::lines`]); [`irq`] binds them. A 64-bit BAR is the BAR of its
@@ -116,6 +117,7 @@
 #![deny(unsafe_code)]
 
 pub mod dma;
+pub mod inject;
 pub mod irq;
 pub mod pci;
 pub mod virtio;
@@ -219,6 +221,8 @@ impl Device {
             }
         }
         let first = info.args[1] as u32;
+        // A fault to commit on purpose (`inject`), for this run only.
+        inject::arm((info.args[4] >> 32) as u32);
         Ok(Device {
             id: info.args[0] as u32,
             lines: first..first + info.args[2] as u32,

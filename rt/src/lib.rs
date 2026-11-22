@@ -203,10 +203,11 @@ pub fn clock() -> Clock {
 /// The debug console: the kernel's console, through a console capability.
 /// For bring-up, panics and the serial line; the logging service (D08)
 /// replaces it for everything else. [`print!`] and [`println!`] format into
-/// a [`Line`] of up to 256 bytes and write it once, so what one call prints
-/// is not split by another program's output unless it is longer than that.
-/// The kernel starts a fresh line for a writer that finds another's line
-/// unfinished, so a line never begins with someone else's text.
+/// a [`Line`] of up to 224 bytes and write it once, which the kernel puts
+/// on the console whole (`console_write`), so what one call prints is not
+/// split by anyone else's output unless it is longer than that. The kernel
+/// starts a fresh line for a writer that finds another's line unfinished,
+/// so a line never begins with someone else's text.
 pub struct Debug;
 
 impl fmt::Write for Debug {
@@ -224,13 +225,13 @@ impl fmt::Write for Debug {
 ///
 /// [`flush`]: Line::flush
 pub struct Line {
-    buf: [u8; 256],
+    buf: [u8; 224],
     len: usize,
 }
 
 impl Line {
     pub const fn new() -> Line {
-        Line { buf: [0; 256], len: 0 }
+        Line { buf: [0; 224], len: 0 }
     }
 
     /// Write out what has been gathered.

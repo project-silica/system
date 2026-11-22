@@ -14,6 +14,7 @@
 //! the driver did not offer is a protocol error, reported, not followed.
 
 use crate::dma::{self, Dma, DmaMemory};
+use crate::inject::{self, Fault};
 use crate::pci::CAP_VENDOR;
 use crate::{Device, DeviceError};
 use silica_rt::alloc::vec::Vec;
@@ -206,7 +207,7 @@ impl Transport {
         let notify =
             self.notify.part(at, 2).ok_or(DeviceError::Protocol("the queue's notification register lies outside its structure"))?;
         self.common.write16(QUEUE_ENABLE, 1);
-        Ok(Queue { notify, index, ..q })
+        Ok(Queue { notify, index, common: self.common, ..q })
     }
 
     /// Changes of the device-specific configuration raise MSI-X entry `vector`.
@@ -268,6 +269,8 @@ pub struct Queue {
     pending: u16,
     /// The next used-ring entry to read.
     used: u16,
+    /// The transport's common configuration: where an injected reset goes.
+    common: Mmio,
 }
 
 /// The queue has too few free descriptors for the request; take
@@ -301,6 +304,7 @@ impl Queue {
             driver_area,
             device_area,
             notify,
+            common: notify,
             free: 0,
             free_count: size,
             next,
@@ -357,6 +361,10 @@ impl Queue {
         self.free = self.next[at as usize];
         self.free_count -= buffers.len() as u16;
         self.offered[head as usize] = Some((token, buffers.len() as u16));
+        // An injected fault (`inject`): the device never sees this one.
+        if inject::due() == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
+            return Ok(());
+        }
         // Into the available ring; the index that makes it visible is
         // written after the entry.
         let ring = 16 * self.size as usize + 4;
@@ -375,6 +383,11 @@ impl Queue {
             return;
         }
         self.pending = 0;
+        // An injected fault: the device resets itself instead.
+        if inject::pending(Fault::Reset) {
+            self.common.write8(DEVICE_STATUS, 0);
+            return;
+        }
         // The device's "no notification needed" flag is read after the
         // index it will look at was written.
         dma::full_barrier();
@@ -396,6 +409,14 @@ impl Queue {
         // The entry is read after the index that says it is there.
         dma::read_barrier();
         let o = 4 + 8 * (self.used & (self.size - 1)) as usize;
+        // Injected faults: no interrupt brought this one, or the device
+        // wrote nonsense in it.
+        if inject::pending(Fault::Missed) {
+            return Ok(None);
+        }
+        if inject::pending(Fault::Garbage) {
+            u.write32(o, 0xFFFF_FF00);
+        }
         let (id, written) = (u.read32(o), u.read32(o + 4));
         let Some((token, count)) = self.offered.get_mut(id as usize).and_then(Option::take) else {
             return Err(DeviceError::Protocol("the device completed a request the driver never offered"));
