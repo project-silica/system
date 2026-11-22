@@ -16,7 +16,7 @@
 //! device, function, as `Syscall::DeviceAttach` takes it), 1 its first
 //! interrupt line, 2 how many lines it has, 3 one past the highest address
 //! a device can be given on this machine (0: the machine cannot confine
-//! DMA).
+//! DMA), 4 how many times a driver was started for this device before.
 //!
 //! [`Device::take`] turns that into a [`Device`]: registers mapped, ready to
 //! use. The device manager has already switched on the device's memory
@@ -24,6 +24,41 @@
 //! space. Until the driver attaches the device to a device address space
 //! ([`dma::Dma`]) the device reaches no memory at all, and it reaches none
 //! again the moment the driver ends, however it ends.
+//!
+//! # Declaring what a driver drives
+//!
+//! A driver is a program of the `system` workspace (as `silica_rt`
+//! describes) whose `Cargo.toml` says which devices it is for:
+//!
+//! ```text
+//! [package.metadata.silica]
+//! drivers = ["pci 1af4:1042", "class 01.08.02"]
+//! ```
+//!
+//! `pci <vendor>:<device>` (four hexadecimal digits each) names one kind of
+//! device; `class <class>.<subclass>.<interface>` (two each) every device of
+//! that kind, as the PCI class code says (`01.08.02` is an NVMe controller).
+//! The image build collects these into the boot archive's `drivers` list,
+//! and the device manager starts the first driver that names a device's
+//! identifiers, else the first that names its class. The owner can put
+//! another program in a driver's place for one kind of device with
+//! `driver=<vendor>:<device>=<program>` on the kernel command line.
+//!
+//! The device manager knows what a device is for from its class code (01:
+//! storage, a provider of `silica.block.Device`) and hands clients the
+//! driver's endpoint ([`grant::SERVICE`]) through `silica.device.Manager`.
+//! A block driver implements `silica_block::service::Device` and serves it
+//! with `silica_rt::ipc::serve_events`.
+//!
+//! # What happens when a driver fails
+//!
+//! A driver that faults, or exits with a status other than 0, is destroyed
+//! (its memory, its capabilities, and its device's view of memory with
+//! them), its device is silenced, and it is started again, at most three
+//! times; [`Device::starts`] says how many times it has been. Its clients
+//! see `peer_gone` and open the new one. A driver that exits with 0 is not
+//! started again. Reading memory a client lent it (`silica_rt::mem::map_peer`)
+//! never faults: memory the client took back reads as zeros.
 //!
 //! A device is not trusted. Every offset and length read from one is
 //! checked before use ([`Mmio::part`](silica_rt::mmio::Mmio::part)), and a
@@ -90,6 +125,10 @@ pub struct Device {
     pub lines: Range<u32>,
     /// One past the highest device address, or 0 where DMA is not confined.
     pub dma_top: u64,
+    /// How many times a driver was started for this device before this one
+    /// (0 the first time): a driver started again may find its device in
+    /// whatever state the last one left it, and resets it.
+    pub starts: u32,
     config: Mmio,
     bars: [Option<Mmio>; 6],
 }
@@ -128,7 +167,14 @@ impl Device {
             }
         }
         let first = info.args[1] as u32;
-        Ok(Device { id: info.args[0] as u32, lines: first..first + info.args[2] as u32, dma_top: info.args[3], config, bars })
+        Ok(Device {
+            id: info.args[0] as u32,
+            lines: first..first + info.args[2] as u32,
+            dma_top: info.args[3],
+            starts: info.args[4] as u32,
+            config,
+            bars,
+        })
     }
 
     /// Its configuration space (read-only).

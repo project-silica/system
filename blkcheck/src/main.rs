@@ -12,7 +12,8 @@
 //!
 //! Then it measures: 4 KiB reads at queue depth 1 (latency) and 32
 //! (throughput), printed as `BENCH` lines. It prints `TEST <name> PASS` for
-//! each check, and exits with status 0 when every one passed.
+//! each check (`<driver>.<check>`), for every disk the device manager
+//! lists, and exits with status 0 when every one passed.
 #![no_std]
 #![no_main]
 
@@ -41,28 +42,30 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     }
 }
 
-/// The disk to use: the first block device with a driver.
-fn open() -> Result<Disk, &'static str> {
-    let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT)));
+/// Every block device with a driver: its identity and its driver's name.
+fn disks(devices: &mut manager::Client<Channel, Handle>) -> Result<Vec<(u32, silica_rt::alloc::string::String)>, &'static str> {
+    // The device manager answers once it has started a driver for every
+    // device it found; a disk may still be on its way when the first
+    // answer comes, so an empty list is asked again for a while.
     let deadline = silica_rt::clock().now() + 10 * SECOND;
-    // The device manager may still be starting its drivers.
-    let id = loop {
+    loop {
         let listed = devices.list(manager::Class::Block).map_err(|e| why(e, "the device manager does not answer"))?;
-        if let Some(d) = listed.devices.iter().next() {
-            println!("blkcheck: disk {:#x}, driven by {}", d.id, d.driver);
-            break d.id;
+        let found: Vec<_> = listed.devices.iter().map(|d| (d.id, silica_rt::alloc::string::String::from(d.driver))).collect();
+        if !found.is_empty() {
+            return Ok(found);
         }
         if silica_rt::clock().now() > deadline {
             return Err("no block device has a driver after 10 s");
         }
         silica_rt::sys::yield_now();
-    };
+    }
+}
+
+/// A connection to the driver of disk `id`.
+fn open(devices: &mut manager::Client<Channel, Handle>, id: u32) -> Result<Disk, &'static str> {
     let driver = devices.open(id).map_err(|e| why(e, "the device manager cannot open the disk's driver"))?.driver;
     // The capability lives as long as the program.
-    Disk::connect(driver.into_cap()).map_err(|e| {
-        println!("blkcheck: connect: {e:?}");
-        "cannot connect to the driver"
-    })
+    Disk::connect(driver.into_cap()).map_err(|e| why(e, "cannot connect to the driver"))
 }
 
 /// Say what the error was, and return what failed.
@@ -71,12 +74,21 @@ fn why<E: core::fmt::Debug>(e: E, what: &'static str) -> &'static str {
     what
 }
 
-fn pass(name: &str) {
-    println!("TEST {name} PASS");
+fn run() -> Result<(), &'static str> {
+    let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT)));
+    for (id, driver) in disks(&mut devices)? {
+        println!("blkcheck: disk {id:#x}, driven by {driver}");
+        let disk = open(&mut devices, id)?;
+        // The gated block benchmarks are virtio-blk's (blk_*); another
+        // driver's are named after it.
+        let prefix = if driver == "virtio-blk" { "blk" } else { driver.as_str() };
+        check(disk, &driver, prefix)?;
+    }
+    Ok(())
 }
 
-fn run() -> Result<(), &'static str> {
-    let mut disk = open()?;
+fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str> {
+    let pass = |name: &str| println!("TEST {driver}.{name} PASS");
     let info = disk.info().clone();
     let bs = info.block_size as usize;
     println!("blkcheck: {} blocks of {} bytes{}", info.blocks, bs, if info.write_cache { ", write cache" } else { "" });
@@ -182,8 +194,8 @@ fn run() -> Result<(), &'static str> {
         }
     }
     lat.sort_unstable();
-    println!("BENCH blk_read4k_qd1 {} ns", lat[lat.len() / 2]);
-    println!("BENCH blk_read4k_qd1_p99 {} ns", lat[lat.len() * 99 / 100]);
+    println!("BENCH {prefix}_read4k_qd1 {} ns", lat[lat.len() / 2]);
+    println!("BENCH {prefix}_read4k_qd1_p99 {} ns", lat[lat.len() * 99 / 100]);
     let (depth, total) = (32u64, 20000u64);
     let (mut sent, mut done) = (0u64, 0u64);
     let start = clock.now();
@@ -202,6 +214,6 @@ fn run() -> Result<(), &'static str> {
         done += 1;
     }
     let ns = clock.now() - start;
-    println!("BENCH blk_read4k_qd32 {} ops/s", total * SECOND / ns.max(1));
+    println!("BENCH {prefix}_read4k_qd32 {} ops/s", total * SECOND / ns.max(1));
     Ok(())
 }

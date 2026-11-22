@@ -188,9 +188,48 @@ fn option<'a>(cmdline: &'a [u8], key: &str) -> impl Iterator<Item = &'a [u8]> {
     cmdline.split(|b| b.is_ascii_whitespace()).filter_map(move |w| w.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
 }
 
+/// What a driver says it drives: a line of the boot archive's `drivers`
+/// entry, which the image build collects from every driver crate's
+/// `[package.metadata.silica] drivers = [...]`:
+///
+/// ```text
+/// pci <vendor>:<device> <program>      # four hexadecimal digits each
+/// class <class>.<subclass>.<interface> <program>   # two each: any device of that kind
+/// ```
+#[derive(Clone, Copy, Debug)]
+enum Match {
+    Id(u16, u16),
+    Class(u8, u8, u8),
+}
+
+/// The drivers the boot archive offers, in its order.
+fn drivers(archive: &'static [u8]) -> Vec<(Match, &'static str)> {
+    let mut table = Vec::new();
+    let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return table };
+    let hex16 = |s: &str| u16::from_str_radix(s, 16).ok().filter(|_| s.len() == 4);
+    let hex8 = |s: &str| u8::from_str_radix(s, 16).ok().filter(|_| s.len() == 2);
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let mut w = line.split_ascii_whitespace();
+        let m = match (w.next(), w.next()) {
+            (Some("pci"), Some(id)) => id.split_once(':').and_then(|(v, d)| Some(Match::Id(hex16(v)?, hex16(d)?))),
+            (Some("class"), Some(c)) => {
+                let mut p = c.split('.');
+                (|| Some(Match::Class(hex8(p.next()?)?, hex8(p.next()?)?, hex8(p.next()?)?)))()
+            }
+            _ => None,
+        };
+        match (m, w.next(), w.next()) {
+            (Some(m), Some(program), None) => table.push((m, program)),
+            _ => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
+        }
+    }
+    table
+}
+
 /// The driver for a function: the owner's choice on the command line
-/// (`driver=<vendor>:<device>=<program>`), else by what the function says it is.
-fn driver_for(f: &Function, cmdline: &'static [u8]) -> Option<&'static str> {
+/// (`driver=<vendor>:<device>=<program>`), else the first in the archive's
+/// list that names its identifiers, else the first that names its class.
+fn driver_for(f: &Function, cmdline: &'static [u8], table: &[(Match, &'static str)]) -> Option<&'static str> {
     let hex = |b: &[u8]| core::str::from_utf8(b).ok().and_then(|s| u16::from_str_radix(s, 16).ok());
     for choice in option(cmdline, "driver") {
         let mut parts = choice.splitn(2, |b| *b == b'=');
@@ -200,11 +239,9 @@ fn driver_for(f: &Function, cmdline: &'static [u8]) -> Option<&'static str> {
             return core::str::from_utf8(program).ok();
         }
     }
-    match (f.vendor, f.device) {
-        // virtio block: the 1.0 identifier, and the transitional one.
-        (0x1AF4, 0x1042 | 0x1001) => Some("virtio-blk"),
-        _ => None,
-    }
+    let by_id = table.iter().find(|(m, _)| matches!(m, Match::Id(v, d) if (*v, *d) == (f.vendor, f.device)));
+    let by_class = || table.iter().find(|(m, _)| matches!(m, Match::Class(c, s, p) if (*c, *s, *p) == f.class));
+    by_id.or_else(by_class).map(|(_, program)| *program)
 }
 
 impl Manager {
@@ -481,6 +518,10 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     };
     m.enumerate()?;
     let cmdline: &'static [u8] = &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())];
+    let table = drivers(archive);
+    if table.is_empty() {
+        println!("devmgr: the boot archive lists no drivers");
+    }
     if info.dma_top == 0 {
         println!("devmgr: this machine cannot confine DMA: every driver started here is trusted with all of memory");
     }
@@ -488,7 +529,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     let mut failed = false;
     let mut wanted = Vec::new();
     for (i, f) in m.functions.iter().enumerate() {
-        let driver = driver_for(f, cmdline);
+        let driver = driver_for(f, cmdline, &table);
         println!(
             "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x}, {} interrupts: {}",
             name(f.id),
