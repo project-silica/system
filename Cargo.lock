@@ -109,6 +109,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "netload"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-net",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "nvme"
 version = "0.0.0"
 dependencies = [

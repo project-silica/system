@@ -1,0 +1,29 @@
+[package]
+name = "netload"
+description = "The network path under load while its driver is restarted: pings to the user-mode gateway, recovery timed."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+needs = ["silica.device.Manager"]
+memory = 23
+start = "check:netload"
+
+[[bin]]
+name = "netload"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+silica-net = { workspace = true }
+
+
+[lints]
+workspace = true
