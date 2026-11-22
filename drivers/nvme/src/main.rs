@@ -1,25 +1,39 @@
-//! The NVMe controller driver: the first active namespace of an NVMe
-//! controller (PCI class 01.08.02) as a `silica.block.Device`.
+//! The NVMe controller driver: one namespace of an NVMe controller (PCI
+//! class 01.08.02) as a `silica.block.Device`.
 //!
 //! Written against the NVM Express Base Specification 2.0 (sections 3.1
 //! registers, 3.5 controller initialization, 4.1 queues, 4.3 PRPs, 5 admin
 //! commands) and the NVM Command Set Specification 1.0 (I/O commands,
-//! Identify Namespace). One admin queue pair and one I/O queue pair, MSI-X
-//! entry 0 for the admin queue and entry 1 for the I/O queue (both on entry
-//! 0 when the device or the driver has only one), PRPs for data.
+//! Identify Namespace). One admin queue pair and one I/O queue pair, PRPs
+//! for data. MSI-X entry 0 is the admin queue's and entry 1 the I/O
+//! queue's; a controller with one vector (or a driver granted one line)
+//! has both queues interrupt on entry 0, and every interrupt is then looked
+//! at as the I/O queue's.
+//!
+//! Namespaces: every active one is identified (the first 1024 the
+//! controller lists), the first this driver can serve is served, and each
+//! of the others is reported with why it is not: one whose format carries
+//! metadata or a block size outside 512 bytes to 64 KiB, and every one after
+//! the served one, since the device manager names one disk per controller.
+//! Blocks of 512 bytes to 64 KiB are served alike: a 4 KiB block that starts
+//! part-way into a page of the client's memory spans two pages, and the PRPs
+//! say so. A controller with no namespace this driver can serve is left
+//! alone (the driver ends with status 0, which is not a failure).
 //!
 //! The device is not trusted: every completion's phase, queue, submission
 //! queue head and command identifier is checked against what the driver
-//! submitted before anything is done with it. A controller that answers
-//! nonsense, reports fatal status or stops answering ends the driver with a
-//! failure; the device manager then starts it again, which resets the
-//! controller, and the block client sends its requests again.
+//! submitted before anything is done with it, and so is the namespace list.
+//! A controller that answers nonsense, reports fatal status or stops
+//! answering ends the driver with a failure; the device manager then starts
+//! it again, which resets the controller, and the block client sends its
+//! requests again.
 //!
-//! Not handled yet: a command the controller accepts and never completes
-//! while the driver is serving (the block service has no timer to give a
-//! request a deadline), namespaces with metadata or protection information,
-//! more than one namespace, more than one I/O queue, the shutdown
-//! notification (`CC.SHN`) before the driver ends.
+//! Not handled yet: serving more than one namespace (each would be a disk
+//! of its own: the device manager's identities and endpoints are one per
+//! PCI function today), namespaces with metadata or protection information,
+//! more than one I/O queue, namespaces attached or detached while the driver
+//! runs (they are seen when it is next started), the shutdown notification
+//! (`CC.SHN`) before the driver ends.
 
 #![no_std]
 #![no_main]
@@ -316,7 +330,7 @@ impl Controller {
     }
 }
 
-/// The namespace being served, as Identify describes it.
+/// A namespace this driver can serve, as Identify describes it.
 struct Namespace {
     id: u32,
     block_bits: u32,
@@ -324,10 +338,17 @@ struct Namespace {
     read_only: bool,
 }
 
-fn namespace(ctl: &mut Controller, buffer: &DmaMemory, nsid: u32) -> Result<Namespace, DeviceError> {
+/// Namespace `nsid` as Identify Namespace describes it: `Ok(Err(why))` for
+/// one this driver cannot serve, `Err` for a controller that cannot be
+/// relied on.
+fn namespace(ctl: &mut Controller, buffer: &DmaMemory, nsid: u32) -> Result<Result<Namespace, &'static str>, DeviceError> {
     ctl.identify(buffer, 0, nsid, "Identify Namespace")?;
     let m = buffer.shared();
     let blocks = read64(&m, 0);
+    if blocks == 0 {
+        // Before NVMe 1.1 an inactive namespace reads as zeros.
+        return Ok(Err(NO_BLOCKS));
+    }
     let formats = m.read8(25) as u32; // NLBAF, zero-based
     let flbas = m.read8(26) as u32;
     let format = (flbas & 0xF) | (flbas >> 5 & 3) << 4;
@@ -336,16 +357,44 @@ fn namespace(ctl: &mut Controller, buffer: &DmaMemory, nsid: u32) -> Result<Name
     }
     let lbaf = m.read32(128 + 4 * format as usize);
     if lbaf & 0xFFFF != 0 {
-        return Err(DeviceError::Missing("a namespace format without metadata"));
+        return Ok(Err("its format carries metadata"));
     }
     let block_bits = lbaf >> 16 & 0xFF;
     if !(9..=16).contains(&block_bits) {
-        return Err(DeviceError::Missing("a block size from 512 bytes to 64 KiB"));
+        return Ok(Err("its blocks are not 512 bytes to 64 KiB"));
     }
-    if blocks == 0 {
-        return Err(DeviceError::Missing("a namespace with blocks"));
+    Ok(Ok(Namespace { id: nsid, block_bits, blocks, read_only: m.read8(99) & 1 != 0 }))
+}
+
+/// Why a namespace with no blocks (or an inactive one) is not served.
+const NO_BLOCKS: &str = "it has no blocks";
+
+/// The most namespaces looked at: one page of Identify's active list.
+const MAX_NAMESPACES: usize = 1024;
+
+/// The controller's active namespaces, in increasing order (at most
+/// [`MAX_NAMESPACES`]). `namespaces` is Identify Controller's NN.
+fn active_namespaces(ctl: &mut Controller, buffer: &DmaMemory, version: u32, namespaces: u32) -> Result<Vec<u32>, DeviceError> {
+    if version < 0x0001_0100 {
+        // No list before NVMe 1.1: every identifier up to NN, the inactive
+        // ones told apart by Identify Namespace.
+        return Ok((1..=namespaces.min(MAX_NAMESPACES as u32)).collect());
     }
-    Ok(Namespace { id: nsid, block_bits, blocks, read_only: m.read8(99) & 1 != 0 })
+    // Active identifiers above 0, ascending, the list ending at the first zero.
+    ctl.identify(buffer, 2, 0, "Identify Active Namespace List")?;
+    let m = buffer.shared();
+    let mut ids: Vec<u32> = Vec::new();
+    for i in 0..MAX_NAMESPACES {
+        let id = m.read32(4 * i);
+        if id == 0 {
+            break;
+        }
+        if id == u32::MAX || ids.last().is_some_and(|&last| id <= last) || (namespaces != 0 && id > namespaces) {
+            return Err(DeviceError::Protocol("the active namespace list is not one"));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// The driver's part of the block service: the I/O queue pair.
@@ -365,6 +414,9 @@ struct Disk {
     free: Vec<u16>,
     /// Commands pushed since the doorbell was last rung.
     unrung: bool,
+    /// The bit the I/O queue's interrupt signals: `IO_BIT`, or `ADMIN_BIT`
+    /// when both queues share a vector.
+    io_bit: u64,
     // Kept alive for as long as the controller may use them.
     _admin: Queue,
     _interrupts: (Interrupt, Option<Interrupt>),
@@ -486,7 +538,7 @@ impl BlockDevice for Disk {
     fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
         // An injected fault: this interrupt never came (what it brought
         // waits for the next look).
-        if bits & IO_BIT != 0 && inject::pending(Fault::Missed) {
+        if bits & self.io_bit != 0 && inject::pending(Fault::Missed) {
             return;
         }
         let mut taken = 0;
@@ -545,9 +597,12 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     let dma = Dma::new(&device)?;
     let signals = Signals::new()?;
     let admin_irq = Interrupt::bind_to(&device, 0, signals.sender(ADMIN_BIT)?)?;
-    // The I/O queue gets an interrupt of its own where there are two.
+    // The I/O queue gets an interrupt of its own where there are two;
+    // otherwise it shares the admin queue's.
     let io_irq = if vectors >= 2 && lines >= 2 { Some(Interrupt::bind_to(&device, 1, signals.sender(IO_BIT)?)?) } else { None };
-    inject::interrupts(signals.sender(IO_BIT)?);
+    let io_bit = if io_irq.is_some() { IO_BIT } else { ADMIN_BIT };
+    // Injected interrupts arrive as the I/O queue's would.
+    inject::interrupts(signals.sender(io_bit)?);
 
     let cap = read64(&regs, CAP);
     if cap == u64::MAX {
@@ -605,17 +660,28 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         };
     }
 
-    // The first active namespace (the list is NVMe 1.1; before it, namespace 1).
-    let nsid = if version >= 0x0001_0100 {
-        ctl.identify(&buffer, 2, 0, "Identify Active Namespace List")?;
-        m.read32(0)
-    } else {
-        1
-    };
-    if nsid == 0 || nsid == u32::MAX || (namespaces != 0 && nsid > namespaces) {
-        return Err(DeviceError::Missing("an active namespace"));
+    // The first active namespace this driver can serve; the others said.
+    let mut served: Option<Namespace> = None;
+    for nsid in active_namespaces(&mut ctl, &buffer, version, namespaces)? {
+        match namespace(&mut ctl, &buffer, nsid)? {
+            Ok(ns) if served.is_none() => served = Some(ns),
+            Ok(ns) => println!(
+                "nvme: namespace {}: {} blocks of {} bytes, not served: one disk per controller",
+                ns.id,
+                ns.blocks,
+                1u32 << ns.block_bits
+            ),
+            // Before NVMe 1.1 the identifiers tried include inactive ones.
+            Err(why) if version < 0x0001_0100 && why == NO_BLOCKS => {}
+            Err(why) => println!("nvme: namespace {nsid}: not served: {why}"),
+        }
     }
-    let ns = namespace(&mut ctl, &buffer, nsid)?;
+    let Some(ns) = served else {
+        // Nothing here this driver will ever serve: ending well leaves the
+        // controller alone, where a failure would have it started again.
+        println!("nvme: no namespace this driver can serve; leaving the controller alone");
+        silica_rt::exit(0)
+    };
 
     // One I/O queue pair (zero-based counts of submission and completion queues).
     let mut c = [0u32; 16];
@@ -660,6 +726,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         tickets: (0..io_entries).map(|_| None).collect(),
         free: (0..io_entries).rev().collect(),
         unrung: false,
+        io_bit,
         io,
         _admin: ctl.admin,
         _interrupts: (admin_irq, io_irq),

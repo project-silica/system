@@ -115,13 +115,21 @@ pub fn due() -> Option<Fault> {
     silica_rt::println!("inject: {f:?} now");
     if f == Fault::Spurious {
         let _ = sys::signal(Cap(SPURIOUS.load(Ordering::Relaxed)));
+        silica_rt::println!("inject: {f:?} committed");
     } else {
         PENDING.store(f as u64, Ordering::Relaxed);
     }
     Some(f)
 }
 
-/// Whether `f` came due and this is its moment: true once.
+/// Whether `f` came due and this is its moment: true once. The driver
+/// commits the fault when this says so, and the log says it was committed
+/// (`inject: <fault> committed`): a fault that came due and was never
+/// taken was not committed, and the test of it shows nothing.
 pub fn pending(f: Fault) -> bool {
-    PENDING.compare_exchange(f as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    let now = PENDING.compare_exchange(f as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+    if now {
+        silica_rt::println!("inject: {f:?} committed");
+    }
+    now
 }
