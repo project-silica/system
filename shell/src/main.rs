@@ -6,6 +6,7 @@
 //! - `stop <service>`, `start <service>`;
 //! - `devices`: the devices with a running driver, by class;
 //! - `restart-driver <device>`: end a device's driver and start it again;
+//! - `caps <service>`: what a running service holds and what its threads do;
 //! - `shutdown`, `reboot`;
 //! - `echo <text>`, `help`.
 //!
@@ -32,8 +33,7 @@ struct Shell {
     out: String,
 }
 
-const HELP: &str =
-    "commands: services, stop <service>, start <service>, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
+const HELP: &str = "commands: services, stop <service>, start <service>, caps <service>, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
 
 impl Shell {
     fn say(&mut self) {
@@ -74,6 +74,28 @@ impl Shell {
                     }
                     Err(e) => {
                         let _ = writeln!(self.out, "{command}: {arg}: {e:?}");
+                    }
+                }
+            }
+            "caps" if !arg.is_empty() => {
+                // The service's report, part by part; each part is written
+                // out before the next is asked for.
+                let mut from = 0;
+                loop {
+                    match self.system.describe(arg, from) {
+                        Ok(r) => {
+                            self.out.push_str(r.text);
+                            let next = r.next;
+                            self.say();
+                            if next == 0 {
+                                break;
+                            }
+                            from = next;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(self.out, "caps: {arg}: {e:?}");
+                            break;
+                        }
                     }
                 }
             }

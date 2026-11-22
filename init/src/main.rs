@@ -35,6 +35,7 @@ use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
 use silica_proc::{Child, FAULT_BADGE, Grant, Program, spawn};
 use silica_protocols::system::manager;
+use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Handle, Listener};
 use silica_rt::mem::Object;
@@ -75,6 +76,8 @@ struct Manager {
     order: Vec<usize>,
     /// What `list` answers with, rebuilt for each call.
     listed: Vec<manager::Service<'static>>,
+    /// What `describe` answers with.
+    described: String,
 }
 
 /// The value of `key=` on the command line.
@@ -271,6 +274,25 @@ impl manager::Server<Handle> for Manager {
         Ok(manager::StartReply {})
     }
 
+    fn describe<'a>(&'a mut self, name: &str, from: u32) -> Result<manager::DescribeReply<'a>, manager::Error> {
+        let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        let child = self.running[i].child.as_ref().ok_or(manager::Error::Refused)?;
+        let mut all = String::new();
+        silica_proc::report(&mut all, self.services[i].name, child.space()).map_err(|_| manager::Error::Refused)?;
+        // Whole lines from `from`, as many as fit a message.
+        self.described.clear();
+        let mut next = 0;
+        for (n, line) in all.lines().enumerate().skip(from as usize) {
+            if self.described.len() + line.len() + 1 > 3000 {
+                next = n as u32;
+                break;
+            }
+            self.described.push_str(line);
+            self.described.push('\n');
+        }
+        Ok(manager::DescribeReply { text: &self.described, next })
+    }
+
     fn shutdown(&mut self, reboot: bool) -> Result<manager::ShutdownReply, manager::Error> {
         println!("init: shutting down{}", if reboot { " to reset" } else { "" });
         for &i in self.order.clone().iter().rev() {
@@ -325,7 +347,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         });
     }
     let running = services.iter().map(|_| Running { child: None, failures: 0, stopped: false }).collect();
-    let mut m = Manager { root, info, services, endpoints, running, order: order.clone(), listed: Vec::new() };
+    let mut m = Manager { root, info, services, endpoints, running, order: order.clone(), listed: Vec::new(), described: String::new() };
     let mut listener = Listener::new(m.root.parent.exit);
 
     // The system, in order.
