@@ -1,0 +1,25 @@
+[package]
+name = "virtio-net"
+description = "The virtio network device driver: one interface as a silica.net.Device."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# What the device manager starts this driver for (silica_driver documents the forms).
+[package.metadata.silica]
+drivers = ["pci 1af4:1041", "pci 1af4:1000"]
+
+[[bin]]
+name = "virtio-net"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-driver = { workspace = true }
+silica-net = { workspace = true }
+
+[lints]
+workspace = true

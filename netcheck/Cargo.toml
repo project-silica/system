@@ -1,0 +1,29 @@
+[package]
+name = "netcheck"
+description = "Checks every network interface against the user-mode network: ARP and ping to its gateway, as frames built by hand."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+needs = ["silica.device.Manager"]
+memory = 23
+start = "check:net"
+
+[[bin]]
+name = "netcheck"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+silica-net = { workspace = true }
+
+
+[lints]
+workspace = true

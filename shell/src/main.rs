@@ -78,9 +78,12 @@ impl Shell {
                 }
             }
             "devices" => {
-                for (class, name) in
-                    [(devices::Class::Block, "block"), (devices::Class::Display, "display"), (devices::Class::Input, "input")]
-                {
+                for (class, name) in [
+                    (devices::Class::Block, "block"),
+                    (devices::Class::Network, "network"),
+                    (devices::Class::Display, "display"),
+                    (devices::Class::Input, "input"),
+                ] {
                     if let Ok(r) = self.devices.list(class) {
                         for d in r.devices.iter() {
                             let _ = writeln!(

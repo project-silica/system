@@ -99,6 +99,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "netcheck"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-net",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "nvme"
 version = "0.0.0"
 dependencies = [
@@ -150,6 +160,17 @@ version = "0.0.0"
 [[package]]
 name = "silica-idlc"
 version = "0.0.0"
+
+[[package]]
+name = "silica-net"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-idlc",
+ "silica-protocols",
+ "silica-queue",
+ "silica-rt",
+]
 
 [[package]]
 name = "silica-proc"
@@ -245,6 +266,15 @@ dependencies = [
  "silica-idl-rt",
  "silica-protocols",
  "silica-ring",
+ "silica-rt",
+]
+
+[[package]]
+name = "virtio-net"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-net",
  "silica-rt",
 ]
 
