@@ -11,13 +11,16 @@ members = [
     "trial-client",
     "stress",
     "systest",
+    "ring",
+    "storage/block",
     "devmgr",
+    "blkcheck",
     "drivers/framework",
     "drivers/virtio-blk",
     "drivers/virtio-rogue",
 ]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
-default-members = ["rt", "proc", "drivers/framework"]
+default-members = ["rt", "proc", "ring", "storage/block", "drivers/framework"]
 
 [workspace.package]
 version = "0.0.0"
@@ -42,6 +45,8 @@ silica-idlc = { path = "../idl/idlc" }
 silica-rt = { path = "rt" }
 silica-proc = { path = "proc" }
 silica-driver = { path = "drivers/framework" }
+silica-ring = { path = "ring" }
+silica-block = { path = "storage/block" }
 
 [profile.dev]
 panic = "abort"

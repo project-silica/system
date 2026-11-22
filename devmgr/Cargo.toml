@@ -18,6 +18,10 @@ silica-rt = { workspace = true }
 silica-proc = { workspace = true }
 silica-formats = { workspace = true }
 silica-driver = { workspace = true }
+silica-idl-rt = { workspace = true }
+
+[build-dependencies]
+silica-idlc = { workspace = true }
 
 [lints]
 workspace = true

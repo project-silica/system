@@ -13,6 +13,13 @@
 //! configuration space, and the driver gets configuration space read-only,
 //! so no driver can move its device's registers onto another's.
 //!
+//! A driver reads memory its clients lend it (the rings of a block
+//! connection), which a client can take back at any moment. A page fault
+//! there is the client's doing, not the driver's: it is answered with a
+//! page of zeros (up to [`ZERO_PAGES`] in one run of a driver), which the
+//! driver reads as a broken ring and closes that connection. No client can
+//! crash a driver by taking its memory back.
+//!
 //! A driver that faults or ends with a failure is taken down, its device
 //! is silenced (no bus mastering; the kernel has already cut it off from
 //! memory, which happens when the driver's device address space goes), and
@@ -22,9 +29,22 @@
 //! hexadecimal digits each) starts `<program>` from the boot archive for
 //! that kind of device instead of the driver the device manager would pick.
 //!
+//! It provides `silica.device.Manager`: a program that uses devices (the
+//! block server, a filesystem, the network stack) lists the devices of a
+//! class and opens the driver of one. When a driver ends, every capability
+//! to it that was handed out stops working (its endpoint is destroyed), so a
+//! client of a driver that was started again finds out on its next call
+//! and opens the new one.
+//!
+//! One endpoint carries everything the device manager hears, each kind by
+//! its badge: a client's calls (badges from [`CLIENTS`] up; whoever starts
+//! the device manager hands those out), and its drivers' exit reports and
+//! faults (each driver's identifier, below that).
+//!
 //! Started by the root task with, as grants: 0 the frame of the kernel's
 //! `RootInfo` (read-only), 1 the device identities, 2 the interrupt lines,
-//! 3 the I/O ports (or nothing), then `args[0]` frames of the ramdisk (in
+//! 3 the I/O ports (or nothing), 4 its endpoint (to receive on, and to give
+//! drivers their way to report), then `args[0]` frames of the ramdisk (in
 //! `RootInfo` order, read-only), then `args[1]` Untyped capabilities, given
 //! outright: the machine's device memory, in `RootInfo` order.
 #![no_std]
@@ -37,12 +57,15 @@ use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use phys::DeviceMemory;
 use silica_driver::pci::{self, Config};
 use silica_formats::{acpi, ramdisk};
-use silica_proc::{Child, Grant, Parent, Program, spawn};
+use silica_proc::{Child, FAULT_BADGE, Grant, Parent, Program, spawn};
 use silica_rt::alloc::collections::BTreeMap;
 use silica_rt::alloc::vec::Vec;
+use silica_rt::ipc::{Handle, Listener, free_slot, release_slot};
 use silica_rt::mem::{self, Object};
 use silica_rt::mmio::Mmio;
 use silica_rt::{EXIT_LABEL, ProcessInfo, println, slots};
+
+include!(concat!(env!("OUT_DIR"), "/silica_device_manager.rs"));
 
 silica_rt::main!(main);
 
@@ -50,9 +73,16 @@ const RW: Rights = Rights(Rights::READ.0 | Rights::WRITE.0);
 const GRANT_INFO: u64 = 0;
 const GRANT_DEVICES: u64 = 1;
 const GRANT_IRQS: u64 = 2;
-const GRANT_FIRST_RAMDISK: u64 = 4;
+const GRANT_ENDPOINT: u64 = 4;
+const GRANT_FIRST_RAMDISK: u64 = 5;
+/// Badges of the capabilities clients call through start here (and stay
+/// below `silica_proc::FAULT_BADGE`); below are the drivers'.
+pub const CLIENTS: u64 = 1 << 32;
 /// Interrupt lines one device gets at most.
 const LINES_PER_DEVICE: u32 = 8;
+/// Pages of zeros given to one run of a driver in place of memory its
+/// clients took back; a driver that needs more is broken.
+const ZERO_PAGES: usize = 64;
 /// How often a driver that failed is started again before its device is
 /// left alone.
 const MAX_RESTARTS: u32 = 3;
@@ -87,8 +117,9 @@ struct Running<'a> {
     function: usize,
     child: Child,
     /// The endpoint its clients call it on.
-    #[allow(dead_code)]
     service: Object,
+    /// Pages of zeros mapped in place of memory clients took back.
+    zero_pages: Vec<Object>,
 }
 
 struct Manager {
@@ -103,6 +134,43 @@ struct Manager {
     /// The next interrupt line to hand out.
     next_line: u32,
     next_id: u64,
+    /// What `list` answers with, rebuilt for each call.
+    listing: Vec<manager::Device<'static>>,
+    /// Badges of driver capabilities handed out, so each client is told apart.
+    next_client: u64,
+}
+
+/// The class of a function, from its PCI class code.
+fn class_of(f: &Function) -> Option<manager::Class> {
+    match f.class.0 {
+        0x01 => Some(manager::Class::Block),
+        _ => None,
+    }
+}
+
+impl manager::Server<Handle> for Manager {
+    fn list<'a>(&'a mut self, class: manager::Class) -> manager::ListReply<'a, Handle> {
+        self.listing.clear();
+        for r in &self.running {
+            let f = &self.functions[r.function];
+            if class_of(f) == Some(class) {
+                self.listing.push(manager::Device { id: f.id, class, driver: r.name });
+            }
+        }
+        manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing) }
+    }
+
+    fn open(&mut self, id: u32) -> Result<manager::OpenReply<Handle>, manager::Error> {
+        let r = self.running.iter().find(|r| self.functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+        let slot = free_slot().ok_or(manager::Error::NoSuchDevice)?;
+        self.next_client += 1;
+        let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
+        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, self.next_client).is_err() {
+            release_slot(slot);
+            return Err(manager::Error::NoSuchDevice);
+        }
+        Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
+    }
 }
 
 fn name(id: u32) -> impl core::fmt::Display {
@@ -304,7 +372,7 @@ impl Manager {
             self.next_line += lines;
         }
         f.starts += 1;
-        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service });
+        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, zero_pages: Vec::new() });
         Ok(())
     }
 }
@@ -321,6 +389,13 @@ impl Manager {
             registers.write16(msix.cap + 2, registers.read16(msix.cap + 2) & !(1 << 15));
         }
         let ok = r.child.destroy().is_ok();
+        for page in r.zero_pages {
+            // SAFETY: mapped only in the driver, which is gone.
+            #[allow(unsafe_code)]
+            unsafe {
+                page.destroy()
+            };
+        }
         // SAFETY: the endpoint was the ended driver's alone.
         #[allow(unsafe_code)]
         unsafe {
@@ -351,7 +426,7 @@ fn map_archive(info: &RootInfo, frames: u64) -> Result<&'static [u8], &'static s
 
 fn main(process: &ProcessInfo) -> i64 {
     match run(process) {
-        Ok(()) => 0,
+        Ok(never) => match never {},
         Err(e) => {
             println!("ERROR: devmgr: {e}");
             1
@@ -359,7 +434,7 @@ fn main(process: &ProcessInfo) -> i64 {
     }
 }
 
-fn run(process: &ProcessInfo) -> Result<(), &'static str> {
+fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str> {
     let bits = match sys::inspect_slot(slots::SPACE, granted(GRANT_INFO).0) {
         Ok(Some(s)) if s.ty == ObjectType::Frame => s.bits,
         _ => return Err("not started with the machine's description"),
@@ -382,11 +457,15 @@ fn run(process: &ProcessInfo) -> Result<(), &'static str> {
             memory.add(d.base, d.bits, granted(GRANT_FIRST_RAMDISK + ramdisk_frames + i as u64));
         }
     }
-    // Drivers report their exit, and the kernel their faults, to one
-    // endpoint, each badged with the driver's identifier.
-    let events = Object::new(ObjectType::Endpoint, 0).map_err(|_| "no memory for the drivers' endpoint")?;
+    // Drivers report their exit, and the kernel their faults, to the
+    // endpoint clients call, each badged with the driver's identifier.
+    let events = granted(GRANT_ENDPOINT);
+    match sys::inspect_slot(slots::SPACE, events.0) {
+        Ok(Some(s)) if s.ty == ObjectType::Endpoint && s.rights.has(Rights(Rights::READ.0 | Rights::WRITE.0)) => {}
+        _ => return Err("not given an endpoint to receive on and hand out"),
+    }
     let scratch = mem::reserve(1 << 20, 1 << 21).ok_or("no address space to start drivers with")?;
-    let parent = Parent { fault: events.cap(), ..Parent::of(process, events.cap(), scratch) };
+    let parent = Parent { fault: events, ..Parent::of(process, events, scratch) };
     let mut m = Manager {
         info,
         memory,
@@ -397,6 +476,8 @@ fn run(process: &ProcessInfo) -> Result<(), &'static str> {
         running: Vec::new(),
         next_line: info.msi_first as u32,
         next_id: 0,
+        listing: Vec::new(),
+        next_client: CLIENTS,
     };
     m.enumerate()?;
     let cmdline: &'static [u8] = &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())];
@@ -427,24 +508,49 @@ fn run(process: &ProcessInfo) -> Result<(), &'static str> {
             failed = true;
         }
     }
-    // Until there is something that asks the device manager for devices,
-    // its work is done when its drivers are: report each one's end, and
-    // start again the ones that failed.
-    while !m.running.is_empty() {
-        let Ok(msg) = sys::recv(events.cap(), Wait::Until(silica_rt::clock().now() + 30_000_000_000)) else {
-            println!("ERROR: devmgr: a driver has not finished after 30 s");
-            return Err("drivers did not finish");
-        };
-        let Some(at) = m.running.iter().position(|r| msg.badge == r.id) else { continue };
+    if failed {
+        println!("ERROR: devmgr: not every device has its driver");
+    }
+    // From here on: clients' calls, and drivers that end.
+    let mut listener = Listener::new(events);
+    loop {
+        let Ok(msg) = listener.recv(Wait::Forever) else { return Err("its endpoint was taken away") };
+        // Clients' badges are from CLIENTS up; a fault report's has
+        // FAULT_BADGE, above them, which no client is given.
+        if msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 {
+            listener.answer(&msg, |request, caps, reply, reply_caps| manager::dispatch(&mut m, request, caps, reply, reply_caps));
+            continue;
+        }
+        // A fault report carries the driver's identifier plus FAULT_BADGE,
+        // which no program can send itself.
+        let fault = msg.badge & FAULT_BADGE != 0;
+        let Some(at) = m.running.iter().position(|r| msg.badge & !FAULT_BADGE == r.id) else { continue };
         let label = msg.info.label();
+        if fault && label == sys::FAULT_LABEL + sys::Fault::Page as u64 && (mem::PEER_BASE..mem::PEER_END).contains(&msg.words[1]) {
+            let r = &mut m.running[at];
+            if r.zero_pages.len() < ZERO_PAGES
+                && let Ok(page) = Object::new(ObjectType::Frame, 12)
+            {
+                let at = msg.words[1] as usize & !0xFFF;
+                if sys::fault_map(r.child.aspace(), page.cap(), at, Rights(Rights::READ.0 | Rights::WRITE.0)).is_ok() {
+                    r.zero_pages.push(page);
+                    continue;
+                }
+                // SAFETY: mapped nowhere.
+                #[allow(unsafe_code)]
+                unsafe {
+                    page.destroy()
+                };
+            }
+        }
         let r = m.running.remove(at);
         let (driver, function) = (r.name, r.function);
         let device = name(m.functions[function].id);
-        let ended_well = if label == EXIT_LABEL {
+        let ended_well = if label == EXIT_LABEL && !fault {
             let status = msg.words[0] as i64;
             println!("devmgr: {driver} for {device} ended with status {status}");
             status == 0
-        } else if label >= sys::FAULT_LABEL {
+        } else if fault {
             // The kernel's fault message: instruction, address, detail.
             let kind = match label - sys::FAULT_LABEL {
                 1 => "touched memory it may not (page fault)",
@@ -459,20 +565,16 @@ fn run(process: &ProcessInfo) -> Result<(), &'static str> {
         };
         if !m.stop(r) {
             println!("ERROR: devmgr: cannot take back the memory of {driver}");
-            failed = true;
         }
         if ended_well {
             continue;
         }
         if m.functions[function].starts > MAX_RESTARTS {
             println!("ERROR: devmgr: {driver} for {device} failed {} times; the device is left alone", m.functions[function].starts);
-            failed = true;
         } else if let Err(e) = m.start(function, driver) {
             println!("ERROR: devmgr: {device} is not driven: {e}");
-            failed = true;
         } else {
             println!("devmgr: {driver} for {device} started again");
         }
     }
-    if failed { Err("a driver failed") } else { Ok(()) }
 }

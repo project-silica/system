@@ -1,0 +1,18 @@
+[package]
+name = "silica-block"
+description = "The block device class: the data path's rings and records, a client, and the service a block driver provides."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-ring = { workspace = true }
+silica-idl-rt = { workspace = true }
+
+[build-dependencies]
+silica-idlc = { workspace = true }
+
+[lints]
+workspace = true

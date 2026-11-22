@@ -35,6 +35,8 @@ const ASPACE_BITS: u8 = 16;
 /// Largest frame the image is loaded in, in bits. Below the large-page
 /// size, so a frame can be mapped at any page-aligned address.
 const CHUNK_BITS: u8 = 20;
+/// Added to a child's `id` in the badge of its fault reports ([`Parent::fault`]).
+pub const FAULT_BADGE: u64 = 1 << 62;
 /// Most capabilities one spawn can grant.
 pub const MAX_GRANTS: usize = 2048;
 
@@ -52,8 +54,9 @@ pub struct Parent {
     /// send-only capability badged with its `id`).
     pub exit: Cap,
     /// An endpoint the kernel reports a child's fault on, as a call badged
-    /// with the child's `id` ([`Cap::NONE`]: a faulting child stops and the
-    /// kernel logs it). The message is the kernel's fault message
+    /// with the child's `id` plus [`FAULT_BADGE`] ([`Cap::NONE`]: a faulting
+    /// child stops and the kernel logs it). The child holds no capability
+    /// with that badge, so it cannot send what looks like its own fault. The message is the kernel's fault message
     /// (`libsys::FAULT_LABEL`); whoever receives it decides what becomes of
     /// the child, usually by destroying it.
     pub fault: Cap,
@@ -388,7 +391,7 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     // Its faults go to the parent's fault endpoint, badged with its id. The
     // thread keeps a capability of its own; the working one goes again.
     if p.fault != Cap::NONE {
-        sys::cap_derive(p.space, tmp.0, p.fault, Rights::WRITE, id)?;
+        sys::cap_derive(p.space, tmp.0, p.fault, Rights::WRITE, id | FAULT_BADGE)?;
         sys::thread_configure(c.thread, Cap::KEEP, Cap::KEEP, tmp, Cap::KEEP)?;
         // SAFETY: a capability made two lines up, used by nothing else.
         #[allow(unsafe_code)]

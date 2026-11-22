@@ -46,6 +46,11 @@ impl Mmio {
         Mmio { base, len }
     }
 
+    /// The address the range is mapped at.
+    pub const fn addr(&self) -> usize {
+        self.base
+    }
+
     /// The length of the range in bytes.
     pub const fn len(&self) -> usize {
         self.len

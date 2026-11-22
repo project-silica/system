@@ -93,18 +93,21 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     // The device manager: it is given the machine's description and every
     // device capability, and nothing of the machine's ordinary memory
-    // beyond its own budget.
+    // beyond its own budget. Its one endpoint is made here, so that init
+    // can hand out what clients call it through.
     let Some(image) = ramdisk::find(archive, "devmgr") else { fail!("the ramdisk has no program named devmgr") };
+    let Ok(devmgr_ep) = Object::new(ObjectType::Endpoint, 0) else { fail!("cannot create the device manager's endpoint") };
     let mut grants = Vec::new();
     grants.push(Grant::lend(sys::Cap(SLOT_INFO), Rights::READ));
     grants.push(Grant::lend(sys::Cap(SLOT_DEVICES), Rights::ALL));
     grants.push(Grant::lend(sys::Cap(SLOT_IRQS), Rights::ALL));
-    grants.push(if info.msi_first != 0 && root.ports != sys::Cap::NONE { Grant::lend(root.ports, Rights::ALL) } else { Grant::none() });
+    grants.push(if root.ports != sys::Cap::NONE { Grant::lend(root.ports, Rights::ALL) } else { Grant::none() });
+    grants.push(Grant::lend(devmgr_ep.cap(), Rights::ALL));
     grants.extend(root.ramdisk.iter().map(|f| Grant::lend(*f, Rights::READ)));
     let frames = root.ramdisk.len() as u64;
     let device = info.untyped[..info.untyped_count as usize].iter().enumerate().filter(|(_, d)| d.kind == KIND_DEVICE);
     grants.extend(device.map(|(i, _)| Grant::give(sys::Cap(SLOT_FIRST_UNTYPED + i as u64))));
-    let untypeds = grants.len() as u64 - 4 - frames;
+    let untypeds = grants.len() as u64 - 5 - frames;
     let program = Program {
         grants: &grants,
         args: [frames, untypeds, 0, 0, 0, 0, 0, 0],
@@ -113,17 +116,54 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         aspace_bits: 18,
         ..Program::new(image, 300)
     };
-    let devmgr = match spawn(parent, &program) {
+    let _devmgr = match spawn(parent, &program) {
         Ok(c) => c,
         Err(e) => fail!("cannot start the device manager: {e:?}"),
     };
-    let Ok(m) = sys::recv(parent.exit, Wait::Until(silica_rt::clock().now() + 60_000_000_000)) else {
-        fail!("the device manager did not finish within 60 s")
-    };
-    if m.badge != 300 || m.words[0] != 0 {
-        fail!("the device manager (program {}) ended with status {}", m.badge, m.words[0] as i64);
+
+    // What init checks at boot (`checks=` on the command line, default all):
+    // `block` runs blkcheck against the first disk.
+    let cmdline = &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())];
+    let checks = cmdline.split(|b| b.is_ascii_whitespace()).find_map(|w| w.strip_prefix(b"checks=")).unwrap_or(b"block");
+    if checks.split(|b| *b == b',').any(|c| c == b"block") {
+        let Some(image) = ramdisk::find(archive, "blkcheck") else { fail!("the ramdisk has no program named blkcheck") };
+        // Clients of the device manager call with badges from 2^32 up.
+        let devices = Grant::badged(devmgr_ep.cap(), Rights(Rights::WRITE.0 | Rights::GRANT.0), 1 << 32);
+        let check = match spawn(parent, &Program { grants: &[devices], mem_bits: 23, ..Program::new(image, 400) }) {
+            Ok(c) => c,
+            Err(e) => fail!("cannot start blkcheck: {e:?}"),
+        };
+        let Ok(m) = sys::recv(parent.exit, Wait::Until(silica_rt::clock().now() + 60_000_000_000)) else {
+            fail!("blkcheck did not finish within 60 s")
+        };
+        if m.badge != 400 || m.words[0] != 0 {
+            fail!("program {} ended with status {} (400 is blkcheck, 300 the device manager)", m.badge, m.words[0] as i64);
+        }
+        if check.destroy().is_err() {
+            fail!("cannot take back blkcheck's memory");
+        }
+        println!("init: blkcheck read and wrote the disk through the device manager and its driver");
+        // `bench` on the command line: blkcheck's measurements are the
+        // block benchmarks (tools/bench.sh reads them up to this line).
+        if cmdline.split(|b| b.is_ascii_whitespace()).any(|w| w == b"bench") {
+            println!("BENCH DONE");
+        }
+    } else {
+        // No check to end the boot: the system stays up, and init reports
+        // whatever of its programs ends.
+        println!("BOOT OK");
+        loop {
+            if let Ok(m) = sys::recv(parent.exit, Wait::Forever) {
+                println!("ERROR: init: program {} ended with status {}", m.badge, m.words[0] as i64);
+            }
+        }
     }
-    let _ = devmgr;
     println!("BOOT OK");
+    // `halt=reboot` on the command line: reset the machine instead of
+    // turning it off (the test of the reset path).
+    if cmdline.split(|b| b.is_ascii_whitespace()).any(|w| w == b"halt=reboot") {
+        let why = sys::reboot(sys::Cap(libsys::root::SLOT_POWER), 0);
+        fail!("the machine cannot be reset: {why:?}");
+    }
     finish(true)
 }

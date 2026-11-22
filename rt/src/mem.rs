@@ -212,6 +212,37 @@ pub fn reserve(bytes: usize, align: usize) -> Option<usize> {
     }
 }
 
+/// Where memory lent by other programs is mapped ([`map_peer`]): 512 GiB to
+/// 1 TiB. A peer can take its memory back at any moment (it revokes the
+/// frame, or ends), which unmaps it here. A program's supervisor answers a
+/// fault in this range by mapping a page of zeros in its place, so reading
+/// or writing lent memory never stops the program: memory that was lent
+/// can turn into zeros, and code that reads it treats what it reads as
+/// untrusted anyway. Nowhere else is a missing page forgiven.
+pub const PEER_BASE: u64 = 0x80_0000_0000;
+/// One past the end of that range.
+pub const PEER_END: u64 = 0x100_0000_0000;
+static PEER_RESERVED: AtomicU64 = AtomicU64::new(PEER_BASE);
+
+/// Map `frame`, of `2^bits` bytes, lent by another program, with `rights`,
+/// and say where. See [`PEER_BASE`] for what happens when the lender takes
+/// it back.
+pub fn map_peer(frame: Cap, bits: u8, rights: sys::Rights) -> Result<usize, Error> {
+    let size = 1u64.checked_shl(bits as u32).ok_or(Error::BadArg)?;
+    let align = size.min(1 << sys::LARGE_BITS);
+    let mut at = PEER_RESERVED.load(Ordering::Relaxed);
+    let start = loop {
+        let start = (at + align - 1) & !(align - 1);
+        let end = start.checked_add(size).filter(|e| *e <= PEER_END).ok_or(Error::NoMemory)?;
+        match PEER_RESERVED.compare_exchange_weak(at, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break start,
+            Err(now) => at = now,
+        }
+    };
+    sys::map(slots::ASPACE, frame, start as usize, rights)?;
+    Ok(start as usize)
+}
+
 /// Map `frame`, of `2^bits` bytes, somewhere in this program with `rights`,
 /// and say where. The mapping lasts until the capability is deleted or
 /// unmapped.

@@ -3,12 +3,24 @@
 version = 4
 
 [[package]]
+name = "blkcheck"
+version = "0.0.0"
+dependencies = [
+ "silica-block",
+ "silica-idl-rt",
+ "silica-idlc",
+ "silica-rt",
+]
+
+[[package]]
 name = "devmgr"
 version = "0.0.0"
 dependencies = [
  "libsys",
  "silica-driver",
  "silica-formats",
+ "silica-idl-rt",
+ "silica-idlc",
  "silica-proc",
  "silica-rt",
 ]
@@ -60,6 +72,16 @@ name = "silica-abi"
 version = "0.0.0"
 
 [[package]]
+name = "silica-block"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-idlc",
+ "silica-ring",
+ "silica-rt",
+]
+
+[[package]]
 name = "silica-driver"
 version = "0.0.0"
 dependencies = [
@@ -84,6 +106,13 @@ version = "0.0.0"
 dependencies = [
  "libsys",
  "silica-formats",
+ "silica-rt",
+]
+
+[[package]]
+name = "silica-ring"
+version = "0.0.0"
+dependencies = [
  "silica-rt",
 ]
 
@@ -134,6 +163,7 @@ dependencies = [
 name = "virtio-blk"
 version = "0.0.0"
 dependencies = [
+ "silica-block",
  "silica-driver",
  "silica-rt",
 ]

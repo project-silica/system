@@ -32,6 +32,16 @@ pub struct Dma {
     top: u64,
 }
 
+/// Someone else's memory the device was let reach ([`Dma::share`]).
+#[derive(Debug)]
+pub struct Shared {
+    /// The address the device uses for its first byte.
+    pub address: u64,
+    /// The slot of the copy of the frame capability the device's mapping
+    /// was made through (0 where DMA is not confined).
+    copy: u64,
+}
+
 /// Memory the driver and its device share: mapped in the driver, and
 /// reachable by the device at [`DmaMemory::device_address`].
 #[derive(Debug)]
@@ -99,18 +109,34 @@ impl Dma {
     }
 
     /// Let the device reach `frame` (of `2^bits` bytes; someone else's
-    /// memory, lent to the driver), without mapping it in the driver.
-    /// Returns the address the device uses for it. The device loses it
-    /// again when the lender revokes the frame.
-    pub fn share(&self, frame: Cap, bits: u8, device_writes: bool) -> Result<u64, DeviceError> {
+    /// memory, lent to the driver), without mapping it in the driver. The
+    /// device loses it again when the lender revokes the frame, or with
+    /// [`Dma::unshare`].
+    pub fn share(&self, frame: Cap, bits: u8, device_writes: bool) -> Result<Shared, DeviceError> {
         let size = 1usize.checked_shl(bits as u32).ok_or(sys::Error::BadArg)?;
         let at = mem::reserve(size, size.min(1 << sys::LARGE_BITS)).ok_or(sys::Error::NoMemory)?;
-        self.map(frame, at as u64, device_writes)
+        self.map_copy(frame, at as u64, device_writes)
+    }
+
+    /// The device no longer reaches what `shared` let it reach; when this
+    /// returns, the IOMMU has dropped it.
+    pub fn unshare(&self, shared: Shared) {
+        if shared.copy != 0 {
+            // SAFETY: the copy `share` made, used for the device's mapping
+            // and nothing else.
+            #[allow(unsafe_code)]
+            let _ = unsafe { sys::cap_delete(Cap(shared.copy)) };
+            release_slot(shared.copy);
+        }
     }
 
     fn map(&self, frame: Cap, at: u64, device_writes: bool) -> Result<u64, DeviceError> {
+        self.map_copy(frame, at, device_writes).map(|s| s.address)
+    }
+
+    fn map_copy(&self, frame: Cap, at: u64, device_writes: bool) -> Result<Shared, DeviceError> {
         let Some(space) = self.space else {
-            return Ok(sys::frame_address(granted(grant::IDENTITY), frame)?);
+            return Ok(Shared { address: sys::frame_address(granted(grant::IDENTITY), frame)?, copy: 0 });
         };
         if at >= self.top {
             return Err(DeviceError::Missing("device addresses as high as this driver's memory"));
@@ -127,6 +153,6 @@ impl Dma {
             release_slot(copy);
             return Err(e.into());
         }
-        Ok(at)
+        Ok(Shared { address: at, copy })
     }
 }

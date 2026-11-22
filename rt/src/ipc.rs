@@ -101,7 +101,24 @@ impl Drop for Handle {
     }
 }
 
-impl Capability for Handle {}
+impl Capability for Handle {
+    /// What the kernel says the capability is, so generated decoding
+    /// refuses a `cap<Frame>` that is not a frame.
+    fn object_type(&self) -> Option<&str> {
+        Some(match sys::inspect_slot(crate::slots::SPACE, self.0.0).ok()??.ty {
+            sys::ObjectType::Untyped => "Untyped",
+            sys::ObjectType::CapSpace => "CapSpace",
+            sys::ObjectType::Thread => "Thread",
+            sys::ObjectType::AddressSpace => "AddressSpace",
+            sys::ObjectType::Frame => "Frame",
+            sys::ObjectType::Endpoint => "Endpoint",
+            sys::ObjectType::Notification => "Notification",
+            sys::ObjectType::SchedContext => "SchedContext",
+            sys::ObjectType::Hw => "Hw",
+            sys::ObjectType::Vcpu => "Vcpu",
+        })
+    }
+}
 
 /// The message words in registers for `bytes`; the rest goes to the buffer.
 fn pack(buf: &IpcBuffer, bytes: &[u8]) -> [u64; 4] {
@@ -245,6 +262,94 @@ pub fn serve(endpoint: Cap, mut handle: impl FnMut(u64, &[u8], CapList<Handle>, 
         let (slots, sent) = give(&buf, &mut reply_caps);
         let words = pack(&buf, &reply[..n]);
         next = sys::reply_recv(endpoint, info(n, sent), words);
+        given(slots, sent);
+    }
+}
+
+/// What a provider that also hears signals does with each: the two halves
+/// of the loop [`serve_events`] runs.
+pub trait Events {
+    /// A request arrived through a capability with `badge`: write the reply
+    /// and return its length, as for [`serve`] (normally a call to a
+    /// generated `dispatch`).
+    fn call(&mut self, badge: u64, request: &[u8], caps: CapList<Handle>, reply: &mut [u8], reply_caps: &mut CapList<Handle>) -> usize;
+    /// The notification was signalled: `signals` are the badges of the
+    /// capabilities it was signalled through, ORed together (an interrupt's
+    /// line, a client's wake-up).
+    fn signals(&mut self, signals: u64);
+}
+
+/// Provide a protocol on `endpoint` and listen on `notification`, for ever,
+/// in one thread and one wait: each request goes to [`Events::call`] and is
+/// answered, each batch of signals to [`Events::signals`]. This is the loop
+/// of a driver (its clients' calls, its device's interrupts, its clients'
+/// wake-ups) and of any server with something to hear besides calls.
+///
+/// As for [`serve`], a caller that has gone is not an error, and the loop
+/// ends (the program exits with status -3) only when the endpoint or the
+/// notification is taken away.
+pub fn serve_events(endpoint: Cap, notification: Cap, handler: &mut impl Events) -> ! {
+    let buf = buffer();
+    let mut request = [0u8; MAX_MESSAGE];
+    let mut reply = [0u8; MAX_MESSAGE];
+    let mut next = sys::recv_listening(endpoint, notification, Wait::Forever);
+    loop {
+        let m = match next {
+            Ok(m) => m,
+            Err(_) => crate::exit(-3),
+        };
+        if let Some(signals) = m.signals() {
+            handler.signals(signals);
+            next = sys::recv_listening(endpoint, notification, Wait::Forever);
+            continue;
+        }
+        let mut caps = CapList::new();
+        collect(&buf, m.info.caps(), &mut caps);
+        let len = unpack(&buf, m.words, m.info.label() as usize, &mut request);
+        let mut reply_caps = CapList::new();
+        let n = handler.call(m.badge, &request[..len], caps, &mut reply, &mut reply_caps).min(MAX_MESSAGE);
+        let (slots, sent) = give(&buf, &mut reply_caps);
+        let words = pack(&buf, &reply[..n]);
+        next = sys::reply_recv_listening(endpoint, notification, info(n, sent), words);
+        given(slots, sent);
+    }
+}
+
+/// Receiving for a program whose endpoint carries more than one kind of
+/// message: IDL requests beside something else (a supervisor hears its
+/// children's exits and faults on the endpoint it also serves a protocol
+/// on). It receives plain kernel messages and answers the ones the program
+/// says are requests.
+pub struct Listener {
+    endpoint: Cap,
+    request: [u8; MAX_MESSAGE],
+    reply: [u8; MAX_MESSAGE],
+}
+
+impl Listener {
+    /// A listener on `endpoint`.
+    pub fn new(endpoint: Cap) -> Listener {
+        Listener { endpoint, request: [0; MAX_MESSAGE], reply: [0; MAX_MESSAGE] }
+    }
+
+    /// The next message, whatever it is.
+    pub fn recv(&mut self, wait: Wait) -> Result<sys::Message, Error> {
+        sys::recv(self.endpoint, wait)
+    }
+
+    /// `m`, just received, is an IDL request (a call): hand it to `handle`
+    /// as [`serve`] would and send the reply.
+    pub fn answer(&mut self, m: &sys::Message, handle: impl FnOnce(&[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize) {
+        let buf = buffer();
+        let mut caps = CapList::new();
+        collect(&buf, m.info.caps(), &mut caps);
+        let len = unpack(&buf, m.words, m.info.label() as usize, &mut self.request);
+        let mut reply_caps = CapList::new();
+        let n = handle(&self.request[..len], caps, &mut self.reply, &mut reply_caps).min(MAX_MESSAGE);
+        let (slots, sent) = give(&buf, &mut reply_caps);
+        let words = pack(&buf, &self.reply[..n]);
+        // A caller that has gone is nobody to answer.
+        let _ = sys::reply(info(n, sent), words);
         given(slots, sent);
     }
 }

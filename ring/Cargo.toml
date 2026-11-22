@@ -1,0 +1,13 @@
+[package]
+name = "silica-ring"
+description = "Rings: fixed-size records passed between two programs through shared memory, with wake-ups only when the other side sleeps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+silica-rt = { workspace = true }
+
+[lints]
+workspace = true
