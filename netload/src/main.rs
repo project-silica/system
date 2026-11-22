@@ -11,6 +11,10 @@
 //! [`RETRY_NS`] is sent again. It fails if a transmit fails, if a recovery
 //! took longer than [`RECOVERY_NS`], or if, after the restarts stop, the
 //! last [`CLEAN`] pings are not all answered at once.
+//!
+//! Built a second time as `netfault` (the package beside this one), it
+//! restarts nothing: the load under which an injected device fault
+//! (`silica_driver::inject`) must cost no more than a delay.
 #![no_std]
 #![no_main]
 
@@ -30,6 +34,8 @@ const SECOND: u64 = 1_000_000_000;
 const DEPTH: usize = 8;
 const RUN_NS: u64 = 3 * SECOND;
 const KILL_EVERY_NS: u64 = 200_000_000;
+/// Whether this build restarts the driver (`netload`) or not (`netfault`).
+const KILL: bool = !matches!(env!("CARGO_BIN_NAME").as_bytes(), b"netfault");
 const RECOVERY_NS: u64 = 250_000_000;
 const RETRY_NS: u64 = 100_000_000;
 /// Pings after the restarts stop, every one of which must be answered.
@@ -45,11 +51,11 @@ const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 fn main(_info: &'static ProcessInfo) -> i64 {
     match run() {
         Ok(()) => {
-            println!("NETLOAD OK");
+            println!("{} OK", if KILL { "NETLOAD" } else { "NETFAULT" });
             0
         }
         Err(e) => {
-            println!("ERROR: netload: {e}");
+            println!("ERROR: {}: {e}", env!("CARGO_BIN_NAME"));
             1
         }
     }
@@ -166,7 +172,7 @@ fn run() -> Result<(), &'static str> {
     while clock.now() < settled || clean < CLEAN {
         let now = clock.now();
         let killing = now < settled;
-        if now < start + RUN_NS && now >= next_kill {
+        if KILL && now < start + RUN_NS && now >= next_kill {
             devices.restart(id).map_err(|_| "the device manager would not restart the driver")?;
             restarts += 1;
             next_kill = now + KILL_EVERY_NS;
@@ -225,7 +231,7 @@ fn run() -> Result<(), &'static str> {
         }
     }
     println!("netload: {answered} pings answered, {resent} sent again, {restarts} restarts, the slowest recovery {} ms", worst / 1_000_000);
-    if restarts < 10 {
+    if KILL && restarts < 10 {
         return Err("the driver was restarted fewer than 10 times");
     }
     Ok(())

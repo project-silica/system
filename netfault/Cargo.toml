@@ -1,0 +1,29 @@
+[package]
+name = "netfault"
+description = "The network path under load with nothing restarted: what an injected device fault costs (netload's source)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+needs = ["silica.device.Manager"]
+memory = 23
+start = "check:netfault"
+
+[[bin]]
+name = "netfault"
+path = "../netload/src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+silica-net = { workspace = true }
+
+
+[lints]
+workspace = true

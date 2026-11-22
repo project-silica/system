@@ -1,14 +1,19 @@
-//! A hostile driver for a virtio block device: the test of what a driver
-//! cannot do (`spec/TESTING.md`: every promise is tested by trying to break
-//! it). The device manager starts it in place of the real driver
-//! (`driver=1af4:1042=virtio-rogue` on the kernel command line), so it holds
-//! exactly what a driver holds, and it uses that against the system:
+//! A hostile driver for a virtio block or network device: the test of what
+//! a driver cannot do (`spec/TESTING.md`: every promise is tested by trying
+//! to break it). The device manager starts it in place of the real driver
+//! (`driver=1af4:1042=virtio-rogue` or `driver=1af4:1041=virtio-rogue` on
+//! the kernel command line), so it holds exactly what a driver holds, and it
+//! uses that against the system:
 //!
 //! - it claims another device's identity and another device's interrupt;
 //! - it tells its device to write to, and to read from, memory the driver
 //!   never mapped for it, and to write to memory mapped for reading only;
 //! - it asks where its memory physically is;
 //! - it writes its device's configuration space.
+//!
+//! A disk is made to write and read with read and write requests; a network
+//! device (on QEMU's user-mode network) with a receive buffer the gateway's
+//! answer to an ARP request lands in, and a frame sent from the address.
 //!
 //! Each attempt must fail the way the design says, and the device must be
 //! usable again afterwards. The last one is a fault: the device manager
@@ -22,6 +27,7 @@ use silica_driver::dma::{Dma, DmaMemory};
 use silica_driver::irq::Interrupt;
 use silica_driver::virtio::{Buffer, Queue, STATUS_NEEDS_RESET, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
+use silica_rt::alloc::boxed::Box;
 use silica_rt::sys::{self, Cap, Error, Rights};
 use silica_rt::{ProcessInfo, mem, println, slots};
 
@@ -29,8 +35,21 @@ silica_rt::main!(main);
 
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
+/// The modern virtio network device's PCI device ID, and its MAC feature.
+const NET_DEVICE: u16 = 0x1041;
+const F_MAC: u64 = 1 << 5;
 /// How long the device gets to answer, or to be seen not answering.
 const WAIT_NS: u64 = 300_000_000;
+
+/// A device made to write or read where the driver says.
+trait Weapon {
+    /// Write into (`T_IN`) or read from (`T_OUT`) device address `data`.
+    fn aim(&mut self, kind: u32, data: u64) -> Result<Outcome, DeviceError>;
+    /// The driver's own memory the device writes on an honest `aim`, and
+    /// whether what it wrote is what the device should have written.
+    fn own(&self) -> u64;
+    fn honest(&self) -> bool;
+}
 
 struct Disk {
     transport: Transport,
@@ -40,13 +59,23 @@ struct Disk {
     request: DmaMemory,
 }
 
-fn bring_up(device: &Device, dma: &Dma) -> Result<Disk, DeviceError> {
+fn bring_up(device: &Device, dma: &Dma) -> Result<Box<dyn Weapon>, DeviceError> {
     let transport = Transport::new(device)?;
+    if device.config().device() == NET_DEVICE {
+        transport.negotiate(dma, F_MAC, 0)?;
+        let interrupt = Interrupt::bind(device, 0)?;
+        let rx = transport.queue(dma, 0, 64, Some(0))?;
+        let tx = transport.queue(dma, 1, 64, Some(0))?;
+        let config = transport.device_config().ok_or(DeviceError::Missing("a network configuration"))?;
+        let mac = core::array::from_fn(|i| config.read8(i));
+        transport.start();
+        return Ok(Box::new(Nic { transport, rx, tx, interrupt, memory: dma.memory(14, true)?, mac }));
+    }
     transport.negotiate(dma, 0, 0)?;
     let interrupt = Interrupt::bind(device, 0)?;
     let queue = transport.queue(dma, 0, 64, Some(0))?;
     transport.start();
-    Ok(Disk { transport, queue, interrupt, request: dma.memory(13, true)? })
+    Ok(Box::new(Disk { transport, queue, interrupt, request: dma.memory(13, true)? }))
 }
 
 /// What became of a request.
@@ -58,13 +87,14 @@ enum Outcome {
     Refused,
 }
 
-impl Disk {
-    /// One request for sector `sector` whose data the device finds at `data`.
-    fn request(&mut self, kind: u32, sector: u64, data: u64) -> Result<Outcome, DeviceError> {
+impl Weapon for Disk {
+    /// One request for sector 1 (a read) or 2 (a write) whose data the
+    /// device finds at `data`.
+    fn aim(&mut self, kind: u32, data: u64) -> Result<Outcome, DeviceError> {
         let (m, base) = (self.request.shared(), self.request.device_address());
         m.write32(0, kind);
         m.write32(4, 0);
-        m.write64(8, sector);
+        m.write64(8, if kind == T_IN { 1 } else { 2 });
         m.write8(16, 0xFF);
         let buffers = [
             Buffer { address: base, len: 16, device_writes: false },
@@ -82,6 +112,88 @@ impl Disk {
                 return Ok(Outcome::Refused);
             }
         }
+    }
+
+    fn own(&self) -> u64 {
+        self.request.device_address() + 4096
+    }
+
+    /// Sector 1 is the disk's partition table header.
+    fn honest(&self) -> bool {
+        self.request.shared().read64(4096) == u64::from_le_bytes(*b"EFI PART")
+    }
+}
+
+/// A network device on QEMU's user-mode network.
+struct Nic {
+    transport: Transport,
+    rx: Queue,
+    tx: Queue,
+    interrupt: Interrupt,
+    /// Headers at 0 (12 bytes received, zeros sent at 64), a frame to send
+    /// at 4096, a frame received at 8192.
+    memory: DmaMemory,
+    mac: [u8; 6],
+}
+
+impl Weapon for Nic {
+    /// Write: offer a receive buffer at `data` and ask the gateway for its
+    /// address, whose answer lands there. Read: send a frame from `data`.
+    fn aim(&mut self, kind: u32, data: u64) -> Result<Outcome, DeviceError> {
+        let (m, base) = (self.memory.shared(), self.memory.device_address());
+        for i in (0..128).step_by(8) {
+            m.write64(i, 0);
+        }
+        let header = |at: u64, writes: bool| Buffer { address: base + at, len: 12, device_writes: writes };
+        if kind == T_IN {
+            self.rx
+                .add(&[header(0, true), Buffer { address: data, len: 1514, device_writes: true }], 1)
+                .map_err(|_| DeviceError::Protocol("no room in an empty queue"))?;
+            self.rx.notify();
+            // ARP: who has 10.0.2.2? Tell 10.0.2.15.
+            let mut f = [0u8; 60];
+            f[..6].fill(0xFF);
+            f[6..12].copy_from_slice(&self.mac);
+            f[12..22].copy_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+            f[22..28].copy_from_slice(&self.mac);
+            f[28..32].copy_from_slice(&[10, 0, 2, 15]);
+            f[38..42].copy_from_slice(&[10, 0, 2, 2]);
+            for (i, b) in f.iter().enumerate() {
+                m.write8(4096 + i, *b);
+            }
+            self.tx
+                .add(&[header(64, false), Buffer { address: base + 4096, len: 60, device_writes: false }], 2)
+                .map_err(|_| DeviceError::Protocol("no room in an empty queue"))?;
+        } else {
+            self.tx
+                .add(&[header(64, false), Buffer { address: data, len: 60, device_writes: false }], 2)
+                .map_err(|_| DeviceError::Protocol("no room in an empty queue"))?;
+        }
+        self.tx.notify();
+        let deadline = silica_rt::clock().now() + WAIT_NS;
+        loop {
+            let _ = self.tx.pop()?;
+            if kind == T_IN {
+                if let Some((_, n)) = self.rx.pop()? {
+                    return Ok(Outcome::Status(if n > 12 { 0 } else { 1 }));
+                }
+            } else if self.tx.room() == self.tx.size() {
+                return Ok(Outcome::Status(0));
+            }
+            if self.transport.status() & STATUS_NEEDS_RESET != 0 || !self.interrupt.wait(Some(deadline)) {
+                return Ok(Outcome::Refused);
+            }
+        }
+    }
+
+    fn own(&self) -> u64 {
+        self.memory.device_address() + 8192
+    }
+
+    /// The gateway's answer: an ARP reply.
+    fn honest(&self) -> bool {
+        let m = self.memory.shared();
+        m.read8(8192 + 12) == 0x08 && m.read8(8192 + 13) == 0x06 && m.read8(8192 + 21) == 2
     }
 }
 
@@ -114,9 +226,9 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     if info.args[4] != 0 {
         // The second run, after the fault: the device works for a new driver.
         let mut disk = bring_up(&device, &dma)?;
-        let data = disk.request.device_address() + 4096;
-        let outcome = disk.request(T_IN, 1, data)?;
-        if outcome != Outcome::Status(0) || disk.request.shared().read64(4096) != u64::from_le_bytes(*b"EFI PART") {
+        let own = disk.own();
+        let outcome = disk.aim(T_IN, own)?;
+        if outcome != Outcome::Status(0) || !disk.honest() {
             return Err(fail("rogue_restart", format_args!("the restarted driver's read came back {outcome:?}")));
         }
         pass("rogue_restart");
@@ -163,32 +275,32 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     // write that went nowhere); the kernel's line naming the refused
     // access is, and the harness requires it.
     let mut disk = bring_up(&device, &dma)?;
-    let own = disk.request.device_address() + 4096;
-    if disk.request(T_IN, 1, own)? != Outcome::Status(0) {
+    let own = disk.own();
+    if disk.aim(T_IN, own)? != Outcome::Status(0) {
         return Err(fail("rogue_setup", format_args!("an honest read failed")));
     }
-    let outcome = disk.request(T_IN, 1, 0x10_0000)?;
+    let outcome = disk.aim(T_IN, 0x10_0000)?;
     println!("virtio-rogue: told the device to write at 0x100000: {outcome:?}");
     // To read from it: a disk write whose data is someone else's memory.
     // (Sector 2: nothing in this test reads it afterwards, and the disk is
     // a snapshot.)
     let mut disk = bring_up(&device, &dma)?;
-    let outcome = disk.request(T_OUT, 2, 0x20_0000)?;
+    let outcome = disk.aim(T_OUT, 0x20_0000)?;
     println!("virtio-rogue: told the device to read at 0x200000: {outcome:?}");
     // To write to memory it may only read. This one the driver sees for
     // itself: the memory is its own.
     let mut disk = bring_up(&device, &dma)?;
     let read_only = dma.memory(12, false)?;
     read_only.shared().write64(0, 0x5EA1_ED00_5EA1_ED00);
-    let outcome = disk.request(T_IN, 1, read_only.device_address())?;
+    let outcome = disk.aim(T_IN, read_only.device_address())?;
     if read_only.shared().read64(0) != 0x5EA1_ED00_5EA1_ED00 {
         return Err(fail("rogue_write_read_only", format_args!("the device wrote memory mapped for reading only ({outcome:?})")));
     }
     pass("rogue_write_read_only");
     // After all that, a reset makes the device usable again.
     let mut disk = bring_up(&device, &dma)?;
-    let own = disk.request.device_address() + 4096;
-    if disk.request(T_IN, 1, own)? != Outcome::Status(0) || disk.request.shared().read64(4096) != u64::from_le_bytes(*b"EFI PART") {
+    let own = disk.own();
+    if disk.aim(T_IN, own)? != Outcome::Status(0) || !disk.honest() {
         return Err(fail("rogue_recovers", format_args!("the device does not work after a reset")));
     }
     pass("rogue_recovers");
