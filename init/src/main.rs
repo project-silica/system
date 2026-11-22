@@ -12,11 +12,12 @@
 #![no_std]
 #![no_main]
 
-use libsys::root::RootInfo;
+use libsys::root::{KIND_DEVICE, RootInfo, SLOT_DEVICES, SLOT_FIRST_UNTYPED, SLOT_INFO, SLOT_IRQS};
 use libsys::{self as sys, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, finish};
 use silica_proc::{Grant, Program, spawn};
+use silica_rt::alloc::vec::Vec;
 use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, println};
 
@@ -69,8 +70,8 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         };
         let Ok(endpoint_object) = Object::new(ObjectType::Endpoint, 0) else { fail!("cannot create an endpoint for the echo programs") };
         let endpoint = endpoint_object.cap();
-        let receive = Grant { cap: endpoint, rights: Rights::READ, badge: 0 };
-        let send = Grant { cap: endpoint, rights: Rights(Rights::WRITE.0 | Rights::GRANT.0), badge: 7 };
+        let receive = Grant::lend(endpoint, Rights::READ);
+        let send = Grant::badged(endpoint, Rights(Rights::WRITE.0 | Rights::GRANT.0), 7);
         let server = spawn(parent, &Program { grants: &[receive], ..Program::new(server_image, id) });
         let client = spawn(parent, &Program { grants: &[send], ..Program::new(client_image, id + 1) });
         let (Ok(server), Ok(client)) = (server, client) else { fail!("cannot start {server_name} and {client_name}") };
@@ -90,6 +91,39 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         };
         println!("init: {client_name} and {server_name} talked over sample.Echo; both are gone and their memory is back");
     }
+    // The device manager: it is given the machine's description and every
+    // device capability, and nothing of the machine's ordinary memory
+    // beyond its own budget.
+    let Some(image) = ramdisk::find(archive, "devmgr") else { fail!("the ramdisk has no program named devmgr") };
+    let mut grants = Vec::new();
+    grants.push(Grant::lend(sys::Cap(SLOT_INFO), Rights::READ));
+    grants.push(Grant::lend(sys::Cap(SLOT_DEVICES), Rights::ALL));
+    grants.push(Grant::lend(sys::Cap(SLOT_IRQS), Rights::ALL));
+    grants.push(if info.msi_first != 0 && root.ports != sys::Cap::NONE { Grant::lend(root.ports, Rights::ALL) } else { Grant::none() });
+    grants.extend(root.ramdisk.iter().map(|f| Grant::lend(*f, Rights::READ)));
+    let frames = root.ramdisk.len() as u64;
+    let device = info.untyped[..info.untyped_count as usize].iter().enumerate().filter(|(_, d)| d.kind == KIND_DEVICE);
+    grants.extend(device.map(|(i, _)| Grant::give(sys::Cap(SLOT_FIRST_UNTYPED + i as u64))));
+    let untypeds = grants.len() as u64 - 4 - frames;
+    let program = Program {
+        grants: &grants,
+        args: [frames, untypeds, 0, 0, 0, 0, 0, 0],
+        mem_bits: 26,
+        space_bits: 13,
+        aspace_bits: 18,
+        ..Program::new(image, 300)
+    };
+    let devmgr = match spawn(parent, &program) {
+        Ok(c) => c,
+        Err(e) => fail!("cannot start the device manager: {e:?}"),
+    };
+    let Ok(m) = sys::recv(parent.exit, Wait::Until(silica_rt::clock().now() + 60_000_000_000)) else {
+        fail!("the device manager did not finish within 60 s")
+    };
+    if m.badge != 300 || m.words[0] != 0 {
+        fail!("the device manager (program {}) ended with status {}", m.badge, m.words[0] as i64);
+    }
+    let _ = devmgr;
     println!("BOOT OK");
     finish(true)
 }

@@ -6,6 +6,7 @@ use libsys::root::{
     KIND_RAM, KIND_RAMDISK, ROOT_MAGIC, RootInfo, SLOT_ASPACE, SLOT_CAPSPACE, SLOT_CONSOLE, SLOT_FIRST_UNTYPED, SLOT_PORTS, SLOT_POWER,
 };
 use libsys::{self as sys, Cap, ObjectType, Rights};
+use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::free_slot;
 use silica_rt::mem;
 
@@ -23,6 +24,9 @@ pub struct Root {
     pub parent: Parent,
     /// Every I/O port of the machine (x86_64; an empty slot elsewhere).
     pub ports: Cap,
+    /// The frames of the ramdisk, in the order the kernel listed its memory:
+    /// what a program that reads the boot archive itself is lent.
+    pub ramdisk: Vec<Cap>,
 }
 
 /// Start the runtime in the root task and prepare it to spawn. On failure
@@ -44,8 +48,10 @@ pub fn start(info: &'static RootInfo) -> Result<Root, &'static str> {
         return Err("the kernel handed over no memory");
     }
 
+    let mut ramdisk = Vec::new();
     for (i, d) in descs.iter().enumerate().filter(|(_, d)| d.kind == KIND_RAMDISK) {
         let frame = free_slot().ok_or("the root CapSpace is full")?;
+        ramdisk.push(Cap(frame));
         sys::retype(Cap(SLOT_FIRST_UNTYPED + i as u64), ObjectType::Frame, d.bits, space, frame, 1)
             .and_then(|()| sys::map(aspace, Cap(frame), RAMDISK_VADDR + d.base as usize, Rights::READ))
             .map_err(|_| "cannot map the ramdisk")?;
@@ -62,8 +68,17 @@ pub fn start(info: &'static RootInfo) -> Result<Root, &'static str> {
     // The exit endpoint lives as long as the system: no block of its own.
     let page = mem::alloc(12).map_err(|_| "no memory for the exit endpoint")?;
     sys::retype(page, ObjectType::Endpoint, 0, space, exit, 1).map_err(|_| "cannot create the exit endpoint")?;
-    let parent = Parent { space, aspace, scratch: SCRATCH_VADDR, exit: Cap(exit), debug: Cap(debug), cpus: info.cpus, clock: info.clock };
-    Ok(Root { archive, parent, ports })
+    let parent = Parent {
+        space,
+        aspace,
+        scratch: SCRATCH_VADDR,
+        exit: Cap(exit),
+        fault: Cap::NONE,
+        debug: Cap(debug),
+        cpus: info.cpus,
+        clock: info.clock,
+    };
+    Ok(Root { archive, parent, ports, ramdisk })
 }
 
 /// Turn the machine off, telling a test harness whether everything

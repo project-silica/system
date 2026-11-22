@@ -1,0 +1,20 @@
+[package]
+name = "virtio-rogue"
+description = "A hostile driver for a virtio block device: the test of what a driver cannot do."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "virtio-rogue"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-driver = { workspace = true }
+
+[lints]
+workspace = true

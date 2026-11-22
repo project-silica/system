@@ -1,0 +1,13 @@
+[package]
+name = "silica-driver"
+description = "The driver framework: what every Silica driver is written against (its device, DMA, interrupts) and what each class of driver shares."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+silica-rt = { workspace = true }
+
+[lints]
+workspace = true

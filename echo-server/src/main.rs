@@ -28,7 +28,7 @@ impl echo::Server<Handle> for Echo {
         }
     }
 
-    fn echo_caps<'a>(&'a mut self, frame: Handle, peer: Option<Handle>, any: Handle) -> echo::EchoCapsReply<Handle> {
+    fn echo_caps(&mut self, frame: Handle, peer: Option<Handle>, any: Handle) -> echo::EchoCapsReply<Handle> {
         echo::EchoCapsReply { frame, peer, any }
     }
 }

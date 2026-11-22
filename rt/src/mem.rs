@@ -21,6 +21,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Untyped capabilities blocks are made from, as `slot | bits << 56`,
 /// smallest first (0: none, at the end).
 static SOURCES: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+/// Flag in a source's entry: blocks have been made from it.
+const USED: u64 = 1 << 63;
+/// A source that was handed out whole as a block: skipped from then on (it
+/// comes back through the list of empty blocks when it is freed).
+const SPENT: u64 = 1 << 62;
 /// Empty blocks: `slot | bits << 56` (0: none).
 static FREE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 
@@ -65,12 +70,24 @@ pub fn alloc(bits: u8) -> Result<Cap, Error> {
         if entry == 0 {
             break;
         }
-        if ((entry >> 56) as u8) < bits {
+        let entry_bits = ((entry & !USED) >> 56) as u8;
+        if entry == SPENT || entry_bits < bits {
             continue;
         }
         let source = entry & ((1 << 56) - 1);
         match sys::retype(Cap(source), ObjectType::Untyped, bits, slots::SPACE, slot, 1) {
-            Ok(()) => return Ok(Cap(slot)),
+            Ok(()) => {
+                s.store(entry | USED, Ordering::Relaxed);
+                return Ok(Cap(slot));
+            }
+            // A source of exactly this size cannot be made into a smaller
+            // one: while nothing has been made from it, it is the block.
+            Err(Error::NoMemory) if entry_bits == bits && entry & USED == 0 => {
+                if s.compare_exchange(entry, SPENT, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    release_slot(slot);
+                    return Ok(Cap(source));
+                }
+            }
             Err(Error::NoMemory) => {}
             Err(e) => {
                 release_slot(slot);
@@ -160,5 +177,111 @@ impl Object {
         if self.cap != self.block {
             release_slot(self.cap.0);
         }
+    }
+}
+
+/// Where this program's own mappings go: from 64 GiB to 512 GiB, handed
+/// out upward by [`reserve`] and never reused. Above every image, below the
+/// start-up record, in the part of the address space the first page-table
+/// level of the image already covers, and below the lowest limit an IOMMU
+/// puts on device addresses (2^39), so a driver can give its device the
+/// addresses it uses itself.
+const RESERVE_BASE: u64 = 0x10_0000_0000;
+const RESERVE_END: u64 = 0x80_0000_0000;
+static RESERVED: AtomicU64 = AtomicU64::new(RESERVE_BASE);
+
+/// `bytes` of this program's address space that nothing else will be mapped
+/// in, at a multiple of `align` (a power of two, at least a page): where to
+/// map a frame. Address space is not memory: a reservation costs nothing
+/// until something is mapped there (and then page tables, one per 2 MiB
+/// touched, from the address space's own pool), so it is never given back.
+/// `None` when the range set aside for it is used up.
+pub fn reserve(bytes: usize, align: usize) -> Option<usize> {
+    let align = align.max(4096) as u64;
+    let mut at = RESERVED.load(Ordering::Relaxed);
+    loop {
+        let start = at.checked_add(align - 1)? & !(align - 1);
+        let end = start.checked_add((bytes as u64).checked_add(4095)? & !4095)?;
+        if end > RESERVE_END {
+            return None;
+        }
+        match RESERVED.compare_exchange_weak(at, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(start as usize),
+            Err(now) => at = now,
+        }
+    }
+}
+
+/// Map `frame`, of `2^bits` bytes, somewhere in this program with `rights`,
+/// and say where. The mapping lasts until the capability is deleted or
+/// unmapped.
+pub fn map(frame: Cap, bits: u8, rights: sys::Rights) -> Result<usize, Error> {
+    let size = 1usize.checked_shl(bits as u32).ok_or(Error::BadArg)?;
+    let at = reserve(size, size.min(1 << sys::LARGE_BITS)).ok_or(Error::NoMemory)?;
+    sys::map(slots::ASPACE, frame, at, rights)?;
+    Ok(at)
+}
+
+/// Memory of this program's own: a frame of `2^bits` bytes from its
+/// Untyped, mapped readable and writable, zeroed.
+#[derive(Debug)]
+pub struct Memory {
+    frame: Object,
+    addr: usize,
+    bits: u8,
+}
+
+impl Memory {
+    /// New memory of `2^bits` bytes (at least a page: `bits` from 12).
+    pub fn new(bits: u8) -> Result<Memory, Error> {
+        let frame = Object::new(ObjectType::Frame, bits)?;
+        match map(frame.cap(), bits, sys::Rights(sys::Rights::READ.0 | sys::Rights::WRITE.0)) {
+            Ok(addr) => Ok(Memory { frame, addr, bits }),
+            Err(e) => {
+                // SAFETY: the frame was never mapped; nothing uses it.
+                #[allow(unsafe_code)]
+                unsafe {
+                    frame.destroy()
+                };
+                Err(e)
+            }
+        }
+    }
+
+    /// Where it is mapped.
+    pub fn addr(&self) -> usize {
+        self.addr
+    }
+
+    /// Its size in bytes.
+    pub fn len(&self) -> usize {
+        1 << self.bits
+    }
+
+    /// Whether it is empty (never: the smallest is a page).
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Its size in bits.
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+
+    /// The frame capability: the original, to derive what others are given
+    /// from (a device address space maps a copy, a peer gets a derived one).
+    pub fn frame(&self) -> Cap {
+        self.frame.cap()
+    }
+
+    /// Unmap it and give the memory back.
+    ///
+    /// # Safety
+    /// Nothing may still refer to the memory: no reference into it, and no
+    /// device still told to write there.
+    #[allow(unsafe_code)]
+    pub unsafe fn free(self) {
+        // SAFETY: the caller's promise.
+        unsafe { self.frame.destroy() }
     }
 }

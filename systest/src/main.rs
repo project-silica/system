@@ -124,8 +124,8 @@ impl Tests {
         for i in 0..pairs {
             let ep = self.endpoint()?;
             let (server_cpu, client_cpu) = cpus(i);
-            self.start(SERVER, [0, 0], server_cpu, &[Grant { cap: ep, rights: Rights::READ, badge: 0 }])?;
-            (_, clients[i as usize]) = self.start(CLIENT, [count, 0], client_cpu, &[Grant { cap: ep, rights: SEND, badge: 1 }])?;
+            self.start(SERVER, [0, 0], server_cpu, &[Grant::lend(ep, Rights::READ)])?;
+            (_, clients[i as usize]) = self.start(CLIENT, [count, 0], client_cpu, &[Grant::badged(ep, SEND, 1)])?;
         }
         // Clients finish in any order.
         for _ in 0..pairs {
@@ -146,8 +146,8 @@ impl Tests {
     fn moved_mid_call(&mut self) -> Outcome {
         let ep = self.endpoint()?;
         let cpus = self.root.parent.cpus;
-        let server = self.start(SERVER, [0, 0], 1, &[Grant { cap: ep, rights: Rights::READ, badge: 0 }])?.0.thread();
-        let (client, id) = self.start(CLIENT, [200_000, 0], 2, &[Grant { cap: ep, rights: SEND, badge: 1 }])?;
+        let server = self.start(SERVER, [0, 0], 1, &[Grant::lend(ep, Rights::READ)])?.0.thread();
+        let (client, id) = self.start(CLIENT, [200_000, 0], 2, &[Grant::badged(ep, SEND, 1)])?;
         let client = client.thread();
         let (start, mut moves) = (silica_rt::clock().now(), 0u64);
         loop {
@@ -176,12 +176,12 @@ impl Tests {
     /// capability away and gives it back every 200 microseconds.
     fn revoke_and_regrant(&mut self) -> Outcome {
         let ep = self.endpoint()?;
-        self.start(SERVER, [0, 0], 1, &[Grant { cap: ep, rights: Rights::READ, badge: 0 }])?;
+        self.start(SERVER, [0, 0], 1, &[Grant::lend(ep, Rights::READ)])?;
         let (client, id) = self.start(CLIENT, [1_000_000, 1], 2, &[])?;
         // The revoker's source is its own child of the endpoint, so revoking
         // it touches only what the revoker granted.
-        let source = Grant { cap: ep, rights: SEND, badge: 0 };
-        let space = Grant { cap: client.space(), rights: Rights::ALL, badge: 0 };
+        let source = Grant::lend(ep, SEND);
+        let space = Grant::lend(client.space(), Rights::ALL);
         self.start(REVOKER, [200_000, 0], 3, &[source, space])?;
         match self.next_exit(300 * SECOND)? {
             (who, 0) if who == id => Ok(()),
@@ -208,8 +208,8 @@ impl Tests {
     /// beside it is not affected, and the memory comes back with the program.
     fn exhaustion(&mut self) -> Outcome {
         let ep = self.endpoint()?;
-        self.start(SERVER, [0, 0], 1, &[Grant { cap: ep, rights: Rights::READ, badge: 0 }])?;
-        let (_, client) = self.start(CLIENT, [200_000, 0], 2, &[Grant { cap: ep, rights: SEND, badge: 1 }])?;
+        self.start(SERVER, [0, 0], 1, &[Grant::lend(ep, Rights::READ)])?;
+        let (_, client) = self.start(CLIENT, [200_000, 0], 2, &[Grant::badged(ep, SEND, 1)])?;
         let (_, hog) = self.start(HOG, [0, 0], 3, &[])?;
         for _ in 0..2 {
             match self.next_exit(60 * SECOND)? {
@@ -237,7 +237,7 @@ impl Tests {
     /// and receiving on the very object the slot names.
     fn the_debug_console_lists_every_thread_and_capability(&mut self) -> Outcome {
         let ep = self.endpoint()?;
-        let (server, _) = self.start(SERVER, [0, 0], 1, &[Grant { cap: ep, rights: Rights::READ, badge: 0 }])?;
+        let (server, _) = self.start(SERVER, [0, 0], 1, &[Grant::lend(ep, Rights::READ)])?;
         let (thread, space) = (server.thread(), server.space());
         let until = silica_rt::clock().now() + 10 * SECOND;
         while sys::inspect_thread(thread).map(|t| t.state) != Ok(sys::THREAD_RECEIVING) {
@@ -282,7 +282,7 @@ impl Tests {
         // itself, so it can be revoked while this task keeps receiving.
         let lent = self.keep(Cap(free_slot().ok_or("the root CapSpace is full")?))?;
         sys::cap_derive(self.root.parent.space, lent.0, ep, SEND, 5).map_err(|_| "cannot derive the capability to lend")?;
-        let (_, id) = self.start(ONE_CALL, [0, 0], 1, &[Grant { cap: lent, rights: SEND, badge: 0 }])?;
+        let (_, id) = self.start(ONE_CALL, [0, 0], 1, &[Grant::lend(lent, SEND)])?;
         let m = sys::recv(ep, Wait::Until(silica_rt::clock().now() + 10 * SECOND)).map_err(|_| "the call did not arrive")?;
         if (m.badge, m.words[0]) != (5, 41) {
             return Err("the call arrived with the wrong badge or word");

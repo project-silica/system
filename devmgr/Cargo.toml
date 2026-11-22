@@ -1,0 +1,23 @@
+[package]
+name = "devmgr"
+description = "The device manager: finds the machine's devices, starts a driver for each with only that device's capabilities, and restarts it when it fails."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "devmgr"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libsys = { workspace = true }
+silica-rt = { workspace = true }
+silica-proc = { workspace = true }
+silica-formats = { workspace = true }
+silica-driver = { workspace = true }
+
+[lints]
+workspace = true

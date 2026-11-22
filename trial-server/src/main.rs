@@ -36,8 +36,8 @@ impl echo::Server<Handle> for Provider {
         Ok(echo::EchoRecordsReply { records })
     }
 
-    fn echo_caps<'a>(
-        &'a mut self,
+    fn echo_caps(
+        &mut self,
         frame: Handle,
         peer: Option<Handle>,
         any: Handle,

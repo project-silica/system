@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "devmgr"
+version = "0.0.0"
+dependencies = [
+ "libsys",
+ "silica-driver",
+ "silica-formats",
+ "silica-proc",
+ "silica-rt",
+]
+
+[[package]]
 name = "echo-client"
 version = "0.0.0"
 dependencies = [
@@ -47,6 +58,13 @@ dependencies = [
 [[package]]
 name = "silica-abi"
 version = "0.0.0"
+
+[[package]]
+name = "silica-driver"
+version = "0.0.0"
+dependencies = [
+ "silica-rt",
+]
 
 [[package]]
 name = "silica-formats"
@@ -109,5 +127,21 @@ version = "0.0.0"
 dependencies = [
  "silica-idl-rt",
  "silica-idlc",
+ "silica-rt",
+]
+
+[[package]]
+name = "virtio-blk"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-rt",
+]
+
+[[package]]
+name = "virtio-rogue"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
  "silica-rt",
 ]

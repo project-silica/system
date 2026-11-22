@@ -27,17 +27,16 @@ pub const IPC_VADDR: usize = 0x7F00_0001_0000;
 /// The lowest address of a child's first stack (64 KiB).
 pub const STACK_VADDR: usize = 0x7F00_0010_0000;
 const STACK_BITS: u8 = 16;
-/// Slots in a child's CapSpace, in bits.
+/// Slots in a child's CapSpace, in bits, unless the program says otherwise.
 const SPACE_BITS: u8 = 10;
-/// Size of a child's address-space object in bits (room for 14 page tables).
+/// Size of a child's address-space object in bits unless the program says
+/// otherwise (room for 14 page tables: about 20 MiB of mappings).
 const ASPACE_BITS: u8 = 16;
 /// Largest frame the image is loaded in, in bits. Below the large-page
 /// size, so a frame can be mapped at any page-aligned address.
 const CHUNK_BITS: u8 = 20;
-/// First slot of the child's CapSpace used for its image, stack and record.
-const FIRST_IMAGE_SLOT: u64 = 64;
 /// Most capabilities one spawn can grant.
-pub const MAX_GRANTS: usize = (FIRST_IMAGE_SLOT - slots::FIRST_GRANT) as usize;
+pub const MAX_GRANTS: usize = 2048;
 
 /// What the parent spawns with: its own capabilities and working space.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +51,12 @@ pub struct Parent {
     /// An endpoint children report their exit on (each child gets a
     /// send-only capability badged with its `id`).
     pub exit: Cap,
+    /// An endpoint the kernel reports a child's fault on, as a call badged
+    /// with the child's `id` ([`Cap::NONE`]: a faulting child stops and the
+    /// kernel logs it). The message is the kernel's fault message
+    /// (`libsys::FAULT_LABEL`); whoever receives it decides what becomes of
+    /// the child, usually by destroying it.
+    pub fault: Cap,
     /// The debug console to pass on, or [`Cap::NONE`].
     pub debug: Cap,
     /// Number of processors and clock calibration, passed on unchanged.
@@ -63,13 +68,41 @@ pub struct Parent {
 /// One capability to give the child.
 #[derive(Clone, Copy, Debug)]
 pub struct Grant {
-    /// The parent's capability. The child's is derived from it: revoking
-    /// this one takes the child's away.
+    /// The parent's capability ([`Cap::NONE`]: nothing; the child's slot
+    /// stays empty). Unless `give` is set the child's is derived from it:
+    /// revoking this one takes the child's away.
     pub cap: Cap,
     /// The rights the child gets (at most the parent's).
     pub rights: Rights,
-    /// A badge for an endpoint or notification capability (0: none).
+    /// A badge for an endpoint or notification capability, or the range of
+    /// a hardware capability (start in the low half, end in the high half);
+    /// 0: none.
     pub badge: u64,
+    /// The child gets the capability itself and the parent no longer has
+    /// it (`rights` and `badge` are not used): the only way to pass on an
+    /// Untyped, which has one capability. It comes back with everything
+    /// else the child held only if it was made from the child's memory;
+    /// otherwise it is gone when the child is destroyed.
+    pub give: bool,
+}
+
+impl Grant {
+    /// Lend `cap` with `rights`: the child's capability is derived from it.
+    pub const fn lend(cap: Cap, rights: Rights) -> Grant {
+        Grant { cap, rights, badge: 0, give: false }
+    }
+    /// The same with a badge (or a hardware capability's narrower range).
+    pub const fn badged(cap: Cap, rights: Rights, badge: u64) -> Grant {
+        Grant { cap, rights, badge, give: false }
+    }
+    /// Give `cap` away: the child holds the capability itself.
+    pub const fn give(cap: Cap) -> Grant {
+        Grant { cap, rights: Rights::ALL, badge: 0, give: true }
+    }
+    /// An empty slot, keeping the numbering of the grants after it.
+    pub const fn none() -> Grant {
+        Grant { cap: Cap::NONE, rights: Rights::NONE, badge: 0, give: false }
+    }
 }
 
 /// A running child owned by its parent. Destroying it consumes this handle
@@ -96,7 +129,16 @@ impl Parent {
     /// (an endpoint of the program's) and print where it prints. `scratch`
     /// is as in [`Parent::scratch`].
     pub fn of(info: &ProcessInfo, exit: Cap, scratch: usize) -> Parent {
-        Parent { space: slots::SPACE, aspace: slots::ASPACE, scratch, exit, debug: slots::DEBUG, cpus: info.cpus, clock: info.clock }
+        Parent {
+            space: slots::SPACE,
+            aspace: slots::ASPACE,
+            scratch,
+            exit,
+            fault: Cap::NONE,
+            debug: slots::DEBUG,
+            cpus: info.cpus,
+            clock: info.clock,
+        }
     }
 }
 
@@ -192,20 +234,27 @@ pub struct Program<'a> {
     pub args: [u64; 8],
     /// The processor its first thread runs on (an index below `Parent::cpus`).
     pub cpu: usize,
+    /// Slots in its CapSpace, in bits (at least 8; room is needed for the
+    /// grants, one slot per megabyte of image, and what it makes itself).
+    pub space_bits: u8,
+    /// Size in bits of its address-space object: a header page, the root
+    /// table and one page table per further page (16: about 20 MiB of
+    /// mappings; a program that maps more, or far apart, needs more).
+    pub aspace_bits: u8,
 }
 
 impl<'a> Program<'a> {
     /// `image` with 4 MiB, no grants, no arguments, on processor 0.
     pub fn new(image: &'a [u8], id: u64) -> Self {
-        Program { image, mem_bits: 22, id, grants: &[], args: [0; 8], cpu: 0 }
+        Program { image, mem_bits: 22, id, grants: &[], args: [0; 8], cpu: 0, space_bits: SPACE_BITS, aspace_bits: ASPACE_BITS }
     }
 }
 
 /// Start `prog`: its first thread runs on `prog.cpu` from its first
 /// instruction.
 pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
-    let Program { image, mem_bits, id, grants, args, cpu } = *prog;
-    if cpu as u64 >= p.cpus {
+    let Program { image, mem_bits, cpu, .. } = *prog;
+    if cpu as u64 >= p.cpus || !(8..=20).contains(&prog.space_bits) {
         return Err(SpawnError::Kernel(Error::BadArg));
     }
     // Three slots for the child's objects and two to work with.
@@ -226,7 +275,7 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
         }
     };
     let child = Child { untyped, mem_bits, thread: Cap(got[0]), space: Cap(got[1]), aspace: Cap(got[2]) };
-    let result = match build(p, &child, [Cap(got[3]), Cap(got[4])], image, mem_bits, id, grants, args, cpu) {
+    let result = match build(p, &child, [Cap(got[3]), Cap(got[4])], image, prog) {
         Ok(()) => Ok(child),
         Err(e) => {
             // Nothing half-made stays behind: returning the block revokes
@@ -245,33 +294,25 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build(
-    p: &Parent,
-    c: &Child,
-    [tmp, own]: [Cap; 2],
-    image: &[u8],
-    mem_bits: u8,
-    id: u64,
-    grants: &[Grant],
-    args: [u64; 8],
-    cpu: usize,
-) -> Result<(), SpawnError> {
+fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Program) -> Result<(), SpawnError> {
+    let Program { mem_bits, id, grants, args, cpu, space_bits, aspace_bits, .. } = *prog;
     let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
-    if grants.len() > MAX_GRANTS {
+    // The image's slots follow the grants.
+    let first_image_slot = slots::FIRST_GRANT + grants.len() as u64;
+    if grants.len() > MAX_GRANTS || first_image_slot >= 1 << space_bits {
         return Err(SpawnError::TooMany);
     }
     let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
     // The child's own allocatable memory comes first: half the budget.
     sys::retype(c.untyped, ObjectType::Untyped, mem_bits - 1, p.space, own.0, 1)?;
-    sys::retype(c.untyped, ObjectType::CapSpace, SPACE_BITS, p.space, c.space.0, 1)?;
-    sys::retype(c.untyped, ObjectType::AddressSpace, ASPACE_BITS, p.space, c.aspace.0, 1)?;
+    sys::retype(c.untyped, ObjectType::CapSpace, space_bits, p.space, c.space.0, 1)?;
+    sys::retype(c.untyped, ObjectType::AddressSpace, aspace_bits, p.space, c.aspace.0, 1)?;
     sys::retype(c.untyped, ObjectType::Thread, 0, p.space, c.thread.0, 1)?;
 
     // A frame of `bits` filled by `fill` (given the address it is mapped at
     // in the parent), mapped at `vaddr` in the child, its capability left in
     // the child's CapSpace at `slot`.
-    let next_slot = core::cell::Cell::new(FIRST_IMAGE_SLOT);
+    let next_slot = core::cell::Cell::new(first_image_slot);
     let place = |bits: u8, vaddr: usize, rights: Rights, slot: Option<u64>, fill: &mut dyn FnMut(usize)| -> Result<(), SpawnError> {
         sys::retype(c.untyped, ObjectType::Frame, bits, p.space, tmp.0, 1)?;
         sys::map(p.aspace, tmp, p.scratch, rw)?;
@@ -284,7 +325,7 @@ fn build(
         sys::map(c.aspace, tmp, vaddr, rights)
             .map_err(|e| if e == Error::Overlap || e == Error::BadArg { SpawnError::Segment } else { e.into() })?;
         let to = slot.unwrap_or_else(|| next_slot.replace(next_slot.get() + 1));
-        if to >= 1 << SPACE_BITS {
+        if to >= 1 << space_bits {
             return Err(SpawnError::TooMany);
         }
         sys::cap_move(c.space, to, tmp)?;
@@ -328,7 +369,7 @@ fn build(
     let info = ProcessInfo {
         magic: PROCESS_MAGIC,
         ipc_buffer: IPC_VADDR as u64,
-        capspace_slots: 1 << SPACE_BITS,
+        capspace_slots: 1 << space_bits,
         first_free_slot: first_free + 1,
         untyped_bits: mem_bits as u64 - 1,
         grants: grants.len() as u64,
@@ -344,6 +385,17 @@ fn build(
     sys::map(c.aspace, tmp, IPC_VADDR, rw)?;
     sys::thread_configure(c.thread, c.space, c.aspace, Cap::NONE, tmp)?;
     sys::cap_move(c.space, slots::IPC_BUFFER.0, tmp)?;
+    // Its faults go to the parent's fault endpoint, badged with its id. The
+    // thread keeps a capability of its own; the working one goes again.
+    if p.fault != Cap::NONE {
+        sys::cap_derive(p.space, tmp.0, p.fault, Rights::WRITE, id)?;
+        sys::thread_configure(c.thread, Cap::KEEP, Cap::KEEP, tmp, Cap::KEEP)?;
+        // SAFETY: a capability made two lines up, used by nothing else.
+        #[allow(unsafe_code)]
+        unsafe {
+            sys::cap_delete(tmp)?
+        };
+    }
 
     // What every program starts with, then what this one was granted.
     sys::cap_duplicate(c.space, slots::THREAD.0, c.thread, Rights::ALL, 0)?;
@@ -355,7 +407,15 @@ fn build(
         sys::cap_derive(c.space, slots::DEBUG.0, p.debug, Rights::ALL, 0)?;
     }
     for (i, g) in grants.iter().enumerate() {
-        sys::cap_derive(c.space, slots::FIRST_GRANT + i as u64, g.cap, g.rights, g.badge)?;
+        let to = slots::FIRST_GRANT + i as u64;
+        if g.cap == Cap::NONE {
+            continue;
+        }
+        if g.give {
+            sys::cap_move(c.space, to, g.cap)?;
+        } else {
+            sys::cap_derive(c.space, to, g.cap, g.rights, g.badge)?;
+        }
     }
     sys::thread_set_cpu(c.thread, cpu)?;
     // SAFETY: the entry point of an image just loaded into the thread's

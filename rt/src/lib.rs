@@ -96,11 +96,21 @@
 //! with status -1), so a program defines none. [`print!`] and [`println!`]
 //! take the same format strings and arguments as `core::format_args!`. A
 //! grant is used as `sys::Cap(slots::FIRST_GRANT + n)`.
+//!
+//! A program has a heap: `silica_rt::alloc` is Rust's `alloc` crate
+//! (`alloc::vec::Vec`, `alloc::boxed::Box`, `alloc::collections::BTreeMap`),
+//! allocating from the program's own memory ([`heap`]). Memory that is
+//! shared, handed to a device or given back is held as [`mem::Memory`];
+//! device registers are reached through [`mmio::Mmio`].
 #![no_std]
 #![deny(unsafe_code)]
 
+pub extern crate alloc;
+
+pub mod heap;
 pub mod ipc;
 pub mod mem;
+pub mod mmio;
 
 pub use libsys as sys;
 
@@ -250,6 +260,11 @@ macro_rules! main {
         }
     };
 }
+
+/// The heap every program allocates from (`alloc`'s boxes, vectors and maps).
+#[cfg(target_os = "silica")]
+#[global_allocator]
+static HEAP: heap::Heap = heap::Heap::new();
 
 #[cfg(target_os = "silica")]
 #[panic_handler]
