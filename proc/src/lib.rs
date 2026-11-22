@@ -289,12 +289,16 @@ pub struct Program<'a> {
     /// table and one page table per further page (16: about 20 MiB of
     /// mappings; a program that maps more, or far apart, needs more).
     pub aspace_bits: u8,
+    /// Its log: a ring frame of `silica_rt::log::BITS` and what wakes the
+    /// log service (derived into `slots::LOG` and `slots::LOG_WAKE`); without
+    /// one it prints to the debug console.
+    pub log: Option<(Cap, Cap)>,
 }
 
 impl<'a> Program<'a> {
     /// `image` with 4 MiB, no grants, no arguments, on processor 0.
     pub fn new(image: &'a [u8], id: u64) -> Self {
-        Program { image, mem_bits: 22, id, grants: &[], args: [0; 8], cpu: 0, space_bits: SPACE_BITS, aspace_bits: ASPACE_BITS }
+        Program { image, mem_bits: 22, id, grants: &[], args: [0; 8], cpu: 0, space_bits: SPACE_BITS, aspace_bits: ASPACE_BITS, log: None }
     }
 }
 
@@ -455,6 +459,10 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     sys::cap_derive(c.space, slots::PARENT.0, p.exit, Rights::WRITE, id)?;
     if p.debug != Cap::NONE {
         sys::cap_derive(c.space, slots::DEBUG.0, p.debug, Rights::ALL, 0)?;
+    }
+    if let Some((ring, wake)) = prog.log {
+        sys::cap_derive(c.space, slots::LOG.0, ring, Rights(Rights::READ.0 | Rights::WRITE.0), 0)?;
+        sys::cap_derive(c.space, slots::LOG_WAKE.0, wake, Rights::WRITE, 0)?;
     }
     for (i, g) in grants.iter().enumerate() {
         let to = slots::FIRST_GRANT + i as u64;

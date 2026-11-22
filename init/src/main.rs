@@ -28,6 +28,7 @@
 
 mod manifest;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, RootInfo, SLOT_DEVICES, SLOT_FIRST_UNTYPED, SLOT_INFO, SLOT_IRQS};
 use libsys::{self as sys, ObjectType, Rights, Wait};
 use manifest::{Service, Start};
@@ -43,10 +44,33 @@ use silica_rt::{EXIT_LABEL, println};
 
 macro_rules! fail {
     ($($a:tt)*) => {{
+        flush_log();
         silica_rt::print!("ERROR: init: ");
         println!($($a)*);
         finish(false)
     }};
+}
+
+/// The log service's notification, badged [`FLUSH`], and the notification it
+/// answers a flush on (0: no log service).
+static FLUSH_TO: AtomicU64 = AtomicU64::new(0);
+static FLUSHED: AtomicU64 = AtomicU64::new(0);
+/// The bit of the log's notification that asks it to flush (`logd`).
+const FLUSH: u64 = 2;
+
+/// Have the log service put everything its rings hold on the console before
+/// what init says next, waiting at most 200 ms: init never waits on a
+/// service for long.
+fn flush_log() {
+    let (to, done) = (FLUSH_TO.load(Ordering::Relaxed), FLUSHED.load(Ordering::Relaxed));
+    if to == 0 {
+        return;
+    }
+    // A late answer to an earlier flush is not this one's.
+    let _ = sys::recv(sys::Cap(done), Wait::Poll);
+    if sys::signal(sys::Cap(to)).is_ok() {
+        let _ = sys::recv(sys::Cap(done), Wait::Until(silica_rt::clock().now() + 200_000_000));
+    }
 }
 
 const SECOND: u64 = 1_000_000_000;
@@ -78,6 +102,16 @@ struct Manager {
     listed: Vec<manager::Service<'static>>,
     /// What `describe` answers with.
     described: String,
+    /// The log: the service that provides it, its notification, what it
+    /// answers flushes on, and a ring per service (`silica_rt::log`).
+    log: Option<LogSetup>,
+}
+
+struct LogSetup {
+    service: usize,
+    note: Object,
+    flushed: Object,
+    rings: Vec<Option<Object>>,
 }
 
 /// The value of `key=` on the command line.
@@ -107,6 +141,17 @@ impl Manager {
             };
             grants.push(Grant::badged(ep, Rights(Rights::WRITE.0 | Rights::GRANT.0), CONSUMERS + i as u64));
         }
+        if let Some(log) = self.log.as_ref().filter(|l| l.service == i) {
+            grants.push(Grant::lend(log.note.cap(), Rights::ALL));
+            grants.push(Grant::lend(log.flushed.cap(), Rights::WRITE));
+            for r in &log.rings {
+                grants.push(match r {
+                    Some(f) => Grant::lend(f.cap(), Rights(Rights::READ.0 | Rights::WRITE.0)),
+                    None => Grant::none(),
+                });
+            }
+            args[0] = log.rings.len() as u64;
+        }
         if s.machine {
             let info = self.info;
             grants.push(Grant::lend(sys::Cap(SLOT_INFO), Rights::READ));
@@ -132,9 +177,11 @@ impl Manager {
         let s = &self.services[i];
         let image = ramdisk::find(self.root.archive, s.program).ok_or("its program is not in the boot archive")?;
         let (grants, args) = self.grants(i)?;
+        let log = self.log.as_ref().and_then(|l| Some((l.rings.get(i)?.as_ref()?.cap(), l.note.cap())));
         let program = Program {
             grants: &grants,
             args,
+            log,
             mem_bits: s.memory,
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
@@ -294,6 +341,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn shutdown(&mut self, reboot: bool) -> Result<manager::ShutdownReply, manager::Error> {
+        flush_log();
         println!("init: shutting down{}", if reboot { " to reset" } else { "" });
         for &i in self.order.clone().iter().rev() {
             if self.stop(i) {
@@ -347,7 +395,31 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         });
     }
     let running = services.iter().map(|_| Running { child: None, failures: 0, stopped: false }).collect();
-    let mut m = Manager { root, info, services, endpoints, running, order: order.clone(), listed: Vec::new(), described: String::new() };
+    // The log, when a service provides it: a ring for every other service,
+    // made before anything starts; the log starts first.
+    let mut order = order;
+    let log = match services.iter().position(|s| s.provides == Some("silica.log.Reader")) {
+        None => None,
+        Some(l) => {
+            let object = |ty, bits| Object::new(ty, bits).unwrap_or_else(|_| fail!("no memory for the log"));
+            let note = object(ObjectType::Notification, 0);
+            let flushed = object(ObjectType::Notification, 0);
+            let rings = (0..services.len()).map(|i| (i != l).then(|| object(ObjectType::Frame, silica_rt::log::BITS))).collect();
+            order.retain(|&i| i != l);
+            order.insert(0, l);
+            Some(LogSetup { service: l, note, flushed, rings })
+        }
+    };
+    let mut m =
+        Manager { root, info, services, endpoints, running, order: order.clone(), listed: Vec::new(), described: String::new(), log };
+    if let Some(l) = &m.log {
+        let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for the log"));
+        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, l.note.cap(), Rights::WRITE, FLUSH).is_err() {
+            fail!("cannot make the log's flush capability");
+        }
+        FLUSH_TO.store(to, Ordering::Relaxed);
+        FLUSHED.store(l.flushed.cap().0, Ordering::Relaxed);
+    }
     let mut listener = Listener::new(m.root.parent.exit);
 
     // The system, in order.
@@ -371,7 +443,9 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             if let Err(e) = m.start(i) {
                 fail!("{name}: {e}");
             }
-            match m.wait_for(&mut listener, i, 120 * SECOND) {
+            let ended = m.wait_for(&mut listener, i, 120 * SECOND);
+            flush_log();
+            match ended {
                 Ok(0) => println!("init: {name} passed"),
                 Ok(s) => fail!("{name} ended with status {s}"),
                 Err(e) => fail!("{name}: {e}"),
@@ -383,6 +457,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         checked = true;
     }
     if checked || checks.contains(&&b"programs"[..]) {
+        flush_log();
         if option(cmdline, "bench").is_some() || cmdline.split(|b| b.is_ascii_whitespace()).any(|w| w == b"bench") {
             println!("BENCH DONE");
         }
@@ -394,6 +469,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         finish(true)
     }
     // No checks: the system stays up, and its services are looked after.
+    flush_log();
     println!("BOOT OK");
     loop {
         let _ = m.step(&mut listener, Wait::Forever, None);

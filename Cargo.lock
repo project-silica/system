@@ -99,6 +99,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "logd"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "netcheck"
 version = "0.0.0"
 dependencies = [

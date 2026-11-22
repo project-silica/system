@@ -7,6 +7,7 @@
 //! - `devices`: the devices with a running driver, by class;
 //! - `restart-driver <device>`: end a device's driver and start it again;
 //! - `caps <service>`: what a running service holds and what its threads do;
+//! - `log <service>`: what a service printed (the last 32 KiB);
 //! - `shutdown`, `reboot`;
 //! - `echo <text>`, `help`.
 //!
@@ -17,6 +18,7 @@
 use core::fmt::Write;
 use silica_protocols::console::terminal;
 use silica_protocols::device::manager as devices;
+use silica_protocols::log::reader as log;
 use silica_protocols::system::manager as system;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
@@ -30,10 +32,11 @@ struct Shell {
     term: terminal::Client<Channel, Handle>,
     system: system::Client<Channel, Handle>,
     devices: devices::Client<Channel, Handle>,
+    log: log::Client<Channel, Handle>,
     out: String,
 }
 
-const HELP: &str = "commands: services, stop <service>, start <service>, caps <service>, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
+const HELP: &str = "commands: services, stop <service>, start <service>, caps <service>, log <service>, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
 
 impl Shell {
     fn say(&mut self) {
@@ -94,6 +97,31 @@ impl Shell {
                         }
                         Err(e) => {
                             let _ = writeln!(self.out, "caps: {arg}: {e:?}");
+                            break;
+                        }
+                    }
+                }
+            }
+            "log" if !arg.is_empty() => {
+                // From the oldest text kept, part by part, each line
+                // indented as the shell's other listings are.
+                let (mut from, mut fresh) = (0, true);
+                loop {
+                    match self.log.read(arg, from) {
+                        Ok(r) if !r.text.is_empty() => {
+                            for c in r.text.chars() {
+                                if fresh {
+                                    self.out.push_str("  ");
+                                }
+                                self.out.push(c);
+                                fresh = c == '\n';
+                            }
+                            from = r.next;
+                            self.say();
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            let _ = writeln!(self.out, "log: {arg}: {e:?}");
                             break;
                         }
                     }
@@ -161,6 +189,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         term: terminal::Client::from(grant(0)),
         system: system::Client::from(grant(1)),
         devices: devices::Client::from(grant(2)),
+        log: log::Client::from(grant(3)),
         out: String::new(),
     };
     let _ = shell.term.write("Silica. Type help for the commands.\n");

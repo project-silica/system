@@ -109,8 +109,10 @@ pub extern crate alloc;
 
 pub mod heap;
 pub mod ipc;
+pub mod log;
 pub mod mem;
 pub mod mmio;
+pub mod ring;
 
 pub use libsys as sys;
 
@@ -138,11 +140,16 @@ pub mod slots {
     /// The debug console (a console capability: `sys::console_write`), when
     /// the parent grants one; otherwise empty and [`crate::print!`] discards.
     pub const DEBUG: Cap = Cap(7);
+    /// The program's log ring, a frame of 16 KiB (`crate::log`), when the
+    /// service manager gives it one; [`crate::print!`] writes there then.
+    pub const LOG: Cap = Cap(8);
+    /// What tells the log there is text in the ring.
+    pub const LOG_WAKE: Cap = Cap(9);
     /// The first capability the parent granted beyond these. Slots from
     /// here to 64 that the parent did not fill are left empty, for
     /// capabilities the program is given later; the program's own
     /// allocations start above them.
-    pub const FIRST_GRANT: u64 = 8;
+    pub const FIRST_GRANT: u64 = 10;
 }
 
 /// `ProcessInfo::magic`.
@@ -200,9 +207,9 @@ pub fn clock() -> Clock {
     Clock::new([CLOCK[0].load(Ordering::Relaxed), CLOCK[1].load(Ordering::Relaxed), CLOCK[2].load(Ordering::Relaxed)])
 }
 
-/// The debug console: the kernel's console, through a console capability.
-/// For bring-up, panics and the serial line; the logging service (D08)
-/// replaces it for everything else. [`print!`] and [`println!`] format into
+/// What [`print!`] and [`println!`] write to: the program's log ring when
+/// it has one ([`log`]), else the kernel's console, through a console
+/// capability (bring-up, the root task, drivers). [`print!`] and [`println!`] format into
 /// a [`Line`] of up to 224 bytes and write it once, which the kernel puts
 /// on the console whole (`console_write`), so what one call prints is not
 /// split by anyone else's output unless it is longer than that. The kernel
@@ -212,6 +219,9 @@ pub struct Debug;
 
 impl fmt::Write for Debug {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        if log::write(s.as_bytes()) {
+            return Ok(());
+        }
         let console = Cap(DEBUG.load(Ordering::Relaxed));
         if console.0 != 0 {
             let _ = sys::console_write(console, s.as_bytes());
@@ -298,6 +308,7 @@ pub fn start(info: &'static ProcessInfo, main: fn(&'static ProcessInfo) -> i64) 
         exit(-1);
     }
     init(slots::DEBUG, info.clock);
+    log::start();
     ipc::init(info.ipc_buffer, info.first_free_slot, info.capspace_slots);
     mem::add_source(slots::UNTYPED, info.untyped_bits as u8);
     exit(main(info))

@@ -21,6 +21,7 @@ members = [
     "blkload",
     "netcheck",
     "netload",
+    "logd",
     "drivers/framework",
     "drivers/virtio-blk",
     "drivers/virtio-net",

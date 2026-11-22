@@ -7,7 +7,8 @@
 //! - [`input::device`]: `silica.input.Device`, the input device class;
 //! - [`display::device`]: `silica.display.Device`, the display device
 //!   class;
-//! - [`console::terminal`]: `silica.console.Terminal`, the local console.
+//! - [`console::terminal`]: `silica.console.Terminal`, the local console;
+//! - [`log::reader`]: `silica.log.Reader`, the system's log, read.
 //!
 //! Each module's reference page is `silica-idlc docs`'s page for the
 //! protocol. A program wraps a capability it was granted to a provider as
@@ -37,4 +38,9 @@ pub mod display {
 /// `silica.console.Terminal`.
 pub mod console {
     include!(concat!(env!("OUT_DIR"), "/silica_console_terminal.rs"));
+}
+
+/// `silica.log.Reader`.
+pub mod log {
+    include!(concat!(env!("OUT_DIR"), "/silica_log_reader.rs"));
 }
