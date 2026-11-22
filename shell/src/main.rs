@@ -6,7 +6,8 @@
 //! - `stop <service>`, `start <service>`;
 //! - `devices`: the devices with a running driver, by class;
 //! - `restart-driver <device>`: end a device's driver and start it again;
-//! - `caps <service>`: what a running service holds and what its threads do;
+//! - `caps <service>` or `caps <device>`: what a running service, or a
+//!   device's driver, holds and what its threads do;
 //! - `log <service>`: what a service printed (the last 32 KiB);
 //! - `trace`: one read of the first partition's block 0, traced through the
 //!   block server, the client and the driver;
@@ -22,6 +23,7 @@ use silica_protocols::console::terminal;
 use silica_protocols::device::{PciAddress, manager as devices};
 use silica_protocols::log::reader as log;
 use silica_protocols::system::manager as system;
+use silica_rt::alloc::format;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle};
@@ -38,7 +40,7 @@ struct Shell {
     out: String,
 }
 
-const HELP: &str = "commands: services, stop <service>, start <service>, caps <service>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
+const HELP: &str = "commands: services, stop <service>, start <service>, caps <service|device>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
 
 impl Shell {
     fn say(&mut self) {
@@ -83,14 +85,21 @@ impl Shell {
                 }
             }
             "caps" if !arg.is_empty() => {
-                // The service's report, part by part; each part is written
-                // out before the next is asked for.
+                // A device (its address, or its driver's log name,
+                // devmgr/<driver>@<address>) is the device manager's to
+                // describe; any other name is a service's. The report comes
+                // part by part; each part is written out before the next is
+                // asked for.
+                let device = arg.rsplit_once('@').map_or(arg, |(_, a)| a).parse::<PciAddress>().ok();
                 let mut from = 0;
                 loop {
-                    match self.system.describe(arg, from) {
-                        Ok(r) => {
-                            self.out.push_str(r.text);
-                            let next = r.next;
+                    let part = match device {
+                        Some(id) => self.devices.describe(id.0, from).map(|r| (String::from(r.text), r.next)).map_err(|e| format!("{e:?}")),
+                        None => self.system.describe(arg, from).map(|r| (String::from(r.text), r.next)).map_err(|e| format!("{e:?}")),
+                    };
+                    match part {
+                        Ok((text, next)) => {
+                            self.out.push_str(&text);
                             self.say();
                             if next == 0 {
                                 break;
@@ -98,7 +107,7 @@ impl Shell {
                             from = next;
                         }
                         Err(e) => {
-                            let _ = writeln!(self.out, "caps: {arg}: {e:?}");
+                            let _ = writeln!(self.out, "caps: {arg}: {e}");
                             break;
                         }
                     }

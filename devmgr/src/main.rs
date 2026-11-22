@@ -152,6 +152,8 @@ struct Manager {
     next_id: u64,
     /// What `list` answers with, rebuilt for each call.
     listing: Vec<manager::Device<'static>>,
+    /// What `describe` answers with, one part of it.
+    described: silica_rt::alloc::string::String,
     /// Badges of driver capabilities handed out, so each client is told apart.
     next_client: u64,
     /// The kernel command line: `inject=<driver>:<fault>@<n>`
@@ -244,6 +246,26 @@ impl manager::Server<Handle> for Manager {
             manager::Error::NoSuchDevice
         })?;
         Ok(manager::RestartReply {})
+    }
+
+    fn describe<'a>(&'a mut self, id: u32, from: u32) -> Result<manager::DescribeReply<'a>, manager::Error> {
+        let functions = &self.functions;
+        let r = self.running.iter().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+        let name = silica_rt::alloc::format!("{}@{}", r.name, PciAddress(id));
+        let mut all = silica_rt::alloc::string::String::new();
+        silica_proc::report(&mut all, &name, r.child.space()).map_err(|_| manager::Error::NoSuchDevice)?;
+        // Whole lines from `from`, as many as fit a message.
+        self.described.clear();
+        let mut next = 0;
+        for (n, line) in all.lines().enumerate().skip(from as usize) {
+            if self.described.len() + line.len() + 1 > 3000 {
+                next = n as u32;
+                break;
+            }
+            self.described.push_str(line);
+            self.described.push('\n');
+        }
+        Ok(manager::DescribeReply { text: &self.described, next })
     }
 }
 
@@ -763,6 +785,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         next_line: info.msi_first as u32,
         next_id: 0,
         listing: Vec::new(),
+        described: silica_rt::alloc::string::String::new(),
         next_client: CLIENTS,
         cmdline: &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())],
         ports: Vec::new(),
