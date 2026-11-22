@@ -114,9 +114,15 @@ impl Config {
 
     /// Memory BAR `index` as it is now, without its size: its address, and
     /// whether it takes two registers (64 bits). `None` for an I/O port BAR
-    /// or an index beyond the header's BARs.
+    /// or an index beyond the header's BARs (six for a device, two for a
+    /// bridge, none for a header type this does not know), including a
+    /// 64-bit BAR whose upper half would lie beyond them.
     pub fn bar_address(&self, index: usize) -> Option<(u64, bool)> {
-        let count = if self.header() == 0 { 6 } else { 2 };
+        let count = match self.header() {
+            0 => 6,
+            1 => 2,
+            _ => 0,
+        };
         if index >= count {
             return None;
         }
@@ -125,7 +131,10 @@ impl Config {
             return None;
         }
         let wide = lo >> 1 & 3 == 2;
-        let hi = if wide && index + 1 < count { self.0.read32(0x14 + index * 4) } else { 0 };
+        if wide && index + 1 >= count {
+            return None;
+        }
+        let hi = if wide { self.0.read32(0x14 + index * 4) } else { 0 };
         Some(((hi as u64) << 32 | (lo & !0xF) as u64, wide))
     }
 

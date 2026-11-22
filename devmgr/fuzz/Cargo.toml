@@ -1,0 +1,29 @@
+[package]
+name = "devmgr-fuzz"
+description = "Coverage-guided fuzz targets for what the device manager and a driver read from PCI configuration space (run by tools/fuzz.sh)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+devmgr = { path = ".." }
+silica-driver = { path = "../../drivers/framework" }
+silica-rt = { path = "../../rt" }
+
+[[bin]]
+name = "pci_config"
+path = "fuzz_targets/pci_config.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the system workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[profile.release]
+debug = 1

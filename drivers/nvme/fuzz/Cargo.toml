@@ -1,0 +1,28 @@
+[package]
+name = "nvme-fuzz"
+description = "Coverage-guided fuzz targets for what an NVMe controller writes and the driver reads (run by tools/fuzz.sh)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nvme = { path = ".." }
+silica-rt = { path = "../../../rt" }
+
+[[bin]]
+name = "nvme_controller"
+path = "fuzz_targets/nvme_controller.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the system workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[profile.release]
+debug = 1

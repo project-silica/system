@@ -15,6 +15,11 @@ memory = 26
 start = "boot"
 restart = "never"
 
+[lib]
+path = "src/lib.rs"
+test = false
+bench = false
+
 [[bin]]
 name = "devmgr"
 path = "src/main.rs"

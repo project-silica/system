@@ -1,0 +1,27 @@
+[package]
+name = "silica-rt-fuzz"
+description = "Coverage-guided fuzz targets for the runtime's shared-memory rings: what a peer writes and this side reads (run by tools/fuzz.sh)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+silica-rt = { path = ".." }
+
+[[bin]]
+name = "ring"
+path = "fuzz_targets/ring.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the system workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[profile.release]
+debug = 1

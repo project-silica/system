@@ -78,11 +78,14 @@ struct Window {
 }
 
 impl Window {
-    fn take(&mut self, bits: u8) -> Option<u64> {
+    /// `2^bits` bytes at a multiple of their size; for a 32-bit BAR
+    /// (`wide` false) below 4 GiB, which is all its register can say.
+    fn take(&mut self, bits: u8, wide: bool) -> Option<u64> {
         let size = 1u64 << bits;
         let at = self.next.checked_add(size - 1)? & !(size - 1);
         let end = at.checked_add(size)?;
-        (end <= self.end).then(|| {
+        let limit = if wide { self.end } else { self.end.min(1 << 32) };
+        (end <= limit).then(|| {
             self.next = end;
             at
         })
@@ -118,7 +121,9 @@ impl Port {
         if r.read16(express + CAPS) & SLOT_IMPLEMENTED == 0 || r.read32(express + SLOT_CAPS) & HOT_PLUG_CAPABLE == 0 {
             return None;
         }
-        let window = |base: u64, limit: u64| (base <= limit).then_some(Window { next: base, end: limit + 1 });
+        // A limit at the very top of the address space (a 64-bit window's
+        // upper half all ones) gives up its last byte rather than wrap.
+        let window = |base: u64, limit: u64| (base <= limit).then_some(Window { next: base, end: limit.saturating_add(1) });
         // Bits 15..4 of the base and limit registers are address bits 31..20.
         let memory = window(((r.read16(0x20) & 0xFFF0) as u64) << 16, ((r.read16(0x22) & 0xFFF0) as u64) << 16 | 0xF_FFFF);
         let (pb, pl) = (r.read16(0x24), r.read16(0x26));
@@ -222,11 +227,16 @@ impl Port {
             };
             if let Some((bits, prefetch)) = f.bar_size(i) {
                 let bits = bits.max(12);
-                // Prefetchable memory from its own window when the port has one.
-                let at = match (prefetch, self.prefetchable.as_mut()) {
-                    (true, Some(w)) => w.take(bits),
-                    _ => self.memory.as_mut().and_then(|w| w.take(bits)),
-                };
+                // Prefetchable memory from its own window when the port has
+                // one with room (a 32-bit BAR: below 4 GiB), else from the
+                // plain window, where any BAR may go.
+                let mut at = None;
+                if prefetch {
+                    at = self.prefetchable.as_mut().and_then(|w| w.take(bits, wide));
+                }
+                if at.is_none() {
+                    at = self.memory.as_mut().and_then(|w| w.take(bits, wide));
+                }
                 let Some(at) = at else {
                     let w = |w: Option<Window>| w.map(|w| (w.next, w.end));
                     return Err((i, bits, w(self.memory), w(self.prefetchable)));

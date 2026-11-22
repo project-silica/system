@@ -15,13 +15,13 @@
 #![no_std]
 #![no_main]
 
+use ::partitions as gpt;
 use silica_block::client::Disk;
 use silica_block::device;
 use silica_block::partitions::{self, Error, ListReply, OpenReply, Partition};
 use silica_block::{Op, Request};
 use silica_idl_rt::{Array, CapList};
 use silica_protocols::device::manager;
-use silica_rt::alloc::format;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, serve};
@@ -56,48 +56,11 @@ fn keep(s: String) -> &'static str {
     silica_rt::alloc::boxed::Box::leak(s.into_boxed_str())
 }
 
-/// CRC-32 (IEEE, reflected), as the GPT uses.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in bytes {
-        c ^= b as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { c >> 1 ^ 0xEDB8_8320 } else { c >> 1 };
-        }
-    }
-    !c
-}
-
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    le32(b, at) as u64 | (le32(b, at + 4) as u64) << 32
-}
-
-/// A GUID in its usual text form (the first three fields little-endian).
-fn guid(g: &[u8]) -> String {
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        le32(g, 0),
-        u16::from_le_bytes([g[4], g[5]]),
-        u16::from_le_bytes([g[6], g[7]]),
-        g[8],
-        g[9],
-        g[10],
-        g[11],
-        g[12],
-        g[13],
-        g[14],
-        g[15]
-    )
-}
-
 /// The partitions of disk `id`, from its GPT.
 fn table(id: u32) -> Result<Vec<Part>, &'static str> {
     let mut disk = Disk::open(DEVICES, id).map_err(|_| "it cannot be opened")?;
     let bs = disk.info().block_size as usize;
+    let disk_blocks = disk.info().blocks;
     let memory = Memory::new(16).map_err(|_| "no memory")?;
     disk.add_memory(0, &memory, true).map_err(|_| "its driver takes no memory")?;
     let m = memory.shared();
@@ -106,54 +69,22 @@ fn table(id: u32) -> Result<Vec<Part>, &'static str> {
         disk.run(&r, Some(silica_rt::clock().now() + 5 * SECOND)).map_err(|_| "a read failed")?;
         Ok((0..blocks as usize * bs).map(|i| m.read8(i)).collect())
     };
-    let mut header = read(&mut disk, 1, 1)?;
-    if &header[..8] != b"EFI PART" {
-        return Ok(Vec::new());
-    }
-    let size = (le32(&header, 12) as usize).clamp(92, bs);
-    let sum = le32(&header, 16);
-    header[16..20].fill(0);
-    if crc32(&header[..size]) != sum {
-        return Err("its GPT header's checksum is wrong");
-    }
-    let (at, count, entry) = (le64(&header, 72), le32(&header, 80) as usize, le32(&header, 84) as usize);
-    if !(128..=1024).contains(&entry) || !entry.is_power_of_two() || count > 1024 {
-        return Err("its GPT describes entries no table has");
-    }
-    let bytes = count * entry;
-    let blocks = bytes.div_ceil(bs) as u32;
+    let Some(header) = gpt::header(&read(&mut disk, 1, 1)?, disk_blocks)? else { return Ok(Vec::new()) };
+    let blocks = header.entries_len().div_ceil(bs) as u32;
     if blocks as usize * bs > memory.len() {
         return Err("its GPT's entries do not fit the memory read into");
     }
-    let entries = read(&mut disk, at, blocks)?;
-    if crc32(&entries[..bytes]) != le32(&header, 88) {
-        return Err("its GPT entries' checksum is wrong");
+    let entries = read(&mut disk, header.entries_at, blocks)?;
+    let parts = gpt::entries(&header, &entries, |i, why| println!("partitions: disk {id:#x}: entry {i} left out: {why}"))?;
+    // A partition is named by its disk and its index in a byte.
+    for e in parts.iter().filter(|e| e.index > 0xFF) {
+        println!("partitions: disk {id:#x}: entry {} left out: only the first 256 entries are numbered", e.index);
     }
-    let disk_blocks = disk.info().blocks;
-    let mut parts = Vec::new();
-    for i in 0..count {
-        let e = &entries[i * entry..(i + 1) * entry];
-        if e[..16].iter().all(|b| *b == 0) {
-            continue;
-        }
-        let (first, last) = (le64(e, 32), le64(e, 40));
-        if first > last || last >= disk_blocks {
-            println!("partitions: disk {id:#x}: entry {i} lies outside the disk; left out");
-            continue;
-        }
-        let name: String = char::decode_utf16((0..36).map(|k| u16::from_le_bytes([e[56 + 2 * k], e[57 + 2 * k]])).take_while(|c| *c != 0))
-            .map(|c| c.unwrap_or('?'))
-            .collect();
-        parts.push(Part {
-            id: id << 8 | i as u32,
-            disk: id,
-            first,
-            blocks: last - first + 1,
-            kind: keep(guid(&e[..16])),
-            name: keep(name),
-        });
-    }
-    Ok(parts)
+    Ok(parts
+        .into_iter()
+        .filter(|e| e.index <= 0xFF)
+        .map(|e| Part { id: id << 8 | e.index as u32, disk: id, first: e.first, blocks: e.blocks, kind: keep(e.kind), name: keep(e.name) })
+        .collect())
 }
 
 impl partitions::Server<Handle> for Server {

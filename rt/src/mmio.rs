@@ -18,7 +18,9 @@ pub struct Mmio {
 macro_rules! access {
     ($read:ident, $write:ident, $t:ty) => {
         /// Read the register at byte `offset`. Panics when it does not lie
-        /// in the range (take offsets from a device through [`Mmio::part`]).
+        /// in the range or its address is not a multiple of its width (take
+        /// offsets from a device through [`Mmio::part`], and check their
+        /// alignment where the device chose them).
         pub fn $read(&self, offset: usize) -> $t {
             let p = self.at(offset, core::mem::size_of::<$t>());
             // SAFETY: `at` checked that the access lies inside the range,
@@ -68,8 +70,10 @@ impl Mmio {
     }
 
     fn at(&self, offset: usize, width: usize) -> usize {
+        // Aligned as an address, not only as an offset: a range taken at an
+        // offset a device chose ([`Mmio::part`]) may itself be misaligned.
         assert!(
-            offset.is_multiple_of(width) && offset.checked_add(width).is_some_and(|end| end <= self.len),
+            offset.checked_add(width).is_some_and(|end| end <= self.len) && (self.base + offset).is_multiple_of(width),
             "device register access outside its range or misaligned"
         );
         self.base + offset

@@ -43,7 +43,7 @@ use core::convert::Infallible;
 use silica_block::device::{Error, Info};
 use silica_block::service::{CLIENT, Completions, Device as BlockDevice, Refusal, Service, Ticket};
 use silica_block::{Op, Request, Status};
-use silica_driver::dma::{self, Dma, DmaMemory, Shared};
+use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject::{self, Fault};
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::{Device, DeviceError};
@@ -51,6 +51,8 @@ use silica_rt::alloc::vec::Vec;
 use silica_rt::mmio::Mmio;
 use silica_rt::println;
 use silica_rt::sys::{self, Cap, Wait};
+
+use nvme::{MAX_NAMESPACES, NO_BLOCKS, Namespace, Queue, status};
 
 silica_rt::main!(main);
 
@@ -130,109 +132,18 @@ fn write64(regs: &Mmio, at: usize, value: u64) {
     regs.write32(at + 4, (value >> 32) as u32);
 }
 
-/// One completion queue entry, checked against its queue.
-struct Completion {
-    result: u32,
-    cid: u16,
-    /// Status field without the phase: SC bits 0..8, SCT 8..11, CRD, M, DNR.
-    status: u16,
-}
-
-/// A submission queue and the completion queue it reports to, of the same size.
-struct Queue {
-    id: u16,
-    entries: u16,
-    sq: DmaMemory,
-    cq: DmaMemory,
-    sq_mem: Mmio,
-    cq_mem: Mmio,
-    sq_bell: Mmio,
-    cq_bell: Mmio,
-    /// Where the next command goes.
-    tail: u16,
-    /// The oldest command the controller has not yet taken, as it last said.
-    head: u16,
-    cq_head: u16,
-    phase: bool,
-}
-
-impl Queue {
-    fn new(dma: &Dma, regs: &Mmio, stride: usize, id: u16, entries: u16) -> Result<Queue, DeviceError> {
-        let bell = |n: usize| regs.part(DOORBELLS + n * stride, 4).ok_or(DeviceError::Missing("a doorbell inside BAR 0"));
-        // The device only reads its submissions; only completions are its to write.
-        let sq = dma.memory(bits_for(entries as usize * 64), false)?;
-        let cq = dma.memory(bits_for(entries as usize * 16), true)?;
-        Ok(Queue {
-            id,
-            entries,
-            sq_mem: sq.shared(),
-            cq_mem: cq.shared(),
-            sq,
-            cq,
-            sq_bell: bell(2 * id as usize)?,
-            cq_bell: bell(2 * id as usize + 1)?,
-            tail: 0,
-            head: 0,
-            cq_head: 0,
-            phase: true,
-        })
-    }
-
-    fn submitted(&self) -> u16 {
-        (self.tail + self.entries - self.head) % self.entries
-    }
-
-    fn full(&self) -> bool {
-        self.submitted() == self.entries - 1
-    }
-
-    /// Put `command` in the next free entry (the caller checked `full`).
-    fn push(&mut self, command: &[u32; 16]) {
-        let at = self.tail as usize * 64;
-        for (i, word) in command.iter().enumerate() {
-            self.sq_mem.write32(at + 4 * i, *word);
-        }
-        self.tail = (self.tail + 1) % self.entries;
-    }
-
-    /// Tell the controller about every command pushed so far.
-    fn ring(&self) {
-        // The entries must be in memory before the controller hears of them.
-        dma::write_barrier();
-        self.sq_bell.write32(0, self.tail as u32);
-    }
-
-    /// The next completion, if the controller has posted one.
-    fn pop(&mut self) -> Result<Option<Completion>, DeviceError> {
-        let at = self.cq_head as usize * 16;
-        let dw3 = self.cq_mem.read32(at + 12);
-        if (dw3 & 1 << 16 != 0) != self.phase {
-            return Ok(None);
-        }
-        dma::read_barrier();
-        let result = self.cq_mem.read32(at);
-        let dw2 = self.cq_mem.read32(at + 8);
-        self.cq_head += 1;
-        if self.cq_head == self.entries {
-            self.cq_head = 0;
-            self.phase = !self.phase;
-        }
-        let (sq_head, sq_id) = (dw2 as u16, (dw2 >> 16) as u16);
-        if sq_id != self.id {
-            return Err(DeviceError::Protocol("a completion names another submission queue"));
-        }
-        let moved = (sq_head as u32 + self.entries as u32 - self.head as u32) % self.entries as u32;
-        if sq_head >= self.entries || moved > self.submitted() as u32 {
-            return Err(DeviceError::Protocol("a completion moves the submission queue head past its tail"));
-        }
-        self.head = sq_head;
-        Ok(Some(Completion { result, cid: dw3 as u16, status: (dw3 >> 17) as u16 }))
-    }
-
-    /// Give the completions taken so far back to the controller.
-    fn release(&self) {
-        self.cq_bell.write32(0, self.cq_head as u32);
-    }
+/// Queue pair `id` of `entries` entries in new DMA memory, with its
+/// doorbells, and the device addresses of its submission and completion
+/// queues.
+fn queue(dma: &Dma, regs: &Mmio, stride: usize, id: u16, entries: u16) -> Result<(Queue, u64, u64), DeviceError> {
+    let bell = |n: usize| regs.part(DOORBELLS + n * stride, 4).ok_or(DeviceError::Missing("a doorbell inside BAR 0"));
+    // The device only reads its submissions; only completions are its to write.
+    // Never unmapped (`DmaMemory`): the views outlive the values.
+    let sq = dma.memory(bits_for(entries as usize * 64), false)?;
+    let cq = dma.memory(bits_for(entries as usize * 16), true)?;
+    let q = Queue::over(id, entries, sq.shared(), cq.shared(), bell(2 * id as usize)?, bell(2 * id as usize + 1)?)
+        .ok_or(DeviceError::Missing("a queue of at least two entries"))?;
+    Ok((q, sq.device_address(), cq.device_address()))
 }
 
 /// The controller during bring-up, when the driver waits for one thing at a time.
@@ -319,23 +230,15 @@ impl Controller {
         self.admin(c, what).map(|_| ())
     }
 
-    fn create_queue(&mut self, opcode: u32, q: &Queue, memory: &DmaMemory, cdw11: u32, what: &'static str) -> Result<(), DeviceError> {
+    fn create_queue(&mut self, opcode: u32, q: &Queue, address: u64, cdw11: u32, what: &'static str) -> Result<(), DeviceError> {
         let mut c = [0u32; 16];
         c[0] = opcode;
-        c[6] = memory.device_address() as u32;
-        c[7] = (memory.device_address() >> 32) as u32;
+        c[6] = address as u32;
+        c[7] = (address >> 32) as u32;
         c[10] = (q.entries as u32 - 1) << 16 | q.id as u32;
         c[11] = cdw11;
         self.admin(c, what).map(|_| ())
     }
-}
-
-/// A namespace this driver can serve, as Identify describes it.
-struct Namespace {
-    id: u32,
-    block_bits: u32,
-    blocks: u64,
-    read_only: bool,
 }
 
 /// Namespace `nsid` as Identify Namespace describes it: `Ok(Err(why))` for
@@ -343,34 +246,8 @@ struct Namespace {
 /// relied on.
 fn namespace(ctl: &mut Controller, buffer: &DmaMemory, nsid: u32) -> Result<Result<Namespace, &'static str>, DeviceError> {
     ctl.identify(buffer, 0, nsid, "Identify Namespace")?;
-    let m = buffer.shared();
-    let blocks = read64(&m, 0);
-    if blocks == 0 {
-        // Before NVMe 1.1 an inactive namespace reads as zeros.
-        return Ok(Err(NO_BLOCKS));
-    }
-    let formats = m.read8(25) as u32; // NLBAF, zero-based
-    let flbas = m.read8(26) as u32;
-    let format = (flbas & 0xF) | (flbas >> 5 & 3) << 4;
-    if format > formats {
-        return Err(DeviceError::Protocol("the namespace's format index names no format"));
-    }
-    let lbaf = m.read32(128 + 4 * format as usize);
-    if lbaf & 0xFFFF != 0 {
-        return Ok(Err("its format carries metadata"));
-    }
-    let block_bits = lbaf >> 16 & 0xFF;
-    if !(9..=16).contains(&block_bits) {
-        return Ok(Err("its blocks are not 512 bytes to 64 KiB"));
-    }
-    Ok(Ok(Namespace { id: nsid, block_bits, blocks, read_only: m.read8(99) & 1 != 0 }))
+    nvme::namespace(&buffer.shared(), nsid)
 }
-
-/// Why a namespace with no blocks (or an inactive one) is not served.
-const NO_BLOCKS: &str = "it has no blocks";
-
-/// The most namespaces looked at: one page of Identify's active list.
-const MAX_NAMESPACES: usize = 1024;
 
 /// The controller's active namespaces, in increasing order (at most
 /// [`MAX_NAMESPACES`]). `namespaces` is Identify Controller's NN.
@@ -380,21 +257,8 @@ fn active_namespaces(ctl: &mut Controller, buffer: &DmaMemory, version: u32, nam
         // ones told apart by Identify Namespace.
         return Ok((1..=namespaces.min(MAX_NAMESPACES as u32)).collect());
     }
-    // Active identifiers above 0, ascending, the list ending at the first zero.
     ctl.identify(buffer, 2, 0, "Identify Active Namespace List")?;
-    let m = buffer.shared();
-    let mut ids: Vec<u32> = Vec::new();
-    for i in 0..MAX_NAMESPACES {
-        let id = m.read32(4 * i);
-        if id == 0 {
-            break;
-        }
-        if id == u32::MAX || ids.last().is_some_and(|&last| id <= last) || (namespaces != 0 && id > namespaces) {
-            return Err(DeviceError::Protocol("the active namespace list is not one"));
-        }
-        ids.push(id);
-    }
-    Ok(ids)
+    nvme::active_list(&buffer.shared(), namespaces)
 }
 
 /// The driver's part of the block service: the I/O queue pair.
@@ -455,17 +319,6 @@ impl Disk {
 fn give_up(why: DeviceError) -> ! {
     println!("nvme: giving up on the controller: {:?}", why);
     silica_rt::exit(2)
-}
-
-/// A completion's status as the block protocol says it.
-fn status(s: u16) -> Result<(), Status> {
-    let (code, kind) = (s & 0xFF, s >> 8 & 7);
-    match (kind, code) {
-        (0, 0) => Ok(()),
-        // Invalid opcode, invalid field, LBA out of range.
-        (0, 0x01 | 0x02 | 0x80) => Err(Status::Invalid),
-        _ => Err(Status::Io),
-    }
 }
 
 impl BlockDevice for Disk {
@@ -614,11 +467,11 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     if cap >> 48 & 0xF != 0 {
         return Err(DeviceError::Missing("4 KiB memory pages"));
     }
-    let io_entries = IO_ENTRIES.min((cap & 0xFFFF) as u16 + 1).max(2);
+    let io_entries = nvme::queue_entries(cap, IO_ENTRIES);
     let stride = 4usize << (cap >> 32 & 0xF);
     let version = regs.read32(VS);
 
-    let admin = Queue::new(&dma, &regs, stride, 0, ADMIN_ENTRIES)?;
+    let (admin, asq, acq) = queue(&dma, &regs, stride, 0, ADMIN_ENTRIES)?;
     let mut ctl = Controller {
         regs: regs.part(0, regs.len()).ok_or(DeviceError::Missing("BAR 0"))?,
         ready_ns: (cap >> 24 & 0xFF).max(1) * 500_000_000,
@@ -637,8 +490,8 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     ctl.wait_ready(false)?;
     let a = ADMIN_ENTRIES as u32 - 1;
     regs.write32(AQA, a << 16 | a);
-    write64(&regs, ASQ, ctl.admin.sq.device_address());
-    write64(&regs, ACQ, ctl.admin.cq.device_address());
+    write64(&regs, ASQ, asq);
+    write64(&regs, ACQ, acq);
     regs.write32(CC, CC_ENTRY_SIZES | CC_EN);
     ctl.wait_ready(true)?;
 
@@ -688,11 +541,11 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     c[0] = ADMIN_SET_FEATURES;
     c[10] = FEATURE_QUEUES;
     ctl.admin(c, "Set Features (Number of Queues)")?;
-    let io = Queue::new(&dma, &regs, stride, 1, io_entries)?;
+    let (io, sq, cq) = queue(&dma, &regs, stride, 1, io_entries)?;
     let vector = io_irq.is_some() as u32;
     // Physically contiguous, interrupts on, on `vector`.
-    ctl.create_queue(ADMIN_CREATE_CQ, &io, &io.cq, vector << 16 | 3, "Create I/O Completion Queue")?;
-    ctl.create_queue(ADMIN_CREATE_SQ, &io, &io.sq, (io.id as u32) << 16 | 1, "Create I/O Submission Queue")?;
+    ctl.create_queue(ADMIN_CREATE_CQ, &io, cq, vector << 16 | 3, "Create I/O Completion Queue")?;
+    ctl.create_queue(ADMIN_CREATE_SQ, &io, sq, (io.id as u32) << 16 | 1, "Create I/O Submission Queue")?;
 
     let mut max_bytes = MAX_TRANSFER;
     if mdts != 0 && mdts < 32 {

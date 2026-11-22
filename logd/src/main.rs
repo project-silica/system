@@ -125,9 +125,8 @@ impl Log {
                 Ok(Some(r)) => {
                     taken += 1;
                     s.broken = false;
-                    let n = (r[0] as usize).min(RECORD - 1);
-                    let text = &r[1..1 + n];
-                    s.written += n as u64;
+                    let text = silica_rt::log::text(&r);
+                    s.written += text.len() as u64;
                     for &b in text {
                         if s.kept.len() == KEPT {
                             s.kept.pop_front();

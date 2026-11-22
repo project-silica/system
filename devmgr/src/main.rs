@@ -58,10 +58,10 @@
 #![no_std]
 #![no_main]
 
-mod hotplug;
 mod phys;
 mod power;
 
+use devmgr::hotplug;
 use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, KIND_RAMDISK, ROOT_MAGIC, RootInfo};
 use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use phys::DeviceMemory;

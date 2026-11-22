@@ -13,7 +13,7 @@
 //! in use and never reads one back; a completion that names a descriptor
 //! the driver did not offer is a protocol error, reported, not followed.
 
-use crate::dma::{self, Dma, DmaMemory};
+use crate::dma::{self, Dma};
 use crate::inject::{self, Fault};
 use crate::pci::CAP_VENDOR;
 use crate::{Device, DeviceError};
@@ -85,6 +85,11 @@ impl Transport {
             }
             let (kind, bar) = (reg.read8(at + 3), reg.read8(at + 4) as usize);
             let (offset, length) = (reg.read32(at + 8) as usize, reg.read32(at + 12) as usize);
+            // Every structure is 4-byte aligned (virtio 1.2, 4.1.4), the
+            // notification one 2-byte; one that is not is not used.
+            if offset % if kind == 2 { 2 } else { 4 } != 0 {
+                continue;
+            }
             // The first capability of each kind that names registers the
             // driver was given wins (the specification's order of preference).
             let Some(part) = device.bar(bar).and_then(|b| b.part(offset, length)) else { continue };
@@ -198,8 +203,8 @@ impl Transport {
             return Err(DeviceError::Protocol("a queue of no descriptors"));
         }
         self.common.write16(QUEUE_SIZE, size);
-        let q = Queue::new(dma, size)?;
-        for (reg, address) in [(QUEUE_DESC, q.desc_address()), (QUEUE_DRIVER, q.avail_address()), (QUEUE_DEVICE, q.used_address())] {
+        let (q, addresses) = Queue::new(dma, size)?;
+        for (reg, address) in [QUEUE_DESC, QUEUE_DRIVER, QUEUE_DEVICE].into_iter().zip(addresses) {
             self.common.write32(reg, address as u32);
             self.common.write32(reg + 4, (address >> 32) as u32);
         }
@@ -212,8 +217,11 @@ impl Transport {
             self.common.write16(QUEUE_VECTOR, NO_VECTOR);
         }
         let at = self.common.read16(QUEUE_NOTIFY_OFF) as usize * self.notify_multiplier as usize;
-        let notify =
-            self.notify.part(at, 2).ok_or(DeviceError::Protocol("the queue's notification register lies outside its structure"))?;
+        let notify = self
+            .notify
+            .part(at, 2)
+            .filter(|n| n.addr() % 2 == 0)
+            .ok_or(DeviceError::Protocol("the queue's notification register lies outside its structure or is misaligned"))?;
         self.common.write16(QUEUE_ENABLE, 1);
         Ok(Queue { notify, index, common: self.common, event_idx: self.event_idx.get(), ..q })
     }
@@ -242,7 +250,7 @@ impl Transport {
 /// device writes it.
 #[derive(Clone, Copy, Debug)]
 pub struct Buffer {
-    /// The device's address for it ([`DmaMemory::device_address`], [`Dma::share`]).
+    /// The device's address for it ([`crate::dma::DmaMemory::device_address`], [`Dma::share`]).
     pub address: u64,
     /// Its length in bytes.
     pub len: u32,
@@ -260,17 +268,17 @@ pub struct Queue {
     size: u16,
     index: u16,
     /// Descriptor table, then the available ring: the device only reads them.
-    driver_area: DmaMemory,
+    driver_area: Mmio,
     /// The used ring: the device writes it.
-    device_area: DmaMemory,
+    device_area: Mmio,
     notify: Mmio,
     /// Descriptors not in use, linked through `next`.
     free: u16,
     free_count: u16,
     /// The driver's own record of each descriptor's successor, and for a
-    /// chain's first descriptor its token and length while it is with the device.
+    /// chain's first descriptor what it was offered as while it is with the device.
     next: Vec<u16>,
-    offered: Vec<Option<(u64, u16)>>,
+    offered: Vec<Option<Offered>>,
     /// The next available-ring index to write, and how many were written
     /// since the device was last told.
     avail: u16,
@@ -288,14 +296,50 @@ pub struct Queue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueueFull;
 
+/// A request while the device has it: its token, how many descriptors it
+/// takes, and how many bytes the device may write into it.
+#[derive(Clone, Copy, Debug)]
+struct Offered {
+    token: u64,
+    count: u16,
+    writable: u64,
+}
+
+/// The bytes a split virtqueue of `size` descriptors takes in the area only
+/// the driver writes (the descriptor table, then the available ring) and in
+/// the area the device writes (the used ring).
+pub const fn queue_areas(size: u16) -> (usize, usize) {
+    let n = size as usize;
+    // Descriptors (16 bytes each), then flags, index, the ring, used_event;
+    // flags, index, the ring (8 bytes each), avail_event.
+    (16 * n + 6 + 2 * n, 6 + 8 * n)
+}
+
 impl Queue {
-    fn new(dma: &Dma, size: u16) -> Result<Queue, DeviceError> {
-        let n = size as usize;
+    /// The queue's memory, and the device addresses of its descriptor
+    /// table, available ring and used ring.
+    fn new(dma: &Dma, size: u16) -> Result<(Queue, [u64; 3]), DeviceError> {
         let bits_for = |bytes: usize| (usize::BITS - (bytes.max(4096) - 1).leading_zeros()) as u8;
-        // Descriptors (16 bytes each), then flags, index, the ring, used_event.
-        let driver_area = dma.memory(bits_for(16 * n + 6 + 2 * n), false)?;
-        // Flags, index, the ring (8 bytes each), avail_event.
-        let device_area = dma.memory(bits_for(6 + 8 * n), true)?;
+        let (driver, device) = queue_areas(size);
+        let driver_area = dma.memory(bits_for(driver), false)?;
+        let device_area = dma.memory(bits_for(device), true)?;
+        // Never unmapped (`DmaMemory`), so the views outlive the values.
+        let q = Queue::over(size, driver_area.shared(), device_area.shared())?;
+        let at = driver_area.device_address();
+        Ok((q, [at, at + 16 * size as u64, device_area.device_address()]))
+    }
+
+    /// A queue of `size` descriptors (a power of two up to 32768) laid out
+    /// in `driver_area` and `device_area` ([`queue_areas`] says how many
+    /// bytes each needs; both zeroed), with no notification register: what
+    /// [`Transport::queue`] builds on, and how a test or a fuzzer plays the
+    /// device against the queue a driver uses.
+    pub fn over(size: u16, driver_area: Mmio, device_area: Mmio) -> Result<Queue, DeviceError> {
+        let (driver, device) = queue_areas(size);
+        if !size.is_power_of_two() || size > 1 << 15 || driver_area.len() < driver || device_area.len() < device {
+            return Err(DeviceError::Kernel(silica_rt::sys::Error::BadArg));
+        }
+        let n = size as usize;
         let mut next = Vec::new();
         let mut offered = Vec::new();
         next.try_reserve_exact(n).map_err(|_| silica_rt::sys::Error::NoMemory)?;
@@ -304,8 +348,8 @@ impl Queue {
             next.push(if i + 1 < size { i + 1 } else { NONE });
             offered.push(None);
         }
-        // SAFETY: an empty range; replaced by the queue's notification
-        // register before the queue is returned to the driver.
+        // SAFETY: an empty range; every access to it panics. The
+        // transport replaces it with the queue's notification register.
         #[allow(unsafe_code)]
         let notify = unsafe { Mmio::new(0, 0) };
         Ok(Queue {
@@ -326,14 +370,10 @@ impl Queue {
         })
     }
 
-    fn desc_address(&self) -> u64 {
-        self.driver_area.device_address()
-    }
-    fn avail_address(&self) -> u64 {
-        self.driver_area.device_address() + 16 * self.size as u64
-    }
-    fn used_address(&self) -> u64 {
-        self.device_area.device_address()
+    /// Use event indices (`F_RING_EVENT_IDX`), and `register` as the
+    /// queue's notification register: for a queue made by [`Queue::over`].
+    pub fn with_notify(self, register: Mmio, event_idx: bool) -> Queue {
+        Queue { notify: register, event_idx, ..self }
     }
 
     /// How many descriptors the queue has.
@@ -354,7 +394,7 @@ impl Queue {
         if buffers.is_empty() || buffers.len() > self.free_count as usize {
             return Err(QueueFull);
         }
-        let d = self.driver_area.shared();
+        let d = self.driver_area;
         let head = self.free;
         let mut at = head;
         for (i, b) in buffers.iter().enumerate() {
@@ -371,7 +411,8 @@ impl Queue {
         }
         self.free = self.next[at as usize];
         self.free_count -= buffers.len() as u16;
-        self.offered[head as usize] = Some((token, buffers.len() as u16));
+        let writable = buffers.iter().filter(|b| b.device_writes).map(|b| b.len as u64).sum();
+        self.offered[head as usize] = Some(Offered { token, count: buffers.len() as u16, writable });
         // An injected fault (`inject`): the device never sees this one.
         if inject::due() == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
             return Ok(());
@@ -406,12 +447,12 @@ impl Queue {
         let wanted = if self.event_idx {
             // A doorbell only if the requests added since the last one
             // passed the one the device asked to be told about.
-            let event = self.device_area.shared().read16(4 + 8 * self.size as usize);
+            let event = self.device_area.read16(4 + 8 * self.size as usize);
             let (new, old) = (self.avail, self.avail.wrapping_sub(added));
             new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
         } else {
             // The device's "no notification needed" flag.
-            self.device_area.shared().read16(0) & 1 == 0
+            self.device_area.read16(0) & 1 == 0
         };
         if wanted {
             self.notify.write16(0, self.index);
@@ -421,17 +462,18 @@ impl Queue {
     /// The next request the device has finished: its token and how many
     /// bytes the device wrote into its writable buffers. `Ok(None)` when
     /// there is none yet. An answer that does not name a request the
-    /// driver offered is the device breaking the protocol: the queue must
-    /// not be used again until the device is reset.
+    /// driver offered, or says the device wrote more than the request's
+    /// writable buffers hold, is the device breaking the protocol: the
+    /// queue must not be used again until the device is reset.
     pub fn pop(&mut self) -> Result<Option<(u64, u32)>, DeviceError> {
-        let u = self.device_area.shared();
+        let u = self.device_area;
         if u.read16(2) == self.used {
             if !self.event_idx {
                 return Ok(None);
             }
             // Ask for an interrupt for the next completion, then look once
             // more: one that came while asking would bring none.
-            self.driver_area.shared().write16(16 * self.size as usize + 4 + 2 * self.size as usize, self.used);
+            self.driver_area.write16(16 * self.size as usize + 4 + 2 * self.size as usize, self.used);
             dma::full_barrier();
             if u.read16(2) == self.used {
                 return Ok(None);
@@ -449,9 +491,18 @@ impl Queue {
             u.write32(o, 0xFFFF_FF00);
         }
         let (id, written) = (u.read32(o), u.read32(o + 4));
-        let Some((token, count)) = self.offered.get_mut(id as usize).and_then(Option::take) else {
+        let Some(slot) = self.offered.get_mut(id as usize) else {
             return Err(DeviceError::Protocol("the device completed a request the driver never offered"));
         };
+        let Some(Offered { token, count, writable }) = *slot else {
+            return Err(DeviceError::Protocol("the device completed a request the driver never offered"));
+        };
+        // A length past the buffers would have a client read what the
+        // device never wrote: the device is not believed.
+        if written as u64 > writable {
+            return Err(DeviceError::Protocol("the device says it wrote more than the request's buffers hold"));
+        }
+        *slot = None;
         self.used = self.used.wrapping_add(1);
         // The chain's descriptors are free again, from the driver's own record.
         let mut last = id as u16;
@@ -469,11 +520,11 @@ impl Queue {
     /// anyway. After asking for interrupts again, look once more with
     /// [`Queue::pop`] before waiting.
     pub fn suppress_interrupts(&mut self, suppress: bool) {
-        self.driver_area.shared().write16(16 * self.size as usize, suppress as u16);
+        self.driver_area.write16(16 * self.size as usize, suppress as u16);
         if self.event_idx {
             // The completion asked an interrupt for: one long past, or the next.
             let at = if suppress { self.used.wrapping_sub(0x8000) } else { self.used };
-            self.driver_area.shared().write16(16 * self.size as usize + 4 + 2 * self.size as usize, at);
+            self.driver_area.write16(16 * self.size as usize + 4 + 2 * self.size as usize, at);
         }
         dma::full_barrier();
     }

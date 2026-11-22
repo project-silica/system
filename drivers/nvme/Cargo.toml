@@ -10,6 +10,11 @@ publish.workspace = true
 [package.metadata.silica]
 drivers = ["class 01.08.02"]
 
+[lib]
+path = "src/lib.rs"
+test = false
+bench = false
+
 [[bin]]
 name = "nvme"
 path = "src/main.rs"

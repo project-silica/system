@@ -59,6 +59,12 @@ pub(crate) fn start() {
     }
 }
 
+/// The text of a record as a reader takes it out of the ring: its length
+/// byte is the writer's, so it is clamped to the record.
+pub fn text(record: &[u8; RECORD]) -> &[u8] {
+    &record[1..1 + (record[0] as usize).min(RECORD - 1)]
+}
+
 fn push(ring: &mut Producer<RECORD>, text: &[u8]) {
     for chunk in text.chunks(RECORD - 1) {
         let mut r = [0u8; RECORD];

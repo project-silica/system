@@ -233,6 +233,27 @@ impl Device {
         })
     }
 
+    /// A device whose configuration space is `config` (4 KiB) and whose
+    /// BARs are `bars`, with `lines` interrupt lines, unconfined, not given
+    /// by the device manager: how a test or a fuzzer plays a device against
+    /// the code that reads one.
+    pub fn over(config: Mmio, bars: [Option<Mmio>; 6], lines: u32) -> Device {
+        Device { id: 0, lines: 0..lines, dma_top: 0, starts: 0, config, bars }
+    }
+
+    /// MSI-X table entry `index` of the device, and the line that carries
+    /// it: where [`irq::Interrupt::bind`] writes the message. An entry
+    /// beyond the table, the lines, or the BAR the device says holds the
+    /// table is an error.
+    pub fn msix_entry(&self, index: u16) -> Result<(u32, Mmio), DeviceError> {
+        let pci::Msix { vectors, bar, offset, .. } = self.config().msix().ok_or(DeviceError::Missing("MSI-X"))?;
+        let line = self.lines.start.checked_add(index as u32).filter(|l| *l < self.lines.end && index < vectors);
+        let line = line.ok_or(DeviceError::Missing("an interrupt line for this MSI-X entry"))?;
+        let table = self.bar(bar as usize).ok_or(DeviceError::Protocol("the MSI-X table is in a BAR the device does not have"))?;
+        let entry = (offset as usize).checked_add(index as usize * 16).and_then(|at| table.part(at, 16));
+        Ok((line, entry.ok_or(DeviceError::Protocol("the MSI-X table lies outside its BAR"))?))
+    }
+
     /// Its configuration space (read-only).
     pub fn config(&self) -> pci::Config {
         pci::Config::new(self.config)

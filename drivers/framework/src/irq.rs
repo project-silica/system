@@ -15,7 +15,6 @@
 //! for one with [`Signals::wait`] (or [`Interrupt::wait`] on an interrupt
 //! bound alone), with a deadline.
 
-use crate::pci::Msix;
 use crate::{Device, DeviceError, grant, granted};
 use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::mem::Object;
@@ -83,12 +82,7 @@ impl Interrupt {
     /// As [`Interrupt::bind`], signalling `notification` (a capability from
     /// [`Signals::sender`], whose bits say which interrupt it was).
     pub fn bind_to(device: &Device, index: u16, notification: Cap) -> Result<Interrupt, DeviceError> {
-        let Msix { vectors, bar, offset, .. } = device.config().msix().ok_or(DeviceError::Missing("MSI-X"))?;
-        let line = device.lines.start.checked_add(index as u32).filter(|l| *l < device.lines.end && index < vectors);
-        let line = line.ok_or(DeviceError::Missing("an interrupt line for this MSI-X entry"))?;
-        let table = device.bar(bar as usize).ok_or(DeviceError::Protocol("the MSI-X table is in a BAR the device does not have"))?;
-        let entry =
-            table.part(offset as usize + index as usize * 16, 16).ok_or(DeviceError::Protocol("the MSI-X table lies outside its BAR"))?;
+        let (line, entry) = device.msix_entry(index)?;
         let (address, data) = sys::irq_bind_msi(granted(grant::INTERRUPTS), line, notification, granted(grant::IDENTITY), device.id)?;
         // Masked while the message changes, as the PCI specification asks.
         entry.write32(12, 1);
