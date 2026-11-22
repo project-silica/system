@@ -164,6 +164,16 @@ impl<const N: usize> Consumer<N> {
         Ok(Some(record))
     }
 
+    /// After [`Broken`]: give up what the ring holds and go on from the
+    /// record the producer says it will write next, as if everything
+    /// before it had been taken. For a consumer that outlives its
+    /// producers (a log whose writer is replaced): the records are lost,
+    /// the ring is usable again once its producer writes sense.
+    pub fn skip(&mut self) {
+        self.head = self.ring.word(TAIL).load(Ordering::Acquire);
+        self.ring.word(HEAD).store(self.head, Ordering::Release);
+    }
+
     /// Before waiting for a wake-up: say that this side is going to sleep.
     /// Returns whether to wait: `false` when a record arrived meanwhile
     /// (take it instead). After `true`, wait on the notification the

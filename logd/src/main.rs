@@ -7,11 +7,17 @@
 //! (to learn the services' names), 2 the notification, 3 a notification of
 //! the service manager's to answer flushes on, then one ring per declared
 //! service, in the order the service manager lists them (an empty slot
-//! where a service has none, as this one). A signal with [`FLUSH`] asks for
+//! where a service has none, as this one). A service that runs programs of
+//! its own gives each a ring through the service manager too (the device
+//! manager, one per device for its drivers: `add_log`); the service manager
+//! signals [`ADDED`], and this service asks it for the new rings, which are
+//! sources named `<service>/<name>`. A signal with [`FLUSH`] asks for
 //! everything to be on the console now: the service manager's way to put a
 //! service's last lines before its own verdict, without calling the log. On every wake-up it takes the
 //! text out of every ring, keeps the last [`KEPT`] bytes of each service's,
-//! and puts each complete line on the console as it was written.
+//! and puts it on the console as it was written: another source's text
+//! starts on a fresh line, and a line it cut short (a prompt, and what was
+//! typed after it) is shown again below it, for its writer to go on.
 //!
 //! Nothing here waits on a writer, and the service manager never calls this
 //! service: a log that stops costs the system its log, not its services.
@@ -36,21 +42,43 @@ silica_rt::main!(main);
 const KEPT: usize = 32 * 1024;
 /// The longest line put on the console in one piece; a longer one goes in parts.
 const LINE: usize = 220;
+/// The writer [`Log::emit`] knows this service's own lines by.
+const OWN: usize = usize::MAX;
+/// Rounds of taking text (a ring's worth of each source) between looking
+/// at calls.
+const ROUNDS: usize = 4;
 /// The bit of the notification that asks for a flush (the service manager's).
 const FLUSH: u64 = 2;
+/// The bit of the notification that says services gave their programs logs
+/// (`silica.system.Manager`'s `add_log`): this service asks for the rings.
+const ADDED: u64 = 4;
 
 struct Source {
     /// Made once, at start, and kept as long as the program runs.
     name: &'static str,
-    ring: Option<Consumer<RECORD>>,
+    ring: Consumer<RECORD>,
     kept: VecDeque<u8>,
     written: u64,
+    /// Its ring made no sense, and that was said.
+    broken: bool,
+    /// Its text since its last newline: what is shown again when another
+    /// source's line cut it short.
+    partial: Vec<u8>,
 }
 
 struct Log {
     sources: Vec<Source>,
+    /// The service manager, which has the rings of programs' logs.
+    system: manager::Client<Channel, Handle>,
+    /// How many of those this service has.
+    given: u32,
+    /// Some ring had more than the last drain took.
+    more: bool,
     /// The source whose unfinished line the console ends with.
     open: Option<usize>,
+    /// The source whose unfinished line another's text cut short, until
+    /// it is shown again.
+    cut: Option<usize>,
     /// Signalled when a flush asked for is done.
     flushed: Cap,
     listed: Vec<proto::Source<'static>>,
@@ -64,46 +92,144 @@ impl Log {
     /// service starts on a fresh line, as the kernel does for its writers
     /// (to the kernel, all of this is one writer).
     fn drain(&mut self) {
-        for (i, s) in self.sources.iter_mut().enumerate() {
-            let mut out: Vec<u8> = Vec::new();
-            while let Some(ring) = s.ring.as_mut() {
-                match ring.pop() {
-                    Ok(Some(r)) => {
-                        let n = (r[0] as usize).min(RECORD - 1);
-                        let text = &r[1..1 + n];
-                        s.written += n as u64;
-                        for &b in text {
-                            if s.kept.len() == KEPT {
-                                s.kept.pop_front();
-                            }
-                            s.kept.push_back(b);
+        // A round takes at most a ring's worth from each source, so one
+        // that writes without pause cannot keep the others waiting, and a
+        // few rounds at a time, so it cannot keep callers (a flush, the
+        // shell) waiting either: what is left is taken at once after them
+        // (`deadline`).
+        for _ in 0..ROUNDS {
+            let mut more = false;
+            for i in 0..self.sources.len() {
+                more |= self.drain_one(i);
+            }
+            self.more = more;
+            if !more {
+                return;
+            }
+        }
+    }
+
+    /// Take up to a ring's worth of source `i`'s text and put it on the
+    /// console. Returns whether it has more.
+    fn drain_one(&mut self, i: usize) -> bool {
+        let s = &mut self.sources[i];
+        let mut out: Vec<u8> = Vec::new();
+        let (mut more, mut taken, mut notice) = (false, 0, None);
+        let ring = &mut s.ring;
+        loop {
+            if taken == RECORDS {
+                more = true;
+                break;
+            }
+            match ring.pop() {
+                Ok(Some(r)) => {
+                    taken += 1;
+                    s.broken = false;
+                    let n = (r[0] as usize).min(RECORD - 1);
+                    let text = &r[1..1 + n];
+                    s.written += n as u64;
+                    for &b in text {
+                        if s.kept.len() == KEPT {
+                            s.kept.pop_front();
                         }
-                        out.extend_from_slice(text);
+                        s.kept.push_back(b);
                     }
-                    Ok(None) => {
-                        if ring.sleep() {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        println!("logd: the log ring of {} makes no sense; nothing more is read from it", s.name);
-                        s.ring = None;
+                    out.extend_from_slice(text);
+                }
+                Ok(None) => {
+                    if ring.sleep() {
+                        break;
                     }
                 }
-            }
-            if out.is_empty() {
-                continue;
-            }
-            if self.open.is_some_and(|o| o != i) {
-                print!("\n");
-            }
-            // In pieces of whole lines where it can, each written whole.
-            for piece in out.split_inclusive(|b| *b == b'\n') {
-                for part in piece.chunks(LINE) {
-                    print!("{}", String::from_utf8_lossy(part));
+                Err(_) => {
+                    // Its writer broke the ring: what it held is lost, and
+                    // reading goes on from what the writer (or the next
+                    // one: a driver started again) writes next. Said once
+                    // until the ring makes sense again.
+                    if !s.broken {
+                        notice =
+                            Some(silica_rt::alloc::format!("logd: the log ring of {} made no sense; what it held is skipped\n", s.name));
+                        s.broken = true;
+                    }
+                    ring.skip();
+                    taken += 1;
                 }
             }
-            self.open = (out.last() != Some(&b'\n')).then_some(i);
+        }
+        if let Some(n) = notice {
+            self.emit(OWN, n.as_bytes());
+        }
+        self.emit(i, &out);
+        more
+    }
+
+    /// Put `out`, text of source `from` (or [`OWN`]), on the console:
+    /// another source's unfinished line ends first, and is shown again
+    /// below once this text ends its line, for its writer to go on.
+    fn emit(&mut self, from: usize, out: &[u8]) {
+        if out.is_empty() {
+            return;
+        }
+        if let Some(o) = self.open.filter(|o| *o != from) {
+            print!("\n");
+            // One line cut short is kept: the first, until shown again.
+            self.cut.get_or_insert(o);
+        }
+        if self.cut == Some(from) {
+            // This source's own line was cut short: it goes on where it was.
+            self.cut = None;
+            self.show_partial(from);
+        }
+        // In pieces of whole lines where it can, each written whole.
+        for piece in out.split_inclusive(|b| *b == b'\n') {
+            for part in piece.chunks(LINE) {
+                print!("{}", String::from_utf8_lossy(part));
+            }
+        }
+        if let Some(s) = self.sources.get_mut(from) {
+            match out.iter().rposition(|b| *b == b'\n') {
+                Some(n) => s.partial = out[n + 1..].to_vec(),
+                None => s.partial.extend_from_slice(out),
+            }
+            // Longer than is shown again: only the length counts.
+            s.partial.truncate(LINE + 1);
+        }
+        self.open = (out.last() != Some(&b'\n')).then_some(from);
+        if self.open.is_none()
+            && let Some(c) = self.cut.take()
+        {
+            // The line done, the one it cut short (a prompt and what was
+            // typed after it) again below it, for its next text to continue.
+            if self.show_partial(c) {
+                self.open = Some(c);
+            }
+        }
+    }
+
+    /// Put source `i`'s unfinished line on the console again, if it was
+    /// kept whole.
+    fn show_partial(&self, i: usize) -> bool {
+        let Some(s) = self.sources.get(i) else { return false };
+        if s.partial.len() > LINE {
+            return false;
+        }
+        print!("{}", String::from_utf8_lossy(&s.partial));
+        true
+    }
+
+    /// Take the rings of programs' logs given since the last time.
+    fn take_given(&mut self) {
+        loop {
+            let (name, ring) = match self.system.log_ring(self.given) {
+                Ok(r) => (String::from(r.name), r.ring),
+                Err(_) => return,
+            };
+            self.given += 1;
+            if let Some(source) = source(name, ring.cap()) {
+                // Kept for as long as the program runs: the ring stays mapped.
+                let _ = ring.into_cap();
+                self.sources.push(source);
+            }
         }
     }
 
@@ -145,12 +271,46 @@ impl Events for Log {
         proto::dispatch(self, request, caps, reply, reply_caps)
     }
 
+    fn deadline(&self) -> Option<u64> {
+        // Text left over: at once, after any calls waiting.
+        self.more.then_some(0)
+    }
+
+    fn timer(&mut self) {
+        self.drain();
+    }
+
     fn signals(&mut self, bits: u64) {
+        if bits & ADDED != 0 {
+            self.take_given();
+        }
         self.drain();
         if bits & FLUSH != 0 {
+            // Everything written so far on the console before the answer
+            // (within reason: a writer that never pauses is not waited for).
+            for _ in 0..16 {
+                if !self.more {
+                    break;
+                }
+                self.drain();
+            }
             let _ = sys::signal(self.flushed);
         }
     }
+}
+
+/// The source `name` reading the log ring in the frame `cap`, if it is one.
+fn source(name: String, cap: Cap) -> Option<Source> {
+    let Ok(Some(slot)) = sys::inspect_slot(slots::SPACE, cap.0) else { return None };
+    if slot.ty != ObjectType::Frame || slot.bits != BITS {
+        return None;
+    }
+    let region = mem::peer(cap, BITS, Rights(Rights::READ.0 | Rights::WRITE.0)).ok()?;
+    let mut ring = Consumer::new(region, RECORDS)?;
+    let _ = ring.sleep();
+    // Names last as long as the program: sources are never removed.
+    let name: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_boxed_str());
+    Some(Source { name, ring, kept: VecDeque::new(), written: 0, broken: false, partial: Vec::new() })
 }
 
 fn main(info: &'static ProcessInfo) -> i64 {
@@ -166,19 +326,13 @@ fn main(info: &'static ProcessInfo) -> i64 {
     let rings = info.args[0] as usize;
     let mut sources = Vec::new();
     for (i, name) in names.into_iter().enumerate().take(rings) {
-        let cap = grant(4 + i as u64);
-        let Ok(Some(slot)) = sys::inspect_slot(slots::SPACE, cap.0) else { continue };
-        if slot.ty != ObjectType::Frame || slot.bits != BITS {
-            continue;
-        }
-        let Ok(region) = mem::peer(cap, BITS, Rights(Rights::READ.0 | Rights::WRITE.0)) else { continue };
-        let Some(mut ring) = Consumer::new(region, RECORDS) else { continue };
-        let _ = ring.sleep();
-        let name: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_boxed_str());
-        sources.push(Source { name, ring: Some(ring), kept: VecDeque::new(), written: 0 });
+        sources.extend(source(name, grant(4 + i as u64)));
     }
-    let mut log = Log { sources, open: None, flushed: grant(3), listed: Vec::new(), text: String::new() };
-    // What was written before this service started (or before it last ended).
+    let mut log =
+        Log { sources, system, given: 0, more: false, open: None, cut: None, flushed: grant(3), listed: Vec::new(), text: String::new() };
+    // The programs' logs given so far, and what was written before this
+    // service started (or before it last ended).
+    log.take_given();
     log.drain();
     serve_events(grant(0), grant(2), &mut log)
 }

@@ -9,6 +9,7 @@
 //! - it tells its device to write to, and to read from, memory the driver
 //!   never mapped for it, and to write to memory mapped for reading only;
 //! - it asks where its memory physically is;
+//! - it writes nonsense into its log ring, which the log service reads;
 //! - it writes its device's configuration space.
 //!
 //! A disk is made to write and read with read and write requests; a network
@@ -206,6 +207,15 @@ fn fail(name: &str, what: core::fmt::Arguments<'_>) -> DeviceError {
     DeviceError::Protocol("a boundary did not hold")
 }
 
+/// Let `ns` nanoseconds pass (a test's hostile driver may spin).
+fn pause(ns: u64) {
+    let clock = silica_rt::clock();
+    let until = clock.now() + ns;
+    while clock.now() < until {
+        sys::yield_now();
+    }
+}
+
 fn main(info: &ProcessInfo) -> i64 {
     match run(info) {
         Ok(()) => 0,
@@ -281,12 +291,17 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     }
     let outcome = disk.aim(T_IN, 0x10_0000)?;
     println!("virtio-rogue: told the device to write at 0x100000: {outcome:?}");
+    // Time for the kernel to report the refusal before the next one: an
+    // IOMMU keeps few fault records (QEMU's, one), and drops faults while
+    // they are full.
+    pause(50_000_000);
     // To read from it: a disk write whose data is someone else's memory.
     // (Sector 2: nothing in this test reads it afterwards, and the disk is
     // a snapshot.)
     let mut disk = bring_up(&device, &dma)?;
     let outcome = disk.aim(T_OUT, 0x20_0000)?;
     println!("virtio-rogue: told the device to read at 0x200000: {outcome:?}");
+    pause(50_000_000);
     // To write to memory it may only read. This one the driver sees for
     // itself: the memory is its own.
     let mut disk = bring_up(&device, &dma)?;
@@ -304,6 +319,31 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
         return Err(fail("rogue_recovers", format_args!("the device does not work after a reset")));
     }
     pass("rogue_recovers");
+
+    // Its log ring, which the log service reads: a header announcing a
+    // million records. The log service says so, skips what the ring held
+    // and reads on from what is written next (a line lost to the skip,
+    // then this run's and the next run's lines, which the harness needs).
+    // (The runtime has the ring mapped through its capability; a copy of
+    // it maps a second time.)
+    let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
+    let copy = silica_rt::ipc::free_slot().ok_or(DeviceError::Missing("a free slot"))?;
+    let log = sys::cap_derive(slots::SPACE, copy, slots::LOG, rw, 0)
+        .ok()
+        .and_then(|()| mem::peer(Cap(copy), silica_rt::log::BITS, rw).ok())
+        .ok_or_else(|| fail("rogue_log_ring", format_args!("the driver has no log ring to break")))?;
+    // What it wrote before is read first: its PASS lines must not go with
+    // the skip.
+    let _ = sys::signal(slots::LOG_WAKE);
+    let clock = silica_rt::clock();
+    let until = clock.now() + 1_000_000_000;
+    while log.read32(32) != log.read32(0) && clock.now() < until {
+        sys::yield_now();
+    }
+    log.write32(0, log.read32(32).wrapping_add(1_000_000));
+    let _ = sys::signal(slots::LOG_WAKE);
+    pause(100_000_000);
+    println!("virtio-rogue: the log ring was broken on purpose (this line is skipped with it)");
 
     // Configuration space is the device manager's: writing it is a fault,
     // which ends this run. The device manager starts the driver again.

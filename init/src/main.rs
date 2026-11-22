@@ -13,12 +13,15 @@
 //! their exits on (callers' badges are from 2^32 up, programs' below):
 //! the services and what they do, stopping and starting one, and turning
 //! the machine off in order (`shutdown`: services stopped last-started
-//! first, then the power).
+//! first, then the power). It makes the log's rings: one per service, and
+//! one per program a service asks for (`add_log`), which the log service
+//! takes from it (`log_ring`).
 //!
 //! The kernel command line chooses what is checked at boot (`checks=`, a
 //! comma list; default `programs,block`): `programs` runs the round trips
 //! everything rests on (a program's memory comes back, two programs talk
-//! through a protocol), and every other name runs the services declared
+//! through a protocol), `spawn` measures starting a program, and every
+//! other name runs the services declared
 //! `start=check:<name>`, which must end with status 0. When checks ran, the
 //! machine is turned off when they are done (`halt=reboot`: reset);
 //! without them the system stays up. `bench` on the command line prints
@@ -57,6 +60,10 @@ static FLUSH_TO: AtomicU64 = AtomicU64::new(0);
 static FLUSHED: AtomicU64 = AtomicU64::new(0);
 /// The bit of the log's notification that asks it to flush (`logd`).
 const FLUSH: u64 = 2;
+/// The bit of the log's notification that says logs were added (`add_log`).
+const ADDED: u64 = 4;
+/// The most logs services give their programs (`add_log`).
+const MAX_LOGS: usize = 64;
 
 /// Have the log service put everything its rings hold on the console before
 /// what init says next, waiting at most 200 ms: init never waits on a
@@ -102,6 +109,8 @@ struct Manager {
     listed: Vec<manager::Service<'static>>,
     /// What `describe` answers with.
     described: String,
+    /// The badge of the call being answered.
+    caller: u64,
     /// The log: the service that provides it, its notification, what it
     /// answers flushes on, and a ring per service (`silica_rt::log`).
     log: Option<LogSetup>,
@@ -112,6 +121,11 @@ struct LogSetup {
     note: Object,
     flushed: Object,
     rings: Vec<Option<Object>>,
+    /// The note, badged [`ADDED`].
+    added: sys::Cap,
+    /// The logs services gave their programs (`add_log`): the source's
+    /// name and the ring.
+    given: Vec<(String, Handle)>,
 }
 
 /// The value of `key=` on the command line.
@@ -244,6 +258,7 @@ impl Manager {
     fn step(&mut self, listener: &mut Listener, wait: Wait, watch: Option<usize>) -> Result<Option<(usize, Option<i64>)>, ()> {
         let m = listener.recv(wait).map_err(|_| ())?;
         if m.badge >= CONSUMERS && m.badge & FAULT_BADGE == 0 {
+            self.caller = m.badge;
             listener.answer(&m, |request, caps, reply, reply_caps| manager::dispatch(self, request, caps, reply, reply_caps));
             return Ok(None);
         }
@@ -353,6 +368,43 @@ impl manager::Server<Handle> for Manager {
         println!("ERROR: init: the machine cannot be turned off: {why:?}");
         Err(manager::Error::Refused)
     }
+
+    fn add_log(&mut self, name: &str, ring: Handle) -> Result<manager::AddLogReply<Handle>, manager::Error> {
+        let caller = self.caller.checked_sub(CONSUMERS).and_then(|i| self.services.get(i as usize)).ok_or(manager::Error::Refused)?;
+        let source = silica_rt::alloc::format!("{}/{name}", caller.name);
+        let log = self.log.as_mut().ok_or(manager::Error::Refused)?;
+        if log.given.iter().any(|(n, _)| *n == source) {
+            return Err(manager::Error::Exists);
+        }
+        // A ring of the size every log's writer and reader assume.
+        let fits = matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), ring.cap().0),
+            Ok(Some(i)) if i.ty == ObjectType::Frame && i.bits == silica_rt::log::BITS);
+        if !fits || log.given.len() >= MAX_LOGS || name.is_empty() || name.len() > 64 {
+            return Err(manager::Error::Refused);
+        }
+        let to = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused)?;
+        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, log.note.cap(), Rights::WRITE, 0).is_err() {
+            silica_rt::ipc::release_slot(to);
+            return Err(manager::Error::Refused);
+        }
+        log.given.push((source, ring));
+        let _ = sys::signal(log.added);
+        Ok(manager::AddLogReply { wake: Handle::new(sys::Cap(to)) })
+    }
+
+    fn log_ring<'a>(&'a mut self, index: u32) -> Result<manager::LogRingReply<'a, Handle>, manager::Error> {
+        let log = self.log.as_ref().ok_or(manager::Error::Refused)?;
+        if self.caller != CONSUMERS + log.service as u64 {
+            return Err(manager::Error::Refused);
+        }
+        let (name, ring) = log.given.get(index as usize).ok_or(manager::Error::NoSuchLog)?;
+        let to = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused)?;
+        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, ring.cap(), Rights(Rights::READ.0 | Rights::WRITE.0), 0).is_err() {
+            silica_rt::ipc::release_slot(to);
+            return Err(manager::Error::Refused);
+        }
+        Ok(manager::LogRingReply { name, ring: Handle::new(sys::Cap(to)) })
+    }
 }
 
 /// Program entry, called by libsys's `_start`.
@@ -371,6 +423,9 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
 
     if checks.contains(&&b"programs"[..]) {
         program_checks(&root);
+    }
+    if checks.contains(&&b"spawn"[..]) {
+        spawn_bench(&root);
     }
 
     let Some(list) = ramdisk::find(root.archive, "services").and_then(|b| core::str::from_utf8(b).ok()) else {
@@ -407,11 +462,21 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             let rings = (0..services.len()).map(|i| (i != l).then(|| object(ObjectType::Frame, silica_rt::log::BITS))).collect();
             order.retain(|&i| i != l);
             order.insert(0, l);
-            Some(LogSetup { service: l, note, flushed, rings })
+            Some(LogSetup { service: l, note, flushed, rings, added: sys::Cap(0), given: Vec::new() })
         }
     };
-    let mut m =
-        Manager { root, info, services, endpoints, running, order: order.clone(), listed: Vec::new(), described: String::new(), log };
+    let mut m = Manager {
+        root,
+        info,
+        services,
+        endpoints,
+        running,
+        order: order.clone(),
+        listed: Vec::new(),
+        described: String::new(),
+        caller: 0,
+        log,
+    };
     if let Some(l) = &m.log {
         let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for the log"));
         if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, l.note.cap(), Rights::WRITE, FLUSH).is_err() {
@@ -419,6 +484,13 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         }
         FLUSH_TO.store(to, Ordering::Relaxed);
         FLUSHED.store(l.flushed.cap().0, Ordering::Relaxed);
+    }
+    if let Some(l) = m.log.as_mut() {
+        let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for the log"));
+        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, l.note.cap(), Rights::WRITE, ADDED).is_err() {
+            fail!("cannot make the log's capability for added logs");
+        }
+        l.added = sys::Cap(to);
     }
     let mut listener = Listener::new(m.root.parent.exit);
 
@@ -432,7 +504,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     // The checks the command line asks for, in its order.
     let mut checked = false;
-    for c in checks.iter().filter(|c| **c != b"programs") {
+    for c in checks.iter().filter(|c| **c != b"programs" && **c != b"spawn") {
         let mut any = false;
         for &i in &order {
             if !matches!(m.services[i].start, Start::Check(n) if n.as_bytes() == *c) {
@@ -456,7 +528,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         }
         checked = true;
     }
-    if checked || checks.contains(&&b"programs"[..]) {
+    if checked || checks.contains(&&b"programs"[..]) || checks.contains(&&b"spawn"[..]) {
         flush_log();
         if option(cmdline, "bench").is_some() || cmdline.split(|b| b.is_ascii_whitespace()).any(|w| w == b"bench") {
             println!("BENCH DONE");
@@ -479,6 +551,45 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
 /// The round trips everything rests on: a program runs in its own address
 /// space and CapSpace, reports its exit, and its memory comes back; two
 /// programs call each other through a protocol.
+/// `checks=spawn`: how long a program takes from its parent's `spawn` to
+/// its own first line of code (`hello` asked to answer with the time it
+/// started), over [`SPAWNS`] programs started and taken down one after
+/// another, before any service runs. Prints `BENCH spawn` (median) and
+/// `BENCH spawn_p99`, in nanoseconds; the Linux baseline measures fork or
+/// vfork and exec of a static program to its `main` the same way
+/// (os/bench/linux/init.c).
+fn spawn_bench(root: &Root) {
+    const SPAWNS: usize = 2000;
+    const WARMUP: usize = 200;
+    let parent = &root.parent;
+    let Some(image) = ramdisk::find(root.archive, "hello") else { fail!("the ramdisk has no program named hello") };
+    let clock = silica_rt::clock();
+    let mut took = Vec::with_capacity(SPAWNS);
+    for n in 0..SPAWNS + WARMUP {
+        let id = 100;
+        let start = clock.now();
+        let child = match spawn(parent, &Program { args: [0, 1, 0, 0, 0, 0, 0, 0], ..Program::new(image, id) }) {
+            Ok(c) => c,
+            Err(e) => fail!("cannot start hello: {e:?}"),
+        };
+        let Ok(m) = sys::recv(parent.exit, Wait::Until(clock.now() + 5 * SECOND)) else {
+            fail!("hello did not report its exit within 5 s")
+        };
+        if m.info.label() != EXIT_LABEL || m.badge != id || m.words[0] < start {
+            fail!("hello's exit message is not the time it started");
+        }
+        if n >= WARMUP {
+            took.push(m.words[0] - start);
+        }
+        if child.destroy().is_err() {
+            fail!("cannot take back hello's memory");
+        }
+    }
+    took.sort_unstable();
+    println!("BENCH spawn {} ns", took[SPAWNS / 2]);
+    println!("BENCH spawn_p99 {} ns", took[SPAWNS - SPAWNS / 100 - 1]);
+}
+
 fn program_checks(root: &Root) {
     let (parent, archive) = (&root.parent, root.archive);
     let Some(image) = ramdisk::find(archive, "hello") else { fail!("the ramdisk has no program named hello") };

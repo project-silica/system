@@ -1,5 +1,6 @@
-//! The program's log: where [`crate::print!`] writes when the service
-//! manager gave the program a log ring ([`crate::slots::LOG`]).
+//! The program's log: where [`crate::print!`] writes when the program was
+//! started with a log ring ([`crate::slots::LOG`]): every service is, by the
+//! service manager, and every driver, by the device manager.
 //!
 //! The ring (`crate::ring`, [`RECORDS`] records of [`RECORD`] bytes in a
 //! frame of 2^[`BITS`] bytes) carries text: each record is a byte of

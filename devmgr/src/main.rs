@@ -119,6 +119,10 @@ struct Function {
     /// How many times its driver failed (faulted, or ended with a failure);
     /// an owner's restart is not a failure.
     failures: u32,
+    /// Its drivers' log (`silica.system.Manager`'s `add_log`): the ring and
+    /// what its writer signals, made when its first driver starts and
+    /// handed to every one after it.
+    log: Option<(Object, Handle)>,
 }
 
 /// A driver that is running.
@@ -183,6 +187,7 @@ fn function_of(id: u32, config: Config, config_frame: Cap) -> Function {
         lines: None,
         starts: 0,
         failures: 0,
+        log: None,
     }
 }
 
@@ -620,6 +625,8 @@ impl Manager {
         }
         // A fault to commit on purpose, in the driver's first run only.
         let inject = if f.starts == 0 { inject_plan(self.cmdline, driver) } else { 0 };
+        let starts = f.starts;
+        let log = self.log_of(index, driver);
         let program = Program {
             grants: &grants,
             args: [
@@ -627,12 +634,13 @@ impl Manager {
                 first_line as u64,
                 lines as u64,
                 self.info.dma_top,
-                f.starts as u64 | (inject as u64) << 32,
+                starts as u64 | (inject as u64) << 32,
                 display[0],
                 display[1],
                 display[2],
             ],
             aspace_bits: 18,
+            log,
             ..Program::new(image, self.next_id)
         };
         let child = spawn(&self.parent, &program).map_err(|e| {
@@ -651,6 +659,26 @@ impl Manager {
 }
 
 impl Manager {
+    /// The log of the drivers of function `index` (`driver` names it with
+    /// the function's address): made with the service manager the first
+    /// time, the same ring after. `None` when the system keeps no log or
+    /// gives no more; the driver then writes to the console itself.
+    fn log_of(&mut self, index: usize, driver: &str) -> Option<(Cap, Cap)> {
+        if self.functions[index].log.is_none() {
+            let ring = Object::new(ObjectType::Frame, silica_rt::log::BITS).ok()?;
+            let slot = free_slot()?;
+            if sys::cap_derive(slots::SPACE, slot, ring.cap(), RW, 0).is_err() {
+                release_slot(slot);
+                return None;
+            }
+            let name = silica_rt::alloc::format!("{driver}@{}", name(self.functions[index].id));
+            let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
+            let wake = system.add_log(&name, Handle::new(Cap(slot))).ok()?.wake;
+            self.functions[index].log = Some((ring, wake));
+        }
+        self.functions[index].log.as_ref().map(|(ring, wake)| (ring.cap(), wake.cap()))
+    }
+
     /// The driver `r` is no longer to run: silence its device and take
     /// back everything the driver was made of. The kernel cuts the device
     /// off from memory as the driver's device address space goes.
