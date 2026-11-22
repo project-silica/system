@@ -1,10 +1,13 @@
-//! Generates the Rust module of the silica.device.Manager protocol into OUT_DIR.
+//! Generates the Rust modules of the system's protocols into OUT_DIR.
 use std::path::PathBuf;
 
 fn main() {
-    let idl = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../idl/protocols/silica/device/manager.idl");
-    println!("cargo::rerun-if-changed={}", idl.display());
-    let protocols = idlc::load(&[idl]).unwrap_or_else(|errs| {
+    let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../idl/protocols/silica");
+    let files: Vec<PathBuf> = ["device/manager.idl", "system/manager.idl"].iter().map(|f| root.join(f)).collect();
+    for f in &files {
+        println!("cargo::rerun-if-changed={}", f.display());
+    }
+    let protocols = idlc::load(&files).unwrap_or_else(|errs| {
         for e in errs {
             println!("cargo::warning=ERROR: {e}");
         }

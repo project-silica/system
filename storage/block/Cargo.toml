@@ -10,6 +10,7 @@ publish.workspace = true
 silica-rt = { workspace = true }
 silica-ring = { workspace = true }
 silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
 
 [build-dependencies]
 silica-idlc = { workspace = true }

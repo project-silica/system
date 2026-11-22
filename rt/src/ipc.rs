@@ -337,6 +337,12 @@ impl Listener {
         sys::recv(self.endpoint, wait)
     }
 
+    /// The next message, or `notification`'s signals if they come first
+    /// (`sys::Message::signals` says which).
+    pub fn recv_listening(&mut self, notification: Cap, wait: Wait) -> Result<sys::Message, Error> {
+        sys::recv_listening(self.endpoint, notification, wait)
+    }
+
     /// `m`, just received, is an IDL request (a call): hand it to `handle`
     /// as [`serve`] would and send the reply.
     pub fn answer(&mut self, m: &sys::Message, handle: impl FnOnce(&[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize) {

@@ -8,6 +8,56 @@
 //! registered memory before the driver sees it, so a driver's `start` is
 //! only ever asked for something the device can do; it keeps the rings, the
 //! wake-ups and the memory table; and it notices a client that has gone.
+//!
+//! # A block driver's shape
+//!
+//! ```text
+//! use silica_block::device::{Error, Info};
+//! use silica_block::service::{Busy, CLIENT, Completions, Device, Service, Ticket};
+//! use silica_block::{Request, Status};
+//! use silica_driver::dma::{Dma, Shared};
+//! use silica_driver::irq::{Interrupt, Signals};
+//!
+//! struct Disk { dma: Dma, info: Info, /* the device's queues, its registers */ }
+//!
+//! impl Device for Disk {
+//!     type Mapping = Shared;
+//!     fn info(&self) -> Info { self.info.clone() }
+//!     // Let the device reach a client's frame: where it reaches its first byte.
+//!     fn map(&mut self, frame: Cap, bits: u8, writable: bool) -> Result<(u64, Shared), Error> {
+//!         let s = self.dma.share(frame, bits, writable).map_err(|_| Error::NoRoom)?;
+//!         Ok((s.address, s))
+//!     }
+//!     fn unmap(&mut self, m: Shared) { self.dma.unshare(m) }
+//!     // Put the request on the device's queue; keep `ticket` until it is done.
+//!     fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Busy> { /* ... */ }
+//!     // Tell the device about requests started since the last call.
+//!     fn kick(&mut self) { /* ring the doorbell once */ }
+//!     // An interrupt (the bits its Signals sender carries): report every finished request.
+//!     fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
+//!         /* for each completion the device reports: */ done(ticket, Ok(()));
+//!     }
+//! }
+//!
+//! fn run(info: &silica_rt::ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
+//!     let device = silica_driver::Device::take(info)?;
+//!     let dma = Dma::new(&device)?;
+//!     let signals = Signals::new()?;
+//!     // Interrupt n of the device signals the value 2 << n (CLIENT is 1).
+//!     let _irq = Interrupt::bind_to(&device, 0, signals.sender(2)?)?;
+//!     // ... bring the device up, then:
+//!     let disk = Disk { dma, info: /* ... */ };
+//!     let mut service = Service::new(disk, signals.sender(CLIENT)?);
+//!     silica_rt::ipc::serve_events(silica_driver::granted(silica_driver::grant::SERVICE), signals.listen(), &mut service)
+//! }
+//! ```
+//!
+//! `start` is called with a request the device can do; return [`Busy`] when
+//! the device's queue is full (the request is offered again after the next
+//! completion). Every ticket `start` accepted must reach `done` exactly
+//! once: with `Ok`, or an error [`Status`] (`Io` for a device error,
+//! `Aborted` when the driver gives up on the device). Keep the interrupt
+//! objects alive for as long as the driver runs.
 
 use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, RemoveMemoryReply};
 use crate::{COMPLETION_BYTES, COMPLETIONS_AT, Completion, MEMORIES, Op, QUEUE, REQUEST_BYTES, RINGS_BITS, Request, Status};
@@ -27,8 +77,8 @@ pub const CLIENT: u64 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Busy;
 
-/// A request the service has handed to the driver: returned to
-/// [`Completions::done`] when the device has finished it.
+/// A request the service has handed to the driver: given back through the
+/// `done` of [`Device::signals`] when the device has finished it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ticket {
     tag: u64,

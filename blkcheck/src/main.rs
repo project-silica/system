@@ -26,7 +26,7 @@ use silica_rt::mmio::Mmio;
 use silica_rt::sys::Cap;
 use silica_rt::{ProcessInfo, println, slots};
 
-include!(concat!(env!("OUT_DIR"), "/silica_device_manager.rs"));
+use silica_protocols::device::manager;
 
 silica_rt::main!(main);
 
@@ -61,13 +61,6 @@ fn disks(devices: &mut manager::Client<Channel, Handle>) -> Result<Vec<(u32, sil
     }
 }
 
-/// A connection to the driver of disk `id`.
-fn open(devices: &mut manager::Client<Channel, Handle>, id: u32) -> Result<Disk, &'static str> {
-    let driver = devices.open(id).map_err(|e| why(e, "the device manager cannot open the disk's driver"))?.driver;
-    // The capability lives as long as the program.
-    Disk::connect(driver.into_cap()).map_err(|e| why(e, "cannot connect to the driver"))
-}
-
 /// Say what the error was, and return what failed.
 fn why<E: core::fmt::Debug>(e: E, what: &'static str) -> &'static str {
     println!("blkcheck: {what}: {e:?}");
@@ -78,7 +71,7 @@ fn run() -> Result<(), &'static str> {
     let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT)));
     for (id, driver) in disks(&mut devices)? {
         println!("blkcheck: disk {id:#x}, driven by {driver}");
-        let disk = open(&mut devices, id)?;
+        let disk = Disk::open(Cap(slots::FIRST_GRANT), id).map_err(|e| why(e, "cannot open the disk"))?;
         // The gated block benchmarks are virtio-blk's (blk_*); another
         // driver's are named after it.
         let prefix = if driver == "virtio-blk" { "blk" } else { driver.as_str() };

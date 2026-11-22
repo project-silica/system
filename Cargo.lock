@@ -8,7 +8,16 @@ version = "0.0.0"
 dependencies = [
  "silica-block",
  "silica-idl-rt",
- "silica-idlc",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
+name = "blkload"
+version = "0.0.0"
+dependencies = [
+ "silica-block",
+ "silica-protocols",
  "silica-rt",
 ]
 
@@ -20,8 +29,8 @@ dependencies = [
  "silica-driver",
  "silica-formats",
  "silica-idl-rt",
- "silica-idlc",
  "silica-proc",
+ "silica-protocols",
  "silica-rt",
 ]
 
@@ -56,7 +65,9 @@ version = "0.0.0"
 dependencies = [
  "libsys",
  "silica-formats",
+ "silica-idl-rt",
  "silica-proc",
+ "silica-protocols",
  "silica-rt",
 ]
 
@@ -77,6 +88,7 @@ version = "0.0.0"
 dependencies = [
  "silica-idl-rt",
  "silica-idlc",
+ "silica-protocols",
  "silica-ring",
  "silica-rt",
 ]
@@ -107,6 +119,14 @@ dependencies = [
  "libsys",
  "silica-formats",
  "silica-rt",
+]
+
+[[package]]
+name = "silica-protocols"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-idlc",
 ]
 
 [[package]]

@@ -41,18 +41,25 @@
 //! the device manager hands those out), and its drivers' exit reports and
 //! faults (each driver's identifier, below that).
 //!
-//! Started by the root task with, as grants: 0 the frame of the kernel's
-//! `RootInfo` (read-only), 1 the device identities, 2 the interrupt lines,
-//! 3 the I/O ports (or nothing), 4 its endpoint (to receive on, and to give
-//! drivers their way to report), then `args[0]` frames of the ramdisk (in
+//! The machine's ACPI fixed events are its too: the power button asks the
+//! service manager to shut the system down (`silica.system.Manager`).
+//!
+//! Started by the service manager (its service is declared `machine`) with,
+//! as grants: 0 its endpoint (to receive on, and to give drivers their way
+//! to report), 1 the service manager's (`silica.system.Manager`), 2 the
+//! frame of the kernel's `RootInfo` (read-only), 3 the device identities,
+//! 4 the interrupt lines, 5 the I/O ports (or nothing), then `args[0]`
+//! frames of the ramdisk (in
 //! `RootInfo` order, read-only), then `args[1]` Untyped capabilities, given
-//! outright: the machine's device memory, in `RootInfo` order.
+//! outright: the machine's device memory and the firmware's memory (where
+//! its ACPI tables are), in `RootInfo` order.
 #![no_std]
 #![no_main]
 
 mod phys;
+mod power;
 
-use libsys::root::{KIND_DEVICE, KIND_RAMDISK, ROOT_MAGIC, RootInfo};
+use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, KIND_RAMDISK, ROOT_MAGIC, RootInfo};
 use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use phys::DeviceMemory;
 use silica_driver::pci::{self, Config};
@@ -60,21 +67,23 @@ use silica_formats::{acpi, ramdisk};
 use silica_proc::{Child, FAULT_BADGE, Grant, Parent, Program, spawn};
 use silica_rt::alloc::collections::BTreeMap;
 use silica_rt::alloc::vec::Vec;
-use silica_rt::ipc::{Handle, Listener, free_slot, release_slot};
+use silica_rt::ipc::{Channel, Handle, Listener, free_slot, release_slot};
 use silica_rt::mem::{self, Object};
 use silica_rt::mmio::Mmio;
 use silica_rt::{EXIT_LABEL, ProcessInfo, println, slots};
 
-include!(concat!(env!("OUT_DIR"), "/silica_device_manager.rs"));
+use silica_protocols::device::manager;
 
 silica_rt::main!(main);
 
 const RW: Rights = Rights(Rights::READ.0 | Rights::WRITE.0);
-const GRANT_INFO: u64 = 0;
-const GRANT_DEVICES: u64 = 1;
-const GRANT_IRQS: u64 = 2;
-const GRANT_ENDPOINT: u64 = 4;
-const GRANT_FIRST_RAMDISK: u64 = 5;
+const GRANT_ENDPOINT: u64 = 0;
+const GRANT_SYSTEM: u64 = 1;
+const GRANT_INFO: u64 = 2;
+const GRANT_DEVICES: u64 = 3;
+const GRANT_IRQS: u64 = 4;
+const GRANT_PORTS: u64 = 5;
+const GRANT_FIRST_RAMDISK: u64 = 6;
 /// Badges of the capabilities clients call through start here (and stay
 /// below `silica_proc::FAULT_BADGE`); below are the drivers'.
 pub const CLIENTS: u64 = 1 << 32;
@@ -107,6 +116,9 @@ struct Function {
     lines: Option<(u32, u32)>,
     /// How many times a driver has been started for it.
     starts: u32,
+    /// How many times its driver failed (faulted, or ended with a failure);
+    /// an owner's restart is not a failure.
+    failures: u32,
 }
 
 /// A driver that is running.
@@ -120,6 +132,8 @@ struct Running<'a> {
     service: Object,
     /// Pages of zeros mapped in place of memory clients took back.
     zero_pages: Vec<Object>,
+    /// What clients asked to have signalled when this driver ends.
+    gone: Vec<Handle>,
 }
 
 struct Manager {
@@ -160,8 +174,13 @@ impl manager::Server<Handle> for Manager {
         manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing) }
     }
 
-    fn open(&mut self, id: u32) -> Result<manager::OpenReply<Handle>, manager::Error> {
-        let r = self.running.iter().find(|r| self.functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+    fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<manager::OpenReply<Handle>, manager::Error> {
+        let functions = &self.functions;
+        let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+        if let Some(g) = gone {
+            // Kept until the driver ends; a notice nobody can signal is dropped then.
+            r.gone.push(g);
+        }
         let slot = free_slot().ok_or(manager::Error::NoSuchDevice)?;
         self.next_client += 1;
         let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
@@ -170,6 +189,21 @@ impl manager::Server<Handle> for Manager {
             return Err(manager::Error::NoSuchDevice);
         }
         Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
+    }
+
+    fn restart(&mut self, id: u32) -> Result<manager::RestartReply, manager::Error> {
+        let at = self.running.iter().position(|r| self.functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+        let r = self.running.remove(at);
+        let (driver, function) = (r.name, r.function);
+        println!("devmgr: restarting {driver} for {}, as asked", name(id));
+        if !self.stop(r) {
+            println!("ERROR: devmgr: cannot take back the memory of {driver}");
+        }
+        self.start(function, driver).map_err(|e| {
+            println!("ERROR: devmgr: {} is not driven: {e}", name(id));
+            manager::Error::NoSuchDevice
+        })?;
+        Ok(manager::RestartReply {})
     }
 }
 
@@ -322,6 +356,7 @@ impl Manager {
                     vectors,
                     lines: None,
                     starts: 0,
+                    failures: 0,
                 };
                 self.functions.push(f);
             }
@@ -409,7 +444,15 @@ impl Manager {
             self.next_line += lines;
         }
         f.starts += 1;
-        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, zero_pages: Vec::new() });
+        self.running.push(Running {
+            name: driver,
+            id: self.next_id,
+            function: index,
+            child,
+            service,
+            zero_pages: Vec::new(),
+            gone: Vec::new(),
+        });
         Ok(())
     }
 }
@@ -426,6 +469,10 @@ impl Manager {
             registers.write16(msix.cap + 2, registers.read16(msix.cap + 2) & !(1 << 15));
         }
         let ok = r.child.destroy().is_ok();
+        // Its clients hear of it now, not on their next call.
+        for g in r.gone {
+            let _ = sys::signal(g.cap());
+        }
         for page in r.zero_pages {
             // SAFETY: mapped only in the driver, which is gone.
             #[allow(unsafe_code)]
@@ -488,7 +535,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     let archive = map_archive(info, ramdisk_frames)?;
     // The device memory, in the order the kernel listed it.
     let mut memory = DeviceMemory::new();
-    let device = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_DEVICE);
+    let device = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_DEVICE || d.kind == KIND_FIRMWARE);
     for (i, d) in device.enumerate() {
         if (i as u64) < untypeds {
             memory.add(d.base, d.bits, granted(GRANT_FIRST_RAMDISK + ramdisk_frames + i as u64));
@@ -552,10 +599,32 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     if failed {
         println!("ERROR: devmgr: not every device has its driver");
     }
-    // From here on: clients' calls, and drivers that end.
+    // The power button.
+    let button = match power::Button::new(&mut m, granted(GRANT_PORTS), granted(GRANT_IRQS)) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            println!("devmgr: no power button: {e}");
+            None
+        }
+    };
+    // From here on: clients' calls, drivers that end, and the button.
     let mut listener = Listener::new(events);
     loop {
-        let Ok(msg) = listener.recv(Wait::Forever) else { return Err("its endpoint was taken away") };
+        let got = match &button {
+            Some(b) => listener.recv_listening(b.notification(), Wait::Forever),
+            None => listener.recv(Wait::Forever),
+        };
+        let Ok(msg) = got else { return Err("its endpoint was taken away") };
+        if let (Some(_), Some(b)) = (msg.signals(), &button) {
+            if b.pressed() {
+                println!("devmgr: the power button was pressed: shutting down");
+                let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
+                if let Err(e) = system.shutdown(false) {
+                    println!("ERROR: devmgr: the service manager would not shut down: {e:?}");
+                }
+            }
+            continue;
+        }
         // Clients' badges are from CLIENTS up; a fault report's has
         // FAULT_BADGE, above them, which no client is given.
         if msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 {
@@ -610,8 +679,9 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         if ended_well {
             continue;
         }
-        if m.functions[function].starts > MAX_RESTARTS {
-            println!("ERROR: devmgr: {driver} for {device} failed {} times; the device is left alone", m.functions[function].starts);
+        m.functions[function].failures += 1;
+        if m.functions[function].failures > MAX_RESTARTS {
+            println!("ERROR: devmgr: {driver} for {device} failed {} times; the device is left alone", m.functions[function].failures);
         } else if let Err(e) = m.start(function, driver) {
             println!("ERROR: devmgr: {device} is not driven: {e}");
         } else {

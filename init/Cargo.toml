@@ -13,6 +13,8 @@ test = false
 bench = false
 
 [dependencies]
+silica-protocols = { workspace = true }
+silica-idl-rt = { workspace = true }
 libsys = { workspace = true }
 silica-formats = { workspace = true }
 silica-rt = { workspace = true }

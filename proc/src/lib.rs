@@ -24,9 +24,10 @@ pub mod root;
 pub const INFO_VADDR: usize = 0x7F00_0000_0000;
 /// Where a child's first IPC buffer is mapped.
 pub const IPC_VADDR: usize = 0x7F00_0001_0000;
-/// The lowest address of a child's first stack (64 KiB).
+/// The lowest address of a child's first stack (256 KiB: a generated
+/// protocol client alone takes 8 KiB).
 pub const STACK_VADDR: usize = 0x7F00_0010_0000;
-const STACK_BITS: u8 = 16;
+const STACK_BITS: u8 = 18;
 /// Slots in a child's CapSpace, in bits, unless the program says otherwise.
 const SPACE_BITS: u8 = 10;
 /// Size of a child's address-space object in bits unless the program says
@@ -39,6 +40,8 @@ const CHUNK_BITS: u8 = 20;
 pub const FAULT_BADGE: u64 = 1 << 62;
 /// Most capabilities one spawn can grant.
 pub const MAX_GRANTS: usize = 2048;
+/// The lowest slot of a child's CapSpace used for its image, stack and record.
+const FIRST_IMAGE_SLOT: u64 = 64;
 
 /// What the parent spawns with: its own capabilities and working space.
 #[derive(Clone, Copy, Debug)]
@@ -300,8 +303,10 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
 fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Program) -> Result<(), SpawnError> {
     let Program { mem_bits, id, grants, args, cpu, space_bits, aspace_bits, .. } = *prog;
     let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
-    // The image's slots follow the grants.
-    let first_image_slot = slots::FIRST_GRANT + grants.len() as u64;
+    // The image's slots follow the grants, from slot 64 at the lowest: the
+    // slots from FIRST_GRANT to 64 a parent did not fill stay empty, for
+    // capabilities given to the program later (as a supervisor does).
+    let first_image_slot = (slots::FIRST_GRANT + grants.len() as u64).max(FIRST_IMAGE_SLOT);
     if grants.len() > MAX_GRANTS || first_image_slot >= 1 << space_bits {
         return Err(SpawnError::TooMany);
     }

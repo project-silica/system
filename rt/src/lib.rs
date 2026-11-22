@@ -138,7 +138,10 @@ pub mod slots {
     /// The debug console (a console capability: `sys::console_write`), when
     /// the parent grants one; otherwise empty and [`crate::print!`] discards.
     pub const DEBUG: Cap = Cap(7);
-    /// The first capability the parent granted beyond these.
+    /// The first capability the parent granted beyond these. Slots from
+    /// here to 64 that the parent did not fill are left empty, for
+    /// capabilities the program is given later; the program's own
+    /// allocations start above them.
     pub const FIRST_GRANT: u64 = 8;
 }
 
