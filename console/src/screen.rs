@@ -5,7 +5,7 @@
 //! that differ from what the display was last given are drawn, so typing a
 //! character redraws one row and a burst of output scrolls once.
 
-use crate::font::{self, HEIGHT, WIDTH};
+use silica_formats::font::{self, HEIGHT, WIDTH};
 use silica_protocols::display::device::{Client, Format, Rect};
 use silica_rt::alloc::vec;
 use silica_rt::alloc::vec::Vec;

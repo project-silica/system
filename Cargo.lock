@@ -25,6 +25,7 @@ dependencies = [
 name = "console"
 version = "0.0.0"
 dependencies = [
+ "silica-formats",
  "silica-idl-rt",
  "silica-protocols",
  "silica-ring",

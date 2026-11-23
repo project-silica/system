@@ -16,7 +16,6 @@
 #![no_std]
 #![no_main]
 
-mod font;
 mod keys;
 mod screen;
 
