@@ -1,6 +1,6 @@
 [package]
 name = "silica-inet"
-description = "The network stack's wire formats: Ethernet, ARP, IPv4, ICMP, UDP and DHCPv4, parsed from untrusted bytes and built into buffers, with no allocation and no unsafe code."
+description = "The network stack's wire formats (Ethernet, ARP, IPv4, ICMP, UDP, TCP and DHCPv4), parsed from untrusted bytes and built into buffers, and TCP's connection state machine, with no allocation and no unsafe code."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

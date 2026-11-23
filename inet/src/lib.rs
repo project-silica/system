@@ -25,6 +25,8 @@ pub mod dhcp_client;
 pub mod ether;
 pub mod icmp;
 pub mod ipv4;
+pub mod tcp;
+pub mod tcp_conn;
 pub mod udp;
 
 use core::fmt;

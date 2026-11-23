@@ -1,6 +1,6 @@
 [package]
 name = "inet-fuzz"
-description = "Coverage-guided fuzz target for the network stack's wire formats: every parser over frames from the wire (run by tools/fuzz.sh)."
+description = "Coverage-guided fuzz targets for the network stack: every parser over frames from the wire, and a TCP connection driven by a hostile peer (run by tools/fuzz.sh)."
 version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -16,6 +16,13 @@ silica-inet = { path = ".." }
 [[bin]]
 name = "frames"
 path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_peer"
+path = "fuzz_targets/tcp_peer.rs"
 test = false
 doc = false
 bench = false

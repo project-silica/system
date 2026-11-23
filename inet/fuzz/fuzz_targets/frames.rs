@@ -1,10 +1,10 @@
 //! A frame from the wire, through every parser the stack chains: Ethernet,
-//! then ARP or IPv4, then ICMP or UDP, then DHCP. Nothing may panic, and
+//! then ARP or IPv4, then ICMP, UDP or TCP, then DHCP. Nothing may panic, and
 //! every view a parser returns must lie inside the bytes it was given.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use silica_inet::{arp, dhcp, ether, icmp, ipv4, udp};
+use silica_inet::{arp, dhcp, ether, icmp, ipv4, tcp, udp};
 
 fn inside(outer: &[u8], inner: &[u8]) {
     let (o, i) = (outer.as_ptr() as usize, inner.as_ptr() as usize);
@@ -21,6 +21,10 @@ fuzz_target!(|frame: &[u8]| {
     inside(f.payload, p.payload);
     if let Ok(m) = icmp::parse(p.payload) {
         inside(p.payload, m.data);
+    }
+    if let Ok(s) = tcp::parse(p.payload, p.src, p.dst) {
+        inside(p.payload, s.data);
+        let _ = tcp::reset_reply(&s);
     }
     if let Ok(d) = udp::parse(p.payload, p.src, p.dst) {
         inside(p.payload, d.data);
