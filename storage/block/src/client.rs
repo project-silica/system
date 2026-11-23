@@ -153,10 +153,9 @@ impl Disk {
         &self.info
     }
 
-    /// How long the last recovery from a driver's end took, from the end
-    /// being noticed to the first completion after it (ns), once: the next
-    /// call says `None` until there is another.
-    pub fn take_recovery(&mut self) -> Option<u64> {
+    /// How the last recovery from a driver's end went, once: the next call
+    /// says `None` until there is another.
+    pub fn take_recovery(&mut self) -> Option<silica_queue::client::Recovery> {
         self.queue.take_recovery()
     }
 

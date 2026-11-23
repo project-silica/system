@@ -205,6 +205,18 @@ struct Link<C> {
     wake: Handle,
 }
 
+/// How a recovery from a driver's end went, in monotonic nanoseconds from
+/// the client noticing the end: until the next driver took the connection
+/// (the device manager stopping the old one and starting the next, and the
+/// next starting up), and in all, to the first completion after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    pub total: u64,
+    pub reconnecting: u64,
+    /// Connections tried before one was taken.
+    pub tries: u32,
+}
+
 /// A connection to a device that outlives its driver.
 pub struct Queue<C: Control> {
     // The generated clients carry their message buffers (4 KB each): boxed,
@@ -226,9 +238,12 @@ pub struct Queue<C: Control> {
     /// Completions taken from a driver's ring and not yet returned.
     ready: VecDeque<Completion>,
     /// When the driver last ended (monotonic ns; 0: not since connecting),
-    /// and how long the last recovery took.
+    /// when the next one took the connection and after how many tries, and
+    /// how the last recovery went.
     lost_at: u64,
-    recovered_in: Option<u64>,
+    reconnected_at: u64,
+    tries: u32,
+    recovered_in: Option<Recovery>,
     /// When the driver was last looked for (`LIVENESS_NS`).
     checked_at: u64,
 }
@@ -276,6 +291,8 @@ impl<C: Control> Queue<C> {
             in_flight: InFlight::new()?,
             ready: VecDeque::new(),
             lost_at: 0,
+            reconnected_at: 0,
+            tries: 0,
             recovered_in: None,
             checked_at: 0,
         };
@@ -360,8 +377,12 @@ impl<C: Control> Queue<C> {
         }
         let deadline = self.lost_at + Self::RECONNECT_NS;
         loop {
+            self.tries += 1;
             match self.connect() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.reconnected_at = clock.now();
+                    return Ok(());
+                }
                 // Not back yet: the device manager is starting it again.
                 Err(Error::Gone) if clock.now() < deadline => sys::yield_now(),
                 Err(e) => return Err(e),
@@ -383,10 +404,9 @@ impl<C: Control> Queue<C> {
         Ok(&mut self.link()?.control)
     }
 
-    /// How long the last recovery from a driver's end took, from the end
-    /// being noticed to the first completion after it (ns), once: the next
-    /// call says `None` until there is another.
-    pub fn take_recovery(&mut self) -> Option<u64> {
+    /// How the last recovery from a driver's end went, once: the next call
+    /// says `None` until there is another.
+    pub fn take_recovery(&mut self) -> Option<Recovery> {
         self.recovered_in.take()
     }
 
@@ -475,8 +495,12 @@ impl<C: Control> Queue<C> {
                         continue;
                     }
                     if self.lost_at != 0 {
-                        self.recovered_in = Some(silica_rt::clock().now() - self.lost_at);
+                        let now = silica_rt::clock().now();
+                        let reconnected = self.reconnected_at.max(self.lost_at);
+                        self.recovered_in =
+                            Some(Recovery { total: now - self.lost_at, reconnecting: reconnected - self.lost_at, tries: self.tries });
                         self.lost_at = 0;
+                        self.tries = 0;
                     }
                     return Ok(Some(c));
                 }

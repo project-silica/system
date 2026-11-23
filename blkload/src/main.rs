@@ -121,7 +121,7 @@ fn run() -> Result<(), &'static str> {
             return Err("a request failed");
         }
         if let Some(r) = disk.take_recovery() {
-            recoveries.push(r);
+            recoveries.push(r.total);
         }
         if c.tag == 0 {
             flushing = false;
@@ -139,7 +139,7 @@ fn run() -> Result<(), &'static str> {
                     return Err("a request failed");
                 }
                 if let Some(r) = disk.take_recovery() {
-                    recoveries.push(r);
+                    recoveries.push(r.total);
                 }
                 done += 1;
                 free.extend(slot_of.remove(&c.tag));

@@ -200,9 +200,18 @@ fn run() -> Result<(), &'static str> {
             Err(_) => return Err("the interface is gone"),
         };
         if let Some(r) = l.nic.take_recovery() {
-            worst = worst.max(r);
-            if r > RECOVERY_NS {
-                println!("netload: a recovery took {} ms", r / 1_000_000);
+            worst = worst.max(r.total);
+            if r.total > RECOVERY_NS {
+                // Where it went: until the next driver took the connection
+                // (the device manager restarting it, and its start-up), and
+                // from there to the first answer.
+                println!(
+                    "netload: a recovery took {} ms: {} ms until the next driver took the connection ({} tries), {} ms from there to the first completion",
+                    r.total / 1_000_000,
+                    r.reconnecting / 1_000_000,
+                    r.tries,
+                    (r.total - r.reconnecting) / 1_000_000
+                );
                 return Err("a recovery took longer than 250 ms");
             }
         }
