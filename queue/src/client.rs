@@ -40,7 +40,8 @@ pub enum Error {
     Protocol,
     /// This program has no memory or capability slots left for it.
     NoMemory,
-    /// [`QUEUE`] requests are in progress, or the tag is in use.
+    /// [`QUEUE`] requests are in progress, the tag is in use, or a
+    /// ringful of saved results must be polled before reconnecting.
     Full,
     /// No completion arrived before the deadline.
     Timeout,
@@ -326,7 +327,9 @@ impl<C: Control> Queue<C> {
             }
         }
         for r in self.in_flight.iter() {
-            link.requests.push(r).map_err(|_| Error::Protocol)?;
+            if !self.ready.iter().any(|c| c.tag == tag_of(r)) {
+                link.requests.push(r).map_err(|_| Error::Protocol)?;
+            }
         }
         self.link = Some(link);
         self.kick();
@@ -343,7 +346,7 @@ impl<C: Control> Queue<C> {
         }
         self.checked_at = now;
         if self.link.as_ref().is_some_and(|l| !matches!(sys::inspect_slot(slots::SPACE, l.wake.cap().0), Ok(Some(_)))) {
-            self.link = None;
+            self.disconnect();
         }
     }
 
@@ -360,33 +363,63 @@ impl<C: Control> Queue<C> {
         }
     }
 
-    /// The driver ended: take what it completed, and connect to the next.
-    fn recover(&mut self) -> Result<(), Error> {
-        let clock = silica_rt::clock();
-        if self.lost_at == 0 {
-            self.lost_at = clock.now();
-        }
+    /// Keep published results before dropping the consumer. Their tags
+    /// remain in use until the caller takes them, including across reconnect.
+    fn disconnect(&mut self) {
         if let Some(mut link) = self.link.take() {
-            // Completions it wrote before it ended are as good as any.
-            while let Ok(Some(raw)) = link.completions.pop() {
+            if self.lost_at == 0 {
+                self.lost_at = silica_rt::clock().now();
+            }
+            for _ in 0..QUEUE {
+                let Ok(Some(raw)) = link.completions.pop() else { break };
                 let c = Completion::decode(&raw);
-                if c.tag >= EVENTS || self.in_flight.remove(c.tag).is_some() {
+                if c.tag >= EVENTS || (self.in_flight.contains(c.tag) && !self.ready.iter().any(|r| r.tag == c.tag)) {
                     self.ready.push_back(c);
                 }
             }
+        }
+    }
+
+    fn recover(&mut self) -> Result<(), Error> {
+        // Keep room for the next driver's entire completion ring. An
+        // application doing only control calls across repeated restarts
+        // must consume queued events before they grow without bound.
+        if self.ready.len() >= QUEUE as usize {
+            return Err(Error::Full);
+        }
+        let clock = silica_rt::clock();
+        if self.lost_at == 0 {
+            self.lost_at = clock.now();
         }
         let deadline = self.lost_at + Self::RECONNECT_NS;
         loop {
             self.tries += 1;
             match self.connect() {
                 Ok(()) => {
-                    self.reconnected_at = clock.now();
+                    let now = clock.now();
+                    self.reconnected_at = now;
+                    // Nothing was sent to the new driver again (every
+                    // request in flight had its result saved): there is no
+                    // completion to wait for, so the recovery ends here.
+                    if self.in_flight.iter().all(|r| self.ready.iter().any(|c| c.tag == tag_of(r))) {
+                        self.recovered(now);
+                    }
                     return Ok(());
                 }
                 // Not back yet: the device manager is starting it again.
                 Err(Error::Gone) if clock.now() < deadline => sys::yield_now(),
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// A recovery in progress ended at `now`: keep how it went.
+    fn recovered(&mut self, now: u64) {
+        if self.lost_at != 0 {
+            let reconnected = self.reconnected_at.max(self.lost_at);
+            self.recovered_in = Some(Recovery { total: now - self.lost_at, reconnecting: reconnected - self.lost_at, tries: self.tries });
+            self.lost_at = 0;
+            self.tries = 0;
         }
     }
 
@@ -424,7 +457,7 @@ impl<C: Control> Queue<C> {
             let lent = lend(memory.frame(), rights, 0)?;
             match self.link()?.control.add_memory(id, lent, writable) {
                 Ok(()) => break,
-                Err(Error::Gone) => self.link = None,
+                Err(Error::Gone) => self.disconnect(),
                 Err(e) => return Err(e),
             }
         }
@@ -437,7 +470,7 @@ impl<C: Control> Queue<C> {
         match self.link()?.control.remove_memory(id) {
             Ok(()) => {}
             // The next driver is not told about it at all.
-            Err(Error::Gone) => self.link = None,
+            Err(Error::Gone) => self.disconnect(),
             Err(e) => return Err(e),
         }
         if let Some(m) = self.memories.get_mut(id as usize) {
@@ -469,7 +502,7 @@ impl<C: Control> Queue<C> {
         let Some(link) = self.link.as_mut() else { return };
         if link.requests.wake_needed() && sys::signal(link.wake.cap()).is_err() {
             // Its notification is gone with it: the death notice follows.
-            self.link = None;
+            self.disconnect();
         }
     }
 
@@ -477,12 +510,15 @@ impl<C: Control> Queue<C> {
     /// up), if one is there.
     pub fn poll(&mut self) -> Result<Option<Completion>, Error> {
         if let Some(c) = self.ready.pop_front() {
+            if c.tag < EVENTS {
+                self.in_flight.remove(c.tag);
+            }
             return Ok(Some(c));
         }
-        let Some(link) = self.link.as_mut() else {
+        if self.link.is_none() {
             self.recover()?;
-            return Ok(self.ready.pop_front());
-        };
+        }
+        let Some(link) = self.link.as_mut() else { return Ok(None) };
         loop {
             match link.completions.pop() {
                 Ok(Some(raw)) => {
@@ -494,14 +530,7 @@ impl<C: Control> Queue<C> {
                     if self.in_flight.remove(c.tag).is_none() {
                         continue;
                     }
-                    if self.lost_at != 0 {
-                        let now = silica_rt::clock().now();
-                        let reconnected = self.reconnected_at.max(self.lost_at);
-                        self.recovered_in =
-                            Some(Recovery { total: now - self.lost_at, reconnecting: reconnected - self.lost_at, tries: self.tries });
-                        self.lost_at = 0;
-                        self.tries = 0;
-                    }
+                    self.recovered(silica_rt::clock().now());
                     return Ok(Some(c));
                 }
                 Ok(None) => break,
@@ -518,13 +547,11 @@ impl<C: Control> Queue<C> {
     /// at once, and the processor is not shared with a client about to
     /// wait. What a request and its answer cost the processor.
     pub fn kick_wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
-        let mut wake = self.link.as_mut().filter(|l| l.requests.wake_needed()).map(|l| l.wake.cap());
+        let mut kick = true;
         loop {
             if let Some(c) = self.poll()? {
-                if let Some(w) = wake
-                    && sys::signal(w).is_err()
-                {
-                    self.link = None;
+                if kick {
+                    self.kick();
                 }
                 return Ok(c);
             }
@@ -532,16 +559,17 @@ impl<C: Control> Queue<C> {
             if !asleep {
                 continue;
             }
-            let w = wake.take().unwrap_or(Cap::NONE);
+            let w = self.link.as_ref().filter(|l| kick && l.requests.wake_needed()).map_or(Cap::NONE, |l| l.wake.cap());
+            kick = false;
             let (until, mine) = self.until(deadline);
             match sys::signal_recv(w, self.note.cap(), Cap::NONE, until) {
-                Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.link = None,
+                Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.disconnect(),
                 Ok(_) => {}
                 Err(sys::Error::Timeout) if mine => self.look(),
                 // The wake-up failed, and nothing was received: the
                 // driver's notification is gone with it (its death notice
                 // follows).
-                Err(e) if w != Cap::NONE && e != sys::Error::Timeout && sys::signal(w).is_err() => self.link = None,
+                Err(e) if w != Cap::NONE && e != sys::Error::Timeout && sys::signal(w).is_err() => self.disconnect(),
                 Err(_) => return Err(Error::Timeout),
             }
         }
@@ -560,7 +588,7 @@ impl<C: Control> Queue<C> {
             }
             let (until, mine) = self.until(deadline);
             match sys::recv(self.note.cap(), until) {
-                Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.link = None,
+                Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.disconnect(),
                 Ok(_) => {}
                 Err(sys::Error::Timeout) if mine => self.look(),
                 Err(_) => return Err(Error::Timeout),
