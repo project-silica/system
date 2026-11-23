@@ -33,9 +33,13 @@ pub struct Root {
 /// says what was wrong with what the kernel handed over.
 pub fn start(info: &'static RootInfo) -> Result<Root, &'static str> {
     let (space, aspace, ports) = (Cap(SLOT_CAPSPACE), Cap(SLOT_ASPACE), Cap(SLOT_PORTS));
-    silica_rt::start_root(Cap(SLOT_CONSOLE), info.clock, info.ipc_buffer, info.first_free_slot, info.capspace_slots);
+    silica_rt::start_root(Cap(SLOT_CONSOLE), info.clock, info.ipc_buffer, info.first_free_slot, info.capspace_slots, &info.entropy);
     if info.magic != ROOT_MAGIC {
         return Err("the kernel's start-up record has the wrong magic");
+    }
+    if info.entropy_sources == 0 {
+        // Every program's generator descends from this one.
+        silica_rt::println!("ERROR: the boot loader found no source of randomness it trusts: random numbers are predictable");
     }
     let descs = &info.untyped[..info.untyped_count as usize];
     // All of the machine's memory.

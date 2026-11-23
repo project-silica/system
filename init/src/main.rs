@@ -671,6 +671,32 @@ fn program_checks(root: &Root) {
         }
         println!("init: hello (id {}) exited with status {}; its memory is back", m.badge, m.words[0]);
     }
+    // Every program has a random number generator of its own, seeded by its
+    // parent: three programs started alike give three different numbers
+    // (one started without a seed would end with an error), none of them
+    // this program's own.
+    let mut drawn = [silica_rt::random::u64(), 0, 0, 0];
+    for (n, slot) in drawn.iter_mut().enumerate().skip(1) {
+        let id = 110 + n as u64;
+        let child = match spawn(parent, &Program { args: [0, 2, 0, 0, 0, 0, 0, 0], ..Program::new(image, id) }) {
+            Ok(c) => c,
+            Err(e) => fail!("cannot start hello: {e:?}"),
+        };
+        let Ok(m) = sys::recv(parent.exit, Wait::Until(silica_rt::clock().now() + 5 * SECOND)) else {
+            fail!("hello did not report its exit within 5 s")
+        };
+        if m.info.label() != EXIT_LABEL || m.badge != id {
+            fail!("hello's exit message is not its random number");
+        }
+        *slot = m.words[0];
+        if child.destroy().is_err() {
+            fail!("cannot take back hello's memory");
+        }
+    }
+    if (0..4).any(|i| (i + 1..4).any(|j| drawn[i] == drawn[j])) {
+        fail!("two programs' random number generators gave the same number: {drawn:x?}");
+    }
+    println!("init: three programs' random number generators and this one's gave four different numbers");
     // Two programs that talk: a provider of the sample.Echo protocol and a
     // client of it, connected by one endpoint. The provider may only
     // receive on it; the client may only send (and pass capabilities).

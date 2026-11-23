@@ -449,7 +449,15 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
         clock: p.clock,
         args,
     };
-    place(12, INFO_VADDR, Rights::READ, None, &mut |mapped| write_info(&info, mapped))?;
+    // The program's own page, read-write: the runtime takes the seed of its
+    // random number generator from it and overwrites it (`silica_rt::random`).
+    let mut seed = [0u8; 32];
+    silica_rt::random::fill(&mut seed);
+    place(12, INFO_VADDR, rw, None, &mut |mapped| {
+        write_info(&info, mapped);
+        write_seed(&seed, mapped + silica_rt::random::SEED_OFFSET);
+    })?;
+    seed.fill(0);
 
     // The IPC buffer: the thread is configured with it while the
     // capability is still the parent's to name.
@@ -514,6 +522,15 @@ fn copy(data: &[u8], to: usize) {
 }
 
 /// Write the start-up record to the page mapped at `to`.
+fn write_seed(seed: &[u8; 32], to: usize) {
+    // SAFETY: `to` lies inside the same fresh page, mapped read-write, past
+    // the ProcessInfo (SEED_OFFSET + 32 <= 4096).
+    #[allow(unsafe_code)]
+    unsafe {
+        core::ptr::copy_nonoverlapping(seed.as_ptr(), to as *mut u8, 32)
+    }
+}
+
 fn write_info(info: &ProcessInfo, to: usize) {
     // SAFETY: `to` is a fresh page mapped read-write, large enough for and
     // aligned as a ProcessInfo.
