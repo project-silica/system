@@ -319,15 +319,20 @@ fn display(devices: &mut manager::Client<Channel, Handle>, note: Cap, grid: &Gri
     d.show(grid).then_some(d)
 }
 
+/// Arm the empty input ring before the driver sees it. A driver can
+/// publish buffered input and signal while its connect call is running.
+fn input_ring() -> Option<(Consumer<8>, Memory)> {
+    let memory = Memory::new(12).ok()?;
+    let mut ring = Consumer::new(memory.shared(), 256)?;
+    ring.sleep().then_some((ring, memory))
+}
+
 /// The keyboard, connected: its ring and the notification it signals.
 fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option<(Consumer<8>, Memory, Handle)> {
     let driver = open(devices, manager::Class::Input, note, KEYBOARD_GONE)?;
     let mut kb = input::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
-    let ring = Memory::new(12).ok()?;
+    let (consumer, ring) = input_ring()?;
     kb.connect(lend(ring.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, KEYS)?).ok()?;
-    let region = ring.shared();
-    let mut consumer = Consumer::new(region, 256)?;
-    let _ = consumer.sleep();
     Some((consumer, ring, driver))
 }
 
@@ -335,10 +340,8 @@ fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option
 fn console_port(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option<Port> {
     let handle = open(devices, manager::Class::Port, note, PORT_GONE)?;
     let mut driver = port::Client::<Channel, Handle>::from(Channel::new(handle.cap()));
-    let memory = Memory::new(12).ok()?;
+    let (ring, memory) = input_ring()?;
     driver.connect(lend(memory.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, PORT_BYTES)?).ok()?;
-    let mut ring = Consumer::new(memory.shared(), 256)?;
-    let _ = ring.sleep();
     Some(Port { ring, _memory: memory, driver, _handle: handle, after_cr: false })
 }
 
