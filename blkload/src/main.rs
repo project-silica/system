@@ -73,13 +73,40 @@ fn run() -> Result<(), &'static str> {
     let m = buffer.shared();
     let (id, mut disk) = scratch(&mut devices, &buffer, m)?;
     println!("blkload: scratch disk {id:#x}, {} blocks", disk.info().blocks);
+    // Leave an acknowledged device write in the completion ring across
+    // restart. Its buffer is withdrawn before the ring is read: only the
+    // original result can succeed, since a replay has no registered frame.
+    let tag = silica_block::service::TRACED;
+    disk.submit(&Request { op: Op::Write, memory: 0, block: 0, offset: 0, blocks: 1, tag })
+        .map_err(|_| "cannot submit the traced write")?;
+    disk.kick();
+    let clock = silica_rt::clock();
+    let until = clock.now() + 5 * SECOND;
+    loop {
+        if disk.trace(tag).is_ok_and(|(_, _, done)| done != 0) {
+            break;
+        }
+        if clock.now() >= until {
+            return Err("the driver did not report completing the traced write");
+        }
+        silica_rt::sys::yield_now();
+    }
+    devices.restart(id).map_err(|_| "cannot restart after the traced write")?;
+    disk.remove_memory(0).map_err(|_| "cannot withdraw the traced write's buffer")?;
+    let completed = disk.wait(Some(clock.now() + 5 * SECOND)).map_err(|_| "lost the traced write's completion")?;
+    if completed.tag != tag || completed.status.is_err() {
+        return Err("the client lost a successful write completion across restart");
+    }
+    disk.add_memory(0, &buffer, true).map_err(|_| "cannot register the load buffer again")?;
+    disk.run(&Request { op: Op::Read, memory: 0, block: 0, offset: 0, blocks: 1, tag: 0 }, Some(clock.now() + 5 * SECOND))
+        .map_err(|_| "the replacement driver did not serve the next read")?;
+    disk.take_recovery();
     // Each slot of the buffer holds one write's data while it is in flight.
     let fill = |slot: u64, round: u64, block: u64| {
         for i in 0..64u64 {
             m.write64((slot * 512 + i * 8) as usize, round << 40 | block << 16 | i);
         }
     };
-    let clock = silica_rt::clock();
     let (start, mut next_kill) = (clock.now(), clock.now() + KILL_EVERY_NS);
     let (mut sent, mut done, mut since_flush, mut kills) = (0u64, 0u64, 0u64, 0u32);
     let mut recoveries = Vec::new();
