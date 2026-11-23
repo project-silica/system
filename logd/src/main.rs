@@ -64,6 +64,11 @@ struct Source {
     /// Its text since its last newline: what is shown again when another
     /// source's line cut it short.
     partial: Vec<u8>,
+    /// The frame of its ring, and for a program's log its place among the
+    /// service manager's (`log_ring`), where a replacement ring appears
+    /// when the service that made it restarts.
+    cap: Cap,
+    given: Option<u32>,
 }
 
 struct Log {
@@ -218,17 +223,31 @@ impl Log {
 
     /// Take the rings of programs' logs given since the last time.
     fn take_given(&mut self) {
+        // A ring that is gone (the service that made it restarted): the
+        // service manager holds its replacement in the same place, and the
+        // source reads on from it, its text kept.
+        for s in self.sources.iter_mut() {
+            let Some(index) = s.given else { continue };
+            if matches!(sys::inspect_slot(slots::SPACE, s.cap.0), Ok(Some(_))) {
+                continue;
+            }
+            let Ok(r) = self.system.log_ring(index) else { continue };
+            if let Some(ring) = ring_in(r.ring.cap()) {
+                (s.ring, s.cap, s.broken) = (ring, r.ring.into_cap(), false);
+            }
+        }
         loop {
             let (name, ring) = match self.system.log_ring(self.given) {
                 Ok(r) => (String::from(r.name), r.ring),
                 Err(_) => return,
             };
-            self.given += 1;
-            if let Some(source) = source(name, ring.cap()) {
+            if let Some(mut source) = source(name, ring.cap()) {
                 // Kept for as long as the program runs: the ring stays mapped.
+                source.given = Some(self.given);
                 let _ = ring.into_cap();
                 self.sources.push(source);
             }
+            self.given += 1;
         }
     }
 
@@ -298,8 +317,8 @@ impl Events for Log {
     }
 }
 
-/// The source `name` reading the log ring in the frame `cap`, if it is one.
-fn source(name: String, cap: Cap) -> Option<Source> {
+/// The log ring in the frame `cap`, mapped, if it is one.
+fn ring_in(cap: Cap) -> Option<Consumer<RECORD>> {
     let Ok(Some(slot)) = sys::inspect_slot(slots::SPACE, cap.0) else { return None };
     if slot.ty != ObjectType::Frame || slot.bits != BITS {
         return None;
@@ -307,9 +326,15 @@ fn source(name: String, cap: Cap) -> Option<Source> {
     let region = mem::peer(cap, BITS, Rights(Rights::READ.0 | Rights::WRITE.0)).ok()?;
     let mut ring = Consumer::new(region, RECORDS)?;
     let _ = ring.sleep();
+    Some(ring)
+}
+
+/// The source `name` reading the log ring in the frame `cap`, if it is one.
+fn source(name: String, cap: Cap) -> Option<Source> {
+    let ring = ring_in(cap)?;
     // Names last as long as the program: sources are never removed.
     let name: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_boxed_str());
-    Some(Source { name, ring, kept: VecDeque::new(), written: 0, broken: false, partial: Vec::new() })
+    Some(Source { name, ring, kept: VecDeque::new(), written: 0, broken: false, partial: Vec::new(), cap, given: None })
 }
 
 fn main(info: &'static ProcessInfo) -> i64 {

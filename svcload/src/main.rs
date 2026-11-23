@@ -15,7 +15,10 @@
 //!   program that the new log service has a line written after the restart;
 //! - `console`: the shell is always in the middle of a call to it (waiting
 //!   for a line), and this program asks it its size;
-//! - `shell`: the console is always in the middle of answering it.
+//! - `shell`: the console is always in the middle of answering it;
+//! - `devmgr`: every driver is its child and ends with it, so the reads in
+//!   flight on the partition lose their driver each time; the disk's
+//!   client reconnects through it and sends them again.
 //!
 //! A recovery is the time from asking for the restart to the first call the
 //! new instance answers; each must be under [`RECOVERY_NS`]. After all of
@@ -112,6 +115,7 @@ fn run() -> Result<(), String> {
     let mut load = Load { system: system::Client::from(Channel::new(grant(0))), slowest: 0 };
     let before = load.system.memory().map_err(|e| format!("memory: {e:?}"))?.free;
     partitions(&mut load)?;
+    devmgr(&mut load)?;
     logd(&mut load)?;
     console(&mut load)?;
     shell(&mut load)?;
@@ -211,6 +215,37 @@ fn partitions(load: &mut Load) -> Result<(), String> {
     let done = reads.finish()?;
     load.said("partitions");
     println!("svcload: {done} reads of the partition, every one completed");
+    Ok(())
+}
+
+fn devmgr(load: &mut Load) -> Result<(), String> {
+    use silica_protocols::device::manager as devices;
+    let mut reads = Reads::new()?;
+    let mut manager = devices::Client::<Channel, Handle>::from(Channel::new(grant(4)));
+    for _ in 0..ROUNDS {
+        let until = now() + EVERY_NS;
+        while now() < until {
+            reads.pump()?;
+        }
+        // What the old driver finished is taken first: a read counted
+        // after the restart is one the new driver did.
+        reads.pump()?;
+        let mut failed = None;
+        let before = reads.done;
+        load.restart("devmgr", || {
+            if let Err(e) = reads.pump() {
+                failed = Some(e);
+                return true;
+            }
+            reads.done > before && manager.list(devices::Class::Block).is_ok_and(|r| !r.devices.is_empty())
+        })?;
+        if let Some(e) = failed {
+            return Err(format!("{e} while the device manager restarted"));
+        }
+    }
+    let done = reads.finish()?;
+    load.said("devmgr");
+    println!("svcload: {done} reads of the partition across the device manager's restarts, every one completed");
     Ok(())
 }
 

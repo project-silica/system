@@ -3,7 +3,9 @@
 //!
 //! A driver can end at any moment: it fails, or its owner restarts it. The
 //! client hears of it at once (the device manager signals the client's
-//! notification, `open`'s `gone`), opens the driver that replaces it,
+//! notification, `open`'s `gone`) or, when the device manager ended too and
+//! its notice with it, within [`Queue::LIVENESS_NS`] of a request waiting
+//! (the client's capability to the driver is gone), opens the driver that replaces it,
 //! registers its memory again, and sends again every request that had not
 //! completed. Completions the old driver had already written are still
 //! delivered. To the program, a driver's end is a delay; a request is never
@@ -227,6 +229,8 @@ pub struct Queue<C: Control> {
     /// and how long the last recovery took.
     lost_at: u64,
     recovered_in: Option<u64>,
+    /// When the driver was last looked for (`LIVENESS_NS`).
+    checked_at: u64,
 }
 
 /// A capability of this program's own, derived from `cap` with `rights`
@@ -243,6 +247,10 @@ impl<C: Control> Queue<C> {
     /// How long a driver that ended has to come back before requests fail
     /// with [`Error::Gone`].
     pub const RECONNECT_NS: u64 = 5_000_000_000;
+    /// How often a client with requests in flight and none completing
+    /// looks whether its driver is still there, for the end no notice
+    /// reports: the device manager's own, which takes its drivers with it.
+    pub const LIVENESS_NS: u64 = 10_000_000;
 
     /// Open the device with identity `id` through the device manager behind
     /// `devices` (a capability to its endpoint; the queue keeps it to find
@@ -269,6 +277,7 @@ impl<C: Control> Queue<C> {
             ready: VecDeque::new(),
             lost_at: 0,
             recovered_in: None,
+            checked_at: 0,
         };
         q.connect()?;
         Ok(q)
@@ -305,6 +314,33 @@ impl<C: Control> Queue<C> {
         self.link = Some(link);
         self.kick();
         Ok(())
+    }
+
+    /// With requests in flight, every [`Self::LIVENESS_NS`]: whether the
+    /// driver is still there. A driver's objects go with it, and with them
+    /// every capability the client was given to them (the slot empties).
+    fn look(&mut self) {
+        let now = silica_rt::clock().now();
+        if self.in_flight.len == 0 || now - self.checked_at < Self::LIVENESS_NS {
+            return;
+        }
+        self.checked_at = now;
+        if self.link.as_ref().is_some_and(|l| !matches!(sys::inspect_slot(slots::SPACE, l.wake.cap().0), Ok(Some(_)))) {
+            self.link = None;
+        }
+    }
+
+    /// The deadline of a wait: the caller's, or sooner while requests are
+    /// in flight, so that a driver's unannounced end is seen.
+    fn until(&self, deadline: Option<u64>) -> (Wait, bool) {
+        if self.in_flight.len == 0 {
+            return (deadline.map_or(Wait::Forever, Wait::Until), false);
+        }
+        let look = silica_rt::clock().now() + Self::LIVENESS_NS;
+        match deadline {
+            Some(d) if d <= look => (Wait::Until(d), false),
+            _ => (Wait::Until(look), true),
+        }
     }
 
     /// The driver ended: take what it completed, and connect to the next.
@@ -444,10 +480,12 @@ impl<C: Control> Queue<C> {
                     }
                     return Ok(Some(c));
                 }
-                Ok(None) => return Ok(None),
+                Ok(None) => break,
                 Err(_) => return Err(Error::Protocol),
             }
         }
+        self.look();
+        Ok(None)
     }
 
     /// [`Queue::kick`] and [`Queue::wait`] together: when the client has
@@ -471,9 +509,11 @@ impl<C: Control> Queue<C> {
                 continue;
             }
             let w = wake.take().unwrap_or(Cap::NONE);
-            match sys::signal_recv(w, self.note.cap(), Cap::NONE, deadline.map_or(Wait::Forever, Wait::Until)) {
+            let (until, mine) = self.until(deadline);
+            match sys::signal_recv(w, self.note.cap(), Cap::NONE, until) {
                 Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.link = None,
                 Ok(_) => {}
+                Err(sys::Error::Timeout) if mine => self.look(),
                 // The wake-up failed, and nothing was received: the
                 // driver's notification is gone with it (its death notice
                 // follows).
@@ -494,9 +534,11 @@ impl<C: Control> Queue<C> {
             if !asleep {
                 continue;
             }
-            match sys::recv(self.note.cap(), deadline.map_or(Wait::Forever, Wait::Until)) {
+            let (until, mine) = self.until(deadline);
+            match sys::recv(self.note.cap(), until) {
                 Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.link = None,
                 Ok(_) => {}
+                Err(sys::Error::Timeout) if mine => self.look(),
                 Err(_) => return Err(Error::Timeout),
             }
         }
