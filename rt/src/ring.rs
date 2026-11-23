@@ -194,6 +194,225 @@ impl<const N: usize> Consumer<N> {
     }
 }
 
+/// A stream of bytes from one program to another, over the same kind of
+/// shared memory as the record rings: a header of [`STREAM_HEADER`] bytes
+/// and a data area of any size. TCP's connections reach programs through
+/// two of these in one frame (`silica_net::tcp`). It adds to the record
+/// ring what a stream needs:
+///
+/// - **Room.** A producer that finds the stream full says so in the header
+///   ([`StreamProducer::sleep_for_room`]) before it waits, and a consumer
+///   that takes bytes signals it then ([`StreamConsumer::room_needed`]),
+///   ordered as the consumer's sleep is: one of the two sees the other.
+/// - **The end.** The producer may say that nothing more will come, with a
+///   reason ([`StreamProducer::close`]): 0 for an orderly end, a protocol's
+///   error code otherwise. The consumer sees it once it has taken every
+///   byte before it.
+///
+/// Positions count bytes modulo twice the capacity, so the capacity need
+/// not be a power of two (a frame holds two headers and two data areas
+/// with nothing left over), and a full stream is told from an empty one.
+/// The other side is not trusted, as for the record rings: a position it
+/// writes that makes no sense reports [`Broken`].
+pub const STREAM_HEADER: usize = 64;
+const STREAM_TAIL: usize = 0;
+const STREAM_SLEEPING: usize = 4;
+const STREAM_CLOSED: usize = 8;
+const STREAM_REASON: usize = 12;
+const STREAM_HEAD: usize = 32;
+const STREAM_WANTS_ROOM: usize = 36;
+
+#[derive(Debug)]
+struct StreamShared {
+    header: Shared,
+    data: Mmio,
+    capacity: u32,
+}
+
+impl StreamShared {
+    fn new(header: Mmio, data: Mmio) -> Option<StreamShared> {
+        let capacity = u32::try_from(data.len()).ok().filter(|c| *c >= 8 && *c <= 1 << 30)?;
+        let aligned = header.addr().is_multiple_of(8) && header.len() >= STREAM_HEADER;
+        aligned.then(|| StreamShared { header: Shared { region: header, base: header.addr(), mask: 0 }, data, capacity })
+    }
+
+    fn word(&self, offset: usize) -> &AtomicU32 {
+        self.header.word(offset)
+    }
+
+    /// Bytes between position `head` and position `tail`, or [`Broken`]
+    /// when either is not a position or they are further apart than the
+    /// stream holds.
+    fn between(&self, head: u32, tail: u32) -> Result<u32, Broken> {
+        let wrap = 2 * self.capacity;
+        if head >= wrap || tail >= wrap {
+            return Err(Broken);
+        }
+        let n = if tail >= head { tail - head } else { tail + wrap - head };
+        if n > self.capacity { Err(Broken) } else { Ok(n) }
+    }
+
+    fn advance(&self, at: u32, n: usize) -> u32 {
+        let next = at as u64 + n as u64;
+        (next % (2 * self.capacity as u64)) as u32
+    }
+
+    /// Copy bytes at position `at` out into `out`, or in from `bytes`, in
+    /// at most two pieces (where the data wraps).
+    fn copy_out(&self, at: u32, out: &mut [u8]) {
+        let start = (at % self.capacity) as usize;
+        let first = out.len().min(self.capacity as usize - start);
+        self.data.read_bytes(start, &mut out[..first]);
+        self.data.read_bytes(0, &mut out[first..]);
+    }
+
+    fn copy_in(&self, at: u32, bytes: &[u8]) {
+        let start = (at % self.capacity) as usize;
+        let first = bytes.len().min(self.capacity as usize - start);
+        self.data.write_bytes(start, &bytes[..first]);
+        self.data.write_bytes(0, &bytes[first..]);
+    }
+}
+
+/// The writing end of a byte stream.
+#[derive(Debug)]
+pub struct StreamProducer {
+    s: StreamShared,
+    tail: u32,
+}
+
+impl StreamProducer {
+    /// The writing end of the stream whose header is `header` (at least
+    /// [`STREAM_HEADER`] bytes, 8-byte aligned) and whose bytes are `data`
+    /// (8 bytes to 1 GiB), both shared memory that starts zeroed. A
+    /// position found there that makes no sense is taken as the start.
+    pub fn new(header: Mmio, data: Mmio) -> Option<StreamProducer> {
+        let s = StreamShared::new(header, data)?;
+        let tail = s.word(STREAM_TAIL).load(Ordering::Relaxed);
+        let tail = if tail < 2 * s.capacity { tail } else { 0 };
+        Some(StreamProducer { s, tail })
+    }
+
+    /// How many more bytes fit now (none when the consumer's position
+    /// makes no sense).
+    pub fn room(&self) -> usize {
+        let head = self.s.word(STREAM_HEAD).load(Ordering::Acquire);
+        self.s.between(head, self.tail).map_or(0, |used| (self.s.capacity - used) as usize)
+    }
+
+    /// Add as much of `bytes` as fits; returns how much did. After the
+    /// last write, [`StreamProducer::wake_needed`].
+    pub fn write(&mut self, bytes: &[u8]) -> usize {
+        let n = bytes.len().min(self.room());
+        if n == 0 {
+            return 0;
+        }
+        self.s.copy_in(self.tail, &bytes[..n]);
+        self.tail = self.s.advance(self.tail, n);
+        self.s.word(STREAM_TAIL).store(self.tail, Ordering::Release);
+        n
+    }
+
+    /// Nothing more will be written: `reason` 0 for an orderly end, a
+    /// protocol's error code otherwise. Then [`StreamProducer::wake_needed`].
+    pub fn close(&mut self, reason: u32) {
+        self.s.word(STREAM_REASON).store(reason, Ordering::Relaxed);
+        self.s.word(STREAM_CLOSED).store(1, Ordering::Release);
+    }
+
+    /// After writing or closing: whether the consumer said it sleeps, in
+    /// which case signal it. Told once.
+    pub fn wake_needed(&self) -> bool {
+        self.s.word(STREAM_SLEEPING).swap(0, Ordering::SeqCst) != 0
+    }
+
+    /// Before waiting for room: say so. Returns whether to wait: `false`
+    /// when room appeared meanwhile (write instead).
+    pub fn sleep_for_room(&mut self) -> bool {
+        self.s.word(STREAM_WANTS_ROOM).store(1, Ordering::SeqCst);
+        // As `Consumer::sleep`: the flag before the position is read.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if self.room() != 0 {
+            self.s.word(STREAM_WANTS_ROOM).store(0, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+}
+
+/// The reading end of a byte stream.
+#[derive(Debug)]
+pub struct StreamConsumer {
+    s: StreamShared,
+    head: u32,
+}
+
+/// What a read found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Read {
+    /// This many bytes (more than 0).
+    Bytes(usize),
+    /// Nothing yet.
+    Empty,
+    /// Nothing more will come: the producer closed it, with this reason.
+    Closed(u32),
+}
+
+impl StreamConsumer {
+    /// The reading end; see [`StreamProducer::new`].
+    pub fn new(header: Mmio, data: Mmio) -> Option<StreamConsumer> {
+        let s = StreamShared::new(header, data)?;
+        let head = s.word(STREAM_HEAD).load(Ordering::Relaxed);
+        let head = if head < 2 * s.capacity { head } else { 0 };
+        Some(StreamConsumer { s, head })
+    }
+
+    /// Bytes waiting now.
+    pub fn available(&self) -> Result<usize, Broken> {
+        let tail = self.s.word(STREAM_TAIL).load(Ordering::Acquire);
+        self.s.between(self.head, tail).map(|n| n as usize)
+    }
+
+    /// Take up to `out.len()` bytes, copied out of the shared memory. After
+    /// taking bytes, [`StreamConsumer::room_needed`].
+    pub fn read(&mut self, out: &mut [u8]) -> Result<Read, Broken> {
+        // The end is looked at before the bytes: a close seen here follows
+        // every byte written before it.
+        let closed = self.s.word(STREAM_CLOSED).load(Ordering::Acquire) != 0;
+        let n = self.available()?.min(out.len());
+        if n == 0 {
+            return Ok(if closed && !out.is_empty() {
+                Read::Closed(self.s.word(STREAM_REASON).load(Ordering::Relaxed))
+            } else {
+                Read::Empty
+            });
+        }
+        self.s.copy_out(self.head, &mut out[..n]);
+        self.head = self.s.advance(self.head, n);
+        self.s.word(STREAM_HEAD).store(self.head, Ordering::Release);
+        Ok(Read::Bytes(n))
+    }
+
+    /// After taking bytes: whether the producer said it waits for room, in
+    /// which case signal it. Told once.
+    pub fn room_needed(&self) -> bool {
+        self.s.word(STREAM_WANTS_ROOM).swap(0, Ordering::SeqCst) != 0
+    }
+
+    /// Before waiting for bytes: say so. Returns whether to wait: `false`
+    /// when bytes (or the end) arrived meanwhile, or the stream is broken.
+    pub fn sleep(&mut self) -> bool {
+        self.s.word(STREAM_SLEEPING).store(1, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let closed = self.s.word(STREAM_CLOSED).load(Ordering::Acquire) != 0;
+        if self.available() != Ok(0) || closed {
+            self.s.word(STREAM_SLEEPING).store(0, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -313,5 +532,143 @@ mod tests {
         }
         consumer.join().unwrap();
         assert!(done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_stream_carries_bytes_across_its_wrap_and_says_how_it_ended() {
+        let (h, d) = (region(STREAM_HEADER), region(16));
+        let (mut p, mut c) = (StreamProducer::new(h, d).unwrap(), StreamConsumer::new(h, d).unwrap());
+        let mut out = [0u8; 32];
+        assert_eq!(c.read(&mut out), Ok(Read::Empty));
+        let mut sent = 0u8;
+        let mut got = 0u8;
+        for round in 0..20 {
+            // Writes of uneven sizes, so the data wraps at every place.
+            let chunk: std::vec::Vec<u8> = (0..(round % 7 + 3)).map(|i| sent.wrapping_add(i)).collect();
+            let n = p.write(&chunk);
+            sent = sent.wrapping_add(n as u8);
+            let Ok(Read::Bytes(k)) = c.read(&mut out[..5]) else { panic!("bytes were written") };
+            for b in &out[..k] {
+                assert_eq!(*b, got);
+                got = got.wrapping_add(1);
+            }
+        }
+        while let Ok(Read::Bytes(k)) = c.read(&mut out) {
+            for b in &out[..k] {
+                assert_eq!(*b, got);
+                got = got.wrapping_add(1);
+            }
+        }
+        assert_eq!(got, sent);
+        assert_eq!(p.write(&[0; 40]), 16, "an empty stream takes its capacity");
+        assert_eq!(p.write(&[0; 1]), 0, "a full one nothing");
+        p.close(7);
+        assert_eq!(c.read(&mut out), Ok(Read::Bytes(16)), "the bytes before the end first");
+        assert_eq!(c.read(&mut out), Ok(Read::Closed(7)));
+    }
+
+    #[test]
+    fn a_full_stream_wakes_its_producer_when_room_appears() {
+        let (h, d) = (region(STREAM_HEADER), region(8));
+        let (mut p, mut c) = (StreamProducer::new(h, d).unwrap(), StreamConsumer::new(h, d).unwrap());
+        assert_eq!(p.write(&[1; 8]), 8);
+        assert_eq!(p.write(&[1]), 0);
+        assert!(p.sleep_for_room());
+        let mut out = [0u8; 3];
+        assert_eq!(c.read(&mut out), Ok(Read::Bytes(3)));
+        assert!(c.room_needed());
+        assert!(!c.room_needed(), "told once");
+        assert!(!p.sleep_for_room(), "room is there: do not sleep");
+        assert!(!c.sleep(), "bytes are there: do not sleep");
+    }
+
+    #[test]
+    fn a_stream_peer_that_lies_about_its_index_gets_nowhere() {
+        let (h, d) = (region(STREAM_HEADER), region(8));
+        let (mut p, mut c) = (StreamProducer::new(h, d).unwrap(), StreamConsumer::new(h, d).unwrap());
+        // Further ahead than the stream holds, and not a position at all.
+        h.write32(STREAM_TAIL, 9);
+        assert_eq!(c.read(&mut [0; 4]), Err(Broken));
+        assert!(!c.sleep(), "a broken stream is not slept on");
+        h.write32(STREAM_TAIL, 16);
+        assert_eq!(c.available(), Err(Broken));
+        h.write32(STREAM_TAIL, 0);
+        h.write32(STREAM_HEAD, 100);
+        assert_eq!((p.room(), p.write(&[0; 4])), (0, 0));
+        assert!(StreamProducer::new(region(STREAM_HEADER - 8), region(8)).is_none());
+        assert!(StreamConsumer::new(region(STREAM_HEADER), region(4)).is_none());
+    }
+
+    /// Two threads, sixteen megabytes in writes and reads of every size,
+    /// both sides sleeping: every byte arrives once, in order, and neither
+    /// side is left asleep.
+    #[test]
+    fn a_stream_between_two_threads_loses_nothing() {
+        use std::sync::{Arc, Condvar, Mutex};
+        const TOTAL: usize = if cfg!(miri) { 20_000 } else { 16 << 20 };
+        // A capacity that is not a power of two.
+        let (h, d) = (region(STREAM_HEADER), region(4000));
+        let (mut p, mut c) = (StreamProducer::new(h, d).unwrap(), StreamConsumer::new(h, d).unwrap());
+        // A notification each way: a flag and a condition variable.
+        type Note = Arc<(Mutex<bool>, Condvar)>;
+        // A wake-up that never comes fails the test instead of hanging it.
+        let wait = |n: &Note| {
+            let mut s = n.0.lock().unwrap();
+            while !*s {
+                let (g, t) = n.1.wait_timeout(s, std::time::Duration::from_secs(10)).unwrap();
+                assert!(!t.timed_out(), "a side slept 10 s: its wake-up was lost (or the other side died)");
+                s = g;
+            }
+            *s = false;
+        };
+        let signal = |n: &Note| {
+            *n.0.lock().unwrap() = true;
+            n.1.notify_one();
+        };
+        let (data, room): (Note, Note) = (Arc::default(), Arc::default());
+        let (d2, r2) = (data.clone(), room.clone());
+        let consumer = std::thread::spawn(move || {
+            let mut next = 0usize;
+            let mut out = std::vec![0u8; 3006];
+            let mut size = 1;
+            loop {
+                size = size % 2999 + 7;
+                match c.read(&mut out[..size]).unwrap() {
+                    Read::Bytes(k) => {
+                        for b in &out[..k] {
+                            assert_eq!(*b, (next % 251) as u8);
+                            next += 1;
+                        }
+                        if c.room_needed() {
+                            signal(&r2);
+                        }
+                    }
+                    Read::Closed(reason) => {
+                        assert_eq!((reason, next), (0, TOTAL));
+                        return;
+                    }
+                    Read::Empty if c.sleep() => wait(&d2),
+                    Read::Empty => {}
+                }
+            }
+        });
+        let bytes: std::vec::Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let (mut at, mut size) = (0, 1);
+        while at < TOTAL {
+            size = size % 4999 + 13;
+            let n = p.write(&bytes[at..(at + size).min(TOTAL)]);
+            at += n;
+            if p.wake_needed() {
+                signal(&data);
+            }
+            if n == 0 && p.sleep_for_room() {
+                wait(&room);
+            }
+        }
+        p.close(0);
+        if p.wake_needed() {
+            signal(&data);
+        }
+        consumer.join().unwrap();
     }
 }
