@@ -5,7 +5,7 @@
 //! ```text
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
-//!        [restart=always|never]
+//!        [restart=always|never] [seed]
 //! ```
 //!
 //! - `provides`: the protocol it serves; the service manager makes its
@@ -19,12 +19,18 @@
 //!   description, the device authority, the interrupt lines, the I/O ports
 //!   (an empty slot where there are none), the boot archive's frames, and
 //!   the device and firmware memory, given outright; `args[0]` and `args[1]`
-//!   count the last two. The device manager alone; it cannot be restarted
-//!   yet (the memory given outright goes with it).
+//!   count the last two. The device manager alone; when it ends, the
+//!   service manager takes the memory given outright back first, emptied,
+//!   for its next start.
 //! - `start=boot` runs at every boot; `start=check:<c>` only when the
 //!   command line's `checks=` names `c`, and the boot waits for it to end
 //!   with status 0.
 //! - `restart=always`: started again when it fails (at most three times).
+//! - `seed`: it is given a secret of its own for every start, derived from
+//!   the boot's entropy (`silica_proc::seed` over its name and the start):
+//!   `args[4..8]`, with `args[3]` saying which trusted sources went into
+//!   the boot's (`RootInfo::entropy_sources`; 0: timing jitter alone). The
+//!   entropy service is seeded so.
 
 use silica_rt::alloc::vec::Vec;
 
@@ -48,6 +54,7 @@ pub struct Service {
     pub provides: Option<&'static str>,
     pub needs: Vec<&'static str>,
     pub machine: bool,
+    pub seed: bool,
     pub start: Start,
     pub restart: bool,
 }
@@ -65,6 +72,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             provides: None,
             needs: Vec::new(),
             machine: false,
+            seed: false,
             start: Start::Boot,
             restart: false,
         };
@@ -78,6 +86,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("provides", p) if !p.is_empty() => s.provides = Some(p),
                 ("needs", n) => s.needs = n.split(',').filter(|p| !p.is_empty()).collect(),
                 ("machine", "") => s.machine = true,
+                ("seed", "") => s.seed = true,
                 ("start", "boot") => s.start = Start::Boot,
                 ("start", c) if c.starts_with("check:") => s.start = Start::Check(&c[6..]),
                 ("restart", "always") => s.restart = true,

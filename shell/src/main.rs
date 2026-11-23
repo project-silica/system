@@ -171,6 +171,7 @@ impl Shell {
                     (devices::Class::Network, "network"),
                     (devices::Class::Display, "display"),
                     (devices::Class::Input, "input"),
+                    (devices::Class::Entropy, "entropy"),
                 ] {
                     if let Ok(r) = self.devices.list(class) {
                         for d in r.devices.iter() {

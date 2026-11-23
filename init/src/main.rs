@@ -95,6 +95,8 @@ struct Running {
     /// the slot in its CapSpace and the slot in this one it came from
     /// (a machine service's device memory and firmware tables).
     given: Vec<(u64, u64)>,
+    /// How many times it was started: what its seed is derived for.
+    starts: u64,
     failures: u32,
     /// Stopped by the owner: not started again until asked.
     stopped: bool,
@@ -187,6 +189,14 @@ impl Manager {
             args[0] = self.root.ramdisk.len() as u64;
             args[1] = (grants.len() - before) as u64;
         }
+        if s.seed {
+            // A secret of its own for this start (`silica_proc::seed`).
+            let seed = silica_proc::seed(&self.info.entropy, s.name, self.running[i].starts);
+            for (k, word) in seed.as_chunks::<8>().0.iter().enumerate() {
+                args[4 + k] = u64::from_le_bytes(*word);
+            }
+            args[3] = self.info.entropy_sources;
+        }
         Ok((grants, args))
     }
 
@@ -209,6 +219,7 @@ impl Manager {
             println!("init: cannot start {}: {e:?}", s.name);
             "it could not be started"
         })?;
+        self.running[i].starts += 1;
         // What was given outright, by the slot it lands in (`silica_proc`
         // puts grant `n` at `FIRST_GRANT + n`).
         self.running[i].given =
@@ -499,7 +510,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             None => None,
         });
     }
-    let running = services.iter().map(|_| Running { child: None, given: Vec::new(), failures: 0, stopped: false }).collect();
+    let running = services.iter().map(|_| Running { child: None, given: Vec::new(), starts: 0, failures: 0, stopped: false }).collect();
     // The log, when a service provides it: a ring for every other service,
     // made before anything starts; the log starts first.
     let mut order = order;

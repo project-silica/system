@@ -250,6 +250,15 @@ impl Child {
     }
 }
 
+/// The seed a parent gives a child for its `start`th start: a keyed
+/// BLAKE2s of the parent's secret `boot` over the child's `name` and the
+/// start, so no two starts of any child share one, and knowing one says
+/// nothing about `boot` or about another's (the service manager's `seed`
+/// declaration; the entropy service is seeded so).
+pub fn seed(boot: &[u8; 32], name: &str, start: u64) -> [u8; 32] {
+    silica_formats::blake2s::Blake2s::keyed(boot).update(b"silica child seed").update(name.as_bytes()).update(&start.to_le_bytes()).finish()
+}
+
 /// Why a program could not be started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpawnError {

@@ -8,7 +8,10 @@
 //! - [`display::device`]: `silica.display.Device`, the display device
 //!   class;
 //! - [`console::terminal`]: `silica.console.Terminal`, the local console;
-//! - [`log::reader`]: `silica.log.Reader`, the system's log, read.
+//! - [`log::reader`]: `silica.log.Reader`, the system's log, read;
+//! - [`entropy::device`]: `silica.entropy.Device`, the class of devices
+//!   that produce random bits;
+//! - [`entropy::source`]: `silica.entropy.Source`, the entropy service.
 //!
 //! Each module's reference page is `silica-idlc docs`'s page for the
 //! protocol. A program wraps a capability it was granted to a provider as
@@ -45,4 +48,10 @@ pub mod console {
 /// `silica.log.Reader`.
 pub mod log {
     include!(concat!(env!("OUT_DIR"), "/silica_log_reader.rs"));
+}
+
+/// `silica.entropy.Device` and `silica.entropy.Source`.
+pub mod entropy {
+    include!(concat!(env!("OUT_DIR"), "/silica_entropy_device.rs"));
+    include!(concat!(env!("OUT_DIR"), "/silica_entropy_source.rs"));
 }

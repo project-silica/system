@@ -193,13 +193,16 @@ fn function_of(id: u32, config: Config, config_frame: Cap) -> Function {
     }
 }
 
-/// The class of a function, from its PCI class code.
+/// The class of a function, from its PCI class code, or for a device no
+/// class code describes, from what its specification says it is (a
+/// virtio entropy device reports "other").
 fn class_of(f: &Function) -> Option<manager::Class> {
-    match f.class.0 {
-        0x01 => Some(manager::Class::Block),
-        0x02 => Some(manager::Class::Network),
-        0x03 => Some(manager::Class::Display),
-        0x09 => Some(manager::Class::Input),
+    match (f.class.0, f.vendor, f.device) {
+        (0x01, ..) => Some(manager::Class::Block),
+        (0x02, ..) => Some(manager::Class::Network),
+        (0x03, ..) => Some(manager::Class::Display),
+        (0x09, ..) => Some(manager::Class::Input),
+        (_, 0x1AF4, 0x1044) => Some(manager::Class::Entropy),
         _ => None,
     }
 }
@@ -718,13 +721,20 @@ fn map_archive(info: &RootInfo, frames: u64) -> Result<&'static [u8], &'static s
     let pieces = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_RAMDISK);
     let first = pieces.clone().map(|d| d.base).min().ok_or("the machine has no boot archive")?;
     let end = pieces.clone().map(|d| d.base + (1 << d.bits)).max().unwrap_or(first);
-    let region = mem::reserve((end - first) as usize, 1 << 21).ok_or("no address space for the boot archive")?;
+    // Each piece lands at the same offset within a 2 MiB page as it has in
+    // physical memory, so a piece of 2 MiB maps as one large page.
+    let skew = first & ((1 << 21) - 1);
+    let region = mem::reserve((end - first + skew) as usize, 1 << 21).ok_or("no address space for the boot archive")? + skew as usize;
     for (i, d) in pieces.enumerate() {
         if i as u64 >= frames {
             return Err("the root task passed fewer boot archive frames than the machine has");
         }
-        sys::map(slots::ASPACE, granted(GRANT_FIRST_RAMDISK + i as u64), region + (d.base - first) as usize, Rights::READ)
-            .map_err(|_| "cannot map the boot archive")?;
+        sys::map(slots::ASPACE, granted(GRANT_FIRST_RAMDISK + i as u64), region + (d.base - first) as usize, Rights::READ).map_err(
+            |e| {
+                println!("devmgr: mapping the boot archive's frame {i} ({} bytes at {:#x}): {e:?}", 1u64 << d.bits, d.base);
+                "cannot map the boot archive"
+            },
+        )?;
     }
     // SAFETY: the archive's frames were just mapped read-only, contiguous
     // as they are in memory, and stay mapped; nothing writes them.
