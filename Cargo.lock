@@ -100,6 +100,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "httpd"
+version = "0.0.0"
+dependencies = [
+ "silica-net",
+ "silica-rt",
+]
+
+[[package]]
 name = "init"
 version = "0.0.0"
 dependencies = [

@@ -13,6 +13,7 @@ fn main() {
         "log/reader.idl",
         "entropy/device.idl",
         "entropy/source.idl",
+        "net/tcp.idl",
     ]
     .iter()
     .map(|f| root.join(f))

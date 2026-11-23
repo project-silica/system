@@ -10,17 +10,25 @@
 //! and reading it in place twice could see two different packets. What is
 //! malformed or not for this host is dropped and counted by reason.
 //!
-//! What it does not do yet (spec/MILESTONES.md, M4): sockets for programs,
-//! TCP, IPv6, more than one interface, reassembly.
+//! It provides TCP to programs (`silica.net.Tcp`, the `tcp` module), in the
+//! same thread and the same wait as its interface: one notification, the
+//! interface's bits below `tcp::FIRST_BIT` and the programs' above.
+//!
+//! What it does not do yet (spec/MILESTONES.md, M4): UDP for programs,
+//! IPv6, more than one interface, reassembly; a program's call made before
+//! the machine has an interface is answered once it has one.
 
 #![no_std]
 #![no_main]
 
+use silica_idl_rt::CapList;
 use silica_inet::dhcp_client::{self, Client, Event, Lease, To};
 use silica_inet::{Ipv4, Mac, Malformed, arp, dhcp, ether, icmp, ipv4, udp};
 use silica_net::client::Interface;
 use silica_net::{Completion, LINK, Op, Request};
 use silica_protocols::device::manager;
+use silica_protocols::net::tcp as proto;
+use silica_rt::ipc::Events;
 use silica_rt::ipc::{Channel, Handle, free_slot, release_slot};
 use silica_rt::mem::{Memory, Object};
 use silica_rt::mmio::Mmio;
@@ -29,9 +37,13 @@ use silica_rt::{ProcessInfo, println, slots};
 
 silica_rt::main!(main);
 
+mod tcp;
+
 const SECOND: u64 = 1_000_000_000;
-/// The device manager: the service's first grant.
-const DEVICES: Cap = Cap(slots::FIRST_GRANT);
+/// The endpoint it provides `silica.net.Tcp` on: its first grant; the
+/// device manager: its second.
+const ENDPOINT: Cap = Cap(slots::FIRST_GRANT);
+const DEVICES: Cap = Cap(slots::FIRST_GRANT + 1);
 /// Receive buffers kept offered (tags 1 to `BUFFERS`), each `BUFFER` bytes
 /// from the start of the memory; then `SLOTS` transmit buffers.
 const BUFFERS: u64 = 16;
@@ -121,7 +133,10 @@ fn run() -> Result<core::convert::Infallible, &'static str> {
 
 /// Run the stack on the interface `id` until it cannot be used.
 fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
-    let mut nic = Interface::open(DEVICES, id).map_err(|e| match e {
+    // One notification for everything: the interface's bits, then the
+    // programs' (`tcp`).
+    let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
+    let mut nic = Interface::open_on(DEVICES, id, note.cap(), 0).map_err(|e| match e {
         silica_net::client::Error::Refused(silica_queue::Refused::Busy) => "another program has it",
         silica_net::client::Error::Gone => "its driver ended",
         _ => "it cannot be opened (its driver does not keep to the protocol)",
@@ -147,11 +162,14 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
         out: [0; BUFFER],
         probe: None,
         dropped: Dropped::default(),
+        tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16)),
+        caller: 0,
+        more: true,
     };
     for tag in 1..=BUFFERS {
         s.offer(tag)?;
     }
-    s.serve()
+    silica_rt::ipc::serve_events(ENDPOINT, note.cap(), &mut s)
 }
 
 #[derive(Clone, Copy)]
@@ -212,6 +230,13 @@ struct Stack {
     out: [u8; BUFFER],
     probe: Option<Probe>,
     dropped: Dropped,
+    /// TCP; out of its place only while it sends through the stack.
+    tcp: Option<tcp::Tcp>,
+    /// The badge of the call being answered.
+    caller: u64,
+    /// Work is left (a completion there, segments with no transmit slot):
+    /// look again at once rather than wait.
+    more: bool,
 }
 
 impl Stack {
@@ -240,19 +265,32 @@ impl Stack {
         }
     }
 
-    fn serve(&mut self) -> Result<core::convert::Infallible, &'static str> {
+    /// Everything there is to do now: timers, the interface's completions
+    /// (frames in, transmit slots back), and TCP's connections. Then
+    /// whether to look again before waiting.
+    fn work(&mut self) {
+        let now = silica_rt::clock().now();
+        if now >= self.dhcp.deadline() {
+            let step = self.dhcp.step(now, None, silica_rt::random::u64());
+            self.dhcp_step(now, step);
+        }
+        self.timers(now);
+        if self.nic.deadline().is_some_and(|d| d <= now) {
+            self.nic.tick();
+        }
+        let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
+        tcp.on_time(now);
+        self.tcp = Some(tcp);
         loop {
-            let now = silica_rt::clock().now();
-            if now >= self.dhcp.deadline() {
-                let step = self.dhcp.step(now, None, silica_rt::random::u64());
-                self.dhcp_step(now, step);
-            }
-            self.timers(now);
-            let deadline = self.deadline();
-            let c: Completion = match self.nic.kick_wait((deadline != u64::MAX).then_some(deadline)) {
-                Ok(c) => c,
-                Err(silica_net::client::Error::Timeout) => continue,
-                Err(_) => return Err("the interface failed"),
+            let c: Completion = match self.nic.poll() {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(_) => {
+                    // The queue gave its driver its time to come back: the
+                    // service is started again with the interface as it is.
+                    println!("ERROR: netd: the interface failed");
+                    silica_rt::exit(1);
+                }
             };
             if c.tag == LINK {
                 println!("netd: link {}", if c.result == Ok(1) { "up" } else { "down" });
@@ -266,17 +304,31 @@ impl Stack {
             if let Ok(n) = c.result {
                 let n = (n as usize).min(BUFFER);
                 self.m.read_bytes((c.tag as usize - 1) * BUFFER, &mut self.frame[..n]);
-                self.offer(c.tag)?;
+                if self.offer(c.tag).is_err() {
+                    println!("ERROR: netd: the interface takes no more receive buffers");
+                    silica_rt::exit(1);
+                }
                 self.receive(n);
-            } else {
-                self.offer(c.tag)?;
+            } else if self.offer(c.tag).is_err() {
+                println!("ERROR: netd: the interface takes no more receive buffers");
+                silica_rt::exit(1);
             }
         }
+        let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
+        let blocked = tcp.pump(now, self);
+        self.tcp = Some(tcp);
+        self.more = (blocked && self.free != 0) || !self.nic.sleep();
     }
 
     /// The soonest of what waits for a time.
     fn deadline(&self) -> u64 {
         let mut d = self.dhcp.deadline();
+        if let Some(t) = self.tcp.as_ref().and_then(|t| t.deadline()) {
+            d = d.min(t);
+        }
+        if let Some(n) = self.nic.deadline() {
+            d = d.min(n);
+        }
         if let Some(h) = &self.held {
             d = d.min(h.asked + SECOND).min(h.since + RESOLVE_WAIT);
         }
@@ -540,6 +592,17 @@ impl Stack {
                 Ok(_) => self.dropped.not_ours += 1,
                 Err(e) => self.dropped.malformed(e),
             },
+            ipv4::TCP if ours => match silica_inet::tcp::parse(p.payload, p.src, p.dst) {
+                Ok(seg) => {
+                    let Some(l) = self.lease else { return };
+                    let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
+                    if let Some(reset) = tcp.segment(now, l.address, p.src, &seg) {
+                        tcp.reset(l.address, p.src, &reset, self);
+                    }
+                    self.tcp = Some(tcp);
+                }
+                Err(e) => self.dropped.malformed(e),
+            },
             _ => self.dropped.not_ours += 1,
         }
     }
@@ -568,5 +631,74 @@ impl Stack {
             }
             _ => {}
         }
+    }
+}
+
+impl tcp::Out for Stack {
+    fn room(&self) -> bool {
+        self.free != 0
+    }
+
+    fn send(&mut self, remote: Ipv4, segment: &[u8]) {
+        self.send_ip(remote, ipv4::TCP, segment);
+    }
+}
+
+impl Events for Stack {
+    fn call(&mut self, badge: u64, request: &[u8], caps: CapList<Handle>, reply: &mut [u8], reply_caps: &mut CapList<Handle>) -> usize {
+        self.caller = badge;
+        let n = proto::dispatch(self, request, caps, reply, reply_caps);
+        // What the call changed (a connection made) goes now.
+        self.work();
+        n
+    }
+
+    fn signals(&mut self, signals: u64) {
+        self.nic.signalled(signals);
+        self.work();
+    }
+
+    fn deadline(&self) -> Option<u64> {
+        if self.more {
+            return Some(0);
+        }
+        let d = Stack::deadline(self);
+        (d != u64::MAX).then_some(d)
+    }
+
+    fn timer(&mut self) {
+        self.work();
+    }
+}
+
+impl proto::Server<Handle> for Stack {
+    fn add_memory(&mut self, memory: Handle) -> Result<proto::AddMemoryReply, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.add_memory(badge, memory)
+    }
+
+    fn listen(&mut self, port: u16, backlog: u32, ready: Handle) -> Result<proto::ListenReply, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, port, backlog, ready)
+    }
+
+    fn accept(&mut self, listener: u32, offset: u64, bits: u8, wake: Handle) -> Result<proto::AcceptReply<Handle>, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.accept(badge, listener, offset, bits, wake)
+    }
+
+    fn connect(&mut self, peer: proto::Endpoint, offset: u64, bits: u8, wake: Handle) -> Result<proto::ConnectReply<Handle>, proto::Error> {
+        let (badge, local) = (self.caller, self.lease.map(|l| l.address));
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.connect(badge, local, peer, offset, bits, wake)
+    }
+
+    fn close(&mut self, connection: u32) -> Result<proto::CloseReply, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.close(badge, connection)
+    }
+
+    fn unlisten(&mut self, listener: u32) -> Result<proto::UnlistenReply, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.unlisten(badge, listener)
     }
 }

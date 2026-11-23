@@ -45,6 +45,9 @@ pub enum Error {
     Full,
     /// No completion arrived before the deadline.
     Timeout,
+    /// An argument the caller gave cannot be used (bits of a notification
+    /// past its 64: [`Queue::open_on`]).
+    BadArgument,
 }
 
 impl<E> From<CallError<E>> for Error
@@ -112,14 +115,36 @@ pub trait Control: Sized {
     fn remove_memory(&mut self, id: u32) -> Result<(), Error>;
 }
 
-/// Bit of the client's notification the driver signals for completions;
-/// the death notice of the connection numbered `g` is [`gone_bit`]`(g)`, so
-/// a late notice about a driver already replaced is told apart.
-const COMPLETED: u64 = 1;
-
-fn gone_bit(generation: u32) -> u64 {
-    1 << (1 + generation % 63)
+/// The bits of the client's notification the queue uses: the first is
+/// what the driver signals for completions, and the death notice of the
+/// connection numbered `g` is [`Bits::gone`]`(g)`, one of the rest by turns,
+/// so a late notice about a driver already replaced is told apart. A queue
+/// with a notification of its own uses all 64; one that shares its
+/// client's ([`Queue::open_on`]) uses [`SHARED_BITS`] of them.
+#[derive(Clone, Copy, Debug)]
+struct Bits {
+    first: u32,
+    count: u32,
 }
+
+impl Bits {
+    const OWN: Bits = Bits { first: 0, count: 64 };
+
+    fn completed(self) -> u64 {
+        1 << self.first
+    }
+
+    fn gone(self, generation: u32) -> u64 {
+        1 << (self.first + 1 + generation % (self.count - 1))
+    }
+
+    fn all(self) -> u64 {
+        if self.count == 64 { u64::MAX } else { ((1u64 << self.count) - 1) << self.first }
+    }
+}
+
+/// Bits of a shared notification a queue uses ([`Queue::open_on`]).
+pub const SHARED_BITS: u32 = 8;
 
 /// Tags from here up are a provider's events (`provider::Session::event`),
 /// not completions: a client's own tags are below it.
@@ -227,9 +252,13 @@ pub struct Queue<C: Control> {
     /// The frame of the two rings, reused (cleared) for each driver.
     rings: Memory,
     link: Option<Box<Link<C>>>,
-    /// What the driver signals (bit COMPLETED) and the device manager
-    /// signals when the driver ends (`gone_bit(generation)`).
-    note: Object,
+    /// What the driver signals (`bits.completed()`) and the device manager
+    /// signals when the driver ends (`bits.gone(generation)`): the queue's
+    /// own, or its client's (`open_on`), which then owns it.
+    note: Cap,
+    /// The queue's own notification, kept while the queue lives.
+    _own_note: Option<Object>,
+    bits: Bits,
     /// Counts connections.
     generation: u32,
     /// Registered memory: the frame and whether the device may write it.
@@ -278,6 +307,28 @@ impl<C: Control> Queue<C> {
     /// Open device `id` through `opener` (which the queue keeps, to find
     /// the next provider when this one ends).
     pub fn open_with(devices: Box<dyn Opener>, id: u32) -> Result<Queue<C>, Error> {
+        let note = Object::new(ObjectType::Notification, 0)?;
+        Queue::open_noting(devices, id, note.cap(), Some(note), Bits::OWN)
+    }
+
+    /// Open device `id` through the device manager behind `devices`,
+    /// signalled on the caller's notification `note`, bits `first` to
+    /// `first + SHARED_BITS - 1` (from 0 to 56): for a program that waits
+    /// for more than this queue at once (a server that is also a driver's
+    /// client), in its own wait. It hands the queue every signal on those
+    /// bits ([`Queue::signalled`]), asks it before waiting
+    /// ([`Queue::sleep`]), and calls [`Queue::tick`] at its
+    /// [`Queue::deadline`]; [`Queue::wait`] and [`Queue::kick_wait`] are
+    /// not for such a queue.
+    pub fn open_on(devices: Cap, id: u32, note: Cap, first: u32) -> Result<Queue<C>, Error> {
+        if first > 64 - SHARED_BITS {
+            return Err(Error::BadArgument);
+        }
+        let opener = Box::new(manager::Client::<Channel, Handle>::from(Channel::new(devices)));
+        Queue::open_noting(opener, id, note, None, Bits { first, count: SHARED_BITS })
+    }
+
+    fn open_noting(devices: Box<dyn Opener>, id: u32, note: Cap, own_note: Option<Object>, bits: Bits) -> Result<Queue<C>, Error> {
         let mut memories = Vec::new();
         memories.try_reserve_exact(MEMORIES as usize).map_err(|_| Error::NoMemory)?;
         memories.resize(MEMORIES as usize, None);
@@ -286,7 +337,9 @@ impl<C: Control> Queue<C> {
             id,
             rings: Memory::new(RINGS_BITS)?,
             link: None,
-            note: Object::new(ObjectType::Notification, 0)?,
+            note,
+            _own_note: own_note,
+            bits,
             generation: 0,
             memories,
             in_flight: InFlight::new()?,
@@ -305,14 +358,14 @@ impl<C: Control> Queue<C> {
     /// and every request still in flight sent again.
     fn connect(&mut self) -> Result<(), Error> {
         self.generation = self.generation.wrapping_add(1);
-        let gone = lend(self.note.cap(), Rights::WRITE, gone_bit(self.generation))?;
+        let gone = lend(self.note, Rights::WRITE, self.bits.gone(self.generation))?;
         let mut control = C::open(self.devices.open(self.id, gone)?)?;
         // The rings start empty: the last driver can no longer touch them.
         let region = self.rings.shared();
         for at in (0..region.len()).step_by(8) {
             region.write64(at, 0);
         }
-        let wake = control.connect(lend(self.rings.frame(), Rights(3), 0)?, lend(self.note.cap(), Rights::WRITE, COMPLETED)?)?;
+        let wake = control.connect(lend(self.rings.frame(), Rights(3), 0)?, lend(self.note, Rights::WRITE, self.bits.completed())?)?;
         let (Some(req), Some(cpl)) = (region.part(0, COMPLETIONS_AT), region.part(COMPLETIONS_AT, region.len() - COMPLETIONS_AT)) else {
             return Err(Error::Protocol);
         };
@@ -506,6 +559,43 @@ impl<C: Control> Queue<C> {
         }
     }
 
+    /// For a queue on its client's notification ([`Queue::open_on`]):
+    /// the client received `bits` on it; the queue takes what is its own (a
+    /// driver's death notice). Completions are then taken with
+    /// [`Queue::poll`].
+    pub fn signalled(&mut self, bits: u64) {
+        if bits & self.bits.all() & self.bits.gone(self.generation) != 0 {
+            self.disconnect();
+        }
+    }
+
+    /// Before its client waits: wakes the driver if it has requests to
+    /// look at, and says that the client sleeps. `false`: do not wait,
+    /// something is there already (take it with [`Queue::poll`]).
+    pub fn sleep(&mut self) -> bool {
+        self.kick();
+        if !self.ready.is_empty() {
+            return false;
+        }
+        match self.link.as_mut() {
+            Some(link) => link.completions.sleep(),
+            // Connecting again happens in `poll`.
+            None => false,
+        }
+    }
+
+    /// When the client is to call [`Queue::tick`] (`None`: no need): with
+    /// requests in flight, the queue looks whether its driver is still
+    /// there every [`Self::LIVENESS_NS`].
+    pub fn deadline(&self) -> Option<u64> {
+        (self.in_flight.len != 0).then(|| self.checked_at + Self::LIVENESS_NS)
+    }
+
+    /// At [`Queue::deadline`]: look whether the driver is still there.
+    pub fn tick(&mut self) {
+        self.look();
+    }
+
     /// The next completion (or provider's event: a tag from [`EVENTS`]
     /// up), if one is there.
     pub fn poll(&mut self) -> Result<Option<Completion>, Error> {
@@ -562,8 +652,8 @@ impl<C: Control> Queue<C> {
             let w = self.link.as_ref().filter(|l| kick && l.requests.wake_needed()).map_or(Cap::NONE, |l| l.wake.cap());
             kick = false;
             let (until, mine) = self.until(deadline);
-            match sys::signal_recv(w, self.note.cap(), Cap::NONE, until) {
-                Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.disconnect(),
+            match sys::signal_recv(w, self.note, Cap::NONE, until) {
+                Ok(m) if m.badge & self.bits.gone(self.generation) != 0 => self.disconnect(),
                 Ok(_) => {}
                 Err(sys::Error::Timeout) if mine => self.look(),
                 // The wake-up failed, and nothing was received: the
@@ -587,8 +677,8 @@ impl<C: Control> Queue<C> {
                 continue;
             }
             let (until, mine) = self.until(deadline);
-            match sys::recv(self.note.cap(), until) {
-                Ok(m) if m.badge & gone_bit(self.generation) != 0 => self.disconnect(),
+            match sys::recv(self.note, until) {
+                Ok(m) if m.badge & self.bits.gone(self.generation) != 0 => self.disconnect(),
                 Ok(_) => {}
                 Err(sys::Error::Timeout) if mine => self.look(),
                 Err(_) => return Err(Error::Timeout),

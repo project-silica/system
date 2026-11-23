@@ -71,6 +71,35 @@ impl Interface {
         Ok(Interface { queue: Queue::<Net>::open(devices, id)? })
     }
 
+    /// Open the interface `id`, signalled on the caller's notification
+    /// `note`, bits `first` to `first + 7`, for a program that waits for
+    /// more than the interface (`silica_queue::client::Queue::open_on`:
+    /// the network stack, which also serves its programs).
+    pub fn open_on(devices: Cap, id: u32, note: Cap, first: u32) -> Result<Interface, Error> {
+        Ok(Interface { queue: Queue::<Net>::open_on(devices, id, note, first)? })
+    }
+
+    /// The caller received `bits` on its notification (`open_on`).
+    pub fn signalled(&mut self, bits: u64) {
+        self.queue.signalled(bits)
+    }
+
+    /// Before the caller waits (`open_on`): wakes the driver if needed;
+    /// `false` when a completion is there already.
+    pub fn sleep(&mut self) -> bool {
+        self.queue.sleep()
+    }
+
+    /// When to call [`Interface::tick`] (`open_on`), if at all.
+    pub fn deadline(&self) -> Option<u64> {
+        self.queue.deadline()
+    }
+
+    /// At [`Interface::deadline`]: look whether the driver is still there.
+    pub fn tick(&mut self) {
+        self.queue.tick()
+    }
+
     /// What the interface is, as its current driver said when it was opened.
     pub fn info(&mut self) -> Result<Info, Error> {
         Ok(self.queue.control()?.info.clone())

@@ -55,6 +55,9 @@ impl From<client::Error> for Error {
             client::Error::NoMemory => Error::NoMemory,
             client::Error::Full => Error::Full,
             client::Error::Timeout => Error::Timeout,
+            // Only a queue on its client's notification is given bits to
+            // check (`Queue::open_on`); this client's has its own.
+            client::Error::BadArgument => Error::Protocol,
         }
     }
 }

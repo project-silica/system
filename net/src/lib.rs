@@ -34,6 +34,7 @@
 
 pub mod client;
 pub mod service;
+pub mod tcp;
 
 include!(concat!(env!("OUT_DIR"), "/silica_net_device.rs"));
 

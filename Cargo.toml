@@ -28,6 +28,7 @@ members = [
     "netfault",
     "partcheck",
     "logd",
+    "httpd",
     "entropy",
     "entropycheck",
     "drivers/framework",

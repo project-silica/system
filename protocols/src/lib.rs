@@ -12,7 +12,9 @@
 //! - [`log::reader`]: `silica.log.Reader`, the system's log, read;
 //! - [`entropy::device`]: `silica.entropy.Device`, the class of devices
 //!   that produce random bits;
-//! - [`entropy::source`]: `silica.entropy.Source`, the entropy service.
+//! - [`entropy::source`]: `silica.entropy.Source`, the entropy service;
+//! - [`net::tcp`]: `silica.net.Tcp`, TCP connections, provided by the
+//!   network stack.
 //!
 //! Each module's reference page is `silica-idlc docs`'s page for the
 //! protocol. A program wraps a capability it was granted to a provider as
@@ -56,4 +58,9 @@ pub mod log {
 pub mod entropy {
     include!(concat!(env!("OUT_DIR"), "/silica_entropy_device.rs"));
     include!(concat!(env!("OUT_DIR"), "/silica_entropy_source.rs"));
+}
+
+/// `silica.net.Tcp`.
+pub mod net {
+    include!(concat!(env!("OUT_DIR"), "/silica_net_tcp.rs"));
 }

@@ -1,0 +1,27 @@
+[package]
+name = "httpd"
+description = "A small HTTP/1.1 server over silica.net.Tcp: answers GET /<n> with n bytes, for the network server's exit test."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields): a check, for
+# now. A server the owner turns on is owed (M4: remote management).
+[package.metadata.silica.service]
+needs = ["silica.net.Tcp"]
+memory = 24
+start = "check:http"
+
+[[bin]]
+name = "httpd"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-net = { workspace = true }
+
+[lints]
+workspace = true
