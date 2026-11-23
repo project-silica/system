@@ -77,6 +77,18 @@ impl device::Server<Handle> for Keyboard {
 }
 
 impl Keyboard {
+    /// Forget a client that has ended (or taken its ring back): its ring's
+    /// capability went with it, and what is typed until the next one
+    /// connects (a console restarting) waits in `early` instead of going
+    /// into memory nobody reads.
+    fn forget_gone_client(&mut self) {
+        if let Some((ring, _, _)) = &self.client
+            && !matches!(sys::inspect_slot(slots::SPACE, ring.cap().0), Ok(Some(_)))
+        {
+            self.client = None;
+        }
+    }
+
     fn offer(&mut self, slot: u16) {
         let b = Buffer { address: self.events.device_address() + slot as u64 * 8, len: 8, device_writes: true };
         let _ = self.queue.add(&[b], slot as u64);
@@ -90,6 +102,7 @@ impl Events for Keyboard {
 
     fn signals(&mut self, _bits: u64) {
         let mut added = false;
+        self.forget_gone_client();
         loop {
             let (slot, written) = match self.queue.pop() {
                 Ok(Some(done)) => done,
