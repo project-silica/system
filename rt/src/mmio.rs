@@ -83,4 +83,50 @@ impl Mmio {
     access!(read16, write16, u16);
     access!(read32, write32, u32);
     access!(read64, write64, u64);
+
+    /// Copy `out.len()` bytes from `offset` into `out`, each byte read once:
+    /// what memory a device or another program may be writing holds is
+    /// taken as one copy, and then parsed from there (reading it in place
+    /// twice could see two different things). Eight bytes at a time where
+    /// the address allows. Panics when the range does not lie inside.
+    pub fn read_bytes(&self, offset: usize, out: &mut [u8]) {
+        assert!(offset.checked_add(out.len()).is_some_and(|end| end <= self.len), "device memory copy outside its range");
+        let base = self.base + offset;
+        let mut i = 0;
+        while i < out.len() {
+            let p = base + i;
+            if p.is_multiple_of(8) && out.len() - i >= 8 {
+                // SAFETY: inside the checked range, aligned for a u64.
+                let v = unsafe { core::ptr::read_volatile(p as *const u64) };
+                out[i..i + 8].copy_from_slice(&v.to_ne_bytes());
+                i += 8;
+            } else {
+                // SAFETY: inside the checked range.
+                out[i] = unsafe { core::ptr::read_volatile(p as *const u8) };
+                i += 1;
+            }
+        }
+    }
+
+    /// Copy `bytes` to `offset`, each byte written once, eight at a time
+    /// where the address allows. Panics when the range does not lie inside.
+    pub fn write_bytes(&self, offset: usize, bytes: &[u8]) {
+        assert!(offset.checked_add(bytes.len()).is_some_and(|end| end <= self.len), "device memory copy outside its range");
+        let base = self.base + offset;
+        let mut i = 0;
+        while i < bytes.len() {
+            let p = base + i;
+            if p.is_multiple_of(8) && bytes.len() - i >= 8 {
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&bytes[i..i + 8]);
+                // SAFETY: inside the checked range, aligned for a u64.
+                unsafe { core::ptr::write_volatile(p as *mut u64, u64::from_ne_bytes(w)) };
+                i += 8;
+            } else {
+                // SAFETY: inside the checked range.
+                unsafe { core::ptr::write_volatile(p as *mut u8, bytes[i]) };
+                i += 1;
+            }
+        }
+    }
 }

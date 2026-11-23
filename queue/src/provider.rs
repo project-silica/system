@@ -123,6 +123,8 @@ pub struct Session<M> {
     wake: Cap,
     /// Where `take` starts, so no client's ring is always looked at last.
     next: usize,
+    /// One client at a time ([`Session::exclusive`]).
+    exclusive: bool,
 }
 
 impl<M> Session<M> {
@@ -131,7 +133,16 @@ impl<M> Session<M> {
     pub fn new(wake: Cap) -> Session<M> {
         let mut connections = Vec::new();
         connections.resize_with(CONNECTIONS, || None);
-        Session { connections, generation: 0, wake, next: 0 }
+        Session { connections, generation: 0, wake, next: 0, exclusive: false }
+    }
+
+    /// As [`Session::new`], for a device that serves one client at a time:
+    /// another client's `connect` is refused (`Busy`) while the first is
+    /// there. A network interface is one: the device puts each frame that
+    /// arrives into whichever client's buffer comes next, so two clients
+    /// would each lose what the other was given, silently.
+    pub fn exclusive(wake: Cap) -> Session<M> {
+        Session { exclusive: true, ..Session::new(wake) }
     }
 
     /// End connection `slot`: the device loses the client's memory.
@@ -172,6 +183,9 @@ impl<M> Session<M> {
                 return Err(Refused::Busy);
             }
             self.close_slot(slot, mapper);
+        }
+        if self.exclusive && self.connections.iter().flatten().any(|c| c.client != caller && c.alive()) {
+            return Err(Refused::Busy);
         }
         // A free slot, or one whose client has gone.
         let slot = match self.connections.iter().position(Option::is_none) {

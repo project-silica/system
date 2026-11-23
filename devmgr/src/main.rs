@@ -166,6 +166,9 @@ struct Manager {
     table: Vec<(Match, &'static str)>,
     /// Every configuration space mapped, by function identity.
     configs: BTreeMap<u32, (Config, Cap)>,
+    /// What clients asked to have signalled when a device of a class gains
+    /// or loses its driver (`watch`).
+    watchers: Vec<(manager::Class, Handle)>,
 }
 
 /// A function as found, its BARs probed.
@@ -250,6 +253,11 @@ impl manager::Server<Handle> for Manager {
             manager::Error::NoSuchDevice
         })?;
         Ok(manager::RestartReply {})
+    }
+
+    fn watch(&mut self, class: manager::Class, changed: Handle) -> manager::WatchReply {
+        self.watchers.push((class, changed));
+        manager::WatchReply {}
     }
 
     fn describe<'a>(&'a mut self, id: u32, from: u32) -> Result<manager::DescribeReply<'a>, manager::Error> {
@@ -668,11 +676,20 @@ impl Manager {
         }
         f.starts += 1;
         self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, gone: Vec::new() });
+        self.changed(index);
         Ok(())
     }
 }
 
 impl Manager {
+    /// Function `index` gained or lost its driver: signal whoever watches
+    /// its class. A watcher whose notification can no longer be signalled
+    /// (its holder ended) is forgotten.
+    fn changed(&mut self, index: usize) {
+        let Some(class) = class_of(&self.functions[index]) else { return };
+        self.watchers.retain(|(c, n)| *c != class || sys::signal(n.cap()).is_ok());
+    }
+
     /// The log of the drivers of function `index` (`driver` names it with
     /// the function's address): made with the service manager the first
     /// time, the same ring after. `None` when the system keeps no log or
@@ -708,6 +725,7 @@ impl Manager {
         for g in r.gone {
             let _ = sys::signal(g.cap());
         }
+        self.changed(r.function);
         // SAFETY: the endpoint was the ended driver's alone.
         #[allow(unsafe_code)]
         unsafe {
@@ -802,6 +820,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         ports: Vec::new(),
         table: drivers(archive),
         configs: BTreeMap::new(),
+        watchers: Vec::new(),
     };
     m.enumerate()?;
     let cmdline = m.cmdline;

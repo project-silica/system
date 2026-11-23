@@ -24,7 +24,11 @@
 //! other name runs the services declared
 //! `start=check:<name>`, which must end with status 0. When checks ran, the
 //! machine is turned off when they are done (`halt=reboot`: reset);
-//! without them the system stays up. `bench` on the command line prints
+//! without them the system stays up. `off=` (a comma list of service
+//! names) keeps those boot services from starting, as if stopped: what an
+//! owner does to boot without a service (and what a driver's own check
+//! does to have its device to itself); `start <name>` starts one later.
+//! `bench` on the command line prints
 //! `BENCH DONE` when the checks are done (`tools/bench.sh` reads up to it).
 #![no_std]
 #![no_main]
@@ -555,11 +559,23 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
     }
     let mut listener = Listener::new(m.root.parent.exit);
 
-    // The system, in order.
+    // The system, in order, but for what the command line keeps off.
+    let off: Vec<&[u8]> = option(cmdline, "off").unwrap_or(b"").split(|b| *b == b',').filter(|c| !c.is_empty()).collect();
+    for o in &off {
+        if !m.services.iter().any(|s| s.name.as_bytes() == *o) {
+            fail!("off= names {}, which no service is declared for", core::str::from_utf8(o).unwrap_or("?"));
+        }
+    }
     for &i in &order {
-        if m.services[i].start == Start::Boot
-            && let Err(e) = m.start(i)
-        {
+        if m.services[i].start != Start::Boot {
+            continue;
+        }
+        if off.contains(&m.services[i].name.as_bytes()) {
+            m.running[i].stopped = true;
+            println!("init: {} is off, as the command line asks", m.services[i].name);
+            continue;
+        }
+        if let Err(e) = m.start(i) {
             fail!("{}: {e}", m.services[i].name);
         }
     }
