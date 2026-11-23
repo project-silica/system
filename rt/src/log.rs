@@ -119,3 +119,58 @@ pub fn write(text: &[u8]) -> bool {
     })
     .unwrap_or(false)
 }
+
+/// The directory of log rings: how the service manager tells the log
+/// service which rings it has, without either of them calling the other.
+///
+/// The service manager waits for the log service (a flush, before a
+/// verdict or turning the machine off), so the log service must never wait
+/// for the service manager: a call from it, answered only once the manager
+/// stops waiting, held both until the wait gave up and lost what the rings
+/// still held (2026-11-23, half of 48 loaded boots of the entropy check).
+/// So the manager puts each ring's capability in a slot of the log
+/// service's own CapSpace (entry `k`'s ring is in the `k`th of the slots it
+/// reserved for them), then writes the source's name in entry `k` of this
+/// frame, which the log service maps read-only, and then the entry's
+/// generation, with release ordering, and signals; the log service reads a
+/// generation with acquire ordering, then the name, then takes the ring
+/// from its slot. A generation that changed names a new ring for the same
+/// source (the program that made the old one was started again).
+pub mod directory {
+    use crate::mmio::Mmio;
+
+    /// Size of the directory's frame in bits.
+    pub const BITS: u8 = 14;
+    /// Bytes of an entry: its generation (0: none yet), the name's length,
+    /// then the name.
+    pub const ENTRY: usize = 128;
+    /// Entries in the directory.
+    pub const ENTRIES: usize = (1 << BITS) / ENTRY;
+    /// The longest name.
+    pub const NAME: usize = ENTRY - 8;
+
+    /// Name source `name` in entry `k`, whose ring is in its slot already:
+    /// the writer's side. A longer name is cut at [`NAME`] bytes.
+    pub fn publish(directory: &Mmio, k: usize, name: &[u8]) {
+        let at = k * ENTRY;
+        let n = name.len().min(NAME);
+        directory.write_bytes(at + 8, &name[..n]);
+        directory.write32(at + 4, n as u32);
+        let generation = directory.read32(at).wrapping_add(1).max(1);
+        directory.store_release32(at, generation);
+    }
+
+    /// Entry `k`: its generation (0: nothing there yet) and its name, read
+    /// into `name`, whose first `.1` bytes it is. The writer is trusted
+    /// (the service manager), and the length is clamped all the same.
+    pub fn read(directory: &Mmio, k: usize, name: &mut [u8; NAME]) -> (u32, usize) {
+        let at = k * ENTRY;
+        let generation = directory.load_acquire32(at);
+        if generation == 0 {
+            return (0, 0);
+        }
+        let n = (directory.read32(at + 4) as usize).min(NAME);
+        directory.read_bytes(at + 8, &mut name[..n]);
+        (generation, n)
+    }
+}

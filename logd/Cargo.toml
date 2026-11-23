@@ -10,7 +10,6 @@ publish.workspace = true
 # manager gives it every other service's log ring and starts it first.
 [package.metadata.silica.service]
 provides = "silica.log.Reader"
-needs = ["silica.system.Manager"]
 memory = 22
 start = "boot"
 restart = "always"

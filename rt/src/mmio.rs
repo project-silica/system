@@ -84,6 +84,30 @@ impl Mmio {
     access!(read32, write32, u32);
     access!(read64, write64, u64);
 
+    /// The 32-bit word at `offset` of memory another program shares, read
+    /// as an atomic with acquire ordering: everything its writer wrote
+    /// before the [`Mmio::store_release32`] of the value read is seen
+    /// after. Panics as [`Mmio::read32`] does.
+    pub fn load_acquire32(&self, offset: usize) -> u32 {
+        self.word32(offset).load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Write the 32-bit word at `offset` as an atomic with release
+    /// ordering, after everything written before it (see
+    /// [`Mmio::load_acquire32`]). Panics as [`Mmio::write32`] does.
+    pub fn store_release32(&self, offset: usize, value: u32) {
+        self.word32(offset).store(value, core::sync::atomic::Ordering::Release);
+    }
+
+    fn word32(&self, offset: usize) -> &core::sync::atomic::AtomicU32 {
+        let p = self.at(offset, 4);
+        // SAFETY: `at` checked that the word lies inside the range, which
+        // `new`'s caller promised is mapped, and is aligned for a u32; an
+        // atomic is how memory another program writes concurrently may be
+        // accessed. The reference lives no longer than `self`.
+        unsafe { core::sync::atomic::AtomicU32::from_ptr(p as *mut u32) }
+    }
+
     /// Copy `out.len()` bytes from `offset` into `out`, each byte read once:
     /// what memory a device or another program may be writing holds is
     /// taken as one copy, and then parsed from there (reading it in place

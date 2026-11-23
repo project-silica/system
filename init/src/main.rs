@@ -15,7 +15,7 @@
 //! the machine off in order (`shutdown`: services stopped last-started
 //! first, then the power). It makes the log's rings: one per service, and
 //! one per program a service asks for (`add_log`), which the log service
-//! takes from it (`log_ring`).
+//! finds in its directory (`silica_rt::log::directory`).
 //!
 //! The kernel command line chooses what is checked at boot (`checks=`, a
 //! comma list; default `programs,block`): `programs` runs the round trips
@@ -46,6 +46,7 @@ use silica_protocols::system::manager;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Handle, Listener};
+use silica_rt::log::directory;
 use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, println};
 
@@ -69,9 +70,24 @@ const ADDED: u64 = 4;
 /// The most logs services give their programs (`add_log`).
 const MAX_LOGS: usize = 64;
 
+/// Whether the ring `h` names is still there: one whose maker ended is gone,
+/// and every capability derived from it with it.
+fn alive(h: &Handle) -> bool {
+    matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), h.cap().0), Ok(Some(_)))
+}
+
+/// The longest init waits for the log service to answer a flush.
+const FLUSH_WAIT: u64 = 2_000_000_000;
+
 /// Have the log service put everything its rings hold on the console before
-/// what init says next, waiting at most 200 ms: init never waits on a
-/// service for long.
+/// what init says next: a failure, a check's verdict, `BOOT OK`, and the
+/// machine turning off, after which nothing in a ring would reach the
+/// console. Init waits for the answer, which normally comes at once, at
+/// most [`FLUSH_WAIT`] so that a log service that hangs cannot hang
+/// shutdown; if it does not come, init says so, so that missing lines are
+/// never missing silently. (200 ms was too short: on a loaded host half of
+/// 48 boots of the entropy check lost a service's last lines at power-off,
+/// 2026-11-23.)
 fn flush_log() {
     let (to, done) = (FLUSH_TO.load(Ordering::Relaxed), FLUSHED.load(Ordering::Relaxed));
     if to == 0 {
@@ -79,8 +95,8 @@ fn flush_log() {
     }
     // A late answer to an earlier flush is not this one's.
     let _ = sys::recv(sys::Cap(done), Wait::Poll);
-    if sys::signal(sys::Cap(to)).is_ok() {
-        let _ = sys::recv(sys::Cap(done), Wait::Until(silica_rt::clock().now() + 200_000_000));
+    if sys::signal(sys::Cap(to)).is_ok() && sys::recv(sys::Cap(done), Wait::Until(silica_rt::clock().now() + FLUSH_WAIT)).is_err() {
+        println!("init: the log service did not put its text on the console within 2 s: services' last lines may be missing");
     }
 }
 
@@ -136,6 +152,9 @@ struct LogSetup {
     /// The logs services gave their programs (`add_log`): the source's
     /// name and the ring.
     given: Vec<(String, Handle)>,
+    /// The ring directory (`silica_rt::log::directory`): entry `i` names
+    /// service `i`'s ring, entry `services + k` the `k`th given one.
+    directory: silica_rt::mem::Memory,
 }
 
 /// The value of `key=` on the command line.
@@ -166,15 +185,27 @@ impl Manager {
             grants.push(Grant::badged(ep, Rights(Rights::WRITE.0 | Rights::GRANT.0), CONSUMERS + i as u64));
         }
         if let Some(log) = self.log.as_ref().filter(|l| l.service == i) {
+            // The notification, the flush's answer, the directory, then a
+            // slot for each ring the directory can name (`log_slot`): the
+            // services' and those given so far; `add_log` fills the rest.
+            debug_assert_eq!(grants.len() as u64, self.log_grants());
             grants.push(Grant::lend(log.note.cap(), Rights::ALL));
             grants.push(Grant::lend(log.flushed.cap(), Rights::WRITE));
+            grants.push(Grant::lend(log.directory.frame(), Rights::READ));
+            let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
             for r in &log.rings {
                 grants.push(match r {
-                    Some(f) => Grant::lend(f.cap(), Rights(Rights::READ.0 | Rights::WRITE.0)),
+                    Some(f) => Grant::lend(f.cap(), rw),
                     None => Grant::none(),
                 });
             }
-            args[0] = log.rings.len() as u64;
+            for k in 0..MAX_LOGS {
+                grants.push(match log.given.get(k) {
+                    Some((_, ring)) if alive(ring) => Grant::lend(ring.cap(), rw),
+                    _ => Grant::none(),
+                });
+            }
+            args[0] = (log.rings.len() + MAX_LOGS) as u64;
         }
         if s.machine {
             let info = self.info;
@@ -202,6 +233,20 @@ impl Manager {
             args[3] = self.info.entropy_sources;
         }
         Ok((grants, args))
+    }
+
+    /// How many grants the log service has before its notification: its
+    /// endpoint and its needs (`grants`).
+    fn log_grants(&self) -> u64 {
+        let l = self.log.as_ref().map_or(0, |l| l.service);
+        self.endpoints[l].is_some() as u64 + self.services[l].needs.len() as u64
+    }
+
+    /// The slot of the log service's CapSpace that holds the ring of
+    /// directory entry `entry` (`grants`: grant `n` lands in
+    /// `FIRST_GRANT + n`).
+    fn log_slot(&self, entry: usize) -> u64 {
+        silica_rt::slots::FIRST_GRANT + self.log_grants() + 3 + entry as u64
     }
 
     /// Start service `i`.
@@ -433,7 +478,6 @@ impl manager::Server<Handle> for Manager {
         // ring that is gone (the service that made it restarted, its
         // memory with it) is replaced by the new one, and the log service
         // reads on from it under the same source.
-        let alive = |h: &Handle| matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), h.cap().0), Ok(Some(_)));
         let again = log.given.iter().position(|(n, _)| *n == source);
         if again.is_some_and(|k| alive(&log.given[k].1)) {
             return Err(manager::Error::Exists);
@@ -441,7 +485,8 @@ impl manager::Server<Handle> for Manager {
         // A ring of the size every log's writer and reader assume.
         let fits = matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), ring.cap().0),
             Ok(Some(i)) if i.ty == ObjectType::Frame && i.bits == silica_rt::log::BITS);
-        if !fits || (again.is_none() && log.given.len() >= MAX_LOGS) || name.is_empty() || name.len() > 64 {
+        if !fits || (again.is_none() && log.given.len() >= MAX_LOGS) || name.is_empty() || name.len() > 64 || source.len() > directory::NAME
+        {
             return Err(manager::Error::Refused);
         }
         let to = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused)?;
@@ -449,26 +494,32 @@ impl manager::Server<Handle> for Manager {
             silica_rt::ipc::release_slot(to);
             return Err(manager::Error::Refused);
         }
-        match again {
-            Some(k) => log.given[k].1 = ring,
-            None => log.given.push((source, ring)),
+        let k = match again {
+            Some(k) => {
+                log.given[k].1 = ring;
+                k
+            }
+            None => {
+                log.given.push((source, ring));
+                log.given.len() - 1
+            }
+        };
+        // Into the log service's own slot for it, if it runs (one started
+        // later is given it with the others: `grants`), then named in the
+        // directory: the log service never asks the service manager
+        // (`silica_rt::log::directory`). The slot of a ring that is gone
+        // emptied when it went, with every capability derived from it.
+        let entry = self.services.len() + k;
+        let slot = self.log_slot(entry);
+        let log = self.log.as_ref().ok_or(manager::Error::Refused)?;
+        if let Some(child) = &self.running[log.service].child
+            && let Err(e) = sys::cap_derive(child.space(), slot, log.given[k].1.cap(), Rights(Rights::READ.0 | Rights::WRITE.0), 0)
+        {
+            println!("init: cannot give the log service the ring of {}: {e:?}", log.given[k].0);
         }
+        directory::publish(&log.directory.shared(), entry, log.given[k].0.as_bytes());
         let _ = sys::signal(log.added);
         Ok(manager::AddLogReply { wake: Handle::new(sys::Cap(to)) })
-    }
-
-    fn log_ring<'a>(&'a mut self, index: u32) -> Result<manager::LogRingReply<'a, Handle>, manager::Error> {
-        let log = self.log.as_ref().ok_or(manager::Error::Refused)?;
-        if self.caller != CONSUMERS + log.service as u64 {
-            return Err(manager::Error::Refused);
-        }
-        let (name, ring) = log.given.get(index as usize).ok_or(manager::Error::NoSuchLog)?;
-        let to = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused)?;
-        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, ring.cap(), Rights(Rights::READ.0 | Rights::WRITE.0), 0).is_err() {
-            silica_rt::ipc::release_slot(to);
-            return Err(manager::Error::Refused);
-        }
-        Ok(manager::LogRingReply { name, ring: Handle::new(sys::Cap(to)) })
     }
 }
 
@@ -527,7 +578,16 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             let rings = (0..services.len()).map(|i| (i != l).then(|| object(ObjectType::Frame, silica_rt::log::BITS))).collect();
             order.retain(|&i| i != l);
             order.insert(0, l);
-            Some(LogSetup { service: l, note, flushed, rings, added: sys::Cap(0), given: Vec::new() })
+            if services.len() + MAX_LOGS > directory::ENTRIES {
+                fail!("more services than the log's directory names");
+            }
+            let directory = silica_rt::mem::Memory::new(directory::BITS).unwrap_or_else(|_| fail!("no memory for the log"));
+            for (i, s) in services.iter().enumerate() {
+                if i != l {
+                    directory::publish(&directory.shared(), i, s.name.as_bytes());
+                }
+            }
+            Some(LogSetup { service: l, note, flushed, rings, added: sys::Cap(0), given: Vec::new(), directory })
         }
     };
     let mut m = Manager {

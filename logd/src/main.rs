@@ -3,15 +3,16 @@
 //! The service manager gives every other service a ring to print into
 //! (`silica_rt::log`), creates the rings and the notification their writers
 //! signal before it starts anything, and gives them all to this service:
-//! grants 0 its endpoint, 1 the service manager's `silica.system.Manager`
-//! (to learn the services' names), 2 the notification, 3 a notification of
-//! the service manager's to answer flushes on, then one ring per declared
-//! service, in the order the service manager lists them (an empty slot
-//! where a service has none, as this one). A service that runs programs of
-//! its own gives each a ring through the service manager too (the device
-//! manager, one per device for its drivers: `add_log`); the service manager
-//! signals [`ADDED`], and this service asks it for the new rings, which are
-//! sources named `<service>/<name>`. A signal with [`FLUSH`] asks for
+//! grants 0 its endpoint, 1 the notification, 2 a notification of the
+//! service manager's to answer flushes on, 3 the ring directory
+//! (`silica_rt::log::directory`), then a slot per entry of the directory
+//! (`args[0]` of them), holding that entry's ring. A service that runs
+//! programs of its own gives each a ring through the service manager too
+//! (the device manager, one per device for its drivers: `add_log`), which
+//! puts it in the next slot, names it in the directory and signals
+//! [`ADDED`]: those are sources named `<service>/<name>`. This service
+//! never calls the service manager, which waits for its flushes. A signal
+//! with [`FLUSH`] asks for
 //! everything to be on the console now: the service manager's way to put a
 //! service's last lines before its own verdict, without calling the log. On every wake-up it takes the
 //! text out of every ring, keeps the last [`KEPT`] bytes of each service's,
@@ -26,12 +27,11 @@
 
 use silica_idl_rt::{Array, CapList};
 use silica_protocols::log::reader::{self as proto, Error, ReadReply, SourcesReply};
-use silica_protocols::system::manager;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
-use silica_rt::ipc::{Channel, Events, Handle, serve_events};
-use silica_rt::log::{BITS, RECORD, RECORDS};
+use silica_rt::ipc::{Events, Handle, serve_events};
+use silica_rt::log::{BITS, RECORD, RECORDS, directory};
 use silica_rt::ring::Consumer;
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{ProcessInfo, mem, print, println, slots};
@@ -64,19 +64,18 @@ struct Source {
     /// Its text since its last newline: what is shown again when another
     /// source's line cut it short.
     partial: Vec<u8>,
-    /// The frame of its ring, and for a program's log its place among the
-    /// service manager's (`log_ring`), where a replacement ring appears
-    /// when the service that made it restarts.
-    cap: Cap,
-    given: Option<u32>,
+    /// Its directory entry, and that entry's generation when its ring was
+    /// taken: a new one names a replacement ring (the program that made
+    /// the old one was started again), taken from the same slot.
+    entry: usize,
+    generation: u32,
 }
 
 struct Log {
     sources: Vec<Source>,
-    /// The service manager, which has the rings of programs' logs.
-    system: manager::Client<Channel, Handle>,
-    /// How many of those this service has.
-    given: u32,
+    /// The ring directory, and how many entries (and ring slots) there are.
+    directory: silica_rt::mmio::Mmio,
+    entries: usize,
     /// Some ring had more than the last drain took.
     more: bool,
     /// The source whose unfinished line the console ends with.
@@ -221,33 +220,44 @@ impl Log {
         true
     }
 
-    /// Take the rings of programs' logs given since the last time.
-    fn take_given(&mut self) {
-        // A ring that is gone (the service that made it restarted): the
-        // service manager holds its replacement in the same place, and the
-        // source reads on from it, its text kept.
-        for s in self.sources.iter_mut() {
-            let Some(index) = s.given else { continue };
-            if matches!(sys::inspect_slot(slots::SPACE, s.cap.0), Ok(Some(_))) {
+    /// Take the rings the directory names that are new, or replaced since
+    /// they were taken.
+    fn take_rings(&mut self) {
+        let mut name = [0u8; directory::NAME];
+        for entry in 0..self.entries {
+            let (generation, n) = directory::read(&self.directory, entry, &mut name);
+            if generation == 0 {
                 continue;
             }
-            let Ok(r) = self.system.log_ring(index) else { continue };
-            if let Some(ring) = ring_in(r.ring.cap()) {
-                (s.ring, s.cap, s.broken) = (ring, r.ring.into_cap(), false);
+            let known = self.sources.iter().position(|s| s.entry == entry);
+            if known.is_some_and(|i| self.sources[i].generation == generation) {
+                continue;
             }
-        }
-        loop {
-            let (name, ring) = match self.system.log_ring(self.given) {
-                Ok(r) => (String::from(r.name), r.ring),
-                Err(_) => return,
-            };
-            if let Some(mut source) = source(name, ring.cap()) {
-                // Kept for as long as the program runs: the ring stays mapped.
-                source.given = Some(self.given);
-                let _ = ring.into_cap();
-                self.sources.push(source);
+            // Not there (its maker already ended): looked at again with the
+            // next change.
+            let Some(ring) = ring_in(ring_slot(entry)) else { continue };
+            match known {
+                // Read on from the new ring under the same source, its text kept.
+                Some(i) => {
+                    let s = &mut self.sources[i];
+                    (s.ring, s.broken, s.generation) = (ring, false, generation);
+                }
+                None => {
+                    let name = String::from_utf8_lossy(&name[..n]);
+                    // Names last as long as the program: sources are never removed.
+                    let name: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_owned().into_boxed_str());
+                    self.sources.push(Source {
+                        name,
+                        ring,
+                        kept: VecDeque::new(),
+                        written: 0,
+                        broken: false,
+                        partial: Vec::new(),
+                        entry,
+                        generation,
+                    });
+                }
             }
-            self.given += 1;
         }
     }
 
@@ -300,7 +310,7 @@ impl Events for Log {
 
     fn signals(&mut self, bits: u64) {
         if bits & ADDED != 0 {
-            self.take_given();
+            self.take_rings();
         }
         self.drain();
         if bits & FLUSH != 0 {
@@ -329,34 +339,34 @@ fn ring_in(cap: Cap) -> Option<Consumer<RECORD>> {
     Some(ring)
 }
 
-/// The source `name` reading the log ring in the frame `cap`, if it is one.
-fn source(name: String, cap: Cap) -> Option<Source> {
-    let ring = ring_in(cap)?;
-    // Names last as long as the program: sources are never removed.
-    let name: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_boxed_str());
-    Some(Source { name, ring, kept: VecDeque::new(), written: 0, broken: false, partial: Vec::new(), cap, given: None })
+/// The slot holding directory entry `entry`'s ring.
+fn ring_slot(entry: usize) -> Cap {
+    Cap(slots::FIRST_GRANT + 4 + entry as u64)
 }
 
 fn main(info: &'static ProcessInfo) -> i64 {
     let grant = |n: u64| Cap(slots::FIRST_GRANT + n);
-    let mut system = manager::Client::<Channel, Handle>::from(Channel::new(grant(1)));
-    let names: Vec<String> = match system.list() {
-        Ok(r) => r.services.iter().map(|s| String::from(s.name)).collect(),
+    let directory = match mem::peer(grant(3), directory::BITS, Rights::READ) {
+        Ok(d) => d,
         Err(e) => {
-            println!("ERROR: logd: the service manager does not answer: {e:?}");
+            println!("ERROR: logd: no ring directory: {e:?}");
             return 1;
         }
     };
-    let rings = info.args[0] as usize;
-    let mut sources = Vec::new();
-    for (i, name) in names.into_iter().enumerate().take(rings) {
-        sources.extend(source(name, grant(4 + i as u64)));
-    }
-    let mut log =
-        Log { sources, system, given: 0, more: false, open: None, cut: None, flushed: grant(3), listed: Vec::new(), text: String::new() };
-    // The programs' logs given so far, and what was written before this
-    // service started (or before it last ended).
-    log.take_given();
+    let mut log = Log {
+        sources: Vec::new(),
+        directory,
+        entries: (info.args[0] as usize).min(directory::ENTRIES),
+        more: false,
+        open: None,
+        cut: None,
+        flushed: grant(2),
+        listed: Vec::new(),
+        text: String::new(),
+    };
+    // Every ring there is, and what was written before this service
+    // started (or before it last ended).
+    log.take_rings();
     log.drain();
-    serve_events(grant(0), grant(2), &mut log)
+    serve_events(grant(0), grant(1), &mut log)
 }

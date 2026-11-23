@@ -180,6 +180,12 @@ impl<const N: usize> Consumer<N> {
     /// producer signals; a signal may also come when there is nothing new.
     pub fn sleep(&mut self) -> bool {
         self.ring.word(SLEEPING).store(1, Ordering::SeqCst);
+        // The flag before the tail is read: a store followed by a load of
+        // another word may otherwise be reordered (an acquire load on
+        // aarch64 may pass the store), and a record added meanwhile would
+        // neither be seen here nor wake this side. The producer's swap of
+        // the flag is a full barrier after its store of the tail.
+        core::sync::atomic::fence(Ordering::SeqCst);
         if self.waiting() != Ok(0) {
             self.ring.word(SLEEPING).store(0, Ordering::SeqCst);
             return false;
