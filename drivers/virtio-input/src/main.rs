@@ -29,6 +29,10 @@ const INTERRUPT: u64 = 2;
 const BUFFERS: u16 = 64;
 /// Records in the client's ring.
 const RING: u32 = 256;
+/// Key records kept while no client is connected: what is typed before the
+/// console has attached (at boot, typed by a test or a person who did not
+/// wait for the prompt) is given to it when it does.
+const EARLY: usize = 64;
 const EV_KEY: u16 = 1;
 
 struct Keyboard {
@@ -39,6 +43,9 @@ struct Keyboard {
     name_len: usize,
     /// The client's ring and what to signal, once connected.
     client: Option<(Handle, Producer<8>, Handle)>,
+    /// Keys that came before any client, oldest first.
+    early: [[u8; 8]; EARLY],
+    early_len: usize,
     _interrupt: Interrupt,
 }
 
@@ -54,7 +61,16 @@ impl device::Server<Handle> for Keyboard {
         }
         // Where lent memory goes: memory the client takes back reads as zeros.
         let region = mem::peer(ring.cap(), 12, Rights(3)).map_err(|_| Error::BadMemory)?;
-        let producer = Producer::new(region, RING).ok_or(Error::BadMemory)?;
+        let mut producer = Producer::new(region, RING).ok_or(Error::BadMemory)?;
+        // What was typed before anyone listened goes first, in order.
+        let mut added = false;
+        for record in &self.early[..self.early_len] {
+            added |= producer.push(record).is_ok();
+        }
+        self.early_len = 0;
+        if added && producer.wake_needed() {
+            let _ = sys::signal(events.cap());
+        }
         self.client = Some((ring, producer, events));
         Ok(ConnectReply {})
     }
@@ -94,12 +110,16 @@ impl Events for Keyboard {
                 continue;
             }
             let Some(usage) = keys::usage(code) else { continue };
+            let mut record = [0u8; 8];
+            record[..2].copy_from_slice(&usage.to_le_bytes());
+            record[2] = value as u8;
+            // A client that does not keep up loses the newest keys, and so
+            // do keys typed before there is one, past the first EARLY.
             if let Some((_, ring, _)) = &mut self.client {
-                let mut record = [0u8; 8];
-                record[..2].copy_from_slice(&usage.to_le_bytes());
-                record[2] = value as u8;
-                // A client that does not keep up loses the newest keys.
                 added |= ring.push(&record).is_ok();
+            } else if self.early_len < EARLY {
+                self.early[self.early_len] = record;
+                self.early_len += 1;
             }
         }
         self.queue.notify();
@@ -142,7 +162,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         }
     }
     let events = dma.memory(12, true)?;
-    let mut keyboard = Keyboard { queue, events, name, name_len, client: None, _interrupt: interrupt };
+    let mut keyboard =
+        Keyboard { queue, events, name, name_len, client: None, early: [[0; 8]; EARLY], early_len: 0, _interrupt: interrupt };
     for slot in 0..BUFFERS.min(keyboard.queue.size()) {
         keyboard.offer(slot);
     }
