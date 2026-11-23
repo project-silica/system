@@ -201,6 +201,7 @@ fn class_of(f: &Function) -> Option<manager::Class> {
         (0x01, ..) => Some(manager::Class::Block),
         (0x02, ..) => Some(manager::Class::Network),
         (0x03, ..) => Some(manager::Class::Display),
+        (0x07, ..) => Some(manager::Class::Port),
         (0x09, ..) => Some(manager::Class::Input),
         (_, 0x1AF4, 0x1044) => Some(manager::Class::Entropy),
         _ => None,

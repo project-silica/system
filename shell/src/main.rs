@@ -172,6 +172,7 @@ impl Shell {
                     (devices::Class::Display, "display"),
                     (devices::Class::Input, "input"),
                     (devices::Class::Entropy, "entropy"),
+                    (devices::Class::Port, "port"),
                 ] {
                     if let Ok(r) = self.devices.list(class) {
                         for d in r.devices.iter() {

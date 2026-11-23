@@ -35,6 +35,7 @@ members = [
     "drivers/nvme",
     "drivers/virtio-input",
     "drivers/virtio-rng",
+    "drivers/virtio-console",
     "drivers/fbdisplay",
     "console",
     "shell",

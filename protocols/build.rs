@@ -9,6 +9,7 @@ fn main() {
         "input/device.idl",
         "display/device.idl",
         "console/terminal.idl",
+        "console/port.idl",
         "log/reader.idl",
         "entropy/device.idl",
         "entropy/source.idl",

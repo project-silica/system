@@ -337,6 +337,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-console"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-ring",
+ "silica-rt",
+]
+
+[[package]]
 name = "virtio-input"
 version = "0.0.0"
 dependencies = [

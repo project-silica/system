@@ -8,6 +8,7 @@
 //! - [`display::device`]: `silica.display.Device`, the display device
 //!   class;
 //! - [`console::terminal`]: `silica.console.Terminal`, the local console;
+//! - [`console::port`]: `silica.console.Port`, the class of console ports;
 //! - [`log::reader`]: `silica.log.Reader`, the system's log, read;
 //! - [`entropy::device`]: `silica.entropy.Device`, the class of devices
 //!   that produce random bits;
@@ -40,9 +41,10 @@ pub mod display {
     include!(concat!(env!("OUT_DIR"), "/silica_display_device.rs"));
 }
 
-/// `silica.console.Terminal`.
+/// `silica.console.Terminal` and `silica.console.Port`.
 pub mod console {
     include!(concat!(env!("OUT_DIR"), "/silica_console_terminal.rs"));
+    include!(concat!(env!("OUT_DIR"), "/silica_console_port.rs"));
 }
 
 /// `silica.log.Reader`.
