@@ -127,6 +127,11 @@ pub fn due() -> Option<Fault> {
 /// (`inject: <fault> committed`): a fault that came due and was never
 /// taken was not committed, and the test of it shows nothing.
 pub fn pending(f: Fault) -> bool {
+    // Ordinary I/O only observes the plan. Claim a fault atomically once
+    // the device model reaches the operation where it takes effect.
+    if PENDING.load(Ordering::Relaxed) != f as u64 {
+        return false;
+    }
     let now = PENDING.compare_exchange(f as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok();
     if now {
         silica_rt::println!("inject: {f:?} committed");
