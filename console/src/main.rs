@@ -145,13 +145,15 @@ impl Console {
     fn char(&mut self, c: char) {
         if self.line.len() < 1000 {
             self.line.push(c);
-            let mut b = [0u8; 4];
-            self.show(c.encode_utf8(&mut b));
+            if self.waiting.is_some() {
+                let mut b = [0u8; 4];
+                self.show(c.encode_utf8(&mut b));
+            }
         }
     }
 
     fn backspace(&mut self) {
-        if self.line.pop().is_some() {
+        if self.line.pop().is_some() && self.waiting.is_some() {
             self.grid.backspace();
             self.update();
             print!("\u{8} \u{8}");
@@ -160,10 +162,12 @@ impl Console {
     }
 
     fn enter(&mut self) {
-        self.show("\n");
         let line = core::mem::take(&mut self.line);
         match self.waiting.take() {
-            Some(p) => answer_line(p, &line),
+            Some(p) => {
+                self.show("\n");
+                answer_line(p, &line);
+            }
             None => self.lines.push_back(line),
         }
     }
@@ -190,6 +194,8 @@ impl terminal::Server<Handle> for Console {
             // The reply borrows the console; the line is kept until the
             // next call in `last`.
             Some(l) => {
+                self.show(&l);
+                self.show("\n");
                 self.line_out = l;
                 ReadLineReply { line: &self.line_out }
             }
@@ -223,6 +229,13 @@ impl Waiting for Console {
             // shell restarted under its call) gives way to the new one; a
             // second reader while the first still waits gets an empty line.
             self.waiting = parked.take();
+            // Typeahead belongs after the reader's prompt, including a
+            // partial line typed while the preceding command was running.
+            if self.waiting.is_some() && !self.line.is_empty() {
+                let typed = core::mem::take(&mut self.line);
+                self.show(&typed);
+                self.line = typed;
+            }
         }
         n
     }
