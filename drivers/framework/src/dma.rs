@@ -128,6 +128,10 @@ impl DmaMemory {
     pub fn addr(&self) -> usize {
         self.memory.addr()
     }
+    /// The frame it is: what a watched interrupt names (`Interrupt::watch`).
+    pub fn frame(&self) -> Cap {
+        self.memory.frame()
+    }
     /// The size in bytes.
     pub fn len(&self) -> usize {
         self.memory.len()

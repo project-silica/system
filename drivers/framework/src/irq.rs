@@ -28,6 +28,8 @@ pub struct Interrupt {
     notification: Cap,
     /// The MSI-X table entry it was put in.
     entry: Mmio,
+    /// The driver's line that carries it.
+    line: u32,
 }
 
 /// The one notification a driver hears everything on: its device's
@@ -90,7 +92,31 @@ impl Interrupt {
         entry.write32(4, (address >> 32) as u32);
         entry.write32(8, data as u32);
         entry.write32(12, 0);
-        Ok(Interrupt { notification, entry })
+        Ok(Interrupt { notification, entry, line })
+    }
+
+    /// Say that the interrupt's news is the 32-bit word at `offset` in
+    /// `frame` under `mask` (`silica_rt::sys::irq_watch`): the device
+    /// changes it before it raises the interrupt, and the driver takes
+    /// everything new each time it is signalled. A processor idling where
+    /// the interrupt is delivered then sees the device's write itself, and
+    /// the driver is woken without waiting for the message to arrive; the
+    /// interrupt that follows wakes it no second time. Call it from the
+    /// thread that bound the interrupt, before the device has anything to
+    /// report. An error leaves the interrupt as it was: slower, not wrong.
+    pub fn watch(&self, frame: Cap, offset: u64, mask: u32) -> Result<(), DeviceError> {
+        Ok(sys::irq_watch(granted(grant::INTERRUPTS), self.line, frame, offset, mask)?)
+    }
+
+    /// For a watched interrupt: the bits `bits` of the 32-bit word at
+    /// `offset` in `frame` tell the device not to interrupt, and the kernel
+    /// sets them exactly while a processor watches for the interrupt's news
+    /// (`silica_rt::sys::irq_quiet`), so the device does not interrupt a
+    /// processor that is already looking. The driver never stores to those
+    /// bits afterwards. Only for a device that writes its news before it
+    /// reads those bits, and interrupts whenever they are clear.
+    pub fn quiet(&self, frame: Cap, offset: u64, bits: u32) -> Result<(), DeviceError> {
+        Ok(sys::irq_quiet(granted(grant::INTERRUPTS), self.line, frame, offset, bits)?)
     }
 
     /// The notification the interrupt signals, to wait on directly or

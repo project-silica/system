@@ -19,6 +19,7 @@ use crate::pci::CAP_VENDOR;
 use crate::{Device, DeviceError};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::mmio::Mmio;
+use silica_rt::sys::Cap;
 
 /// Feature: the device is a virtio 1.0 or later device.
 pub const F_VERSION_1: u64 = 1 << 32;
@@ -271,6 +272,12 @@ pub struct Queue {
     driver_area: Mmio,
     /// The used ring: the device writes it.
     device_area: Mmio,
+    /// The frame it is in (none for a queue over memory of a test's).
+    device_frame: Cap,
+    /// The frame of the descriptor table and available ring.
+    driver_frame: Cap,
+    /// The kernel owns the available ring's "no interrupt" flag (`watch`).
+    kernel_quiet: bool,
     notify: Mmio,
     /// Descriptors not in use, linked through `next`.
     free: u16,
@@ -324,7 +331,11 @@ impl Queue {
         let driver_area = dma.memory(bits_for(driver), false)?;
         let device_area = dma.memory(bits_for(device), true)?;
         // Never unmapped (`DmaMemory`), so the views outlive the values.
-        let q = Queue::over(size, driver_area.shared(), device_area.shared())?;
+        let q = Queue {
+            device_frame: device_area.frame(),
+            driver_frame: driver_area.frame(),
+            ..Queue::over(size, driver_area.shared(), device_area.shared())?
+        };
         let at = driver_area.device_address();
         Ok((q, [at, at + 16 * size as u64, device_area.device_address()]))
     }
@@ -357,6 +368,9 @@ impl Queue {
             index: 0,
             driver_area,
             device_area,
+            device_frame: Cap::NONE,
+            driver_frame: Cap::NONE,
+            kernel_quiet: false,
             notify,
             common: notify,
             event_idx: false,
@@ -515,12 +529,40 @@ impl Queue {
         Ok(Some((token, written)))
     }
 
+    /// Make `interrupt`, the queue's own, watched (`Interrupt::watch`): its
+    /// news is the used ring's index, which the device advances before it
+    /// interrupts, and [`Queue::pop`] until `None` takes all of it. Without
+    /// event indices the device is also told not to interrupt while a
+    /// processor watches (`Interrupt::quiet`, the available ring's
+    /// `NO_INTERRUPT` flag, which the device reads after it writes the
+    /// index); with them it reads `used_event` instead, which the driver
+    /// writes as it takes completions, so there the interrupt that follows
+    /// a watched completion is still sent, and dropped by the kernel. Before
+    /// the first request.
+    pub fn watch(&mut self, interrupt: &crate::irq::Interrupt) -> Result<(), DeviceError> {
+        if self.device_frame == Cap::NONE {
+            return Err(DeviceError::Kernel(silica_rt::sys::Error::BadArg));
+        }
+        // The ring's flags (16 bits) then its index (16 bits): the index alone.
+        interrupt.watch(self.device_frame, 0, 0xFFFF_0000)?;
+        if !self.event_idx {
+            // The available ring's flags: the low half of the word at its start.
+            interrupt.quiet(self.driver_frame, 16 * self.size as u64, 1)?;
+            self.kernel_quiet = true;
+        }
+        Ok(())
+    }
+
     /// Ask the device not to interrupt for completions (the driver is
     /// polling), or to interrupt again. A hint: the device may interrupt
     /// anyway. After asking for interrupts again, look once more with
     /// [`Queue::pop`] before waiting.
     pub fn suppress_interrupts(&mut self, suppress: bool) {
-        self.driver_area.write16(16 * self.size as usize, suppress as u16);
+        // Once the kernel says when the device may interrupt (`watch`), the
+        // flag is its alone.
+        if !self.kernel_quiet {
+            self.driver_area.write16(16 * self.size as usize, suppress as u16);
+        }
         if self.event_idx {
             // The completion asked an interrupt for: one long past, or the next.
             let at = if suppress { self.used.wrapping_sub(0x8000) } else { self.used };

@@ -190,7 +190,12 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let signals = Signals::new()?;
     let interrupt = Interrupt::bind_to(&device, 0, signals.sender(INTERRUPT)?)?;
     inject::interrupts(signals.sender(INTERRUPT)?);
-    let queue = transport.queue(&dma, 0, QUEUE_SIZE, Some(0))?;
+    let mut queue = transport.queue(&dma, 0, QUEUE_SIZE, Some(0))?;
+    // A processor idling for a completion sees the device write it, without
+    // waiting for the interrupt to arrive (spec/ARCHITECTURE.md section 7).
+    if let Err(e) = queue.watch(&interrupt) {
+        println!("virtio-blk: completions wait for the interrupt alone: {e:?}");
+    }
     let config = transport.device_config().ok_or(DeviceError::Missing("the block device's configuration"))?;
     if config.len() < 24 {
         return Err(DeviceError::Protocol("the block device's configuration is too short"));

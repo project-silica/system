@@ -225,8 +225,18 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         interrupts.push(Interrupt::bind_to(&device, 0, signals.sender(RX | TX | CONFIG)?)?);
     }
     inject::interrupts(signals.sender(RX | TX)?);
-    let rx = transport.queue(&dma, 0, QUEUE_SIZE, Some(rx_v))?;
+    let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, Some(rx_v))?;
     let tx = transport.queue(&dma, 1, QUEUE_SIZE, Some(tx_v))?;
+    // A processor idling for a frame sees the device write it, without
+    // waiting for the interrupt (spec/ARCHITECTURE.md section 7). Only where
+    // the receive queue has an interrupt of its own (a shared one's news is
+    // more than one queue's index). Sent frames are nobody's wait: watching
+    // the transmit queue cost 2% of transmit throughput (2026-11-23).
+    if entries >= 3
+        && let Err(e) = rx.watch(&interrupts[0])
+    {
+        println!("virtio-net: completions wait for the interrupt alone: {e:?}");
+    }
     if features & F_STATUS != 0 {
         transport.config_interrupt(cfg_v)?;
     }

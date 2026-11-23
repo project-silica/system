@@ -18,6 +18,7 @@
 #![no_main]
 
 use silica_block::client::{Disk, Error};
+use silica_block::service::TRACED;
 use silica_block::{Op, Request, Status};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle};
@@ -290,6 +291,41 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
         let _ = silica_rt::sys::thread_set_cpu(slots::THREAD, 0);
         println!("blkcheck: depth-1 read median (ns) from each processor:{line}");
     }
+    // Where a depth-1 read's time goes (not gated): the driver keeps a
+    // traced request's times, read back after each read, outside its time.
+    // Submit to the driver taking it (the client's wake-up of the driver),
+    // to the device given it (the checks), to the driver seeing it done (the
+    // device, its interrupt and the driver's wake-up), to the client back
+    // (the completion, the client's wake-up and its return).
+    let mut stages: [Vec<u64>; 4] = Default::default();
+    for i in 0..300u64 {
+        let block = (i * 2654435761) % span;
+        let tag = TRACED | (20000 + i);
+        let t = clock.now();
+        disk.run(&req(Op::Read, block, 0, blocks4k, tag), deadline()).map_err(|e| why(e, "a traced read failed"))?;
+        let back = clock.now();
+        let (taken, started, done) = disk.trace(tag).map_err(|e| why(e, "the driver lost a traced read"))?;
+        if i >= 50 && t <= taken && taken <= started && started <= done && done <= back {
+            for (s, d) in stages.iter_mut().zip([taken - t, started - taken, done - started, back - done]) {
+                s.push(d);
+            }
+        }
+    }
+    if stages[0].is_empty() {
+        return Err("no traced read had its times in order");
+    }
+    for s in stages.iter_mut() {
+        s.sort_unstable();
+    }
+    let m = |s: &Vec<u64>| s[s.len() / 2];
+    println!(
+        "blkcheck: depth-1 read stages, median ns of {}: to the driver {}, to the device {}, device to the driver {}, to the client {}",
+        stages[0].len(),
+        m(&stages[0]),
+        m(&stages[1]),
+        m(&stages[2]),
+        m(&stages[3])
+    );
     let (depth, total) = (32u64, 20000u64);
     let (mut sent, mut done) = (0u64, 0u64);
     let start = clock.now();
