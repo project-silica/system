@@ -207,7 +207,7 @@ struct Link<C> {
 
 /// A connection to a device that outlives its driver.
 pub struct Queue<C: Control> {
-    // The generated clients carry their message buffers (8 KB each): boxed,
+    // The generated clients carry their message buffers (4 KB each): boxed,
     // so a queue is small to keep and to move.
     devices: Box<dyn Opener>,
     id: u32,
