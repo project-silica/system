@@ -457,6 +457,13 @@ pub struct Parked {
 }
 
 impl Parked {
+    /// Whether its caller still waits for the answer: `false` once the
+    /// caller has ended (or its call was cancelled), when answering it
+    /// reaches nobody.
+    pub fn waiting(&self) -> bool {
+        sys::parked(self.note).unwrap_or(false)
+    }
+
     /// Answer with the reply message `reply` (as a generated reply type's
     /// `encode_message` writes it) and its capabilities.
     pub fn answer(self, reply: &[u8], mut caps: CapList<Handle>) {

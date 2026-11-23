@@ -3,7 +3,8 @@
 //! the service manager and the device manager:
 //!
 //! - `services`: every service, what it does, how often it failed;
-//! - `stop <service>`, `start <service>`;
+//! - `stop <service>`, `start <service>`, `restart <service>` (ended at once
+//!   and started again, its clients carrying on);
 //! - `devices`: the devices with a running driver, by class;
 //! - `restart-driver <device>`: end a device's driver and start it again;
 //! - `caps <service>` or `caps <device>`: what a running service, or a
@@ -19,6 +20,7 @@
 #![no_main]
 
 use core::fmt::Write;
+use silica_idl_rt::{CallError, TransportError};
 use silica_protocols::console::terminal;
 use silica_protocols::device::{PciAddress, manager as devices};
 use silica_protocols::log::reader as log;
@@ -40,7 +42,7 @@ struct Shell {
     out: String,
 }
 
-const HELP: &str = "commands: services, stop <service>, start <service>, caps <service|device>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
+const HELP: &str = "commands: services, stop <service>, start <service>, restart <service>, caps <service|device>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
 
 impl Shell {
     fn say(&mut self) {
@@ -73,8 +75,12 @@ impl Shell {
                     let _ = writeln!(self.out, "services: {e:?}");
                 }
             },
-            "stop" | "start" if !arg.is_empty() => {
-                let r = if command == "stop" { self.system.stop(arg).map(|_| ()) } else { self.system.start(arg).map(|_| ()) };
+            "stop" | "start" | "restart" if !arg.is_empty() => {
+                let r = match command {
+                    "stop" => self.system.stop(arg).map(|_| ()),
+                    "start" => self.system.start(arg).map(|_| ()),
+                    _ => self.system.restart(arg).map(|_| ()),
+                };
                 match r {
                     Ok(()) => {
                         let _ = writeln!(self.out, "{command}: {arg}: done");
@@ -243,11 +249,16 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     };
     let _ = shell.term.write("Silica. Type help for the commands.\n");
     loop {
-        if shell.term.write("silica> ").is_err() {
-            return 1;
+        // The console restarted under a call (`peer_gone`): its endpoint is
+        // the service manager's, so calling again reaches the new one, and
+        // the prompt is shown again on its fresh screen.
+        match shell.term.write("silica> ") {
+            Ok(_) | Err(CallError::Transport(TransportError::PeerGone)) => {}
+            Err(_) => return 1,
         }
         let line = match shell.term.read_line() {
             Ok(r) => String::from(r.line),
+            Err(CallError::Transport(TransportError::PeerGone)) => continue,
             Err(_) => return 1,
         };
         shell.run(&line);

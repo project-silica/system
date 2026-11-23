@@ -158,8 +158,10 @@ impl Waiting for Console {
     ) -> usize {
         self.wants_wait = false;
         let n = terminal::dispatch(self, request, caps, reply, reply_caps);
-        if self.wants_wait && self.waiting.is_none() {
-            // Kept until the next line; a second reader gets an empty line.
+        if self.wants_wait && !self.waiting.as_ref().is_some_and(Parked::waiting) {
+            // Kept until the next line. A reader whose caller has gone (a
+            // shell restarted under its call) gives way to the new one; a
+            // second reader while the first still waits gets an empty line.
             self.waiting = parked.take();
         }
         n

@@ -29,6 +29,20 @@ const USED: u64 = 1 << 63;
 const SPENT: u64 = 1 << 62;
 /// Empty blocks: `slot | bits << 56` (0: none).
 static FREE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+/// Bytes of all the sources, bytes made into blocks from them, and bytes
+/// of the empty blocks kept: what [`available`] counts.
+static TOTAL: AtomicU64 = AtomicU64::new(0);
+static MADE: AtomicU64 = AtomicU64::new(0);
+static KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes [`alloc()`] can still give out: the sources not yet made into
+/// blocks, and the empty blocks kept. A block given back with [`free`] is
+/// counted again; one lost (more empty blocks than this module keeps) is
+/// not, so a program that starts and ends children sees memory go only
+/// where it went.
+pub fn available() -> u64 {
+    (TOTAL.load(Ordering::Relaxed) + KEPT.load(Ordering::Relaxed)).saturating_sub(MADE.load(Ordering::Relaxed))
+}
 
 /// Add `untyped`, of `2^bits` bytes, to what [`alloc()`] makes blocks from.
 /// A request is served from the smallest source that has room, so the
@@ -36,6 +50,7 @@ static FREE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 /// than this module keeps, the smallest are left out. Call it while the
 /// program has one thread.
 pub fn add_source(untyped: Cap, bits: u8) {
+    TOTAL.fetch_add(1 << bits, Ordering::Relaxed);
     let mut entry = untyped.0 | (bits as u64) << 56;
     // Insert in order of size; what falls off the end is the largest so
     // far, so swap it against the smallest instead.
@@ -51,6 +66,7 @@ pub fn add_source(untyped: Cap, bits: u8) {
         }
     }
     // Full: `entry` is now the largest of all. Drop the smallest for it.
+    TOTAL.fetch_sub(1 << (SOURCES[0].load(Ordering::Relaxed) >> 56 & 0x3F), Ordering::Relaxed);
     for i in 0..SOURCES.len() - 1 {
         SOURCES[i].store(SOURCES[i + 1].load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -62,6 +78,7 @@ pub fn alloc(bits: u8) -> Result<Cap, Error> {
     for f in &FREE {
         let v = f.load(Ordering::Relaxed);
         if v != 0 && (v >> 56) as u8 == bits && f.compare_exchange(v, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            KEPT.fetch_sub(1 << bits, Ordering::Relaxed);
             return Ok(Cap(v & ((1 << 56) - 1)));
         }
     }
@@ -79,12 +96,14 @@ pub fn alloc(bits: u8) -> Result<Cap, Error> {
         match sys::retype(Cap(source), ObjectType::Untyped, bits, slots::SPACE, slot, 1) {
             Ok(()) => {
                 s.store(entry | USED, Ordering::Relaxed);
+                MADE.fetch_add(1 << bits, Ordering::Relaxed);
                 return Ok(Cap(slot));
             }
             // A source of exactly this size cannot be made into a smaller
             // one: while nothing has been made from it, it is the block.
             Err(Error::NoMemory) if entry_bits == bits && entry & USED == 0 => {
                 if s.compare_exchange(entry, SPENT, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    MADE.fetch_add(1 << bits, Ordering::Relaxed);
                     release_slot(slot);
                     return Ok(Cap(source));
                 }
@@ -114,6 +133,7 @@ pub unsafe fn free(block: Cap, bits: u8) {
     }
     let v = block.0 | (bits as u64) << 56;
     if FREE.iter().any(|f| f.compare_exchange(0, v, Ordering::Relaxed, Ordering::Relaxed).is_ok()) {
+        KEPT.fetch_add(1 << bits, Ordering::Relaxed);
         return;
     }
     // No room to remember it: its memory stays out of use until the source

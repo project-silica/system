@@ -326,6 +326,25 @@ impl manager::Server<Handle> for Manager {
         Ok(manager::StopReply {})
     }
 
+    fn restart(&mut self, name: &str) -> Result<manager::RestartReply, manager::Error> {
+        let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        if self.services[i].machine {
+            return Err(manager::Error::Refused);
+        }
+        let child = self.running[i].child.take().ok_or(manager::Error::Refused)?;
+        if child.destroy().is_err() {
+            println!("ERROR: init: cannot take back the memory of {name}");
+        }
+        Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
+        println!("init: {name} restarted, as asked");
+        Ok(manager::RestartReply {})
+    }
+
+    fn memory(&mut self) -> manager::MemoryReply {
+        let held = self.services.iter().zip(&self.running).filter(|(_, r)| r.child.is_some()).map(|(s, _)| 1u64 << s.memory).sum();
+        manager::MemoryReply { free: silica_rt::mem::available(), held }
+    }
+
     fn start(&mut self, name: &str) -> Result<manager::StartReply, manager::Error> {
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
         if self.running[i].child.is_none() {

@@ -20,6 +20,7 @@ members = [
     "devmgr",
     "blkcheck",
     "blkload",
+    "svcload",
     "netcheck",
     "netload",
     "netfault",

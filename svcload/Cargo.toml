@@ -1,0 +1,28 @@
+[package]
+name = "svcload"
+description = "Restarts each restartable service under its clients' load and measures each recovery."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+needs = ["silica.system.Manager", "silica.block.Partitions", "silica.log.Reader", "silica.console.Terminal"]
+memory = 22
+start = "check:services"
+
+[[bin]]
+name = "svcload"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-block = { workspace = true }
+silica-protocols = { workspace = true }
+
+[lints]
+workspace = true

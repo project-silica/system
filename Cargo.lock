@@ -271,6 +271,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "svcload"
+version = "0.0.0"
+dependencies = [
+ "silica-block",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "systest"
 version = "0.0.0"
 dependencies = [
