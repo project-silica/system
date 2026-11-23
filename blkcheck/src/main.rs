@@ -42,7 +42,11 @@ fn settle() {
     }
 }
 
-fn main(_info: &'static ProcessInfo) -> i64 {
+/// Processors the machine has (from `ProcessInfo`).
+static CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn main(info: &'static ProcessInfo) -> i64 {
+    CPUS.store(info.cpus, core::sync::atomic::Ordering::Relaxed);
     match run() {
         Ok(()) => 0,
         Err(e) => {
@@ -260,6 +264,32 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
     lat.sort_unstable();
     println!("BENCH {prefix}_read4k_qd1 {} ns", lat[lat.len() / 2]);
     println!("BENCH {prefix}_read4k_qd1_p99 {} ns", lat[lat.len() * 99 / 100]);
+    // Where the client waits from matters as much as what it does: from
+    // each processor in turn, the median of 500 reads (not gated; what the
+    // completion path costs across processors and on the driver's own).
+    let cpus = CPUS.load(core::sync::atomic::Ordering::Relaxed).min(8) as usize;
+    if cpus > 1 {
+        let mut line = silica_rt::alloc::string::String::new();
+        for cpu in 0..cpus {
+            if silica_rt::sys::thread_set_cpu(slots::THREAD, cpu).is_err() {
+                continue;
+            }
+            let mut by = Vec::new();
+            for i in 0..600u64 {
+                let block = (i * 2654435761) % span;
+                let t = clock.now();
+                disk.run(&req(Op::Read, block, 0, blocks4k, 9000 + i), deadline()).map_err(|e| why(e, "a read failed"))?;
+                if i >= 100 {
+                    by.push(clock.now() - t);
+                }
+            }
+            by.sort_unstable();
+            use core::fmt::Write;
+            let _ = write!(line, " {cpu}:{}", by[by.len() / 2]);
+        }
+        let _ = silica_rt::sys::thread_set_cpu(slots::THREAD, 0);
+        println!("blkcheck: depth-1 read median (ns) from each processor:{line}");
+    }
     let (depth, total) = (32u64, 20000u64);
     let (mut sent, mut done) = (0u64, 0u64);
     let start = clock.now();
