@@ -13,7 +13,7 @@ needs = ["silica.system.Manager"]
 machine = true
 memory = 26
 start = "boot"
-restart = "never"
+restart = "always"
 
 [lib]
 path = "src/lib.rs"

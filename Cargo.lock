@@ -25,6 +25,7 @@ dependencies = [
 name = "console"
 version = "0.0.0"
 dependencies = [
+ "silica-formats",
  "silica-idl-rt",
  "silica-protocols",
  "silica-ring",
@@ -59,6 +60,25 @@ version = "0.0.0"
 dependencies = [
  "silica-idl-rt",
  "silica-idlc",
+ "silica-rt",
+]
+
+[[package]]
+name = "entropy"
+version = "0.0.0"
+dependencies = [
+ "silica-formats",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
+name = "entropycheck"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-protocols",
  "silica-rt",
 ]
 
@@ -318,6 +338,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-console"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-ring",
+ "silica-rt",
+]
+
+[[package]]
 name = "virtio-input"
 version = "0.0.0"
 dependencies = [
@@ -334,6 +365,16 @@ version = "0.0.0"
 dependencies = [
  "silica-driver",
  "silica-net",
+ "silica-rt",
+]
+
+[[package]]
+name = "virtio-rng"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-idl-rt",
+ "silica-protocols",
  "silica-rt",
 ]
 

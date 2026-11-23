@@ -92,7 +92,8 @@ pub struct Grant {
     /// it (`rights` and `badge` are not used): the only way to pass on an
     /// Untyped, which has one capability. It comes back with everything
     /// else the child held only if it was made from the child's memory;
-    /// otherwise it is gone when the child is destroyed.
+    /// otherwise it is gone when the child is destroyed, unless the parent
+    /// takes it back first ([`Child::take_back`]).
     pub give: bool,
 }
 
@@ -215,6 +216,14 @@ impl Child {
         false
     }
 
+    /// Take back what slot `index` of the child's CapSpace holds (grant
+    /// `n` is at `slots::FIRST_GRANT + n`) into the parent's empty slot
+    /// `to`, keeping its place in the derivation tree: what a parent does
+    /// before destroying a child it gave something outright.
+    pub fn take_back(&self, index: u64, to: u64) -> Result<(), Error> {
+        sys::cap_move_from(slots::SPACE, to, self.space, index)
+    }
+
     /// End the child and take back all of its memory.
     pub fn destroy(self) -> Result<(), Error> {
         // SAFETY: everything derived from this Untyped is the child's; the
@@ -239,6 +248,15 @@ impl Child {
         }
         Ok(())
     }
+}
+
+/// The seed a parent gives a child for its `start`th start: a keyed
+/// BLAKE2s of the parent's secret `boot` over the child's `name` and the
+/// start, so no two starts of any child share one, and knowing one says
+/// nothing about `boot` or about another's (the service manager's `seed`
+/// declaration; the entropy service is seeded so).
+pub fn seed(boot: &[u8; 32], name: &str, start: u64) -> [u8; 32] {
+    silica_formats::blake2s::Blake2s::keyed(boot).update(b"silica child seed").update(name.as_bytes()).update(&start.to_le_bytes()).finish()
 }
 
 /// Why a program could not be started.

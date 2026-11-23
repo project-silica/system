@@ -1,11 +1,14 @@
 //! The local console (component D20's terminal half): it provides
 //! `silica.console.Terminal` to the shell, showing text on the display the
 //! device manager offers and echoing it on the serial line, and reading
-//! lines from the keyboard it offers. Either may be missing: without a
-//! display the serial line is the screen, without a keyboard nothing is
-//! read. Either driver may end: the console hears of it (the device
-//! manager's death notice), opens the one started in its place, and the
-//! screen comes back whole; nothing of the console's is the driver's.
+//! lines from the keyboard it offers. A console port (`silica.console.Port`:
+//! a virtual machine's host console) is one more place the terminal is:
+//! what is shown goes to it too, and what is typed there is edited into
+//! lines as keys are. Any may be missing: without a display the serial
+//! line is the screen, without a keyboard or port nothing is read. Any
+//! driver may end: the console hears of it (the device manager's death
+//! notice), opens the one started in its place, and the screen comes back
+//! whole; nothing of the console's is the driver's.
 //!
 //! The screen is a grid of 8 by 16 pixel cells (the Terminus font), light
 //! text on near black; what does not fit scrolls up. The keyboard layout is
@@ -13,12 +16,12 @@
 #![no_std]
 #![no_main]
 
-mod font;
 mod keys;
 mod screen;
 
 use screen::{Display, Grid};
 use silica_idl_rt::CapList;
+use silica_protocols::console::port;
 use silica_protocols::console::terminal::{self, ReadLineReply, SizeReply, WriteReply};
 use silica_protocols::device::manager;
 use silica_protocols::input::device as input;
@@ -42,6 +45,20 @@ const DEVICES: Cap = Cap(slots::FIRST_GRANT + 1);
 const KEYS: u64 = 1;
 const KEYBOARD_GONE: u64 = 2;
 const DISPLAY_GONE: u64 = 4;
+/// The console port's driver (bytes arrived), and the device manager (it ended).
+const PORT_BYTES: u64 = 8;
+const PORT_GONE: u64 = 16;
+
+/// A console port: its ring of what arrives, the ring's memory, and its driver.
+struct Port {
+    ring: Consumer<8>,
+    _memory: Memory,
+    driver: port::Client<Channel, Handle>,
+    _handle: Handle,
+    /// The last byte was a carriage return: a line feed after it ends no
+    /// second line.
+    after_cr: bool,
+}
 
 struct Console {
     devices: manager::Client<Channel, Handle>,
@@ -50,6 +67,7 @@ struct Console {
     display: Option<Display>,
     /// The ring, its memory, and the driver (its capability).
     keys: Option<(Consumer<8>, Memory, Handle)>,
+    port: Option<Port>,
     modifiers: keys::Modifiers,
     line: String,
     lines: VecDeque<String>,
@@ -67,6 +85,27 @@ impl Console {
         self.grid.write(text);
         self.update();
         print!("{text}");
+        self.send_to_port(text.as_bytes());
+    }
+
+    /// Send `bytes` to the console port, if there is one. A line ends with
+    /// a carriage return too there: the other end is a terminal.
+    fn send_to_port(&mut self, bytes: &[u8]) {
+        let Some(p) = &mut self.port else { return };
+        let mut out = silica_rt::alloc::vec::Vec::with_capacity(bytes.len() + 8);
+        for &b in bytes {
+            if b == b'\n' {
+                out.push(b'\r');
+            }
+            out.push(b);
+        }
+        for chunk in out.chunks(2048) {
+            if p.driver.write(chunk).is_err() {
+                // The driver is gone; its death notice brings the next one.
+                self.port = None;
+                return;
+            }
+        }
     }
 
     /// Bring the display up to date with the grid.
@@ -82,29 +121,54 @@ impl Console {
     /// A key went down: edit the line, or end it.
     fn key(&mut self, usage: u16, down: bool) {
         match self.modifiers.key(usage, down) {
-            Some(keys::Key::Char(c)) => {
-                if self.line.len() < 1000 {
-                    self.line.push(c);
-                    let mut b = [0u8; 4];
-                    self.show(c.encode_utf8(&mut b));
-                }
-            }
-            Some(keys::Key::Backspace) => {
-                if self.line.pop().is_some() {
-                    self.grid.backspace();
-                    self.update();
-                    print!("\u{8} \u{8}");
-                }
-            }
-            Some(keys::Key::Enter) => {
-                self.show("\n");
-                let line = core::mem::take(&mut self.line);
-                match self.waiting.take() {
-                    Some(p) => answer_line(p, &line),
-                    None => self.lines.push_back(line),
-                }
-            }
+            Some(keys::Key::Char(c)) => self.char(c),
+            Some(keys::Key::Backspace) => self.backspace(),
+            Some(keys::Key::Enter) => self.enter(),
             None => {}
+        }
+    }
+
+    /// A byte typed at the console port: printable ASCII goes into the
+    /// line, backspace and delete take a character out, a carriage return
+    /// or line feed (not both) ends the line; the rest is dropped.
+    fn port_byte(&mut self, b: u8) {
+        let after_cr = self.port.as_mut().is_some_and(|p| core::mem::replace(&mut p.after_cr, b == b'\r'));
+        match b {
+            b'\r' => self.enter(),
+            b'\n' if !after_cr => self.enter(),
+            0x08 | 0x7F => self.backspace(),
+            0x20..0x7F => self.char(b as char),
+            _ => {}
+        }
+    }
+
+    fn char(&mut self, c: char) {
+        if self.line.len() < 1000 {
+            self.line.push(c);
+            if self.waiting.is_some() {
+                let mut b = [0u8; 4];
+                self.show(c.encode_utf8(&mut b));
+            }
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.line.pop().is_some() && self.waiting.is_some() {
+            self.grid.backspace();
+            self.update();
+            print!("\u{8} \u{8}");
+            self.send_to_port(b"\x08 \x08");
+        }
+    }
+
+    fn enter(&mut self) {
+        let line = core::mem::take(&mut self.line);
+        match self.waiting.take() {
+            Some(p) => {
+                self.show("\n");
+                answer_line(p, &line);
+            }
+            None => self.lines.push_back(line),
         }
     }
 }
@@ -130,6 +194,8 @@ impl terminal::Server<Handle> for Console {
             // The reply borrows the console; the line is kept until the
             // next call in `last`.
             Some(l) => {
+                self.show(&l);
+                self.show("\n");
                 self.line_out = l;
                 ReadLineReply { line: &self.line_out }
             }
@@ -163,6 +229,13 @@ impl Waiting for Console {
             // shell restarted under its call) gives way to the new one; a
             // second reader while the first still waits gets an empty line.
             self.waiting = parked.take();
+            // Typeahead belongs after the reader's prompt, including a
+            // partial line typed while the preceding command was running.
+            if self.waiting.is_some() && !self.line.is_empty() {
+                let typed = core::mem::take(&mut self.line);
+                self.show(&typed);
+                self.line = typed;
+            }
         }
         n
     }
@@ -179,6 +252,30 @@ impl Waiting for Console {
                 "console: the display's driver ended; {}",
                 if self.display.is_some() { "showing on its successor" } else { "no display" }
             );
+        }
+        if bits & PORT_GONE != 0 {
+            self.port = console_port(&mut self.devices, self.note);
+            println!("console: the console port's driver ended; {}", if self.port.is_some() { "using its successor" } else { "no port" });
+        }
+        // What arrived at the port, a record (up to 7 bytes) at a time.
+        while let Some(p) = &mut self.port {
+            match p.ring.pop() {
+                Ok(Some(r)) => {
+                    for &b in &r[1..1 + (r[0] as usize).min(7)] {
+                        self.port_byte(b);
+                    }
+                }
+                Ok(None) => {
+                    if self.port.as_mut().is_some_and(|p| p.ring.sleep()) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    println!("console: the console port's ring makes no sense; nothing more read from it");
+                    self.port = None;
+                    break;
+                }
+            }
         }
         loop {
             let Some((ring, _, _)) = &mut self.keys else { return };
@@ -234,6 +331,17 @@ fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option
     Some((consumer, ring, driver))
 }
 
+/// The console port, connected: its ring, and the driver it came from.
+fn console_port(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option<Port> {
+    let handle = open(devices, manager::Class::Port, note, PORT_GONE)?;
+    let mut driver = port::Client::<Channel, Handle>::from(Channel::new(handle.cap()));
+    let memory = Memory::new(12).ok()?;
+    driver.connect(lend(memory.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, PORT_BYTES)?).ok()?;
+    let mut ring = Consumer::new(memory.shared(), 256)?;
+    let _ = ring.sleep();
+    Some(Port { ring, _memory: memory, driver, _handle: handle, after_cr: false })
+}
+
 fn main(_info: &'static ProcessInfo) -> i64 {
     let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(DEVICES));
     let Ok(note) = Object::new(ObjectType::Notification, 0) else {
@@ -247,9 +355,11 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         None => (None, Grid::new(80, 25)),
     };
     let keys = keyboard(&mut devices, note.cap());
+    let port = console_port(&mut devices, note.cap());
     println!(
-        "console: {}, {}",
+        "console: {}{}, {}",
         if display.is_some() { "on the display and the serial line" } else { "on the serial line" },
+        if port.is_some() { " and the console port" } else { "" },
         if keys.is_some() { "reading the keyboard" } else { "no keyboard" }
     );
     let mut console = Console {
@@ -258,6 +368,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         grid,
         display,
         keys,
+        port,
         modifiers: keys::Modifiers::default(),
         line: String::new(),
         lines: VecDeque::new(),

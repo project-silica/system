@@ -204,15 +204,16 @@ impl Channel {
 impl Transport<Handle> for Channel {
     fn call(
         &mut self,
-        request: &[u8],
+        message: &mut [u8],
+        len: usize,
         mut caps: CapList<Handle>,
-        reply: &mut [u8],
         reply_caps: &mut CapList<Handle>,
     ) -> Result<usize, TransportError> {
+        let request = message.get(..len).ok_or(TransportError::TooLarge)?;
         let buf = buffer();
         let (slots, sent) = give(&buf, &mut caps);
         let words = pack(&buf, request);
-        let result = sys::call(self.endpoint, info(request.len(), sent), words);
+        let result = sys::call(self.endpoint, info(len, sent), words);
         given(slots, sent);
         let m = result.map_err(|e| match e {
             // The endpoint, or the provider holding the call, went away.
@@ -221,7 +222,7 @@ impl Transport<Handle> for Channel {
             _ => TransportError::Revoked,
         })?;
         collect(&buf, m.info.caps(), reply_caps);
-        Ok(unpack(&buf, m.words, m.info.label() as usize, reply))
+        Ok(unpack(&buf, m.words, m.info.label() as usize, message))
     }
 }
 

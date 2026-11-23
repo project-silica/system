@@ -91,6 +91,12 @@ const MAX_RESTARTS: u32 = 3;
 /// A service and what it is now.
 struct Running {
     child: Option<Child>,
+    /// What it was given outright, to take back before it goes: each as
+    /// the slot in its CapSpace and the slot in this one it came from
+    /// (a machine service's device memory and firmware tables).
+    given: Vec<(u64, u64)>,
+    /// How many times it was started: what its seed is derived for.
+    starts: u64,
     failures: u32,
     /// Stopped by the owner: not started again until asked.
     stopped: bool,
@@ -183,6 +189,14 @@ impl Manager {
             args[0] = self.root.ramdisk.len() as u64;
             args[1] = (grants.len() - before) as u64;
         }
+        if s.seed {
+            // A secret of its own for this start (`silica_proc::seed`).
+            let seed = silica_proc::seed(&self.info.entropy, s.name, self.running[i].starts);
+            for (k, word) in seed.as_chunks::<8>().0.iter().enumerate() {
+                args[4 + k] = u64::from_le_bytes(*word);
+            }
+            args[3] = self.info.entropy_sources;
+        }
         Ok((grants, args))
     }
 
@@ -205,8 +219,36 @@ impl Manager {
             println!("init: cannot start {}: {e:?}", s.name);
             "it could not be started"
         })?;
+        self.running[i].starts += 1;
+        // What was given outright, by the slot it lands in (`silica_proc`
+        // puts grant `n` at `FIRST_GRANT + n`).
+        self.running[i].given =
+            grants.iter().enumerate().filter(|(_, g)| g.give).map(|(n, g)| (silica_rt::slots::FIRST_GRANT + n as u64, g.cap.0)).collect();
         self.running[i].child = Some(child);
         Ok(())
+    }
+
+    /// End service `i`'s program `child`. What it was given outright is
+    /// taken back first, and emptied of everything made from it (frames of
+    /// device registers in the device manager and its drivers), for the
+    /// next instance; then its memory comes back.
+    fn end(&mut self, i: usize, child: Child) {
+        let name = self.services[i].name;
+        let given = core::mem::take(&mut self.running[i].given);
+        for &(at, slot) in &given {
+            if child.take_back(at, slot).is_err() {
+                println!("ERROR: init: cannot take back what {name} was given (its slot {at})");
+            }
+        }
+        if child.destroy().is_err() {
+            println!("ERROR: init: cannot take back the memory of {name}");
+        }
+        for &(_, slot) in &given {
+            // SAFETY: init uses nothing made from the memory it gave: the
+            // frames made from it were the service's and its children's.
+            #[allow(unsafe_code)]
+            let _ = unsafe { sys::cap_revoke(sys::Cap(slot)) };
+        }
     }
 
     /// A message on the exit endpoint about a service: it ended (`EXIT_LABEL`)
@@ -224,9 +266,7 @@ impl Manager {
             return None;
         }
         let child = self.running[i].child.take()?;
-        if child.destroy().is_err() {
-            println!("ERROR: init: cannot take back the memory of {}", self.services[i].name);
-        }
+        self.end(i, child);
         Some((i, if fault { None } else { Some(m.words[0] as i64) }))
     }
 
@@ -277,9 +317,7 @@ impl Manager {
         self.running[i].stopped = true;
         match self.running[i].child.take() {
             Some(child) => {
-                if child.destroy().is_err() {
-                    println!("ERROR: init: cannot take back the memory of {}", self.services[i].name);
-                }
+                self.end(i, child);
                 true
             }
             None => false,
@@ -328,13 +366,8 @@ impl manager::Server<Handle> for Manager {
 
     fn restart(&mut self, name: &str) -> Result<manager::RestartReply, manager::Error> {
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
-        if self.services[i].machine {
-            return Err(manager::Error::Refused);
-        }
         let child = self.running[i].child.take().ok_or(manager::Error::Refused)?;
-        if child.destroy().is_err() {
-            println!("ERROR: init: cannot take back the memory of {name}");
-        }
+        self.end(i, child);
         Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
         println!("init: {name} restarted, as asked");
         Ok(manager::RestartReply {})
@@ -392,13 +425,19 @@ impl manager::Server<Handle> for Manager {
         let caller = self.caller.checked_sub(CONSUMERS).and_then(|i| self.services.get(i as usize)).ok_or(manager::Error::Refused)?;
         let source = silica_rt::alloc::format!("{}/{name}", caller.name);
         let log = self.log.as_mut().ok_or(manager::Error::Refused)?;
-        if log.given.iter().any(|(n, _)| *n == source) {
+        // A name given before keeps its place only while its ring lives: a
+        // ring that is gone (the service that made it restarted, its
+        // memory with it) is replaced by the new one, and the log service
+        // reads on from it under the same source.
+        let alive = |h: &Handle| matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), h.cap().0), Ok(Some(_)));
+        let again = log.given.iter().position(|(n, _)| *n == source);
+        if again.is_some_and(|k| alive(&log.given[k].1)) {
             return Err(manager::Error::Exists);
         }
         // A ring of the size every log's writer and reader assume.
         let fits = matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), ring.cap().0),
             Ok(Some(i)) if i.ty == ObjectType::Frame && i.bits == silica_rt::log::BITS);
-        if !fits || log.given.len() >= MAX_LOGS || name.is_empty() || name.len() > 64 {
+        if !fits || (again.is_none() && log.given.len() >= MAX_LOGS) || name.is_empty() || name.len() > 64 {
             return Err(manager::Error::Refused);
         }
         let to = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused)?;
@@ -406,7 +445,10 @@ impl manager::Server<Handle> for Manager {
             silica_rt::ipc::release_slot(to);
             return Err(manager::Error::Refused);
         }
-        log.given.push((source, ring));
+        match again {
+            Some(k) => log.given[k].1 = ring,
+            None => log.given.push((source, ring)),
+        }
         let _ = sys::signal(log.added);
         Ok(manager::AddLogReply { wake: Handle::new(sys::Cap(to)) })
     }
@@ -468,7 +510,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             None => None,
         });
     }
-    let running = services.iter().map(|_| Running { child: None, failures: 0, stopped: false }).collect();
+    let running = services.iter().map(|_| Running { child: None, given: Vec::new(), starts: 0, failures: 0, stopped: false }).collect();
     // The log, when a service provides it: a ring for every other service,
     // made before anything starts; the log starts first.
     let mut order = order;

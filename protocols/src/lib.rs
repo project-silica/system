@@ -8,7 +8,11 @@
 //! - [`display::device`]: `silica.display.Device`, the display device
 //!   class;
 //! - [`console::terminal`]: `silica.console.Terminal`, the local console;
-//! - [`log::reader`]: `silica.log.Reader`, the system's log, read.
+//! - [`console::port`]: `silica.console.Port`, the class of console ports;
+//! - [`log::reader`]: `silica.log.Reader`, the system's log, read;
+//! - [`entropy::device`]: `silica.entropy.Device`, the class of devices
+//!   that produce random bits;
+//! - [`entropy::source`]: `silica.entropy.Source`, the entropy service.
 //!
 //! Each module's reference page is `silica-idlc docs`'s page for the
 //! protocol. A program wraps a capability it was granted to a provider as
@@ -37,12 +41,19 @@ pub mod display {
     include!(concat!(env!("OUT_DIR"), "/silica_display_device.rs"));
 }
 
-/// `silica.console.Terminal`.
+/// `silica.console.Terminal` and `silica.console.Port`.
 pub mod console {
     include!(concat!(env!("OUT_DIR"), "/silica_console_terminal.rs"));
+    include!(concat!(env!("OUT_DIR"), "/silica_console_port.rs"));
 }
 
 /// `silica.log.Reader`.
 pub mod log {
     include!(concat!(env!("OUT_DIR"), "/silica_log_reader.rs"));
+}
+
+/// `silica.entropy.Device` and `silica.entropy.Source`.
+pub mod entropy {
+    include!(concat!(env!("OUT_DIR"), "/silica_entropy_device.rs"));
+    include!(concat!(env!("OUT_DIR"), "/silica_entropy_source.rs"));
 }
