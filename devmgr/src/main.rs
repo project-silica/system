@@ -837,7 +837,12 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         Ok(Cap(slot))
     };
     let button = match power::Button::new(&mut m, granted(GRANT_PORTS), granted(GRANT_IRQS), sender(power::BUTTON)?) {
-        Ok(b) => Some(b),
+        Ok(b) => {
+            // From here a press is heard; one before was cleared with the
+            // button's old status (a machine keeps the press that turned it on).
+            println!("devmgr: the power button is armed");
+            Some(b)
+        }
         Err(e) => {
             println!("devmgr: no power button: {e}");
             None

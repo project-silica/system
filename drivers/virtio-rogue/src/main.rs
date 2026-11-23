@@ -6,6 +6,9 @@
 //! uses that against the system:
 //!
 //! - it claims another device's identity and another device's interrupt;
+//! - it makes its device send interrupt messages it was never given: one in
+//!   the old format, naming a processor and vector, and one naming another
+//!   device's remapping entry;
 //! - it tells its device to write to, and to read from, memory the driver
 //!   never mapped for it, and to write to memory mapped for reading only;
 //! - it asks where its memory physically is;
@@ -198,6 +201,18 @@ impl Weapon for Nic {
     }
 }
 
+/// Whether the processor is QEMU's emulated one (TCG), from the hypervisor
+/// leaf of CPUID.
+fn emulated() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let r = core::arch::x86_64::__cpuid(0x4000_0000);
+        [r.ebx, r.ecx, r.edx].iter().flat_map(|w| w.to_le_bytes()).eq(*b"TCGTCGTCGTCG")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
 fn pass(name: &str) {
     println!("TEST {name} PASS");
 }
@@ -319,6 +334,53 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
         return Err(fail("rogue_recovers", format_args!("the device does not work after a reset")));
     }
     pass("rogue_recovers");
+
+    // Interrupts: the driver holds the BAR with its device's MSI-X table, so
+    // it can make the device send any message at all. First one in the old
+    // format, naming a processor (0) and the vector this driver's own line
+    // arrives at without remapping (0x30 + line, the kernel's numbering on
+    // x86). The kernel leaves the old format blocked; QEMU's IOMMU does not
+    // model that block and delivers it (hw/i386/intel_iommu.c), so this run
+    // says what happened and real hardware is where it is judged
+    // (spec/COMPONENTS.md, M8). Then one naming remapping entry 9, an I/O
+    // APIC line on this machine (the ACPI SCI, which the device manager
+    // binds): the IOMMU must refuse it as coming from the wrong device.
+    // What the device sends cannot be seen from here but by its absence;
+    // the kernel's line is the evidence, and the harness requires it.
+    let (line, entry) = device.msix_entry(0)?;
+    let forge = |address: u64, data: u32| {
+        entry.write32(12, 1);
+        entry.write32(0, address as u32);
+        entry.write32(4, (address >> 32) as u32);
+        entry.write32(8, data);
+        entry.write32(12, 0);
+    };
+    let mut disk = bring_up(&device, &dma)?;
+    let own = disk.own();
+    forge(0xFEE0_0000, 0x30 + line);
+    let outcome = disk.aim(T_IN, own)?;
+    println!("virtio-rogue: made the device send an old-format interrupt to its own vector: {outcome:?}");
+    pause(50_000_000);
+    // Under KVM, QEMU's virtio-pci turns an unmasked MSI-X entry into a
+    // route of its own at once and asserts when the IOMMU refuses it
+    // (hw/pci/msix.c, msix_fire_vector_notifier): the emulator dies, which
+    // shows nothing about Silica. So this one is sent only where QEMU
+    // emulates the processor (the harness's second run, under TCG), where
+    // the message takes the device's ordinary path through the IOMMU.
+    if emulated() {
+        let mut disk = bring_up(&device, &dma)?;
+        forge(0xFEE0_0000 | 9 << 5 | 1 << 4, 0);
+        let outcome = disk.aim(T_IN, own)?;
+        println!("virtio-rogue: made the device raise remapping entry 9: {outcome:?}");
+        pause(50_000_000);
+    } else {
+        println!("virtio-rogue: remapping entry 9 is tried under QEMU's emulated processor only (its KVM path asserts)");
+    }
+    // Bound again, its own interrupt works.
+    let mut disk = bring_up(&device, &dma)?;
+    if disk.aim(T_IN, own)? != Outcome::Status(0) {
+        return Err(fail("rogue_interrupt_recovers", format_args!("the device's interrupt does not work once bound again")));
+    }
 
     // Its log ring, which the log service reads: a header announcing a
     // million records. The log service says so, skips what the ring held
