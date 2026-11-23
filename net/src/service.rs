@@ -134,7 +134,8 @@ impl<D: Device> Service<D> {
     /// A service for `device`; `wake` signals the driver's notification
     /// with [`CLIENT`].
     pub fn new(device: D, wake: Cap) -> Service<D> {
-        Service { device, session: Session::new(wake), caller: 0, wake: None }
+        // One client: the network stack (`Session::exclusive` says why).
+        Service { device, session: Session::exclusive(wake), caller: 0, wake: None }
     }
 
     /// Tell the client the link went up or down.

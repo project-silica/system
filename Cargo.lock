@@ -138,6 +138,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "netd"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-inet",
+ "silica-net",
+ "silica-protocols",
+ "silica-queue",
+ "silica-rt",
+]
+
+[[package]]
 name = "netfault"
 version = "0.0.0"
 dependencies = [
@@ -228,6 +240,10 @@ version = "0.0.0"
 
 [[package]]
 name = "silica-idlc"
+version = "0.0.0"
+
+[[package]]
+name = "silica-inet"
 version = "0.0.0"
 
 [[package]]
