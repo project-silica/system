@@ -119,8 +119,8 @@ impl Interface {
         Ok(self.queue.wait(deadline)?.into())
     }
 
-    /// How long the last recovery from a driver's end took (ns), once.
-    pub fn take_recovery(&mut self) -> Option<u64> {
+    /// How the last recovery from a driver's end went, once.
+    pub fn take_recovery(&mut self) -> Option<silica_queue::client::Recovery> {
         self.queue.take_recovery()
     }
 }
