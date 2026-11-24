@@ -113,16 +113,21 @@ impl Load {
 
 fn run() -> Result<(), String> {
     let mut load = Load { system: system::Client::from(Channel::new(grant(0))), slowest: 0 };
-    let before = load.system.memory().map_err(|e| format!("memory: {e:?}"))?.free;
+    // What the service manager can give out and what its running services
+    // hold: a service that ends by itself meanwhile (the remote service on
+    // a machine without its keys, at boot) moves memory from one to the
+    // other, and only a leak changes the sum.
+    let total = |m: system::MemoryReply| m.free + m.held;
+    let before = total(load.system.memory().map_err(|e| format!("memory: {e:?}"))?);
     partitions(&mut load)?;
     devmgr(&mut load)?;
     logd(&mut load)?;
     console(&mut load)?;
     shell(&mut load)?;
     // Every instance ended has given its memory back for the next.
-    let after = load.system.memory().map_err(|e| format!("memory: {e:?}"))?.free;
+    let after = total(load.system.memory().map_err(|e| format!("memory: {e:?}"))?);
     if after != before {
-        return Err(format!("the service manager could give out {before} bytes before the restarts and {after} after"));
+        return Err(format!("the service manager could give out or had given {before} bytes before the restarts and {after} after"));
     }
     let listed = load.system.list().map_err(|e| format!("list: {e:?}"))?;
     for s in listed.services.iter() {
