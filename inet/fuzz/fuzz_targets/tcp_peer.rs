@@ -107,6 +107,16 @@ fuzz_target!(|data: &[u8]| {
             _ => {
                 if op & 0x10 != 0 {
                     c.abort();
+                } else if op & 0x20 != 0 {
+                    // The stack doubles a send buffer that holds the
+                    // connection back; here at any moment, up to 4x.
+                    let capacity = c.send_capacity();
+                    let limited = c.buffer_limited();
+                    if capacity < 4 * SEND && c.grow_send_buffer(vec![0u8; 2 * capacity]) {
+                        assert_eq!(c.send_capacity(), 2 * capacity);
+                    } else if limited {
+                        assert!(capacity >= 4 * SEND, "a limited connection takes a larger buffer");
+                    }
                 }
             }
         }
@@ -122,7 +132,7 @@ fuzz_target!(|data: &[u8]| {
             sent_by_us.push((s.header.seq, s.len()));
         }
         assert!(c.readable() <= RECEIVE);
-        assert!(c.writable() <= SEND);
+        assert!(c.writable() <= c.send_capacity() && c.send_capacity() <= 4 * SEND);
     }
 });
 

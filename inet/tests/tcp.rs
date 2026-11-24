@@ -55,6 +55,9 @@ struct Net {
     /// Every segment sent, to look at afterwards: (to B, header, data length).
     log: Vec<(bool, Header, Options, usize)>,
     b_buffers: (usize, usize),
+    /// A's send buffer doubles, up to this many bytes, whenever it is what
+    /// holds A back and A has more to send (netd's policy).
+    grow_to: usize,
 }
 
 impl Net {
@@ -73,6 +76,7 @@ impl Net {
             sent: 0,
             log: Vec::new(),
             b_buffers,
+            grow_to: 0,
         }
     }
 
@@ -207,6 +211,10 @@ fn transfer(net: &mut Net, data: &[u8], limit: u64) -> Vec<u8> {
     let end = net.now + limit;
     while net.now < end {
         if sent < data.len() {
+            let capacity = net.a.send_capacity();
+            if net.a.buffer_limited() && capacity < net.grow_to {
+                assert!(net.a.grow_send_buffer(vec![0; 2 * capacity]));
+            }
             sent += net.a.send(&data[sent..]);
         } else if !closed {
             net.a.close();
@@ -729,12 +737,90 @@ fn first_loss_from_one_sack(segments: usize) {
     assert!(resent(&net), "the first segment resent within a round trip of the SACK: {:?}", net.log);
 }
 
-/// Seconds of simulated time to move 4 MiB from A to B over a 2 ms round
-/// trip with 64 KiB buffers, when `loss` percent of segments are lost each
-/// way and, with `rough`, the path the interop suite's netem makes: 10% of
-/// segments overtake the others (no delay instead of 1 ms) and 1% arrive
-/// twice; for each of five seeds.
-fn time_through_loss(loss: u64, rough: bool) -> Vec<f64> {
+#[test]
+fn a_lost_repair_is_found_by_new_data_sent_behind_it() {
+    // Lose the first data segment twice, so its first repair is lost too.
+    // A repair is found lost when something sent after it is delivered
+    // (RFC 8985): a sender whose whole buffer is already in flight has
+    // nothing to send after it and waits for the retransmission timeout;
+    // one whose buffer grows when it is what holds the sender back does not.
+    let mut times = Vec::new();
+    for grow_to in [0, 128 << 10] {
+        let mut net = Net::new((8 * 1448, 64 << 10), (64 << 10, 64 << 10));
+        net.delay = MS;
+        net.grow_to = grow_to;
+        net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+        let mut first = None;
+        let mut lost = 0;
+        net.drop = Box::new(move |_, s| {
+            if !s.data.is_empty() && s.header.seq == *first.get_or_insert(s.header.seq) && lost < 2 {
+                lost += 1;
+                return true;
+            }
+            false
+        });
+        let data = pattern(128 << 10);
+        let start = net.now;
+        assert_eq!(transfer(&mut net, &data, SECOND), data);
+        let timeouts = net.sender_timeouts;
+        eprintln!("grow to {grow_to}: {} ms, {timeouts} timeouts, send buffer {}", (net.now - start) / MS, net.a.send_capacity());
+        if grow_to == 0 {
+            assert!(timeouts > 0, "the fixed buffer's case is the one this test is about");
+        } else {
+            assert_eq!(timeouts, 0, "the lost repair was found by the data sent after it");
+        }
+        times.push(net.now - start);
+    }
+    assert!(times[1] * 4 < times[0], "{times:?}");
+}
+
+#[test]
+fn a_send_buffer_grows_to_what_the_path_carries() {
+    // 4 MiB over a 10 ms round trip: a fixed 32 KiB send buffer sends 32
+    // KiB a round trip whatever the windows allow; growing, the sender is
+    // held by the congestion window and the scoreboard instead. Growth
+    // copies what is in flight and changes no byte (the data is checked),
+    // and it stops at the bound it was given.
+    let mut times = Vec::new();
+    for grow_to in [0, 128 << 10] {
+        let mut net = Net::new((32 << 10, 64 << 10), (64 << 10, 256 << 10));
+        net.grow_to = grow_to;
+        let data = pattern(4 << 20);
+        assert_eq!(transfer(&mut net, &data, 10 * SECOND), data);
+        assert_eq!(net.a.send_capacity(), (32 << 10).max(grow_to));
+        eprintln!("grow to {grow_to}: {} ms", net.now / MS);
+        times.push(net.now);
+    }
+    assert!(times[1] * 2 < times[0], "{times:?}");
+}
+
+#[test]
+fn a_send_buffer_is_only_replaced_by_a_larger_one_while_data_can_go() {
+    let mut net = Net::new((4096, 4096), (4096, 4096));
+    assert!(!net.a.grow_send_buffer(vec![0; 4096]), "not larger");
+    assert!(net.a.grow_send_buffer(vec![0; 8192]), "SYN-SENT: data may be queued");
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    assert_eq!(transfer(&mut net, &pattern(20_000), SECOND), pattern(20_000));
+    assert!(net.a.is_closed() || net.a.state() == State::TimeWait);
+    assert!(!net.a.grow_send_buffer(vec![0; 16384]), "nothing more will be sent");
+}
+
+/// One 4 MiB transfer through `time_through_loss`'s path: its simulated
+/// seconds, the segments sent again whose first copy had arrived, and the
+/// window reductions that stood (not undone).
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    secs: f64,
+    redundant: usize,
+    reductions: usize,
+}
+
+/// Moves 4 MiB from A to B over a 2 ms round trip with 64 KiB buffers,
+/// when `loss` percent of segments are lost each way and, with `rough`,
+/// the path the interop suite's netem makes: 10% of segments overtake the
+/// others (no delay instead of 1 ms) and 1% arrive twice; for each of five
+/// seeds.
+fn time_through_loss(loss: u64, rough: bool) -> Vec<Run> {
     (1..=5u64)
         .map(|seed| {
             let mut net = Net::new((65536, 65536), (65536, 65536));
@@ -765,17 +851,20 @@ fn time_through_loss(loss: u64, rough: bool) -> Vec<f64> {
             let data = pattern(4 << 20);
             let start = net.now;
             let got = transfer(&mut net, &data, 600 * SECOND);
-            if loss > 0 {
-                let mut sent = std::collections::HashSet::new();
-                let repeats = net.log.iter().filter(|(to_b, h, _, len)| *to_b && *len > 0 && !sent.insert((h.seq, *len))).count();
-                let dsacks = net.log.iter().filter(|(to_b, h, opt, _)| {
-                    !to_b && opt.sack_len > 0 && (opt.sack[0].1.wrapping_sub(h.ack) as i32) <= 0
-                }).count();
-                eprintln!("seed {seed}, reordered {rough}: {repeats} retransmissions ({} redundant), {dsacks} DSACKs, {} window reductions, {} timeouts",
-                    redundant.get(), net.window_reductions, net.sender_timeouts);
-            }
+            let mut sent = std::collections::HashSet::new();
+            let repeats = net.log.iter().filter(|(to_b, h, _, len)| *to_b && *len > 0 && !sent.insert((h.seq, *len))).count();
+            let dsacks = net.log.iter().filter(|(to_b, h, opt, _)| {
+                !to_b && opt.sack_len > 0 && (opt.sack[0].1.wrapping_sub(h.ack) as i32) <= 0
+            }).count();
+            let undone = net.a.info().undone as usize;
+            eprintln!("seed {seed}, {loss}% loss, reordered {rough}: {repeats} retransmissions ({} redundant), {dsacks} DSACKs, {} window reductions ({undone} undone), {} timeouts",
+                redundant.get(), net.window_reductions, net.sender_timeouts);
             assert!(got == data, "seed {seed}: {} of {} bytes arrived in order", got.len(), data.len());
-            (net.now - start) as f64 / SECOND as f64
+            Run {
+                secs: (net.now - start) as f64 / SECOND as f64,
+                redundant: redundant.get(),
+                reductions: net.window_reductions.saturating_sub(undone),
+            }
         })
         .collect()
 }
@@ -785,13 +874,43 @@ fn loss_is_repaired_without_waiting_for_the_timer() {
     // The interop suite's lossy path (2% each way, 2 ms) moved 16 MiB in 22 s
     // under NewReno, where Linux takes 0.1 to 1.1 s: a hole a round trip, and
     // the 200 ms timer whenever a repair was lost. A clean path takes about
-    // 0.13 s here (the window over the round trip).
+    // 0.13 s here (the window over the round trip). Reordered, the sender
+    // once took overtaken segments for lost: 63 to 511 of a run's
+    // retransmissions were of segments that had arrived, and 4 MiB took up
+    // to 0.8 s. The window RACK waits now covers the reordering the path
+    // has shown, measured (2026-11-24: 0.26 to 0.41 s, 3 to 45).
+    let secs = |runs: &[Run]| runs.iter().map(|r| r.secs).collect::<Vec<_>>();
     let clean = time_through_loss(0, false);
     let lossy = time_through_loss(2, false);
     let rough = time_through_loss(2, true);
-    eprintln!("4 MiB: clean {clean:.3?} s; 2% loss each way {lossy:.3?} s; and reordered, duplicated {rough:.3?} s");
-    for (what, t) in [("2% loss", &lossy), ("2% loss, reordering and duplication", &rough)] {
-        let worst = t.iter().copied().fold(0.0, f64::max);
-        assert!(worst < 1.0, "4 MiB through {what} took up to {worst:.2} s");
+    eprintln!(
+        "4 MiB: clean {:.3?} s; 2% loss each way {:.3?} s; and reordered, duplicated {:.3?} s",
+        secs(&clean),
+        secs(&lossy),
+        secs(&rough)
+    );
+    for (what, runs, bound) in [("2% loss", &lossy, 0.7), ("2% loss, reordering and duplication", &rough, 0.45)] {
+        let worst = secs(runs).into_iter().fold(0.0, f64::max);
+        assert!(worst < bound, "4 MiB through {what} took up to {worst:.2} s");
+    }
+    for r in &rough {
+        assert!(r.redundant <= 50, "{r:?}: segments that had arrived were sent again");
+    }
+}
+
+#[test]
+fn reordering_alone_is_learned_not_paid_for() {
+    // The interop path without its loss: 10% of segments overtake the rest
+    // by a millisecond of a 2 ms round trip, 1% arrive twice. Nothing is
+    // lost, so every reduction is a mistake; each overtaking seen shows how
+    // far the path reorders, and the window covers that from then on.
+    // Still paid (2026-11-24): while slow start doubles the window, a wider
+    // burst meets reordering not yet seen, and 8 to 46 segments a run went
+    // again in the first 51 ms of about 130 (5 reductions at most stood).
+    // The time is a clean path's: 0.110 to 0.143 s against 0.135.
+    let clean = time_through_loss(0, false);
+    for (r, c) in time_through_loss(0, true).iter().zip(&clean) {
+        assert!(r.reductions <= 6 && r.redundant <= 50, "{r:?}");
+        assert!(r.secs < c.secs * 1.1, "{r:?} against {c:?} on a clean path");
     }
 }

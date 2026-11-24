@@ -65,6 +65,16 @@ const CLIENTS: usize = 32;
 /// Each connection's own buffers: bytes sent and not acknowledged, and
 /// bytes received and not yet in the program's stream.
 const BUFFER: usize = 32 << 10;
+/// A send buffer doubles when it is what holds its connection back
+/// (`Connection::buffer_limited`: all of it in flight, the windows open)
+/// and its program has more to send, up to `SEND_MOST`. TCP's scoreboard
+/// keeps at most 64 segments in flight (92 KiB at a 1448-byte MSS), so a
+/// larger buffer would never be in flight whole. The bytes added beyond
+/// `BUFFER` across all connections stay under `GROWN_MOST`: peers that
+/// open windows on many connections cost the stack a bounded amount, and
+/// a connection past the bound keeps the buffer it has.
+const SEND_MOST: usize = 128 << 10;
+const GROWN_MOST: usize = 4 << 20;
 /// Sizes of a program's memory, and of a connection's block, in bits.
 const MEMORY_BITS: core::ops::RangeInclusive<u8> = 16..=28;
 const BLOCK_BITS: core::ops::RangeInclusive<u8> = 12..=24;
@@ -237,13 +247,26 @@ fn streams_in(memory: &Mmio, offset: u64, bits: u8) -> Option<(StreamProducer, S
 /// them: a peer that opens connections can make the stack refuse more,
 /// never fail.
 fn buffers() -> Option<Buffers<Vec<u8>>> {
-    let one = || {
-        let mut v = Vec::new();
-        v.try_reserve_exact(BUFFER).ok()?;
-        v.extend(core::iter::repeat_n(0u8, BUFFER));
-        Some(v)
-    };
-    Some(Buffers { send: one()?, receive: one()? })
+    Some(Buffers { send: buffer(BUFFER)?, receive: buffer(BUFFER)? })
+}
+
+/// Send-buffer bytes beyond `BUFFER` that connections hold now (a buffer
+/// shed in TIME-WAIT holds none).
+fn grown(conns: &[Conn]) -> usize {
+    conns.iter().map(|c| c.tcp.send_capacity().saturating_sub(BUFFER)).sum()
+}
+
+/// Whether a connection's send buffer may double now (`SEND_MOST`).
+fn may_grow(tcp: &Connection<Vec<u8>>, grown: usize) -> bool {
+    let capacity = tcp.send_capacity();
+    tcp.buffer_limited() && capacity < SEND_MOST && grown + capacity <= GROWN_MOST
+}
+
+fn buffer(bytes: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(bytes).ok()?;
+    v.resize(bytes, 0);
+    Some(v)
 }
 
 fn reason(e: Option<Failure>) -> u32 {
@@ -351,12 +374,22 @@ impl Tcp {
     /// had no room).
     pub fn pump(&mut self, now: u64, out: &mut dyn Out) -> bool {
         let mut more = false;
+        let mut grown = grown(&self.conns);
         let (scratch, segment) = (&mut self.scratch, &mut self.segment);
         for c in &mut self.conns {
             if let Some(s) = c.streams.as_mut() {
                 // The program's bytes to TCP.
                 let mut took = false;
                 while !s.tx_closed {
+                    if may_grow(&c.tcp, grown) && s.tx.available().is_ok_and(|n| n > 0) {
+                        let capacity = c.tcp.send_capacity();
+                        // Refused memory leaves the buffer as it was.
+                        if let Some(bytes) = buffer(2 * capacity)
+                            && c.tcp.grow_send_buffer(bytes)
+                        {
+                            grown += capacity;
+                        }
+                    }
                     let room = c.tcp.writable().min(scratch.len());
                     if room == 0 {
                         break;
@@ -464,9 +497,11 @@ impl Tcp {
     /// stalled (30 s once in 10,000 answers under load).
     pub fn sleep(&mut self) -> bool {
         let mut sleep = true;
+        let grown = grown(&self.conns);
         for c in &mut self.conns {
             let Some(s) = c.streams.as_mut() else { continue };
-            if !s.tx_closed && c.tcp.writable() > 0 && !s.tx.sleep() {
+            let can_take = c.tcp.writable() > 0 || may_grow(&c.tcp, grown);
+            if !s.tx_closed && can_take && !s.tx.sleep() {
                 sleep = false;
             }
             if !s.rx_closed && c.tcp.readable() > 0 && !s.rx.sleep_for_room() {

@@ -60,6 +60,9 @@ const HOLES: usize = 32;
 /// data waits while it is full. 64 segments of 1,448 bytes is more than a
 /// 64 KiB window.
 const SEGS: usize = 64;
+/// Recoveries a grown reordering window outlasts the last sign of
+/// reordering (RFC 8985 section 6.2.4).
+const REO_PERSIST: u8 = 16;
 /// The shortest wait for a tail loss probe (RFC 8985 section 7.2 asks for
 /// two round trips; on a path of a few hundred microseconds that is shorter
 /// than a peer's acknowledgement takes to come).
@@ -125,6 +128,8 @@ pub struct Info {
     pub peer_window: u32,
     pub cwnd: u32,
     pub ssthresh: u32,
+    /// Window reductions undone, shown needless by the peer's DSACKs.
+    pub undone: u32,
     /// The retransmission timer and the smoothed round trip (ns).
     pub rto: u64,
     pub srtt: u64,
@@ -149,6 +154,23 @@ pub struct Endpoints {
 pub struct Buffers<S> {
     pub send: S,
     pub receive: S,
+}
+
+/// A window reduction that may prove needless (RFC 3708; Linux's
+/// `undo_marker` and `undo_retrans`): segments taken for lost that had
+/// only been overtaken by later ones, as reordering does, are sent again and
+/// the peer then reports each twice (a DSACK). When it has so reported every
+/// segment sent again since the reduction, nothing was lost, and the window
+/// and threshold go back to what they were.
+#[derive(Clone, Copy)]
+struct Undo {
+    /// `snd_una` when the reduction was made: a DSACK below it is of an
+    /// older episode's segment.
+    from: u32,
+    cwnd: u32,
+    ssthresh: u32,
+    /// Segments sent again since, that no DSACK has reported yet.
+    resent: u32,
 }
 
 /// A byte ring over storage the caller gave.
@@ -236,6 +258,8 @@ pub struct Connection<S> {
     // going back over a loss). The send ring holds the data from the first
     // byte not acknowledged.
     iss: u32,
+    /// The SYN occupies the first sequence number until its ACK arrives.
+    syn_unacked: bool,
     snd_una: u32,
     snd_nxt: u32,
     snd_max: u32,
@@ -296,6 +320,10 @@ pub struct Connection<S> {
     dupacks: u32,
     recover: Option<u32>,
     first_repair: bool,
+    /// The last reduction, while it can still be shown needless.
+    undo: Option<Undo>,
+    /// Reductions undone so far.
+    undone: u32,
 
     // RACK (RFC 8985): the newest-sent segment the peer has (when it went,
     // where it ends) and its round trip, the smallest round trip seen,
@@ -307,6 +335,14 @@ pub struct Connection<S> {
     rack_rtt: u64,
     min_rtt: u64,
     reo_mult: u32,
+    /// How late, past RACK's expectation, a segment that was sent once
+    /// arrived behind one sent after it: reordering the path has shown,
+    /// measured, which the window covers without a resent segment's DSACK
+    /// first having to show it.
+    reo_seen: u64,
+    /// Recoveries left before a reordering window grown and not shown
+    /// again goes back to its start (RFC 8985 6.2.4's 16).
+    reo_persist: u8,
     reorder_at: Option<u64>,
     probe_at: Option<u64>,
     tlp_due: bool,
@@ -346,6 +382,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             state,
             error: None,
             iss,
+            syn_unacked: true,
             snd_una: iss,
             snd_nxt: iss,
             snd_max: iss,
@@ -384,11 +421,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             dupacks: 0,
             recover: None,
             first_repair: false,
+            undo: None,
+            undone: 0,
             rack_at: 0,
             rack_end: iss,
             rack_rtt: 0,
             min_rtt: u64::MAX,
             reo_mult: 1,
+            reo_seen: 0,
+            reo_persist: 0,
             reorder_at: None,
             probe_at: None,
             tlp_due: false,
@@ -533,6 +574,42 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         if self.fin_queued || !self.can_send_data() { 0 } else { self.send.free() }
     }
 
+    /// The send buffer is what holds the connection back: every byte in it
+    /// has been sent and awaits acknowledgement, and the peer's window, the
+    /// congestion window and the scoreboard would each let more go now.
+    /// A larger buffer (`grow_send_buffer`) lets it send at the rate the
+    /// path allows; in loss recovery it also lets new data go behind a
+    /// repair, whose delivery is what shows a lost repair without waiting
+    /// for the retransmission timeout (RFC 8985 section 6.2).
+    pub fn buffer_limited(&self) -> bool {
+        !self.fin_queued
+            && self.can_send_data()
+            && self.send.free() == 0
+            && self.snd_nxt == self.send_base().wrapping_add(self.send.len as u32)
+            && self.segs_len < SEGS
+            && before(self.snd_nxt, self.snd_una.wrapping_add(self.snd_wnd))
+            && self.pipe() < self.cwnd
+    }
+
+    /// Bytes the send buffer holds at most (0 once shed).
+    pub fn send_capacity(&self) -> usize {
+        self.send.cap()
+    }
+
+    /// Supply a larger send buffer. Bytes already queued, including those
+    /// still needed for retransmission, keep their sequence numbers.
+    /// Refused (false, the buffer handed back dropped) unless it is larger.
+    pub fn grow_send_buffer(&mut self, mut buffer: S) -> bool {
+        let capacity = buffer.as_ref().len();
+        if !self.can_send_data() || capacity <= self.send.cap() || capacity > i32::MAX as usize {
+            return false;
+        }
+        self.send.peek(0, buffer.as_mut());
+        self.send.buf = buffer;
+        self.send.start = 0;
+        true
+    }
+
     fn can_send_data(&self) -> bool {
         matches!(self.state, State::SynSent | State::SynReceived | State::Established | State::CloseWait)
     }
@@ -641,6 +718,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.ssthresh = (flight / 2).max(2 * self.mss);
         self.cwnd = self.mss;
         self.first_repair = false;
+        // A timeout's reduction is not undone (no F-RTO, RFC 5682).
+        self.undo = None;
         self.avoidance_bytes = 0;
         self.dupacks = 0;
         self.timing = None;
@@ -705,14 +784,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
     }
 
-    /// The first byte of data's sequence number: just after the SYN.
-    fn data_start(&self) -> u32 {
-        self.iss.wrapping_add(1)
-    }
-
     /// The sequence number of the first byte in the send ring.
     fn send_base(&self) -> u32 {
-        if before(self.snd_una, self.data_start()) { self.data_start() } else { self.snd_una }
+        self.snd_una.wrapping_add(u32::from(self.syn_unacked))
     }
 
     /// Where the FIN goes once queued: after all the data.
@@ -878,6 +952,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         let s = self.seg_mut(k);
         s.flags = (s.flags | RETRANS) & !LOST;
         s.at = now;
+        if let Some(u) = self.undo.as_mut() {
+            u.resent += 1;
+        }
         // An echo older than this may be of the first sending (Karn).
         self.resent_ts = Some(self.ts_now(now));
         self.timing = None;
@@ -920,8 +997,14 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     }
 
     /// Everything before `ack` arrived: those segments leave the
-    /// scoreboard, each delivered.
-    fn acked_to(&mut self, now: u64, ack: u32) {
+    /// scoreboard, each delivered. Returns a round trip from the oldest of
+    /// them first heard of now, unless one of them went more than once
+    /// (Karn: the ACK may be of either sending), as Linux's
+    /// `tcp_clean_rtx_queue`: the clock's own resolution, where an echoed
+    /// timestamp has a millisecond's.
+    fn acked_to(&mut self, now: u64, ack: u32) -> Option<u64> {
+        let mut oldest = None;
+        let mut resent = false;
         while self.segs_len > 0 {
             let s = *self.seg(0);
             if before(ack, s.end) {
@@ -929,15 +1012,18 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
                 if before(self.segs_start, ack) {
                     self.segs_start = ack;
                 }
-                return;
+                break;
             }
+            resent |= s.flags & RETRANS != 0;
             if s.flags & SACKED == 0 {
+                oldest = Some(oldest.unwrap_or(s.at));
                 self.delivered(now, s);
             }
             self.segs_start = s.end;
             self.segs_head = (self.segs_head + 1) % SEGS;
             self.segs_len -= 1;
         }
+        oldest.filter(|_| !resent).map(|at| now.saturating_sub(at))
     }
 
     /// The SACK blocks of `s`: each segment one covers whole is SACKed, and
@@ -955,7 +1041,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
                 continue;
             }
             if before_eq(r, s.header.ack) {
-                self.reo_mult = (self.reo_mult + 1).min(16);
+                self.reo_mult = (self.reo_mult + 1).min(255);
+                self.reo_persist = REO_PERSIST;
+                self.needless(l, r);
                 continue;
             }
             let mut start = self.segs_start;
@@ -970,6 +1058,34 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             }
         }
         any
+    }
+
+    /// A DSACK of `l..r`: segments the peer had twice. Each that the last
+    /// reduction resent counts off. One below where that reduction began is
+    /// of an older episode, and one with none of its segments outstanding
+    /// is a duplicate the network made, not a resent segment; neither
+    /// counts.
+    fn needless(&mut self, l: u32, r: u32) {
+        let Some(u) = self.undo.as_mut() else { return };
+        if before(l, u.from) || u.resent == 0 {
+            return;
+        }
+        u.resent = u.resent.saturating_sub(r.wrapping_sub(l).div_ceil(self.mss.max(1)));
+        self.try_undo();
+    }
+
+    /// Once its recovery is over, a reduction all of whose resent segments
+    /// the peer reported having already is undone: the window and threshold
+    /// it had before (slow start goes on if it was in it), as Linux's.
+    fn try_undo(&mut self) {
+        let Some(u) = self.undo else { return };
+        if u.resent > 0 || self.recover.is_some() {
+            return;
+        }
+        self.undo = None;
+        self.cwnd = self.cwnd.max(u.cwnd);
+        self.ssthresh = self.ssthresh.max(u.ssthresh);
+        self.undone += 1;
     }
 
     /// Segment `s` reached the peer: the newest-sent one that did is what
@@ -987,7 +1103,17 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             // for the rest of the connection.
             self.min_rtt = self.min_rtt.min(rtt);
         }
-        if s.at > self.rack_at || (s.at == self.rack_at && before(self.rack_end, s.end)) {
+        let newer = s.at > self.rack_at || (s.at == self.rack_at && before(self.rack_end, s.end));
+        if !newer && s.flags & RETRANS == 0 && self.rack_at != 0 {
+            // Sent once, and heard of after one sent later than it: the
+            // path reordered it, this late past what RACK would wait for.
+            let late = now.saturating_sub(s.at.saturating_add(self.rack_rtt));
+            if late > 0 {
+                self.reo_seen = self.reo_seen.max(late);
+                self.reo_persist = REO_PERSIST;
+            }
+        }
+        if newer {
             self.rack_at = s.at;
             self.rack_end = s.end;
             // Two events with the same clock reading still establish
@@ -1008,7 +1134,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         if self.rack_at == 0 {
             return false;
         }
-        let reo = if self.min_rtt == u64::MAX { 0 } else { (self.min_rtt / 4 * u64::from(self.reo_mult)).min(self.srtt.max(1)) };
+        let reo = if self.min_rtt == u64::MAX {
+            0
+        } else {
+            (self.min_rtt / 4 * u64::from(self.reo_mult)).max(self.reo_seen).min(self.srtt.max(1))
+        };
         let mut lost = false;
         for k in 0..self.segs_len {
             let s = *self.seg(k);
@@ -1034,6 +1164,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     fn losses_found(&mut self) {
         if self.recover.is_none() {
             let flight = self.snd_max.wrapping_sub(self.snd_una);
+            self.undo = Some(Undo { from: self.snd_una, cwnd: self.cwnd, ssthresh: self.ssthresh, resent: 0 });
+            // Reordering not shown again for REO_PERSIST recoveries is
+            // taken to be gone (RFC 8985 6.2.4): losses are found sooner.
+            if self.reo_persist == 0 {
+                self.reo_mult = 1;
+                self.reo_seen = 0;
+            } else {
+                self.reo_persist -= 1;
+            }
             self.ssthresh = (flight / 2).max(2 * self.mss);
             self.cwnd = self.ssthresh;
             self.avoidance_bytes = 0;
@@ -1311,17 +1450,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     fn new_ack(&mut self, now: u64, s: &Segment<'_>, acked: u32) {
         let ack = s.header.ack;
         // The SYN and FIN take a number each and no byte of the ring.
-        let syn = before(self.snd_una, self.data_start()) as u32;
+        let syn = u32::from(core::mem::take(&mut self.syn_unacked));
         let fin = (self.fin_sent.is_some() && !self.fin_acked() && before(self.fin_seq(), ack)) as u32;
         self.send.consume((acked - syn - fin) as usize);
         self.snd_una = ack;
-        self.acked_to(now, ack);
+        let sent_at = self.acked_to(now, ack);
         if before(self.snd_nxt, ack) {
             self.snd_nxt = ack;
         }
         self.retries = 0;
-        // A round trip: from the echoed timestamp, or the timed segment.
+        // A round trip: from when the scoreboard says the acknowledged data
+        // went, else from the echoed timestamp, or the timed segment.
         let sample = match (self.timestamps, s.options.timestamps) {
+            _ if sent_at.is_some() => sent_at,
             (true, Some((_, ecr))) if ecr != 0 && self.resent_ts.is_none_or(|r| !before(ecr, r)) => {
                 Some(u64::from(self.ts_now(now).wrapping_sub(ecr)) * MS).filter(|&r| r < RTO_MAX)
             }
@@ -1354,6 +1495,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
                 self.cwnd = self.ssthresh;
                 self.recover = None;
                 self.first_repair = false;
+                self.try_undo();
             }
             None if self.cwnd < self.ssthresh => self.cwnd += acked.min(self.mss),
             None => {
@@ -1407,6 +1549,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             peer_window: self.snd_wnd,
             cwnd: self.cwnd,
             ssthresh: self.ssthresh,
+            undone: self.undone,
             rto: self.rto,
             srtt: self.srtt,
             retries: self.retries,
