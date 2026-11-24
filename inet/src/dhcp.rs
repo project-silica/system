@@ -18,7 +18,7 @@ const FIXED: usize = 236;
 const COOKIE: [u8; 4] = [99, 130, 83, 99];
 /// The options the client asks for: netmask, router, DNS servers, lease
 /// time, server identifier, renewal and rebinding times.
-const WANTED: [u8; 7] = [1, 3, 6, 51, 54, 58, 59];
+const WANTED: [u8; 8] = [1, 3, 6, 42, 51, 54, 58, 59];
 
 /// A message's kind (option 53).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +72,8 @@ pub struct Reply {
     pub router: Option<Ipv4>,
     /// Up to three DNS servers (option 6), unused ones unspecified.
     pub dns: [Ipv4; 3],
+    /// The first time server (option 42, NTP servers).
+    pub ntp: Option<Ipv4>,
 }
 
 /// Read a server's answer (a UDP payload from port 67).
@@ -100,6 +102,7 @@ pub fn parse(p: &[u8]) -> Result<Reply, Malformed> {
         prefix: None,
         router: None,
         dns: [Ipv4::UNSPECIFIED; 3],
+        ntp: None,
     };
     let mut kind = None;
     let mut at = FIXED + 4;
@@ -129,8 +132,9 @@ pub fn parse(p: &[u8]) -> Result<Reply, Malformed> {
                     *d = ip(v, i * 4);
                 }
             }
+            (42, n) if n >= 4 && n % 4 == 0 => r.ntp = Some(ip(v, 0)),
             // A known option of a length it cannot have.
-            (53 | 54 | 51 | 58 | 59 | 1, _) | (3 | 6, _) => return Err(Malformed::BadOptions),
+            (53 | 54 | 51 | 58 | 59 | 1, _) | (3 | 6 | 42, _) => return Err(Malformed::BadOptions),
             _ => {}
         }
         at += 2 + len;

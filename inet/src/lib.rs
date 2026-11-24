@@ -25,6 +25,7 @@ pub mod dhcp_client;
 pub mod ether;
 pub mod icmp;
 pub mod ipv4;
+pub mod ntp;
 pub mod tcp;
 pub mod tcp_conn;
 pub mod udp;
@@ -110,6 +111,29 @@ pub fn prefix_of(netmask: Ipv4) -> Option<u8> {
     (m.checked_shl(ones).unwrap_or(0) == 0).then_some(ones as u8)
 }
 
+impl core::str::FromStr for Ipv4 {
+    type Err = Malformed;
+
+    /// A dotted quad, exactly: four decimal numbers to 255, no leading
+    /// zeros, nothing else (`10.0.2.2`).
+    fn from_str(s: &str) -> Result<Ipv4, Malformed> {
+        let mut out = [0u8; 4];
+        let mut parts = s.split('.');
+        for b in out.iter_mut() {
+            let p = parts.next().ok_or(Malformed::BadHeader)?;
+            let ok = !p.is_empty() && p.len() <= 3 && p.bytes().all(|c| c.is_ascii_digit()) && (p.len() == 1 || !p.starts_with('0'));
+            if !ok {
+                return Err(Malformed::BadHeader);
+            }
+            *b = p.parse::<u8>().map_err(|_| Malformed::BadHeader)?;
+        }
+        if parts.next().is_some() {
+            return Err(Malformed::BadHeader);
+        }
+        Ok(Ipv4(out))
+    }
+}
+
 impl fmt::Display for Ipv4 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let a = self.0;
@@ -162,6 +186,16 @@ pub(crate) fn be32(b: &[u8], at: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_dotted_quad_parses_and_nothing_else_does() {
+        assert_eq!("10.0.2.2".parse::<Ipv4>(), Ok(Ipv4([10, 0, 2, 2])));
+        assert_eq!("255.255.255.255".parse::<Ipv4>(), Ok(Ipv4::BROADCAST));
+        for bad in ["", "10.0.2", "10.0.2.2.2", "256.0.0.1", "10.0.02.2", "10..2.2", "a.b.c.d", " 10.0.2.2", "10.0.2.2:123", "-1.0.0.0"] {
+            assert!(bad.parse::<Ipv4>().is_err(), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

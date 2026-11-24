@@ -16,6 +16,8 @@ restart = "always"
 # Its lease, kept across its restarts (slots::KEEP): a stack started again
 # answers on its address at once.
 keeps = true
+# Its time-server client sets the wall clock (slots::TIME, writable).
+sets_time = true
 
 [[bin]]
 name = "netd"

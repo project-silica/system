@@ -325,6 +325,9 @@ pub struct Program<'a> {
     /// `slots::TIME`). Without one, a program started by a program that
     /// has a time page gets that page, read-only.
     pub time: Option<(Cap, bool)>,
+    /// Its options (`silica_rt::options`), at most
+    /// `silica_rt::OPTIONS_MAX` bytes: longer is refused.
+    pub options: &'a [u8],
 }
 
 impl<'a> Program<'a> {
@@ -343,6 +346,7 @@ impl<'a> Program<'a> {
             events: None,
             keep: None,
             time: None,
+            options: &[],
         }
     }
 }
@@ -351,7 +355,7 @@ impl<'a> Program<'a> {
 /// instruction.
 pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
     let Program { image, mem_bits, cpu, .. } = *prog;
-    if cpu as u64 >= p.cpus || !(8..=20).contains(&prog.space_bits) {
+    if cpu as u64 >= p.cpus || !(8..=20).contains(&prog.space_bits) || prog.options.len() > silica_rt::OPTIONS_MAX {
         return Err(SpawnError::Kernel(Error::BadArg));
     }
     // Three slots for the child's objects and two to work with.
@@ -483,6 +487,7 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     place(12, INFO_VADDR, rw, None, &mut |mapped| {
         write_info(&info, mapped);
         write_seed(&seed, mapped + silica_rt::random::SEED_OFFSET);
+        write_options(prog.options, mapped + silica_rt::OPTIONS_OFFSET);
     })?;
     seed.fill(0);
 
@@ -567,6 +572,19 @@ fn write_seed(seed: &[u8; 32], to: usize) {
     #[allow(unsafe_code)]
     unsafe {
         core::ptr::copy_nonoverlapping(seed.as_ptr(), to as *mut u8, 32)
+    }
+}
+
+/// Write the options, their length first, to the page at `to`.
+fn write_options(options: &[u8], to: usize) {
+    let len = (options.len() as u16).to_le_bytes();
+    // SAFETY: `to` lies inside the same fresh page, mapped read-write, at
+    // OPTIONS_OFFSET, and the options were checked to fit before it
+    // (`spawn`: at most OPTIONS_MAX bytes after the two of length).
+    #[allow(unsafe_code)]
+    unsafe {
+        core::ptr::copy_nonoverlapping(len.as_ptr(), to as *mut u8, 2);
+        core::ptr::copy_nonoverlapping(options.as_ptr(), (to + 2) as *mut u8, options.len());
     }
 }
 

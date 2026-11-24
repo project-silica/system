@@ -25,6 +25,8 @@ pub struct Lease {
     pub prefix: u8,
     pub router: Option<Ipv4>,
     pub dns: [Ipv4; 3],
+    /// The network's time server, if it names one (option 42).
+    pub ntp: Option<Ipv4>,
     /// The server that gave it, which renewals go to.
     pub server: Ipv4,
     /// How long it was given for, in seconds (`u32::MAX`: for ever).
@@ -291,7 +293,7 @@ fn lease_of(now: u64, r: &Reply, server: Ipv4) -> Option<Lease> {
         128..=191 => 16,
         _ => 24,
     });
-    Some(Lease { address: r.address, prefix, router: r.router, dns: r.dns, server, seconds, renew_at, rebind_at, expires_at })
+    Some(Lease { address: r.address, prefix, router: r.router, dns: r.dns, ntp: r.ntp, server, seconds, renew_at, rebind_at, expires_at })
 }
 
 #[cfg(test)]
@@ -315,6 +317,7 @@ mod tests {
             prefix: Some(24),
             router: Some(SERVER),
             dns: [Ipv4([10, 0, 2, 3]), Ipv4::UNSPECIFIED, Ipv4::UNSPECIFIED],
+            ntp: None,
         }
     }
 

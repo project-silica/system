@@ -137,6 +137,9 @@ struct Manager {
     kept: Vec<Option<Object>>,
     /// The time page (`silica_rt::time`), set from the firmware's clock.
     time: silica_rt::mem::Memory,
+    /// Each service's options: the boot command line's
+    /// `<service>.<key>=<value>` words, as `<key>=<value>`.
+    options: Vec<Vec<u8>>,
     /// The order services were started in, for stopping them in reverse.
     order: Vec<usize>,
     /// What `list` answers with, rebuilt for each call.
@@ -273,6 +276,7 @@ impl Manager {
             events: Some(events),
             keep: self.kept[i].as_ref().map(|p| p.cap()),
             time: Some((self.time.frame(), self.services[i].sets_time)),
+            options: &self.options[i],
             mem_bits: s.memory,
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
@@ -653,6 +657,20 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             Some(LogSetup { service: l, note, flushed, rings, added: sys::Cap(0), given: Vec::new(), directory })
         }
     };
+    // Each service's options, from the boot command line.
+    let options: Vec<Vec<u8>> = services
+        .iter()
+        .map(|s| {
+            let prefix = silica_rt::alloc::format!("{}.", s.name);
+            let words: Vec<&[u8]> = cmdline.split(|b| b.is_ascii_whitespace()).filter_map(|w| w.strip_prefix(prefix.as_bytes())).collect();
+            let o = words.join(&b' ');
+            if o.len() > silica_rt::OPTIONS_MAX {
+                println!("ERROR: init: {}'s options are longer than {} bytes; it is given none", s.name, silica_rt::OPTIONS_MAX);
+                return Vec::new();
+            }
+            o
+        })
+        .collect();
     let mut m = Manager {
         root,
         info,
@@ -662,6 +680,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         events,
         kept,
         time,
+        options,
         order: order.clone(),
         listed: Vec::new(),
         described: String::new(),

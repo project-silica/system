@@ -10,6 +10,11 @@
 //! and reading it in place twice could see two different packets. What is
 //! malformed or not for this host is dropped and counted by reason.
 //!
+//! It sets the wall clock from a time server (SNTP: the `ntp` boot option,
+//! `netd.ntp=<address>[:<port>]`, else the server the lease names), when
+//! bound and then every 64 s doubling to 1,024 s; an answer is taken only
+//! from that server, to the port asked from, echoing the question's time.
+//!
 //! It provides TCP to programs (`silica.net.Tcp`, the `tcp` module), in the
 //! same thread and the same wait as its interface: one notification, the
 //! interface's bits below `tcp::FIRST_BIT` and the programs' above.
@@ -23,7 +28,7 @@
 
 use silica_idl_rt::CapList;
 use silica_inet::dhcp_client::{self, Client, Event, Lease, To};
-use silica_inet::{Ipv4, Mac, Malformed, arp, dhcp, ether, icmp, ipv4, udp};
+use silica_inet::{Ipv4, Mac, Malformed, arp, dhcp, ether, icmp, ipv4, ntp, udp};
 use silica_net::client::Interface;
 use silica_net::{Completion, LINK, Op, Request};
 use silica_protocols::device::manager;
@@ -158,6 +163,7 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
         None => Client::new(mac, now),
     };
     let lease = dhcp.lease().copied();
+    let clock = mem::peer(slots::TIME, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
     // Connection records after the lease (`tcp`): the last stack's, reset.
     let records = keep.as_ref().and_then(|k| k.part(128, 4096 - 128));
     let resets = records.as_ref().map(tcp::kept_connections).unwrap_or_default();
@@ -178,6 +184,7 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
         dropped: Dropped::default(),
         tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records)),
         resets,
+        time: TimeClient::new(clock, now),
         caller: 0,
         more: true,
     };
@@ -197,6 +204,45 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
         }
     }
     silica_rt::ipc::serve_events(ENDPOINT, note.cap(), &mut s)
+}
+
+/// The port the time-server client asks from.
+const TIME_PORT: u16 = 50123;
+
+/// The time-server client's state (SNTP to one server).
+struct TimeClient {
+    /// The time page, writable (this service `sets_time`); none: no clock
+    /// to set, and no question asked.
+    page: Option<Mmio>,
+    /// The server the boot options name (`ntp=<address>[:<port>]`).
+    configured: Option<(Ipv4, u16)>,
+    /// The question in flight: its transmit timestamp, and its time (ns
+    /// since 1970 by this clock).
+    asked: Option<(u64, u64)>,
+    /// When to ask next, questions sent since the last answer, seconds
+    /// between answers, and whether the clock was ever set.
+    next: u64,
+    tries: u32,
+    poll: u64,
+    set: bool,
+}
+
+impl TimeClient {
+    fn new(page: Option<Mmio>, now: u64) -> TimeClient {
+        let configured = silica_rt::option("ntp").and_then(|v| {
+            let (a, port) = v.split_once(':').unwrap_or((v, "123"));
+            Some((a.parse::<Ipv4>().ok()?, port.parse::<u16>().ok()?))
+        });
+        if silica_rt::option("ntp").is_some() && configured.is_none() {
+            println!("ERROR: netd: the ntp option is not <address>[:<port>]");
+        }
+        TimeClient { page, configured, asked: None, next: now, tries: 0, poll: 64, set: false }
+    }
+
+    /// The server to ask: the configured one, else the lease's.
+    fn server(&self, lease: Option<&Lease>) -> Option<(Ipv4, u16)> {
+        self.configured.or_else(|| lease?.ntp.map(|a| (a, ntp::PORT)))
+    }
 }
 
 /// The mark of a lease in the page kept across restarts.
@@ -224,6 +270,7 @@ fn kept_lease(k: &Mmio, mac: Mac) -> Option<Lease> {
         prefix,
         router: ((a >> 40) & 1 != 0).then(|| lo(r)),
         dns: [lo(d), hi(d), lo(e)],
+        ntp: ((k.read64(72) >> 32) & 1 != 0).then(|| lo(k.read64(72))),
         server: hi(r),
         seconds: (e >> 32) as u32,
         renew_at: k.read64(48),
@@ -299,6 +346,7 @@ struct Stack {
     /// Resets owed to the peers of the last stack's connections, sent once
     /// their next hop's address is known.
     resets: Vec<tcp::Kept>,
+    time: TimeClient,
     /// Work is left (a completion there, segments with no transmit slot):
     /// look again at once rather than wait.
     more: bool,
@@ -380,6 +428,7 @@ impl Stack {
             }
         }
         self.send_resets(now);
+        self.ask_time(now);
         let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
         let blocked = tcp.pump(now, self);
         let asleep = tcp.sleep();
@@ -401,6 +450,9 @@ impl Stack {
         }
         if let Some(p) = &self.probe {
             d = d.min(p.until);
+        }
+        if self.time.server(self.lease.as_ref()).is_some() && self.time.page.is_some() {
+            d = d.min(self.time.next);
         }
         d
     }
@@ -496,6 +548,60 @@ impl Stack {
         }
     }
 
+    /// Ask the time server, when it is time to (and the clock is ours to set).
+    fn ask_time(&mut self, now: u64) {
+        let Some((server, port)) = self.time.server(self.lease.as_ref()) else { return };
+        let Some(page) = self.time.page else { return };
+        if now < self.time.next {
+            return;
+        }
+        // The question's time, by this clock (the firmware's, or none yet:
+        // the offset is relative to whatever it says).
+        let (offset, _) = silica_rt::time::read(&page);
+        let t1 = offset.wrapping_add(now);
+        let transmit = ntp::from_unix_ns(t1);
+        let mut q = [0u8; ntp::LEN];
+        ntp::request(&mut q, transmit);
+        self.time.asked = Some((transmit, t1));
+        self.time.tries += 1;
+        self.time.next = if self.time.tries < 3 { now + 2 * SECOND } else { now + self.time.poll * SECOND };
+        if self.time.tries >= 3 {
+            self.time.tries = 0;
+        }
+        self.send_udp(server, TIME_PORT, port, &q);
+    }
+
+    /// The time server answered: set the clock if it answers our question.
+    fn time_answer(&mut self, now: u64, r: &ntp::Reply) {
+        let Some(page) = self.time.page else { return };
+        let Some((transmit, t1)) = self.time.asked else { return };
+        // Only the answer to the question in flight: a blind sender does
+        // not know its time.
+        if r.originate != transmit {
+            return;
+        }
+        let (Some(t2), Some(t3)) = (ntp::to_unix_ns(r.receive), ntp::to_unix_ns(r.transmit)) else { return };
+        self.time.asked = None;
+        let (offset, _) = silica_rt::time::read(&page);
+        let t4 = offset.wrapping_add(now);
+        let (shift, delay) = ntp::offset(t1, t2, t3, t4);
+        let wall = t4.wrapping_add_signed(shift);
+        silica_rt::time::set(&page, wall, now, silica_rt::time::Source::Network);
+        if !self.time.set || shift.unsigned_abs() > SECOND {
+            let (server, port) = self.time.server(self.lease.as_ref()).unwrap_or((Ipv4::UNSPECIFIED, 0));
+            println!(
+                "netd: the wall clock is {} from {server}:{port} (moved {:+} ms, round trip {} us)",
+                silica_rt::time::Civil::from_unix(wall / SECOND),
+                shift / 1_000_000,
+                delay / 1000
+            );
+        }
+        self.time.set = true;
+        self.time.tries = 0;
+        self.time.next = now + self.time.poll * SECOND;
+        self.time.poll = (self.time.poll * 2).min(1024);
+    }
+
     /// Put the lease held (or none) in the page kept across restarts.
     fn keep_lease(&mut self) {
         let Some(k) = self.keep else { return };
@@ -511,6 +617,7 @@ impl Stack {
         k.write64(48, l.renew_at);
         k.write64(56, l.rebind_at);
         k.write64(64, l.expires_at);
+        k.write64(72, ip(l.ntp.unwrap_or(Ipv4::UNSPECIFIED)) | (l.ntp.is_some() as u64) << 32);
         k.write64(0, KEPT_LEASE);
     }
 
@@ -713,6 +820,12 @@ impl Stack {
                     }
                     Err(e) => self.dropped.malformed(e),
                 },
+                Ok(d) if ours && d.dst_port == TIME_PORT && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) => {
+                    match ntp::parse(d.data) {
+                        Ok(r) => self.time_answer(now, &r),
+                        Err(e) => self.dropped.malformed(e),
+                    }
+                }
                 Ok(_) => self.dropped.not_ours += 1,
                 Err(e) => self.dropped.malformed(e),
             },

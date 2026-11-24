@@ -4,7 +4,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use silica_inet::{arp, dhcp, ether, icmp, ipv4, tcp, udp};
+use silica_inet::{arp, dhcp, ether, icmp, ipv4, ntp, tcp, udp};
 
 fn inside(outer: &[u8], inner: &[u8]) {
     let (o, i) = (outer.as_ptr() as usize, inner.as_ptr() as usize);
@@ -29,6 +29,7 @@ fuzz_target!(|frame: &[u8]| {
     if let Ok(d) = udp::parse(p.payload, p.src, p.dst) {
         inside(p.payload, d.data);
         let _ = dhcp::parse(d.data);
+        let _ = ntp::parse(d.data);
     }
     // A UDP payload taken straight as DHCP too: the option walk is the
     // deepest parser and the checksum would hide it from most inputs.

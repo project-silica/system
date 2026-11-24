@@ -202,6 +202,40 @@ pub struct ProcessInfo {
     pub args: [u64; 8],
 }
 
+/// Where in the start-up page (after the [`ProcessInfo`] at its start) the
+/// parent puts the program's options: two bytes of length, then the text
+/// (`key=value` words, space-separated), at most [`OPTIONS_MAX`] bytes. The
+/// service manager gives each service the boot command line's
+/// `<service>.<key>=<value>` words, as `<key>=<value>`.
+pub const OPTIONS_OFFSET: usize = 2560;
+pub const OPTIONS_MAX: usize = 4096 - OPTIONS_OFFSET - 2;
+
+/// The start-up page's address (0: none, as in the root task).
+static INFO_PAGE: AtomicU64 = AtomicU64::new(0);
+
+/// The program's options, as its parent gave them (see [`OPTIONS_OFFSET`]).
+pub fn options() -> &'static str {
+    let at = INFO_PAGE.load(Ordering::Relaxed) as usize;
+    if at == 0 {
+        return "";
+    }
+    // SAFETY: the start-up page is mapped read-write for the whole program
+    // and nothing writes its options after the parent did; the length is
+    // clamped to the space there is.
+    #[allow(unsafe_code)]
+    let bytes = unsafe {
+        let p = core::ptr::with_exposed_provenance::<u8>(at + OPTIONS_OFFSET);
+        let len = (u16::from_le_bytes([*p, *p.add(1)]) as usize).min(OPTIONS_MAX);
+        core::slice::from_raw_parts(p.add(2), len)
+    };
+    core::str::from_utf8(bytes).unwrap_or("")
+}
+
+/// The value of option `key` (`key=value` among [`options`]).
+pub fn option(key: &str) -> Option<&'static str> {
+    options().split_ascii_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+}
+
 static CLOCK: [AtomicU64; 3] = [const { AtomicU64::new(1) }; 3];
 static DEBUG: AtomicU64 = AtomicU64::new(0);
 
@@ -328,6 +362,7 @@ pub fn start(info: &'static ProcessInfo, main: fn(&'static ProcessInfo) -> i64) 
     if info.magic != PROCESS_MAGIC {
         exit(-1);
     }
+    INFO_PAGE.store(core::ptr::from_ref(info).expose_provenance() as u64, Ordering::Relaxed);
     init(slots::DEBUG, info.clock);
     // The seed the parent put after the record (`random::SEED_OFFSET`), in
     // the start-up page, which is the program's own and mapped read-write:

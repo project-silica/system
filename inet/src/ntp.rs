@@ -1,0 +1,156 @@
+//! SNTP: a time server's answer, read, and a question built (RFC 5905's
+//! client side, as RFC 4330 describes it for a client of one server).
+//!
+//! An NTP timestamp is seconds since 1900-01-01 in its high 32 bits and a
+//! binary fraction in its low 32; it wraps in 2036, so a timestamp whose
+//! seconds are below 2^31 is taken to be after that (era 1), as RFC 5905
+//! section 6 suggests for clients that know the time to within 68 years.
+
+use crate::Malformed;
+
+/// The port servers answer on.
+pub const PORT: u16 = 123;
+/// Bytes of a message without extensions.
+pub const LEN: usize = 48;
+/// Seconds from 1900-01-01 to 1970-01-01.
+const UNIX_EPOCH: u64 = 2_208_988_800;
+const NS: u64 = 1_000_000_000;
+
+/// The NTP timestamp of `ns` nanoseconds since 1970.
+pub fn from_unix_ns(ns: u64) -> u64 {
+    let secs = (ns / NS + UNIX_EPOCH) & 0xFFFF_FFFF;
+    let frac = ((ns % NS) << 32) / NS;
+    secs << 32 | frac
+}
+
+/// Nanoseconds since 1970 of the NTP timestamp `t` (0: no time).
+pub fn to_unix_ns(t: u64) -> Option<u64> {
+    if t == 0 {
+        return None;
+    }
+    let mut secs = t >> 32;
+    if secs < 1 << 31 {
+        secs += 1 << 32; // the era after 2036
+    }
+    let frac = ((t & 0xFFFF_FFFF) * NS) >> 32;
+    Some((secs - UNIX_EPOCH) * NS + frac)
+}
+
+/// A client's question, sent at `transmit` (an NTP timestamp the answer
+/// must echo, the client's guard against answers it did not ask for).
+pub fn request(out: &mut [u8; LEN], transmit: u64) {
+    out.fill(0);
+    out[0] = 4 << 3 | 3; // no leap warning, version 4, client
+    out[40..48].copy_from_slice(&transmit.to_be_bytes());
+}
+
+/// A server's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub stratum: u8,
+    /// The question's transmit time, echoed (`T1`).
+    pub originate: u64,
+    /// When the server received the question (`T2`) and sent this (`T3`).
+    pub receive: u64,
+    pub transmit: u64,
+}
+
+fn be64(p: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3], p[at + 4], p[at + 5], p[at + 6], p[at + 7]])
+}
+
+/// Read a server's answer (a UDP payload). Refused: a message too short, not
+/// a server's (mode 4) of version 3 or 4, from a server that is not
+/// synchronized (leap indicator 3, or stratum 0, a "kiss of death", or
+/// above 15), or without the times a client needs.
+pub fn parse(p: &[u8]) -> Result<Reply, Malformed> {
+    if p.len() < LEN {
+        return Err(Malformed::Truncated);
+    }
+    let (leap, version, mode) = (p[0] >> 6, (p[0] >> 3) & 7, p[0] & 7);
+    let stratum = p[1];
+    if mode != 4 || !(3..=4).contains(&version) || leap == 3 || !(1..=15).contains(&stratum) {
+        return Err(Malformed::BadHeader);
+    }
+    let r = Reply { stratum, originate: be64(p, 24), receive: be64(p, 32), transmit: be64(p, 40) };
+    if r.originate == 0 || r.receive == 0 || r.transmit == 0 {
+        return Err(Malformed::BadHeader);
+    }
+    Ok(r)
+}
+
+/// The clock's offset from the server's and the round trip's delay, in
+/// nanoseconds, from the four times (all nanoseconds since 1970): `t1` the
+/// question sent and `t4` the answer received by the client's clock, `t2`
+/// and `t3` the server's (RFC 5905 section 8). The offset is what to add
+/// to the client's clock.
+pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> (i64, i64) {
+    let d = |a: u64, b: u64| a as i128 - b as i128;
+    let offset = (d(t2, t1) + d(t3, t4)) / 2;
+    let delay = d(t4, t1) - d(t3, t2);
+    (offset as i64, delay as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_round_trip_and_wrap_in_2036() {
+        let ns = 1_795_483_425_123_456_789; // 2026-11-24
+        let t = from_unix_ns(ns);
+        assert!(to_unix_ns(t).unwrap().abs_diff(ns) < 2, "within the fraction's resolution");
+        // 2036-02-07T06:28:16Z is NTP second 2^32: era 1 starts at 0.
+        let after = (2_085_978_496 + 10) * NS;
+        assert_eq!(from_unix_ns(after) >> 32, 10);
+        assert_eq!(to_unix_ns(from_unix_ns(after)), Some(after));
+        assert_eq!(to_unix_ns(0), None);
+    }
+
+    fn answer(first: u8, stratum: u8) -> [u8; LEN] {
+        let mut p = [0u8; LEN];
+        p[0] = first;
+        p[1] = stratum;
+        p[24..32].copy_from_slice(&7u64.to_be_bytes());
+        p[32..40].copy_from_slice(&8u64.to_be_bytes());
+        p[40..48].copy_from_slice(&9u64.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn only_a_synchronized_servers_answer_is_read() {
+        assert_eq!(parse(&answer(4 << 3 | 4, 2)), Ok(Reply { stratum: 2, originate: 7, receive: 8, transmit: 9 }));
+        assert_eq!(parse(&answer(3 << 3 | 4, 1)).map(|r| r.stratum), Ok(1), "version 3");
+        assert_eq!(parse(&answer(4 << 3 | 3, 2)), Err(Malformed::BadHeader), "a client's");
+        assert_eq!(parse(&answer(3 << 6 | 4 << 3 | 4, 2)), Err(Malformed::BadHeader), "not synchronized");
+        assert_eq!(parse(&answer(4 << 3 | 4, 0)), Err(Malformed::BadHeader), "a kiss of death");
+        assert_eq!(parse(&answer(4 << 3 | 4, 16)), Err(Malformed::BadHeader), "stratum 16");
+        assert_eq!(parse(&answer(4 << 3 | 4, 2)[..47]), Err(Malformed::Truncated));
+        let mut p = answer(4 << 3 | 4, 2);
+        p[24..32].fill(0);
+        assert_eq!(parse(&p), Err(Malformed::BadHeader), "no originate time");
+    }
+
+    #[test]
+    fn offset_and_delay_are_rfc_5905s() {
+        // The client is 10 s behind; the way out takes 3 ms, back 1 ms, the
+        // server holds it 2 ms.
+        let s = NS;
+        let t1 = 100 * s;
+        let t2 = t1 + 10 * s + 3_000_000;
+        let t3 = t2 + 2_000_000;
+        let t4 = t3 - 10 * s + 1_000_000;
+        let (offset, delay) = offset(t1, t2, t3, t4);
+        assert_eq!(delay, 4_000_000);
+        assert_eq!(offset, 10 * s as i64 + 1_000_000, "the asymmetry is half in the offset, as NTP says");
+    }
+
+    #[test]
+    fn a_request_is_a_version_4_clients() {
+        let mut q = [1u8; LEN];
+        request(&mut q, 0x0102_0304_0506_0708);
+        assert_eq!(q[0], 0x23);
+        assert!(q[1..40].iter().all(|b| *b == 0));
+        assert_eq!(&q[40..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+}
