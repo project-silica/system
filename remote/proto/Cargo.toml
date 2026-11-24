@@ -1,0 +1,13 @@
+[package]
+name = "silica-remote"
+description = "The remote management session's wire: framing, channels, statuses and key files, shared by the machine's service and the owner's client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+silica-crypto = { workspace = true }
+
+[lints]
+workspace = true

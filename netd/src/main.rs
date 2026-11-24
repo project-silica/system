@@ -17,7 +17,8 @@
 //!
 //! It provides TCP to programs (`silica.net.Tcp`, the `tcp` module), in the
 //! same thread and the same wait as its interface: one notification, the
-//! interface's bits below `tcp::FIRST_BIT` and the programs' above.
+//! interface's bits below `tcp::GONE`, then the kernel's notice that a
+//! program using TCP ended, then the programs' bits.
 //!
 //! What it does not do yet (spec/MILESTONES.md, M4): UDP for programs,
 //! IPv6, more than one interface, reassembly; a program's call made before
@@ -124,6 +125,8 @@ impl Devices {
 }
 
 fn run() -> Result<core::convert::Infallible, &'static str> {
+    // Options that do not parse stop the stack, rather than have it guess.
+    let fixed = fixed_lease()?;
     let mut devices = Devices::new()?;
     loop {
         let id = devices.interface()?;
@@ -131,14 +134,14 @@ fn run() -> Result<core::convert::Infallible, &'static str> {
         // keeping to its protocol) is not the stack's to give up on: the
         // device manager restarts a failing driver, and a change is waited
         // for before the interface is tried again.
-        let Err(why) = use_interface(id);
+        let Err(why) = use_interface(id, fixed);
         println!("netd: interface {id:#x}: {why}; waiting for its driver to change");
         devices.wait()?;
     }
 }
 
 /// Run the stack on the interface `id` until it cannot be used.
-fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
+fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infallible, &'static str> {
     // One notification for everything: the interface's bits, then the
     // programs' (`tcp`).
     let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
@@ -162,9 +165,11 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
     // interface's and has not ended: held again at once (`Client::resume`).
     let keep = mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
     let kept = keep.as_ref().and_then(|k| kept_lease(k, mac));
-    let dhcp = match kept {
-        Some(l) => Client::resume(mac, l, now),
-        None => Client::new(mac, now),
+    // An address the owner configured comes before DHCP: held for ever, and
+    // no DHCP message is sent.
+    let dhcp = match (fixed, kept) {
+        (Some(l), _) | (None, Some(l)) => Client::resume(mac, l, now),
+        (None, None) => Client::new(mac, now),
     };
     let lease = dhcp.lease().copied();
     let clock = mem::peer(slots::TIME, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
@@ -205,12 +210,21 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
         s.offer(tag)?;
     }
     if let Some(l) = lease {
-        println!(
-            "netd: {}/{} kept from before it started again; {} connections of the stack before it to reset",
-            l.address,
-            l.prefix,
-            s.resets.len()
-        );
+        if fixed.is_some() {
+            println!(
+                "netd: {}/{} as the boot options say{}",
+                l.address,
+                l.prefix,
+                l.router.map(|r| silica_rt::alloc::format!(", router {r}")).unwrap_or_default()
+            );
+        } else {
+            println!(
+                "netd: {}/{} kept from before it started again; {} connections of the stack before it to reset",
+                l.address,
+                l.prefix,
+                s.resets.len()
+            );
+        }
         // Its router's Ethernet address, before the first answer needs it.
         if let Some(r) = l.router {
             s.ping(now, r);
@@ -260,6 +274,44 @@ impl TimeClient {
 
 /// The mark of a lease in the page kept across restarts.
 const KEPT_LEASE: u64 = 0x4553_4145_4c5f_4454; // "TD_LEASE"
+
+/// The address the boot options give this machine, as a lease that never
+/// ends: `netd.address=<address>/<prefix>`, with `netd.router=<address>`
+/// and `netd.dns=<address>,...` (at most three) if the network has them.
+/// What a server on a network without DHCP is given; `Err` for options
+/// that do not parse, which stops the stack rather than guess.
+fn fixed_lease() -> Result<Option<Lease>, &'static str> {
+    let Some(a) = silica_rt::option("address") else {
+        if silica_rt::option("router").is_some() || silica_rt::option("dns").is_some() {
+            return Err("the router and dns options need an address option");
+        }
+        return Ok(None);
+    };
+    let (address, prefix) = a.split_once('/').ok_or("the address option is not <address>/<prefix>")?;
+    let address = address.parse::<Ipv4>().map_err(|_| "the address option is not <address>/<prefix>")?;
+    let prefix = prefix.parse::<u8>().ok().filter(|p| (1..=32).contains(p)).ok_or("the address option's prefix is not 1 to 32")?;
+    let router = match silica_rt::option("router") {
+        Some(r) => Some(r.parse::<Ipv4>().map_err(|_| "the router option is not an address")?),
+        None => None,
+    };
+    let mut dns = [Ipv4::from_u32(0); 3];
+    for (k, d) in silica_rt::option("dns").unwrap_or("").split(',').filter(|d| !d.is_empty()).enumerate() {
+        *dns.get_mut(k).ok_or("the dns option names more than three servers")? =
+            d.parse::<Ipv4>().map_err(|_| "the dns option is not addresses")?;
+    }
+    Ok(Some(Lease {
+        address,
+        prefix,
+        router,
+        dns,
+        ntp: None,
+        server: Ipv4::from_u32(0),
+        seconds: u32::MAX,
+        renew_at: u64::MAX,
+        rebind_at: u64::MAX,
+        expires_at: u64::MAX,
+    }))
+}
 
 /// The lease an earlier instance kept in `k`, if there is one, for the
 /// interface `mac`.
@@ -899,6 +951,11 @@ impl Events for Stack {
 
     fn signals(&mut self, signals: u64) {
         self.nic.signalled(signals);
+        if signals & tcp::GONE != 0
+            && let Some(t) = self.tcp.as_mut()
+        {
+            t.forget_ended();
+        }
         self.work();
     }
 

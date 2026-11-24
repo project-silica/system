@@ -215,6 +215,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "remote"
+version = "0.0.0"
+dependencies = [
+ "silica-crypto",
+ "silica-idl-rt",
+ "silica-net",
+ "silica-protocols",
+ "silica-remote",
+ "silica-rt",
+]
+
+[[package]]
 name = "shell"
 version = "0.0.0"
 dependencies = [
@@ -238,6 +250,13 @@ dependencies = [
  "silica-queue",
  "silica-ring",
  "silica-rt",
+]
+
+[[package]]
+name = "silica-crypto"
+version = "0.0.0"
+dependencies = [
+ "silica-formats",
 ]
 
 [[package]]
@@ -299,6 +318,13 @@ dependencies = [
  "silica-protocols",
  "silica-ring",
  "silica-rt",
+]
+
+[[package]]
+name = "silica-remote"
+version = "0.0.0"
+dependencies = [
+ "silica-crypto",
 ]
 
 [[package]]

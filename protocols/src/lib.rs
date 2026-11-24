@@ -14,7 +14,9 @@
 //!   that produce random bits;
 //! - [`entropy::source`]: `silica.entropy.Source`, the entropy service;
 //! - [`net::tcp`]: `silica.net.Tcp`, TCP connections, provided by the
-//!   network stack.
+//!   network stack;
+//! - [`remote::session`]: `silica.remote.Session`, the remote management
+//!   session, which carries the others to another machine.
 //!
 //! Each module's reference page is `silica-idlc docs`'s page for the
 //! protocol. A program wraps a capability it was granted to a provider as
@@ -63,4 +65,9 @@ pub mod entropy {
 /// `silica.net.Tcp`.
 pub mod net {
     include!(concat!(env!("OUT_DIR"), "/silica_net_tcp.rs"));
+}
+
+/// `silica.remote.Session`.
+pub mod remote {
+    include!(concat!(env!("OUT_DIR"), "/silica_remote_session.rs"));
 }

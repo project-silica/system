@@ -18,6 +18,8 @@ members = [
     "storage/partitions",
     "net",
     "inet",
+    "crypto",
+    "remote/proto",
     "devmgr",
     "blkcheck",
     "blkload",
@@ -29,6 +31,7 @@ members = [
     "partcheck",
     "logd",
     "httpd",
+    "remote",
     "entropy",
     "entropycheck",
     "drivers/framework",
@@ -45,7 +48,7 @@ members = [
     "shell",
 ]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
-default-members = ["rt", "proc", "ring", "queue", "protocols", "storage/block", "net", "inet", "drivers/framework"]
+default-members = ["rt", "proc", "ring", "queue", "protocols", "storage/block", "net", "inet", "crypto", "remote/proto", "drivers/framework"]
 
 [workspace.package]
 version = "0.0.0"
@@ -74,6 +77,8 @@ silica-ring = { path = "ring" }
 silica-queue = { path = "queue" }
 silica-net = { path = "net" }
 silica-inet = { path = "inet" }
+silica-crypto = { path = "crypto" }
+silica-remote = { path = "remote/proto" }
 silica-protocols = { path = "protocols" }
 silica-block = { path = "storage/block" }
 

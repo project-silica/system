@@ -1,0 +1,28 @@
+[package]
+name = "remote-fuzz"
+description = "Coverage-guided fuzz target for the remote management session as a hostile connection sees it: framing, the handshake, sealed messages and the calls in them (run by tools/fuzz.sh)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+silica-remote = { path = ".." }
+silica-crypto = { path = "../../../crypto" }
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the system workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[profile.release]
+debug = 1

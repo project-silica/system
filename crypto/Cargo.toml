@@ -1,0 +1,13 @@
+[package]
+name = "silica-crypto"
+description = "The cryptography Silica speaks on a network: X25519, ChaCha20-Poly1305, BLAKE2s, and the Noise IK handshake built from them."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+silica-formats = { workspace = true }
+
+[lints]
+workspace = true

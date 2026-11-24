@@ -351,6 +351,40 @@ impl<'a> Program<'a> {
     }
 }
 
+/// The most loadable segments an image may have.
+pub const MAX_SEGMENTS: usize = 16;
+
+/// Check that `image` is a program [`spawn`] can load, without making
+/// anything: an ELF image for this machine whose loadable segments (at
+/// least one, at most [`MAX_SEGMENTS`]) are each writable or executable
+/// but not both, lie below the start-up record ([`INFO_VADDR`]) once
+/// rounded out to pages, and share no page. Returns each segment's page
+/// range, in file order. What the service manager checks a program sent
+/// to it with before it ends the program it replaces (`update`), and what
+/// `spawn` loads by; fuzzed (`system/proc/fuzz`, target `image`).
+pub fn check_image(image: &[u8]) -> Result<Vec<(u64, u64)>, SpawnError> {
+    let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
+    let mut pages: Vec<(u64, u64)> = Vec::new();
+    for seg in elf.segments() {
+        if seg.flags & PF_W != 0 && seg.flags & PF_X != 0 {
+            return Err(SpawnError::Segment);
+        }
+        let start = seg.vaddr & !0xFFF;
+        let end = seg.vaddr.checked_add(seg.memsz).and_then(|e| e.checked_add(0xFFF)).ok_or(SpawnError::Segment)? & !0xFFF;
+        if end > INFO_VADDR as u64 || pages.len() == MAX_SEGMENTS {
+            return Err(SpawnError::Segment);
+        }
+        if pages.iter().any(|&(s, e)| start < e && s < end) {
+            return Err(SpawnError::Segment);
+        }
+        pages.push((start, end));
+    }
+    if pages.is_empty() {
+        return Err(SpawnError::Segment);
+    }
+    Ok(pages)
+}
+
 /// Start `prog`: its first thread runs on `prog.cpu` from its first
 /// instruction.
 pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
@@ -397,6 +431,7 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
 
 fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Program) -> Result<(), SpawnError> {
     let Program { mem_bits, id, grants, args, cpu, space_bits, aspace_bits, .. } = *prog;
+    let pages = check_image(image)?;
     let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
     // The image's slots follow the grants, from slot 64 at the lowest: the
     // slots from FIRST_GRANT to 64 a parent did not fill stay empty, for
@@ -435,19 +470,12 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
         Ok(())
     };
 
-    for seg in elf.segments() {
-        if seg.flags & PF_W != 0 && seg.flags & PF_X != 0 {
-            return Err(SpawnError::Segment);
-        }
+    for (seg, (start, end)) in elf.segments().zip(pages) {
         let rights = Rights(
             Rights::READ.0
                 | if seg.flags & PF_W != 0 { Rights::WRITE.0 } else { 0 }
                 | if seg.flags & PF_X != 0 { Rights::EXEC.0 } else { 0 },
         );
-        let (start, end) = (seg.vaddr & !0xFFF, (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF);
-        if end as usize > INFO_VADDR {
-            return Err(SpawnError::Segment);
-        }
         // Cover [start, end) with frames: the largest power of two that
         // fits what is left, up to 1 MiB each.
         let mut at = start;
@@ -655,4 +683,60 @@ pub fn report(out: &mut dyn core::fmt::Write, name: &str, space: Cap) -> Result<
         }
     }
     Ok((caps, threads))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use silica_formats::elf::ElfError;
+    use silica_rt::alloc;
+    const PF_R: u32 = 4;
+
+    /// An ELF image for this machine with one loadable segment per
+    /// `(vaddr, memsz, flags)`, each with 16 bytes in the file.
+    fn image(segments: &[(u64, u64, u32)]) -> Vec<u8> {
+        let mut f = alloc::vec![0u8; 64 + 56 * segments.len()];
+        f[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        f[16..18].copy_from_slice(&2u16.to_le_bytes());
+        f[18..20].copy_from_slice(&EM_NATIVE.to_le_bytes());
+        f[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes());
+        f[32..40].copy_from_slice(&64u64.to_le_bytes());
+        f[54..56].copy_from_slice(&56u16.to_le_bytes());
+        f[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes());
+        let data = f.len() as u64;
+        for (i, &(vaddr, memsz, flags)) in segments.iter().enumerate() {
+            let p = 64 + 56 * i;
+            f[p..p + 4].copy_from_slice(&1u32.to_le_bytes());
+            f[p + 4..p + 8].copy_from_slice(&flags.to_le_bytes());
+            f[p + 8..p + 16].copy_from_slice(&data.to_le_bytes());
+            f[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes());
+            f[p + 32..p + 40].copy_from_slice(&16u64.min(memsz).to_le_bytes());
+            f[p + 40..p + 48].copy_from_slice(&memsz.to_le_bytes());
+        }
+        f.extend_from_slice(&[0x90; 16]);
+        f
+    }
+
+    #[test]
+    fn a_program_is_checked_by_its_segments() {
+        let (rx, rw) = (PF_R | PF_X, PF_R | PF_W);
+        assert_eq!(
+            check_image(&image(&[(0x40_0000, 0x1800, rx), (0x40_2000, 0x10, rw)])),
+            Ok(alloc::vec![(0x40_0000, 0x40_2000), (0x40_2000, 0x40_3000)])
+        );
+        // Writable and executable at once.
+        assert_eq!(check_image(&image(&[(0x40_0000, 0x1000, rx | PF_W)])), Err(SpawnError::Segment));
+        // Two segments in one page.
+        assert_eq!(check_image(&image(&[(0x40_0000, 0x100, rx), (0x40_0800, 0x10, rw)])), Err(SpawnError::Segment));
+        // Past the start-up record, or rounding past the top of the addresses.
+        assert_eq!(check_image(&image(&[(INFO_VADDR as u64 - 0x800, 0x1000, rw)])), Err(SpawnError::Segment));
+        assert_eq!(check_image(&image(&[(u64::MAX - 0x20, 0x10, rw)])), Err(SpawnError::Segment));
+        // No segment at all, and too many.
+        assert_eq!(check_image(&image(&[])), Err(SpawnError::Segment));
+        let many: Vec<_> = (0..MAX_SEGMENTS as u64 + 1).map(|i| (0x40_0000 + i * 0x1000, 0x10, rw)).collect();
+        assert_eq!(check_image(&image(&many)), Err(SpawnError::Segment));
+        assert!(check_image(&image(&many[..MAX_SEGMENTS])).is_ok());
+        // Not ELF at all.
+        assert_eq!(check_image(b"not a program\n"), Err(SpawnError::Image(ElfError::NotElf)));
+    }
 }

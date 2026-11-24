@@ -28,9 +28,14 @@
 //! for the answer to its SYN needs to take it. 248 records fit; a
 //! connection past them is not recorded.
 //!
-//! What it does not do yet: IPv6, more than one address, a connection's
-//! memory taken back while it runs other than by the program ending, and
-//! sending from the program's memory in place (G14).
+//! A program that ends, or takes back the memory it lent, is told to the
+//! stack by the kernel (`cap_notice` on the notifications it gave for its
+//! listeners and connections, [`GONE`]): its
+//! listeners and connections are let go of at once, so its ports are free
+//! and its peers reset, and the next instance of the service starts clean.
+//!
+//! What it does not do yet: IPv6, more than one address, and sending from
+//! the program's memory in place (G14).
 
 use silica_inet::Ipv4;
 use silica_inet::tcp::{ACK, Header, Options, RST, SYN, Segment};
@@ -44,9 +49,14 @@ use silica_rt::ring::{Read, STREAM_HEADER, StreamConsumer, StreamProducer};
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{mem, slots};
 
+/// The bit of the stack's notification the kernel signals when a program
+/// that lent the stack memory ends (`cap_notice` on its notifications, `Watched`): its
+/// listeners and connections are let go of at once ([`Tcp::forget_ended`]).
+/// The bits below are the interface's.
+pub const GONE: u64 = 1 << 8;
 /// The first bit of the stack's notification that programs signal for
-/// their connections; the bits below are the interface's.
-pub const FIRST_BIT: u32 = 8;
+/// their connections.
+pub const FIRST_BIT: u32 = 9;
 const BITS: u32 = 64 - FIRST_BIT;
 /// The most listeners, connections and programs with memory at once.
 const LISTENERS: usize = 32;
@@ -65,16 +75,20 @@ const EPHEMERAL: core::ops::Range<u16> = 49152..65535;
 struct Client {
     badge: u64,
     memory: Mmio,
-    /// The capability to the memory, kept while it is mapped.
-    _frame: Handle,
+    /// The capability to the memory, kept while it is mapped: its slot is
+    /// empty once the program ended. (A mapped Frame cannot be watched:
+    /// its slot links its mappings. The program's notifications, which
+    /// go with it too, are watched instead: `Watched`.)
+    frame: Handle,
 }
 
 /// A connection's two streams in its program's memory.
 struct Streams {
     rx: StreamProducer,
     tx: StreamConsumer,
-    /// The program's notification for this connection.
-    wake: Handle,
+    /// The program's notification for this connection, watched: the
+    /// program's end signals [`GONE`].
+    wake: Watched,
     /// Where the block is in the program's memory, and its size in bits.
     offset: u64,
     bits: u8,
@@ -105,7 +119,25 @@ struct Listener {
     owner: u64,
     port: u16,
     backlog: u32,
-    ready: Handle,
+    /// The program's notification for the listener, watched as `wake` is.
+    ready: Watched,
+}
+
+/// A capability of a program's that the kernel watches for the stack: it
+/// goes when its object does (the program ended), which signals [`GONE`].
+struct Watched {
+    /// Declared first, so it goes first: letting go of `cap` here signals
+    /// nothing.
+    _notice: Handle,
+    cap: Handle,
+}
+
+impl Watched {
+    fn new(cap: Handle, note: Cap) -> Result<Watched, Error> {
+        let notice = Handle::new(Cap(free_slot().ok_or(Error::NoRoom)?));
+        sys::cap_notice(cap.cap(), note, notice.cap(), GONE).map_err(|_| Error::NoRoom)?;
+        Ok(Watched { _notice: notice, cap })
+    }
 }
 
 /// Where a connection's segments go: the stack's IP layer.
@@ -358,7 +390,7 @@ impl Tcp {
                 }
                 let woken = (took && s.tx.room_needed()) | s.rx.wake_needed();
                 if woken {
-                    let _ = sys::signal(s.wake.cap());
+                    let _ = sys::signal(s.wake.cap.cap());
                 }
             }
             // A connection waiting to be accepted, ready: its listener's
@@ -369,7 +401,7 @@ impl Tcp {
             {
                 c.announced = true;
                 if let Some(l) = self.listeners.iter().find(|x| x.id == l) {
-                    let _ = sys::signal(l.ready.cap());
+                    let _ = sys::signal(l.ready.cap.cap());
                 }
             }
             // Its segments, while there is room for them.
@@ -459,8 +491,16 @@ impl Tcp {
         streams_in(&client.memory, offset, bits).ok_or(Error::BadMemory)
     }
 
+    /// A program lends its memory once. A second `add_memory` from the same
+    /// badge is a new instance of the same service (the service manager
+    /// badges a service's capability, and runs one instance at a time),
+    /// which may call before the kernel's notice of the last one's end has
+    /// been looked at: what the last instance had is let go of first.
     pub fn add_memory(&mut self, badge: u64, memory: Handle) -> Result<proto::AddMemoryReply, Error> {
-        if self.client(badge).is_some() || self.clients.len() >= CLIENTS {
+        if self.client(badge).is_some() {
+            self.forget(badge);
+        }
+        if self.clients.len() >= CLIENTS {
             return Err(Error::BadMemory);
         }
         let Ok(Some(info)) = sys::inspect_slot(slots::SPACE, memory.cap().0) else { return Err(Error::BadMemory) };
@@ -468,8 +508,43 @@ impl Tcp {
             return Err(Error::BadMemory);
         }
         let region = mem::peer(memory.cap(), info.bits, Rights(Rights::READ.0 | Rights::WRITE.0)).map_err(|_| Error::BadMemory)?;
-        self.clients.push(Client { badge, memory: region, _frame: memory });
+        self.clients.push(Client { badge, memory: region, frame: memory });
         Ok(proto::AddMemoryReply {})
+    }
+
+    /// Let go of the programs that ended (or took back the memory they
+    /// lent): the kernel signalled [`GONE`] when a notification of one went,
+    /// and a program that ended has its memory's capability gone from its
+    /// slot too. (A program that never listened nor connected has nothing
+    /// watched; it is found here at the next [`GONE`], or let go of when its
+    /// service lends memory again.)
+    pub fn forget_ended(&mut self) {
+        let gone: Vec<u64> = self
+            .clients
+            .iter()
+            .filter(|c| !matches!(sys::inspect_slot(slots::SPACE, c.frame.cap().0), Ok(Some(_))))
+            .map(|c| c.badge)
+            .collect();
+        for badge in gone {
+            self.forget(badge);
+        }
+    }
+
+    /// Let go of everything the program behind `badge` had: its listeners
+    /// (their ports free for any program), its connections (reset: no
+    /// program reads them any more), and its memory.
+    fn forget(&mut self, badge: u64) {
+        let listeners: Vec<u32> = self.listeners.iter().filter(|l| l.owner == badge).map(|l| l.id).collect();
+        self.listeners.retain(|l| l.owner != badge);
+        for c in self.conns.iter_mut() {
+            let waiting = c.listener.is_some_and(|l| listeners.contains(&l));
+            if (c.owner == badge || waiting) && !c.released {
+                c.tcp.abort();
+                c.released = true;
+                c.streams = None;
+            }
+        }
+        self.clients.retain(|c| c.badge != badge);
     }
 
     pub fn listen(&mut self, badge: u64, port: u16, backlog: u32, ready: Handle) -> Result<proto::ListenReply, Error> {
@@ -483,6 +558,7 @@ impl Tcp {
             return Err(Error::NoRoom);
         }
         let id = self.number();
+        let ready = Watched::new(ready, self.note)?;
         self.listeners.push(Listener { id, owner: badge, port, backlog: backlog.min(CONNECTIONS as u32), ready });
         Ok(proto::ListenReply { listener: id })
     }
@@ -496,6 +572,7 @@ impl Tcp {
         let (rx, tx) = self.block(badge, offset, bits)?;
         let id = self.conns[i].id;
         let requests = self.requests(id)?;
+        let wake = Watched::new(wake, self.note)?;
         let c = &mut self.conns[i];
         c.listener = None;
         c.owner = badge;
@@ -534,6 +611,7 @@ impl Tcp {
         let tcp = Connection::connect(ends, silica_rt::random::u64() as u32, self.mtu, buffers);
         let id = self.number();
         let requests = self.requests(id)?;
+        let wake = Watched::new(wake, self.note)?;
         let streams = Streams { rx, tx, wake, offset, bits, rx_closed: false, tx_closed: false };
         let record = self.record(&tcp);
         self.conns.push(Conn { id, record, owner: badge, tcp, streams: Some(streams), listener: None, announced: true, released: false });

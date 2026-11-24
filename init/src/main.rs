@@ -107,6 +107,13 @@ const CONSUMERS: u64 = 1 << 32;
 const SERVICE_IDS: u64 = 1000;
 /// How often a failing service is started again.
 const MAX_RESTARTS: u32 = 3;
+/// How long an updated service's new program is on trial: failing within
+/// it puts the program before it back (`update`).
+const TRIAL: u64 = 10 * SECOND;
+/// The largest program `update` takes, and the most all callers may have
+/// staged at once.
+const MAX_PROGRAM: u64 = 16 << 20;
+const MAX_STAGED: usize = 32 << 20;
 
 /// A service and what it is now.
 struct Running {
@@ -120,6 +127,18 @@ struct Running {
     failures: u32,
     /// Stopped by the owner: not started again until asked.
     stopped: bool,
+    /// The program it runs, when an `update` gave it one; `None`: the boot
+    /// archive's.
+    program: Option<Vec<u8>>,
+    /// An update on trial: the program to go back to if the new one fails
+    /// (`None` inside: the archive's), and when the trial ends (0: the new
+    /// program has not started yet; the trial starts when it does).
+    trial: Option<(Option<Vec<u8>>, u64)>,
+    /// The BLAKE2s-256 of its program, once asked for (`list`).
+    hash: Option<&'static [u8; 32]>,
+    /// The boot archive's files it is given (`files=`), each in a frame of
+    /// its own made once.
+    files: Vec<Option<silica_rt::mem::Memory>>,
 }
 
 struct Manager {
@@ -148,6 +167,12 @@ struct Manager {
     described: String,
     /// The badge of the call being answered.
     caller: u64,
+    /// The program each caller is sending (`stage`), by its badge.
+    staged: Vec<(u64, Vec<u8>)>,
+    /// Every program hash `list` has shown, each kept once: what a
+    /// service's `hash` points at (a reply borrows it). One per distinct
+    /// program the system ran, 32 bytes each.
+    hashes: Vec<&'static [u8; 32]>,
     /// The log: the service that provides it, its notification, what it
     /// answers flushes on, and a ring per service (`silica_rt::log`).
     log: Option<LogSetup>,
@@ -194,6 +219,13 @@ impl Manager {
                 self.endpoints[p].as_ref().ok_or("a provider without an endpoint")?.cap()
             };
             grants.push(Grant::badged(ep, Rights(Rights::WRITE.0 | Rights::GRANT.0), CONSUMERS + i as u64));
+        }
+        // The archive's files it is given, read-only, after its needs.
+        for f in &self.running[i].files {
+            grants.push(match f {
+                Some(m) => Grant::lend(m.frame(), Rights::READ),
+                None => Grant::none(),
+            });
         }
         if let Some(log) = self.log.as_ref().filter(|l| l.service == i) {
             // The notification, the flush's answer, the directory, then a
@@ -263,7 +295,10 @@ impl Manager {
     /// Start service `i`.
     fn start(&mut self, i: usize) -> Result<(), &'static str> {
         let s = &self.services[i];
-        let image = ramdisk::find(self.root.archive, s.program).ok_or("its program is not in the boot archive")?;
+        let image = match &self.running[i].program {
+            Some(p) => p.as_slice(),
+            None => ramdisk::find(self.root.archive, s.program).ok_or("its program is not in the boot archive")?,
+        };
         let (grants, args) = self.grants(i)?;
         let log = self.log.as_ref().and_then(|l| Some((l.rings.get(i)?.as_ref()?.cap(), l.note.cap())));
         // Nothing a last instance was told is news to this one.
@@ -287,6 +322,10 @@ impl Manager {
             "it could not be started"
         })?;
         self.running[i].starts += 1;
+        // An update's trial runs from its program's first start.
+        if let Some((_, until @ 0)) = &mut self.running[i].trial {
+            *until = silica_rt::clock().now() + TRIAL;
+        }
         // What was given outright, by the slot it lands in (`silica_proc`
         // puts grant `n` at `FIRST_GRANT + n`).
         self.running[i].given =
@@ -363,6 +402,18 @@ impl Manager {
             Some(s) => println!("init: {name} ended with status {s}"),
             None => println!("init: {name} faulted"),
         }
+        if status != Some(0) && self.on_trial(i) && !self.running[i].stopped {
+            println!("init: {name}'s new program failed within {} s of its update; it is started on the program before it", TRIAL / SECOND);
+            self.undo_update(i);
+            match self.start(i) {
+                Ok(()) => {
+                    println!("init: {name} started again on the program before its update");
+                    self.started_again(i);
+                }
+                Err(e) => println!("ERROR: init: {name}: {e}"),
+            }
+            return;
+        }
         if status == Some(0) || !self.services[i].restart || self.running[i].stopped {
             return;
         }
@@ -409,6 +460,53 @@ impl Manager {
         }
     }
 
+    /// Whether service `i` runs an update still on trial. A trial that is
+    /// over is ended here, and the program it kept to go back to let go.
+    fn on_trial(&mut self, i: usize) -> bool {
+        match self.running[i].trial {
+            Some((_, until)) if until == 0 || silica_rt::clock().now() < until => true,
+            Some(_) => {
+                self.running[i].trial = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Put back the program service `i` ran before its update on trial.
+    fn undo_update(&mut self, i: usize) {
+        if let Some((before, _)) = self.running[i].trial.take() {
+            self.running[i].program = before;
+            self.running[i].hash = None;
+        }
+    }
+
+    /// The hash of the program service `i` runs (or will), computed once.
+    fn hash(&mut self, i: usize) -> &'static [u8; 32] {
+        if let Some(h) = self.running[i].hash {
+            return h;
+        }
+        let image = match &self.running[i].program {
+            Some(p) => p.as_slice(),
+            None => ramdisk::find(self.root.archive, self.services[i].program).unwrap_or(&[]),
+        };
+        let h = silica_formats::blake2s::Blake2s::new().update(image).finish();
+        let h = match self.hashes.iter().find(|k| ***k == h) {
+            Some(k) => *k,
+            None => {
+                let k: &'static [u8; 32] = silica_rt::alloc::boxed::Box::leak(silica_rt::alloc::boxed::Box::new(h));
+                self.hashes.push(k);
+                k
+            }
+        };
+        self.running[i].hash = Some(h);
+        h
+    }
+
+    fn find(&self, name: &str) -> Result<usize, manager::Error> {
+        self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)
+    }
+
     /// Wait for service `i` to end, looking after the others meanwhile.
     fn wait_for(&mut self, listener: &mut Listener, i: usize, within: u64) -> Result<i64, &'static str> {
         let deadline = silica_rt::clock().now() + within;
@@ -425,8 +523,10 @@ impl Manager {
 impl manager::Server<Handle> for Manager {
     fn list<'a>(&'a mut self) -> manager::ListReply<'a, Handle> {
         self.listed.clear();
-        for (i, s) in self.services.iter().enumerate() {
-            let r = &self.running[i];
+        for i in 0..self.services.len() {
+            let program = self.hash(i);
+            let _ = self.on_trial(i);
+            let (s, r) = (&self.services[i], &self.running[i]);
             let state = if r.child.is_some() {
                 manager::State::Running
             } else if s.restart && r.failures > MAX_RESTARTS {
@@ -434,7 +534,14 @@ impl manager::Server<Handle> for Manager {
             } else {
                 manager::State::Stopped
             };
-            self.listed.push(manager::Service { name: s.name, state, failures: r.failures, provides: s.provides.unwrap_or("") });
+            self.listed.push(manager::Service {
+                name: s.name,
+                state,
+                failures: r.failures,
+                provides: s.provides.unwrap_or(""),
+                program,
+                updated: r.program.is_some(),
+            });
         }
         manager::ListReply { services: silica_idl_rt::Array::new(&self.listed) }
     }
@@ -505,6 +612,89 @@ impl manager::Server<Handle> for Manager {
         let why = if reboot { sys::reboot(power, 0) } else { sys::power_off(power, 0) };
         println!("ERROR: init: the machine cannot be turned off: {why:?}");
         Err(manager::Error::Refused)
+    }
+
+    fn stage(&mut self, at: u64, data: &[u8]) -> Result<manager::StageReply, manager::Error> {
+        let end = at.checked_add(data.len() as u64).filter(|e| *e <= MAX_PROGRAM).ok_or(manager::Error::TooLarge)?;
+        let caller = self.caller;
+        let k = match self.staged.iter().position(|(c, _)| *c == caller) {
+            Some(k) => k,
+            None => {
+                self.staged.push((caller, Vec::new()));
+                self.staged.len() - 1
+            }
+        };
+        if at == 0 {
+            self.staged[k].1.clear();
+        }
+        let others: usize = self.staged.iter().filter(|(c, _)| *c != caller).map(|(_, p)| p.len()).sum();
+        let program = &mut self.staged[k].1;
+        // In order: a piece starts where the last one ended, or earlier.
+        if at > program.len() as u64 || others + end as usize > MAX_STAGED {
+            return Err(manager::Error::TooLarge);
+        }
+        let (at, end) = (at as usize, end as usize);
+        if end > program.len() {
+            program.try_reserve(end - program.len()).map_err(|_| manager::Error::Refused)?;
+            program.resize(end, 0);
+        }
+        program[at..end].copy_from_slice(data);
+        Ok(manager::StageReply {})
+    }
+
+    fn update(&mut self, name: &str, length: u64) -> Result<manager::UpdateReply, manager::Error> {
+        let i = self.find(name)?;
+        let caller = self.caller;
+        let k = self.staged.iter().position(|(c, _)| *c == caller).ok_or(manager::Error::TooLarge)?;
+        let (_, mut program) = self.staged.swap_remove(k);
+        if length > program.len() as u64 {
+            return Err(manager::Error::TooLarge);
+        }
+        program.truncate(length as usize);
+        program.shrink_to_fit();
+        if let Err(e) = silica_proc::check_image(&program) {
+            println!("init: the program sent to update {name} is not one this machine runs: {e:?}");
+            return Err(manager::Error::NotAProgram);
+        }
+        // What it runs now is what to go back to (an earlier update's trial,
+        // if one is still on, ends here: its program is the one now kept).
+        let before = self.running[i].program.take();
+        self.running[i].program = Some(program);
+        self.running[i].trial = Some((before, 0));
+        self.running[i].hash = None;
+        let hash = self.hash(i);
+        println!("init: {name} has a new program, {length} bytes, BLAKE2s {}", Hex(&hash[..8]));
+        let Some(child) = self.running[i].child.take() else { return Ok(manager::UpdateReply {}) };
+        self.end(i, child);
+        if let Err(e) = Manager::start(self, i) {
+            println!("init: {name}'s new program could not be started ({e}); it is started on the program before it");
+            self.undo_update(i);
+            if let Err(e) = Manager::start(self, i) {
+                println!("ERROR: init: {name}: {e}");
+            }
+            self.started_again(i);
+            return Err(manager::Error::Refused);
+        }
+        println!("init: {name} started on its new program");
+        self.started_again(i);
+        Ok(manager::UpdateReply {})
+    }
+
+    fn revert(&mut self, name: &str) -> Result<manager::RevertReply, manager::Error> {
+        let i = self.find(name)?;
+        if self.running[i].program.is_none() {
+            return Ok(manager::RevertReply {});
+        }
+        self.running[i].program = None;
+        self.running[i].trial = None;
+        self.running[i].hash = None;
+        println!("init: {name} runs its program from the boot archive again, as asked");
+        if let Some(child) = self.running[i].child.take() {
+            self.end(i, child);
+            Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
+            self.started_again(i);
+        }
+        Ok(manager::RevertReply {})
     }
 
     fn add_log(&mut self, name: &str, ring: Handle) -> Result<manager::AddLogReply<Handle>, manager::Error> {
@@ -612,7 +802,23 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             None => None,
         });
     }
-    let running = services.iter().map(|_| Running { child: None, given: Vec::new(), starts: 0, failures: 0, stopped: false }).collect();
+    // The boot archive's files services are given (`files=`), each copied
+    // once into a frame of its own: lent read-only at every start, so no
+    // instance can change what the next is given.
+    let running = services
+        .iter()
+        .map(|s| Running {
+            child: None,
+            given: Vec::new(),
+            starts: 0,
+            failures: 0,
+            stopped: false,
+            program: None,
+            trial: None,
+            hash: None,
+            files: s.files.iter().map(|f| file_frame(root.archive, s.name, f)).collect(),
+        })
+        .collect();
     // Each service's events, and a capability per need to tell it.
     let mut events = Vec::new();
     for s in &services {
@@ -685,6 +891,8 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         listed: Vec::new(),
         described: String::new(),
         caller: 0,
+        staged: Vec::new(),
+        hashes: Vec::new(),
         log,
     };
     if let Some(l) = &m.log {
@@ -890,5 +1098,29 @@ fn program_checks(root: &Root) {
             endpoint_object.destroy()
         };
         println!("init: {client_name} and {server_name} talked over sample.Echo; both are gone and their memory is back");
+    }
+}
+
+/// The boot archive's file `name` in a frame of its own for service
+/// `service` (`files=`): the smallest power of two that holds it, at least
+/// a page, zeros after it. `None`, said in the log, when the archive has no
+/// such file: the service finds that grant's slot empty.
+fn file_frame(archive: &'static [u8], service: &str, name: &str) -> Option<silica_rt::mem::Memory> {
+    let Some(bytes) = ramdisk::find(archive, name) else {
+        println!("init: {service} is to be given the file {name}, which the boot archive does not have");
+        return None;
+    };
+    let bits = (bytes.len().max(1).next_power_of_two().trailing_zeros() as u8).max(12);
+    let m = silica_rt::mem::Memory::new(bits).unwrap_or_else(|_| fail!("no memory for {service}'s file {name}"));
+    m.shared().write_bytes(0, bytes);
+    Some(m)
+}
+
+/// Bytes as hexadecimal digits.
+struct Hex<'a>(&'a [u8]);
+
+impl core::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
     }
 }

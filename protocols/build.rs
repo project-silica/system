@@ -14,6 +14,7 @@ fn main() {
         "entropy/device.idl",
         "entropy/source.idl",
         "net/tcp.idl",
+        "remote/session.idl",
     ]
     .iter()
     .map(|f| root.join(f))

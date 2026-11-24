@@ -42,6 +42,11 @@ silica_rt::main!(main);
 const KEPT: usize = 32 * 1024;
 /// The longest line put on the console in one piece; a longer one goes in parts.
 const LINE: usize = 220;
+/// The kept page (`slots::KEEP`): a mark, then `open` and `cut`, each its
+/// source's directory entry + 1 (0: none), its line's length and its line.
+const KEPT_MAGIC: u64 = 0x3170_6565_6B64_676F; // "ogdkeep1"
+const KEPT_OPEN: usize = 8;
+const KEPT_CUT: usize = KEPT_OPEN + 8 + LINE;
 /// The writer [`Log::emit`] knows this service's own lines by.
 const OWN: usize = usize::MAX;
 /// Rounds of taking text (a ring's worth of each source) between looking
@@ -85,6 +90,9 @@ struct Log {
     cut: Option<usize>,
     /// Signalled when a flush asked for is done.
     flushed: Cap,
+    /// The page the service manager keeps across this service's restarts
+    /// (`slots::KEEP`), with `open` and `cut` and their lines in it.
+    keep: Option<silica_rt::mmio::Mmio>,
     listed: Vec<proto::Source<'static>>,
     text: String,
 }
@@ -108,9 +116,47 @@ impl Log {
             }
             self.more = more;
             if !more {
-                return;
+                break;
             }
         }
+        self.save();
+    }
+
+    /// Keep `open` and `cut`, and their lines, in the kept page: what the
+    /// console ends with is this service's to know, and a log service
+    /// started again must not write after a prompt as if the line were
+    /// empty (it did: `silica> remote: ...`, 2026-11-24). Sources are kept
+    /// by their directory entry, which the next instance finds them by.
+    fn save(&self) {
+        let Some(k) = &self.keep else { return };
+        for (at, which) in [(KEPT_OPEN, self.open), (KEPT_CUT, self.cut)] {
+            let s = which.and_then(|i| self.sources.get(i));
+            k.write32(at, s.map_or(0, |s| s.entry as u32 + 1));
+            let line = s.map_or(&[][..], |s| &s.partial[..s.partial.len().min(LINE)]);
+            k.write32(at + 4, line.len() as u32);
+            k.write_bytes(at + 8, line);
+        }
+        k.write64(0, KEPT_MAGIC);
+    }
+
+    /// What the last instance kept (`save`), once its sources are taken
+    /// again.
+    fn restore(&mut self) {
+        let Some(k) = &self.keep else { return };
+        if k.read64(0) != KEPT_MAGIC {
+            return;
+        }
+        let mut kept = [None, None];
+        for (n, at) in [KEPT_OPEN, KEPT_CUT].into_iter().enumerate() {
+            let entry = k.read32(at) as usize;
+            let len = (k.read32(at + 4) as usize).min(LINE);
+            let Some(i) = entry.checked_sub(1).and_then(|e| self.sources.iter().position(|s| s.entry == e)) else { continue };
+            let mut line = silica_rt::alloc::vec![0u8; len];
+            k.read_bytes(at + 8, &mut line);
+            self.sources[i].partial = line;
+            kept[n] = Some(i);
+        }
+        [self.open, self.cut] = kept;
     }
 
     /// Take up to a ring's worth of source `i`'s text and put it on the
@@ -361,12 +407,14 @@ fn main(info: &'static ProcessInfo) -> i64 {
         open: None,
         cut: None,
         flushed: grant(2),
+        keep: mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok(),
         listed: Vec::new(),
         text: String::new(),
     };
     // Every ring there is, and what was written before this service
     // started (or before it last ended).
     log.take_rings();
+    log.restore();
     log.drain();
     serve_events(grant(0), grant(1), &mut log)
 }
