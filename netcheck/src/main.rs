@@ -299,17 +299,43 @@ fn bench(c: &mut Check, driver: &str) -> Result<(), &'static str> {
         return Ok(());
     }
     let mut times = Vec::new();
+    // When each measured round trip started, for where the slow ones fall.
+    let mut starts = Vec::new();
     for seq in 1..=22_000u32 {
         let t = clock.now();
         echo(c, seq)?;
         c.receive(clock.now() + SECOND, &mut back(seq))?;
         if seq > 2000 {
             times.push(clock.now() - t);
+            starts.push(t);
         }
     }
+    let samples = times.clone();
     times.sort_unstable();
+    let at = |q: usize| times[(times.len() * q / 1000).min(times.len() - 1)];
     println!("BENCH {prefix}_rtt {} ns", times[times.len() / 2]);
     println!("BENCH {prefix}_rtt_p99 {} ns", times[times.len() * 99 / 100]);
+    // The tail's shape (not gated): how many round trips were more than a
+    // microsecond slower than the median, and how far apart they started,
+    // which says whether something periodic makes them.
+    let slow_at = times[times.len() / 2] + 1000;
+    let slow: Vec<u64> = samples.iter().zip(&starts).filter(|(t, _)| **t > slow_at).map(|(_, s)| *s).collect();
+    let mut gaps: Vec<u64> = slow.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_unstable();
+    let gap = |q: usize| gaps.get(gaps.len() * q / 100).map_or(0, |g| g / 1000);
+    println!(
+        "netcheck: {prefix} round trips: p90 {} p99 {} p99.9 {} max {} ns; {} of {} slower than the median by 1 us, {} us apart (p10 {} p50 {} p90 {})",
+        at(900),
+        at(990),
+        at(999),
+        times[times.len() - 1],
+        slow.len(),
+        times.len(),
+        gap(50),
+        gap(10),
+        gap(50),
+        gap(90)
+    );
 
     // Transmit: the same 1514-byte frame, 128 in flight, for a second.
     c.put(o, &[0xFF; 6]);
