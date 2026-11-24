@@ -316,8 +316,9 @@ impl Stack {
         }
         let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
         let blocked = tcp.pump(now, self);
+        let asleep = tcp.sleep();
         self.tcp = Some(tcp);
-        self.more = (blocked && self.free != 0) || !self.nic.sleep();
+        self.more = (blocked && self.free != 0) || !asleep || !self.nic.sleep();
     }
 
     /// The soonest of what waits for a time.

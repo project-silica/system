@@ -301,6 +301,27 @@ impl Tcp {
         more
     }
 
+    /// Before the stack waits: says in every stream the stack waits on
+    /// that it sleeps, so that the program signals it: a transmit stream
+    /// it could take bytes from now, and a receive stream it holds bytes
+    /// for that did not fit. `false`: do not wait, something arrived
+    /// meanwhile. Without this, a program's write after the stack last
+    /// looked woke nobody, and with nothing else in flight a transfer
+    /// stalled (30 s once in 10,000 answers under load).
+    pub fn sleep(&mut self) -> bool {
+        let mut sleep = true;
+        for c in &mut self.conns {
+            let Some(s) = c.streams.as_mut() else { continue };
+            if !s.tx_closed && c.tcp.writable() > 0 && !s.tx.sleep() {
+                sleep = false;
+            }
+            if !s.rx_closed && c.tcp.readable() > 0 && !s.rx.sleep_for_room() {
+                sleep = false;
+            }
+        }
+        sleep
+    }
+
     fn client(&self, badge: u64) -> Option<&Client> {
         self.clients.iter().find(|c| c.badge == badge)
     }
