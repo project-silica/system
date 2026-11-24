@@ -51,6 +51,9 @@ const F_STATUS: u64 = 1 << 16;
 /// The header's flag: sum from `csum_start`, store at `csum_offset` past it.
 const NEEDS_CSUM: u8 = 1;
 const GSO_TCPV4: u8 = 1;
+/// Where in `tx_headers` the header of zeros lies, after the slots' own
+/// (at most 128 slots of 16 bytes), never written.
+const ZERO_HEADER: usize = 2048;
 /// The longest frame a segmentation request gives: an IPv4 packet's most.
 const SEGMENT_BYTES: u32 = 65535 + silica_net::HEADER;
 const S_LINK_UP: u16 = 1;
@@ -137,14 +140,23 @@ impl silica_net::service::Device for Nic {
                 // csum_start, csum_offset (num_buffers is the device's).
                 // The service checked the offloads against `info`, which
                 // has only those negotiated.
+                // A frame that asks nothing goes with the one header of
+                // zeros every such frame shares (one line the device keeps
+                // reading); one with offloads with its slot's own. (A header
+                // per slot for every frame cost 2% of frames sent a second.)
                 let o = r.offload;
-                let h = self.tx_headers.shared();
-                let at = slot as usize * 16;
-                let flags = if o.checksum { NEEDS_CSUM } else { 0 };
-                let gso = if o.segmentation { GSO_TCPV4 } else { 0 };
-                h.write32(at, u32::from(flags) | u32::from(gso) << 8 | u32::from(o.header_bytes) << 16);
-                h.write32(at + 4, u32::from(o.segment) | u32::from(o.checksum_start) << 16);
-                h.write32(at + 8, u32::from(o.checksum_offset));
+                let at = if o == silica_net::Offload::NONE {
+                    ZERO_HEADER
+                } else {
+                    let h = self.tx_headers.shared();
+                    let at = slot as usize * 16;
+                    let flags = if o.checksum { NEEDS_CSUM } else { 0 };
+                    let gso = if o.segmentation { GSO_TCPV4 } else { 0 };
+                    h.write32(at, u32::from(flags) | u32::from(gso) << 8 | u32::from(o.header_bytes) << 16);
+                    h.write32(at + 4, u32::from(o.segment) | u32::from(o.checksum_start) << 16);
+                    h.write32(at + 8, u32::from(o.checksum_offset));
+                    at
+                };
                 let header = Buffer { address: self.tx_headers.device_address() + at as u64, len: HEADER, device_writes: false };
                 let data = Buffer { address, len: r.length, device_writes: false };
                 if self.tx.add(&[header, data], slot as u64).is_err() {
