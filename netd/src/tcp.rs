@@ -20,11 +20,13 @@
 //!
 //! Each connection has a record in the page the service manager keeps
 //! across the stack's restarts (`slots::KEEP`, after the lease): its peer,
-//! its ports and how far it has sent, so that a stack started again resets
-//! every connection the last one had at once ([`kept_connections`]) rather
-//! than leave each peer waiting for an answer that will not come (a peer
-//! that is waiting sends nothing, so it would not learn otherwise). 248
-//! records fit; a connection past them is not recorded.
+//! its ports and how far each side has sent, so that a stack started again
+//! resets every connection the last one had at once ([`kept_connections`])
+//! rather than leave each peer waiting for an answer that will not come (a
+//! peer that is waiting sends nothing, so it would not learn otherwise).
+//! The reset acknowledges what the peer sent, which a peer still waiting
+//! for the answer to its SYN needs to take it. 248 records fit; a
+//! connection past them is not recorded.
 //!
 //! What it does not do yet: IPv6, more than one address, a connection's
 //! memory taken back while it runs other than by the program ending, and
@@ -130,17 +132,24 @@ pub struct Tcp {
     segment: Vec<u8>,
 }
 
-/// Bytes of a connection's record in the kept page: its peer's address,
-/// the two ports, how far it sent, and whether the record is in use.
+/// Bytes of a connection's record in the kept page: its peer's address
+/// (never 0.0.0.0; 0 marks a record not in use, and it is written last),
+/// the two ports, how far it sent, and how far the peer sent.
 pub const RECORD: usize = 16;
 
+/// The mark of records in that layout, kept beside them (`netd`'s page).
+/// Records without it are another version's, or none: they are cleared and
+/// reset nothing.
+pub const RECORDS_MARK: u64 = 0x3253_4e4e_4f43_5f44; // "D_CONNS2"
+
 /// A connection an earlier stack had, from its record: its peer, its
-/// ports, and the sequence number a reset of it carries.
+/// ports, and the sequence and acknowledgement numbers a reset of it carries.
 pub struct Kept {
     pub remote: Ipv4,
     pub remote_port: u16,
     pub local_port: u16,
     pub sequence: u32,
+    pub acknowledges: u32,
 }
 
 /// The connections an earlier stack recorded in `records`, taken out (the
@@ -149,19 +158,29 @@ pub fn kept_connections(records: &Mmio) -> Vec<Kept> {
     let mut kept = Vec::new();
     for i in 0..records.len() / RECORD {
         let at = i * RECORD;
-        if records.read32(at + 12) != 1 {
+        let remote = records.read32(at);
+        if remote == 0 {
             continue;
         }
         let ports = records.read32(at + 4);
         kept.push(Kept {
-            remote: Ipv4::from_u32(records.read32(at)),
+            remote: Ipv4::from_u32(remote),
             remote_port: ports as u16,
             local_port: (ports >> 16) as u16,
             sequence: records.read32(at + 8),
+            acknowledges: records.read32(at + 12),
         });
-        records.write32(at + 12, 0);
+        records.write32(at, 0);
     }
     kept
+}
+
+/// Every record in `records` cleared: another layout's, or memory never
+/// used for records.
+pub fn clear_records(records: &Mmio) {
+    for i in 0..records.len() / RECORD {
+        records.write32(i * RECORD, 0);
+    }
 }
 
 /// The block of 2^`bits` bytes at `offset` in `memory`, as its two streams.
@@ -222,12 +241,13 @@ impl Tcp {
         self.recorded[i] = true;
         let e = c.endpoints();
         let at = i * RECORD;
-        // Valid last: a stack that ends half way leaves no half a record.
-        r.write32(at + 12, 0);
-        r.write32(at, e.remote.to_u32());
+        // The peer's address last: a stack that ends half way leaves no
+        // half a record.
+        r.write32(at, 0);
         r.write32(at + 4, e.remote_port as u32 | (e.local_port as u32) << 16);
         r.write32(at + 8, c.sent_to());
-        r.write32(at + 12, 1);
+        r.write32(at + 12, c.received_to());
+        r.write32(at, e.remote.to_u32());
         Some(i)
     }
 
@@ -362,9 +382,10 @@ impl Tcp {
             if !out.room() {
                 more = true;
             }
-            // How far it has sent, for a reset of it by the next stack.
+            // How far each side has sent, for a reset of it by the next stack.
             if let (Some(i), Some(r)) = (c.record, self.records.as_ref()) {
                 r.write32(i * RECORD + 8, c.tcp.sent_to());
+                r.write32(i * RECORD + 12, c.tcp.received_to());
             }
         }
         // Done: closed, and let go of (or never accepted).
@@ -373,7 +394,7 @@ impl Tcp {
             let c = &self.conns[i];
             if c.tcp.is_closed() && (c.released || (c.listener.is_some() && c.streams.is_none())) {
                 if let (Some(r), Some(records)) = (c.record, self.records.as_ref()) {
-                    records.write32(r * RECORD + 12, 0);
+                    records.write32(r * RECORD, 0);
                     self.recorded[r] = false;
                 }
                 self.conns.swap_remove(i);

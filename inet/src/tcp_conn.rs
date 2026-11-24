@@ -394,6 +394,16 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.snd_max
     }
 
+    /// The sequence number the peer sends next (0 before its SYN is seen):
+    /// what that reset acknowledges, so that a peer still waiting for the
+    /// answer to its SYN takes it. In SYN-SENT a peer drops a reset that
+    /// does not acknowledge its SYN (RFC 9293 section 3.10.7.3), and then
+    /// waits for its own retransmission instead (5.9 s, QEMU's user-mode
+    /// network, 2026-11-24).
+    pub fn received_to(&self) -> u32 {
+        self.rcv_nxt
+    }
+
     /// Why the connection ended, if it did otherwise than by closing.
     pub fn error(&self) -> Option<Error> {
         self.error

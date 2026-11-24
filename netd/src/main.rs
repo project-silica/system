@@ -164,9 +164,18 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
     };
     let lease = dhcp.lease().copied();
     let clock = mem::peer(slots::TIME, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
-    // Connection records after the lease (`tcp`): the last stack's, reset.
+    // Connection records after the lease (`tcp`): the last stack's, reset,
+    // if they are in this stack's layout (their mark just before them).
     let records = keep.as_ref().and_then(|k| k.part(128, 4096 - 128));
-    let resets = records.as_ref().map(tcp::kept_connections).unwrap_or_default();
+    let resets = match (&keep, &records) {
+        (Some(k), Some(r)) if k.read64(120) == tcp::RECORDS_MARK => tcp::kept_connections(r),
+        (Some(k), Some(r)) => {
+            tcp::clear_records(r);
+            k.write64(120, tcp::RECORDS_MARK);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
     let mut s = Stack {
         nic,
         m: memory.shared(),
@@ -533,8 +542,8 @@ impl Stack {
                 src_port: k.local_port,
                 dst_port: k.remote_port,
                 seq: k.sequence,
-                ack: 0,
-                flags: silica_inet::tcp::RST,
+                ack: k.acknowledges,
+                flags: silica_inet::tcp::RST | silica_inet::tcp::ACK,
                 window: 0,
             };
             let mut seg = [0u8; 64];
