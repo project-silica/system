@@ -274,19 +274,22 @@ fn backoff(tries: u32, random: u64) -> u64 {
 /// to use (no lease time: RFC 2131 requires one in an answer to a request).
 fn lease_of(now: u64, r: &Reply, server: Ipv4) -> Option<Lease> {
     let seconds = r.lease?;
-    let at = |s: u64| now.saturating_add(s.saturating_mul(SECOND));
+    if seconds == 0 {
+        return None;
+    }
     let (renew_at, rebind_at, expires_at) = if seconds == u32::MAX {
         (u64::MAX, u64::MAX, u64::MAX)
     } else {
-        let l = seconds as u64;
-        let mut renew = r.renew.map_or(l / 2, |t| t as u64);
-        let mut rebind = r.rebind.map_or(l * 7 / 8, |t| t as u64);
+        let l = u64::from(seconds) * SECOND;
+        let default_rebind = l - l / 8;
+        let mut renew = r.renew.map_or(l / 2, |t| u64::from(t) * SECOND);
+        let mut rebind = r.rebind.map_or(default_rebind, |t| u64::from(t) * SECOND);
         // Times out of order are a server's mistake: use the RFC's.
-        if !(renew <= rebind && rebind <= l) {
+        if !(0 < renew && renew < rebind && rebind < l) {
             renew = l / 2;
-            rebind = l * 7 / 8;
+            rebind = default_rebind;
         }
-        (at(renew), at(rebind), at(l))
+        (now.saturating_add(renew), now.saturating_add(rebind), now.saturating_add(l))
     };
     let prefix = r.prefix.unwrap_or(match r.address.0[0] {
         0..=127 => 8,
@@ -346,6 +349,20 @@ mod tests {
         let mut c = Client::resume(MAC, l, l.expires_at);
         assert_eq!(c.lease(), None, "an expired lease is not held");
         assert_eq!(c.step(l.expires_at, None, 7 << 32).send.unwrap().ask, Ask::Discover, "and the client asks anew");
+    }
+
+    #[test]
+    fn a_short_lease_renews_before_rebinding_and_ignores_zero_length_extensions() {
+        let mut c = bound(1);
+        let held = *c.lease().unwrap();
+        assert_eq!(held.rebind_at - held.renew_at, 375_000_000);
+        assert_eq!(held.expires_at - held.renew_at, 500_000_000);
+        let xid = c.step(held.renew_at, None, 12 << 32).send.unwrap().xid;
+        assert_eq!(c.step(held.renew_at + 1, Some(&reply(Kind::Ack, xid, Some(0))), 0), Step::default());
+        assert_eq!(c.lease(), Some(&held));
+        assert_eq!(c.deadline(), held.rebind_at);
+        assert_eq!(c.step(held.rebind_at, None, 13 << 32).send.unwrap().to, To::Broadcast);
+        assert_eq!(c.step(held.expires_at, None, 14 << 32).event, Some(Event::Lost));
     }
 
     #[test]
@@ -465,7 +482,7 @@ mod tests {
         r.renew = Some(90);
         r.rebind = Some(50);
         let l = lease_of(0, &r, SERVER).unwrap();
-        assert_eq!((l.renew_at, l.rebind_at), (50 * SECOND, 87 * SECOND), "rebinding before renewal: the RFC's times (whole seconds)");
+        assert_eq!((l.renew_at, l.rebind_at), (50 * SECOND, 87 * SECOND + SECOND / 2), "rebinding before renewal: the RFC's times");
         r.prefix = None;
         assert_eq!(lease_of(0, &r, SERVER).unwrap().prefix, 8, "10/8 when the server gives no netmask");
     }
