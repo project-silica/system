@@ -400,8 +400,10 @@ impl Tests {
 /// Program entry, called by libsys's `_start`.
 // SAFETY: the one definition of the symbol `_start` calls.
 #[unsafe(no_mangle)]
-extern "C" fn silica_main(info: &'static RootInfo) -> ! {
-    let root = match root::start(info) {
+extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3: u64) -> ! {
+    // The boot secret: the four words after the record (libsys::root::secret).
+    let secret = [s0, s1, s2, s3];
+    let root = match root::start(info, secret) {
         Ok(r) => r,
         Err(e) => {
             println!("ERROR: systest: {e}");

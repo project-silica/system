@@ -269,7 +269,7 @@ impl Manager {
         }
         if s.seed {
             // A secret of its own for this start (`silica_proc::seed`).
-            let seed = silica_proc::seed(&self.info.entropy, s.name, self.running[i].starts);
+            let seed = silica_proc::seed(&self.root.secret, s.name, self.running[i].starts);
             for (k, word) in seed.as_chunks::<8>().0.iter().enumerate() {
                 args[4 + k] = u64::from_le_bytes(*word);
             }
@@ -753,8 +753,10 @@ impl manager::Server<Handle> for Manager {
 /// Program entry, called by libsys's `_start`.
 // SAFETY: the one definition of the symbol `_start` calls.
 #[unsafe(no_mangle)]
-extern "C" fn silica_main(info: &'static RootInfo) -> ! {
-    let root = match root::start(info) {
+extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3: u64) -> ! {
+    // The boot secret: the four words after the record (libsys::root::secret).
+    let secret = [s0, s1, s2, s3];
+    let root = match root::start(info, secret) {
         Ok(r) => r,
         Err(e) => fail!("{e}"),
     };

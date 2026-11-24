@@ -27,13 +27,20 @@ pub struct Root {
     /// The frames of the ramdisk, in the order the kernel listed its memory:
     /// what a program that reads the boot archive itself is lent.
     pub ramdisk: Vec<Cap>,
+    /// The boot secret (`libsys::root::secret`): every seed and key the root
+    /// task hands out descends from it. It is in the root task's memory
+    /// only, never in a frame lent to anyone.
+    pub secret: [u8; 32],
 }
 
 /// Start the runtime in the root task and prepare it to spawn. On failure
-/// says what was wrong with what the kernel handed over.
-pub fn start(info: &'static RootInfo) -> Result<Root, &'static str> {
+/// says what was wrong with what the kernel handed over. `secret`: the
+/// four words the root thread started with after the record
+/// (`libsys::root::secret`).
+pub fn start(info: &'static RootInfo, secret: [u64; 4]) -> Result<Root, &'static str> {
+    let secret = libsys::root::secret(secret);
     let (space, aspace, ports) = (Cap(SLOT_CAPSPACE), Cap(SLOT_ASPACE), Cap(SLOT_PORTS));
-    silica_rt::start_root(Cap(SLOT_CONSOLE), info.clock, info.ipc_buffer, info.first_free_slot, info.capspace_slots, &info.entropy);
+    silica_rt::start_root(Cap(SLOT_CONSOLE), info.clock, info.ipc_buffer, info.first_free_slot, info.capspace_slots, &secret);
     if info.magic != ROOT_MAGIC {
         return Err("the kernel's start-up record has the wrong magic");
     }
@@ -83,7 +90,7 @@ pub fn start(info: &'static RootInfo) -> Result<Root, &'static str> {
         clock: info.clock,
         time: Cap::NONE,
     };
-    Ok(Root { archive, parent, ports, ramdisk })
+    Ok(Root { archive, parent, ports, ramdisk, secret })
 }
 
 /// Turn the machine off, telling a test harness whether everything
