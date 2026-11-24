@@ -5,7 +5,7 @@
 //! ```text
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
-//!        [restart=always|never] [seed] [keeps]
+//!        [restart=always|never] [seed] [keeps] [sets_time]
 //! ```
 //!
 //! - `provides`: the protocol it serves; the service manager makes its
@@ -35,6 +35,9 @@
 //!   that the service manager keeps across its restarts: what a service
 //!   started again needs to pick up where the last one was (the network
 //!   stack's lease, so that it answers on its address at once).
+//! - `sets_time`: its time page (`slots::TIME`, which every service can
+//!   read) is writable: it may set the wall clock (the network stack's
+//!   time-server client).
 
 use silica_rt::alloc::vec::Vec;
 
@@ -60,6 +63,7 @@ pub struct Service {
     pub machine: bool,
     pub seed: bool,
     pub keeps: bool,
+    pub sets_time: bool,
     pub start: Start,
     pub restart: bool,
 }
@@ -79,6 +83,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             machine: false,
             seed: false,
             keeps: false,
+            sets_time: false,
             start: Start::Boot,
             restart: false,
         };
@@ -94,6 +99,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("machine", "") => s.machine = true,
                 ("seed", "") => s.seed = true,
                 ("keeps", "") => s.keeps = true,
+                ("sets_time", "") => s.sets_time = true,
                 ("start", "boot") => s.start = Start::Boot,
                 ("start", c) if c.starts_with("check:") => s.start = Start::Check(&c[6..]),
                 ("restart", "always") => s.restart = true,

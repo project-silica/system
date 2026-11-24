@@ -73,6 +73,9 @@ pub struct Parent {
     pub cpus: u64,
     /// See `cpus`.
     pub clock: [u64; 3],
+    /// The time page children are given read-only when their `Program`
+    /// names none ([`Cap::NONE`]: none).
+    pub time: Cap,
 }
 
 /// One capability to give the child.
@@ -152,6 +155,7 @@ impl Parent {
             debug: slots::DEBUG,
             cpus: info.cpus,
             clock: info.clock,
+            time: if matches!(sys::inspect_slot(slots::SPACE, slots::TIME.0), Ok(Some(_))) { slots::TIME } else { Cap::NONE },
         }
     }
 }
@@ -317,6 +321,10 @@ pub struct Program<'a> {
     /// A page that outlives it (derived, readable and writable, into
     /// `slots::KEEP`).
     pub keep: Option<Cap>,
+    /// The time page and whether it may set the time (derived into
+    /// `slots::TIME`). Without one, a program started by a program that
+    /// has a time page gets that page, read-only.
+    pub time: Option<(Cap, bool)>,
 }
 
 impl<'a> Program<'a> {
@@ -334,6 +342,7 @@ impl<'a> Program<'a> {
             log: None,
             events: None,
             keep: None,
+            time: None,
         }
     }
 }
@@ -507,6 +516,12 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     if let Some((ring, wake)) = prog.log {
         sys::cap_derive(c.space, slots::LOG.0, ring, Rights(Rights::READ.0 | Rights::WRITE.0), 0)?;
         sys::cap_derive(c.space, slots::LOG_WAKE.0, wake, Rights::WRITE, 0)?;
+    }
+    // The wall clock: the page given, or this program's own, read-only.
+    let time = prog.time.or_else(|| (p.time != Cap::NONE).then_some((p.time, false)));
+    if let Some((page, writable)) = time {
+        let rights = if writable { Rights(Rights::READ.0 | Rights::WRITE.0) } else { Rights::READ };
+        sys::cap_derive(c.space, slots::TIME.0, page, rights, 0)?;
     }
     if let Some(page) = prog.keep {
         sys::cap_derive(c.space, slots::KEEP.0, page, Rights(Rights::READ.0 | Rights::WRITE.0), 0)?;

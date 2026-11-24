@@ -135,6 +135,8 @@ struct Manager {
     events: Vec<(Object, Vec<Handle>)>,
     /// The page each service that `keeps` is given at every start.
     kept: Vec<Option<Object>>,
+    /// The time page (`silica_rt::time`), set from the firmware's clock.
+    time: silica_rt::mem::Memory,
     /// The order services were started in, for stopping them in reverse.
     order: Vec<usize>,
     /// What `list` answers with, rebuilt for each call.
@@ -270,6 +272,7 @@ impl Manager {
             log,
             events: Some(events),
             keep: self.kept[i].as_ref().map(|p| p.cap()),
+            time: Some((self.time.frame(), self.services[i].sets_time)),
             mem_bits: s.memory,
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
@@ -562,7 +565,17 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         Err(e) => fail!("{e}"),
     };
     // Faults of the services are reported where their exits are.
-    let root = Root { parent: silica_proc::Parent { fault: root.parent.exit, ..root.parent }, ..root };
+    // The wall clock, from the firmware's (the machine's real-time clock,
+    // read by the loader), in the time page every program can read.
+    let time = silica_rt::mem::Memory::new(12).unwrap_or_else(|_| fail!("no memory for the time page"));
+    let [wall_secs, wall_at] = info.wall_clock;
+    if wall_secs != 0 {
+        silica_rt::time::set(&time.shared(), wall_secs * 1_000_000_000, wall_at, silica_rt::time::Source::Firmware);
+        println!("init: the wall clock is {} (the firmware's)", silica_rt::time::Civil::from_unix(wall_secs));
+    } else {
+        println!("init: the firmware gave no wall clock; it is unknown until a time server sets it");
+    }
+    let root = Root { parent: silica_proc::Parent { fault: root.parent.exit, time: time.frame(), ..root.parent }, ..root };
     let cmdline: &'static [u8] = &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())];
     let checks: Vec<&[u8]> =
         option(cmdline, "checks").unwrap_or(b"programs,block").split(|b| *b == b',').filter(|c| !c.is_empty()).collect();
@@ -648,6 +661,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         running,
         events,
         kept,
+        time,
         order: order.clone(),
         listed: Vec::new(),
         described: String::new(),

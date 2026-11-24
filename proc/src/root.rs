@@ -81,6 +81,7 @@ pub fn start(info: &'static RootInfo) -> Result<Root, &'static str> {
         debug: Cap(debug),
         cpus: info.cpus,
         clock: info.clock,
+        time: Cap::NONE,
     };
     Ok(Root { archive, parent, ports, ramdisk })
 }

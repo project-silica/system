@@ -114,6 +114,7 @@ pub mod mem;
 pub mod mmio;
 pub mod random;
 pub mod ring;
+pub mod time;
 
 pub use libsys as sys;
 
@@ -159,11 +160,16 @@ pub mod slots {
     /// service's restarts, zeroed at boot): what the next instance needs to
     /// pick up where this one was.
     pub const KEEP: Cap = Cap(11);
+    /// The time page (`crate::time`): what the wall clock reads, as an
+    /// offset from the monotonic clock. Readable by every program the
+    /// service manager or a service starts; writable only by a service
+    /// that sets the time (`sets_time`).
+    pub const TIME: Cap = Cap(12);
     /// The first capability the parent granted beyond these. Slots from
     /// here to 64 that the parent did not fill are left empty, for
     /// capabilities the program is given later; the program's own
     /// allocations start above them.
-    pub const FIRST_GRANT: u64 = 12;
+    pub const FIRST_GRANT: u64 = 13;
 }
 
 /// `ProcessInfo::magic`.

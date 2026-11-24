@@ -42,7 +42,7 @@ struct Shell {
     out: String,
 }
 
-const HELP: &str = "commands: services, stop <service>, start <service>, restart <service>, caps <service|device>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, echo <text>, help\n";
+const HELP: &str = "commands: services, stop <service>, start <service>, restart <service>, caps <service|device>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, date, echo <text>, help\n";
 
 impl Shell {
     fn say(&mut self) {
@@ -56,6 +56,16 @@ impl Shell {
         let arg = words.get(1).copied().unwrap_or("");
         match command {
             "help" => self.out.push_str(HELP),
+            "date" => match silica_rt::time::now() {
+                Some(w) => {
+                    let from = match w.source {
+                        silica_rt::time::Source::Network => "a time server",
+                        _ => "the firmware's clock",
+                    };
+                    let _ = writeln!(self.out, "{} (from {from})", silica_rt::time::Civil::from_unix(w.ns / 1_000_000_000));
+                }
+                None => self.out.push_str("date: the wall clock is not known\n"),
+            },
             "echo" => {
                 let _ = writeln!(self.out, "{}", line.trim_start().strip_prefix("echo").unwrap_or("").trim());
             }
