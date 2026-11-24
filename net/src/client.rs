@@ -31,14 +31,12 @@ impl From<device::Error> for client::Error {
 pub struct Net {
     _endpoint: Handle,
     control: device::Client<Channel, Handle>,
-    info: Info,
 }
 
 impl Control for Net {
     fn open(driver: Handle) -> Result<Net, client::Error> {
-        let mut control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
-        let info = control.info()?.info;
-        Ok(Net { _endpoint: driver, control, info })
+        let control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+        Ok(Net { _endpoint: driver, control })
     }
 
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<Handle, client::Error> {
@@ -100,9 +98,9 @@ impl Interface {
         self.queue.tick()
     }
 
-    /// What the interface is, as its current driver said when it was opened.
+    /// Ask the current driver for the interface's address, MTU and link state.
     pub fn info(&mut self) -> Result<Info, Error> {
-        Ok(self.queue.control()?.info.clone())
+        Ok(self.queue.control()?.control.info()?.info)
     }
 
     /// Register `memory` under the number `id` (below [`crate::MEMORIES`]);

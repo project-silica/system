@@ -161,6 +161,21 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
     let a = info.address.to_le_bytes();
     let mac = [a[0], a[1], a[2], a[3], a[4], a[5]];
     println!("netcheck: MTU {}, link {}", info.mtu, if info.link_up { "up" } else { "down" });
+    if silica_rt::option("link") == Some("cycle") {
+        println!("netcheck: ready for link down");
+        for up in [false, true] {
+            let deadline = silica_rt::clock().now() + 5 * SECOND;
+            let event = nic.kick_wait(Some(deadline)).map_err(|e| why(e, "link change timed out"))?;
+            if event.tag != LINK || event.result != Ok(u32::from(up)) {
+                return Err("unexpected link change");
+            }
+            if nic.info().map_err(|e| why(e, "cannot read changed link state"))?.link_up != up {
+                return Err("interface info disagrees with the link change");
+            }
+            println!("netcheck: confirmed link {}", if up { "up" } else { "down" });
+        }
+        pass("link_cycle");
+    }
     let memory = Memory::new(16).map_err(|e| why(e, "no memory"))?;
     nic.add_memory(0, &memory, true).map_err(|e| why(e, "cannot register memory with the driver"))?;
     let mut c = Check { nic, m: memory.shared(), mac, sent: 0 };
