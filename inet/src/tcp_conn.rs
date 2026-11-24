@@ -320,6 +320,11 @@ pub struct Connection<S> {
     dupacks: u32,
     recover: Option<u32>,
     first_repair: bool,
+    /// What the interface does for this connection's segments
+    /// (`set_offloads`): sums their checksums, and the most payload one
+    /// segment it is given may carry (the MSS when it cuts nothing).
+    checksum_offload: bool,
+    most_payload: u32,
     /// The last reduction, while it can still be shown needless.
     undo: Option<Undo>,
     /// Reductions undone so far.
@@ -421,6 +426,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             dupacks: 0,
             recover: None,
             first_repair: false,
+            checksum_offload: false,
+            most_payload: 0,
             undo: None,
             undone: 0,
             rack_at: 0,
@@ -589,6 +596,29 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             && self.segs_len < SEGS
             && before(self.snd_nxt, self.snd_una.wrapping_add(self.snd_wnd))
             && self.pipe() < self.cwnd
+    }
+
+    /// What the interface does for this connection's segments: sum their
+    /// checksums (each segment then carries only the pseudo-header's sum,
+    /// `tcp::seal_partial`), and take segments of up to `most_payload`
+    /// bytes of data, which it cuts into MSS-sized ones (TCP segmentation
+    /// offload; at most the MSS for an interface that does not). The
+    /// caller asks the interface for what it said, for every segment
+    /// `poll` gives, and segmentation only with the checksum.
+    pub fn set_offloads(&mut self, checksum: bool, most_payload: u32) {
+        self.checksum_offload = checksum;
+        self.most_payload = if checksum { most_payload } else { 0 };
+    }
+
+    /// The most data one segment `poll` gives may carry: the MSS, or as many
+    /// MSS as the interface cuts and the scoreboard has records for.
+    fn burst(&self) -> u32 {
+        let mss = self.mss.max(1);
+        if self.most_payload <= mss {
+            return mss;
+        }
+        let records = (SEGS - self.segs_len) as u32;
+        (self.most_payload / mss).min(records).max(1) * mss
     }
 
     /// Bytes the send buffer holds at most (0 once shed).
@@ -910,7 +940,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             let o = self.options(now);
             return self.emit(out, h, &o, None);
         }
-        let n = (waiting as u32).min(self.mss).min(room);
+        // What the caller's buffer holds behind the longest TCP header, too:
+        // the segment is counted as sent before it is written.
+        let fits = out.len().saturating_sub(60) as u32;
+        let n = (waiting as u32).min(self.burst()).min(room).min(fits);
         let fin = fin_waits && n as usize == waiting && (n < room || waiting == 0);
         if n == 0 && !fin {
             return None;
@@ -928,7 +961,21 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         if fin {
             self.fin_sent = Some(fin_seq);
         }
-        self.record(start, start.wrapping_add(len), now);
+        // One record a segment as it goes on the wire, so that SACK and
+        // RACK judge each one the interface cuts from a longer segment.
+        // The FIN goes with the last of them.
+        let mut at = start;
+        let data_end = start.wrapping_add(n);
+        loop {
+            let piece = data_end.wrapping_sub(at).min(self.mss.max(1));
+            let last = at.wrapping_add(piece) == data_end;
+            let piece_end = at.wrapping_add(piece + u32::from(last && fin));
+            self.record(at, piece_end, now);
+            at = piece_end;
+            if last {
+                break;
+            }
+        }
         self.sent(now, len);
         self.emit(out, h, &o, Some((offset, n as usize)))
     }
@@ -1230,7 +1277,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         let end = n + len;
         let copied = self.send.peek(offset, out.get_mut(n..end)?);
         debug_assert_eq!(copied, len);
-        tcp::seal(&mut out[..end], self.ends.local, self.ends.remote);
+        if self.checksum_offload {
+            tcp::seal_partial(&mut out[..end], self.ends.local, self.ends.remote);
+        } else {
+            tcp::seal(&mut out[..end], self.ends.local, self.ends.remote);
+        }
         Some(end)
     }
 

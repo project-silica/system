@@ -167,7 +167,7 @@ impl<D: Device> Service<D> {
             let m = region.ok_or(invalid)?;
             let fits = (r.offset as u64).checked_add(r.length as u64).is_some_and(|end| end <= m.bytes);
             let ok = match r.op {
-                Op::Transmit => (HEADER..=largest).contains(&r.length),
+                Op::Transmit => r.length >= HEADER && r.offload.allowed(r.length, &info),
                 Op::Receive => m.writable && r.length >= receive,
             };
             if !(fits && ok) {

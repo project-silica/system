@@ -404,7 +404,9 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     regs.write32(IMS, INT_RXQ0 | INT_TXQ0 | INT_OTHER | INT_LSC);
 
     let mut nic = Nic {
-        info: Info { address, mtu: 1500, link_up: false, receive_bytes: RECEIVE_BYTES },
+        // No offloads yet: its TSO and checksum context descriptors are owed
+        // (spec/MILESTONES.md, M4).
+        info: Info { address, mtu: 1500, link_up: false, receive_bytes: RECEIVE_BYTES, offloads: 0, segment_bytes: 0 },
         regs,
         dma,
         rx,

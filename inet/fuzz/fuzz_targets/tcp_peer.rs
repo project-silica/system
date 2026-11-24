@@ -58,7 +58,13 @@ fuzz_target!(|data: &[u8]| {
         peer_seq = peer_seq.wrapping_add(1);
         Connection::accept(ends, &syn, iss, 1500, buffers)
     };
-    let mut out = vec![0u8; 1600];
+    // An interface that sums checksums and cuts segments of up to 44 MSS
+    // (silica.net.Device's offloads), for inputs whose first byte says so.
+    let offloads = first & 2 != 0;
+    if offloads {
+        c.set_offloads(true, 44 * 1448);
+    }
+    let mut out = vec![0u8; if offloads { 1 << 16 } else { 1600 }];
     let mut sent_by_us: Vec<(u32, u32)> = Vec::new();
     let mut steps = 0;
     while let Some(op) = input.u8() {
@@ -127,8 +133,13 @@ fuzz_target!(|data: &[u8]| {
         while let Some(n) = c.poll(now, &mut out) {
             polls += 1;
             assert!(polls < 1000, "poll goes on giving segments");
+            if offloads {
+                // What the device does before the segment is on the wire.
+                tcp::seal(&mut out[..n], US, PEER);
+            }
             let s = tcp::parse(&out[..n], US, PEER).expect("a segment the connection built does not parse");
-            assert!(s.data.len() as u32 <= c.mss().max(1), "a segment larger than the MSS");
+            let most = if offloads { 44 * 1448 } else { c.mss().max(1) };
+            assert!(s.data.len() as u32 <= most, "a segment larger than the MSS, or than the interface cuts");
             sent_by_us.push((s.header.seq, s.len()));
         }
         assert!(c.readable() <= RECEIVE);

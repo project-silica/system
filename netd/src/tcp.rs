@@ -161,8 +161,10 @@ impl Watched {
 pub trait Out {
     /// Whether a packet can be sent now (a transmit slot is free).
     fn room(&self) -> bool;
-    /// Send TCP segment `segment` to `remote`.
-    fn send(&mut self, remote: Ipv4, segment: &[u8]);
+    /// Send TCP segment `segment` to `remote`. `partial`: its checksum
+    /// holds only the pseudo-header's sum, for the interface to finish, and
+    /// one carrying more than `mss` bytes of data is for it to cut.
+    fn send(&mut self, remote: Ipv4, segment: &[u8], partial: bool, mss: u16);
 }
 
 pub struct Tcp {
@@ -177,6 +179,11 @@ pub struct Tcp {
     note: Cap,
     /// The interface's largest payload.
     mtu: u16,
+    /// What the interface does for TCP's segments, given to every
+    /// connection (`Connection::set_offloads`): sums their checksums, and
+    /// cuts ones of up to this much data (0: none).
+    checksum_offload: bool,
+    most_payload: u32,
     scratch: Vec<u8>,
     segment: Vec<u8>,
 }
@@ -280,8 +287,11 @@ fn reason(e: Option<Failure>) -> u32 {
 }
 
 impl Tcp {
-    pub fn new(note: Cap, mtu: u16, records: Option<Mmio>) -> Tcp {
+    pub fn new(note: Cap, mtu: u16, records: Option<Mmio>, checksum_offload: bool, most_payload: u32) -> Tcp {
         let slots = records.as_ref().map_or(0, |r| r.len() / RECORD);
+        // A segment's TCP header and data: the most the interface cuts, else
+        // the MTU's worth.
+        let segment = 60 + (most_payload as usize).max(usize::from(mtu));
         Tcp {
             records,
             recorded: vec![false; slots],
@@ -291,8 +301,10 @@ impl Tcp {
             next: 1,
             note,
             mtu,
+            checksum_offload,
+            most_payload,
             scratch: vec![0; 16 << 10],
-            segment: vec![0; 1600],
+            segment: vec![0; segment],
         }
     }
 
@@ -344,7 +356,8 @@ impl Tcp {
                 && self.conns.len() < CONNECTIONS
                 && let Some(buffers) = buffers()
             {
-                let tcp = Connection::accept(ends, s, silica_rt::random::u64() as u32, self.mtu, buffers);
+                let mut tcp = Connection::accept(ends, s, silica_rt::random::u64() as u32, self.mtu, buffers);
+                tcp.set_offloads(self.checksum_offload, self.most_payload);
                 let id = self.number();
                 let record = self.record(&tcp);
                 self.conns.push(Conn { id, record, owner, tcp, streams: None, listener: Some(lid), announced: false, released: false });
@@ -461,7 +474,7 @@ impl Tcp {
             // Its segments, while there is room for them.
             while out.room() {
                 match c.tcp.poll(now, segment) {
-                    Some(n) => out.send(c.tcp.endpoints().remote, &segment[..n]),
+                    Some(n) => out.send(c.tcp.endpoints().remote, &segment[..n], self.checksum_offload, c.tcp.mss() as u16),
                     None => break,
                 }
             }
@@ -676,7 +689,8 @@ impl Tcp {
             .ok_or(Error::NoRoom)?;
         let ends = Endpoints { local, local_port: port, remote, remote_port: peer.port };
         let buffers = buffers().ok_or(Error::NoRoom)?;
-        let tcp = Connection::connect(ends, silica_rt::random::u64() as u32, self.mtu, buffers);
+        let mut tcp = Connection::connect(ends, silica_rt::random::u64() as u32, self.mtu, buffers);
+        tcp.set_offloads(self.checksum_offload, self.most_payload);
         let id = self.number();
         let requests = self.requests(id)?;
         let wake = Watched::new(wake, self.note)?;
@@ -756,7 +770,7 @@ impl Tcp {
         }
         if let Some(n) = silica_inet::tcp::build(&mut self.segment, local, remote, h, &Options::default(), &[]) {
             let seg = core::mem::take(&mut self.segment);
-            out.send(remote, &seg[..n]);
+            out.send(remote, &seg[..n], false, 0);
             self.segment = seg;
         }
     }

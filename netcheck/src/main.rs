@@ -119,7 +119,14 @@ impl Check {
     }
 
     fn offer(&mut self, tag: u64) -> Result<(), &'static str> {
-        let r = Request { op: Op::Receive, memory: 0, offset: (tag as u32 - 1) * BUFFER, length: BUFFER, tag };
+        let r = Request {
+            op: Op::Receive,
+            memory: 0,
+            offset: (tag as u32 - 1) * BUFFER,
+            length: BUFFER,
+            tag,
+            offload: silica_net::Offload::NONE,
+        };
         self.nic.submit(&r).map_err(|e| why(e, "cannot offer a receive buffer"))
     }
 
@@ -127,7 +134,14 @@ impl Check {
     /// `receive` waits).
     fn send(&mut self, len: u32) -> Result<(), &'static str> {
         self.sent += 1;
-        let r = Request { op: Op::Transmit, memory: 0, offset: OUT, length: len.max(60), tag: SENT + self.sent };
+        let r = Request {
+            op: Op::Transmit,
+            memory: 0,
+            offset: OUT,
+            length: len.max(60),
+            tag: SENT + self.sent,
+            offload: silica_net::Offload::NONE,
+        };
         self.nic.submit(&r).map_err(|e| why(e, "cannot send"))?;
         Ok(())
     }
@@ -307,7 +321,14 @@ fn bench(c: &mut Check, driver: &str) -> Result<(), &'static str> {
     while clock.now() < end || done < sent {
         while sent - done < 128 && clock.now() < end {
             sent += 1;
-            let r = Request { op: Op::Transmit, memory: 0, offset: OUT, length: 1514, tag: SENT + c.sent + sent };
+            let r = Request {
+                op: Op::Transmit,
+                memory: 0,
+                offset: OUT,
+                length: 1514,
+                tag: SENT + c.sent + sent,
+                offload: silica_net::Offload::NONE,
+            };
             c.nic.submit(&r).map_err(|e| why(e, "cannot send"))?;
         }
         let got = c.nic.kick_wait(Some(end + SECOND)).map_err(|e| why(e, "a frame was not sent in time"))?;

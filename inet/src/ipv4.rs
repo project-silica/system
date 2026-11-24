@@ -70,11 +70,19 @@ pub fn parse(p: &[u8]) -> Result<Packet<'_>, Malformed> {
 /// (don't-fragment set: the stack does not fragment what it sends); returns
 /// the payload's place after it.
 pub fn header(out: &mut [u8], src: Ipv4, dst: Ipv4, protocol: u8, id: u16, payload_len: usize) -> Option<&mut [u8]> {
-    let total = u16::try_from(HEADER + payload_len).ok()?;
     if out.len() < HEADER + payload_len {
         return None;
     }
-    let h = &mut out[..HEADER];
+    header_only(&mut out[..HEADER], src, dst, protocol, id, payload_len)?;
+    Some(&mut out[HEADER..HEADER + payload_len])
+}
+
+/// The header alone, into the first 20 bytes of `out`, for a payload of
+/// `payload_len` bytes written elsewhere; `None` when `out` is shorter or
+/// the packet would be longer than IPv4 allows.
+pub fn header_only(out: &mut [u8], src: Ipv4, dst: Ipv4, protocol: u8, id: u16, payload_len: usize) -> Option<()> {
+    let total = u16::try_from(HEADER + payload_len).ok()?;
+    let h = out.get_mut(..HEADER)?;
     h[0] = 0x45;
     h[1] = 0;
     h[2..4].copy_from_slice(&total.to_be_bytes());
@@ -87,7 +95,7 @@ pub fn header(out: &mut [u8], src: Ipv4, dst: Ipv4, protocol: u8, id: u16, paylo
     h[16..20].copy_from_slice(&dst.0);
     let sum = checksum::of(h);
     h[10..12].copy_from_slice(&sum.to_be_bytes());
-    Some(&mut out[HEADER..HEADER + payload_len])
+    Some(())
 }
 
 #[cfg(test)]

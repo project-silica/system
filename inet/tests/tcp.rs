@@ -58,6 +58,42 @@ struct Net {
     /// A's send buffer doubles, up to this many bytes, whenever it is what
     /// holds A back and A has more to send (netd's policy).
     grow_to: usize,
+    /// A's interface sums checksums and cuts segments into pieces of this
+    /// many bytes of data (`device_cuts`), as `silica.net.Device`'s offloads.
+    device: Option<usize>,
+    /// Everything due at one instant is delivered before anyone sends.
+    batch: bool,
+    /// Segments A's `poll` gave (before any cutting).
+    a_polls: usize,
+}
+
+/// What a device with the checksum and TCP segmentation offloads sends for
+/// one segment it is given: pieces of at most `mss` bytes of data behind
+/// copies of its header, their sequence numbers advanced, FIN and PSH on the
+/// last only, each checksum summed (the given segment's field holds only
+/// the pseudo-header's sum).
+fn device_cuts(seg: &[u8], mss: usize) -> Vec<Vec<u8>> {
+    let header = usize::from(seg[12] >> 4) * 4;
+    let data = &seg[header..];
+    let seq = u32::from_be_bytes(seg[4..8].try_into().unwrap());
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    loop {
+        let n = (data.len() - at).min(mss);
+        let last = at + n == data.len();
+        let mut p = seg[..header].to_vec();
+        p[4..8].copy_from_slice(&seq.wrapping_add(at as u32).to_be_bytes());
+        if !last {
+            p[13] &= !(0x01 | 0x08);
+        }
+        p.extend_from_slice(&data[at..at + n]);
+        tcp::seal(&mut p, A, B);
+        pieces.push(p);
+        at += n;
+        if last {
+            return pieces;
+        }
+    }
 }
 
 impl Net {
@@ -77,6 +113,9 @@ impl Net {
             log: Vec::new(),
             b_buffers,
             grow_to: 0,
+            device: None,
+            a_polls: 0,
+            batch: false,
         }
     }
 
@@ -90,11 +129,15 @@ impl Net {
             let last: Vec<_> = sent[sent.len() - 4..].iter().map(|b| tcp::parse(b, src, dst).map(|s| (s.header, s.data.len()))).collect();
             panic!("{who} sent {BURST} segments at one instant; the last: {last:?}");
         };
-        let mut out = [0u8; 1600];
+        let mut out = vec![0u8; 1 << 16];
         let mut sent = Vec::new();
         while let Some(n) = self.a.poll(self.now, &mut out) {
-            sent.push(out[..n].to_vec());
-            if sent.len() == BURST {
+            match self.device {
+                Some(mss) => sent.extend(device_cuts(&out[..n], mss)),
+                None => sent.push(out[..n].to_vec()),
+            }
+            self.a_polls += 1;
+            if sent.len() >= BURST {
                 stuck("A", &sent, A, B);
             }
         }
@@ -140,9 +183,17 @@ impl Net {
         self.now = self.now.max(t);
         let previous_window = self.a.info().cwnd;
         if next_wire == Some(t) {
-            let i = self.wire.iter().position(|f| f.at == t).unwrap();
-            let f = self.wire.remove(i);
-            self.deliver(f);
+            // With `batch`, everything due now arrives before either side
+            // sends again, as a stack takes in what its device delivered
+            // before it sends (what lets segments to cut gather).
+            loop {
+                let i = self.wire.iter().position(|f| f.at == t).unwrap();
+                let f = self.wire.remove(i);
+                self.deliver(f);
+                if !self.batch || !self.wire.iter().any(|f| f.at == t) {
+                    break;
+                }
+            }
         } else {
             let retries = self.a.info().retries;
             self.a.on_time(self.now);
@@ -813,6 +864,8 @@ struct Run {
     secs: f64,
     redundant: usize,
     reductions: usize,
+    /// Segments A's `poll` gave.
+    polls: usize,
 }
 
 /// Moves 4 MiB from A to B over a 2 ms round trip with 64 KiB buffers,
@@ -821,10 +874,20 @@ struct Run {
 /// others (no delay instead of 1 ms) and 1% arrive twice; for each of five
 /// seeds.
 fn time_through_loss(loss: u64, rough: bool) -> Vec<Run> {
+    time_through(loss, rough, false, false)
+}
+
+/// As `time_through_loss`, A's interface with the offloads when `cut`.
+fn time_through(loss: u64, rough: bool, cut: bool, batch: bool) -> Vec<Run> {
     (1..=5u64)
         .map(|seed| {
             let mut net = Net::new((65536, 65536), (65536, 65536));
             net.delay = MS;
+            net.batch = batch;
+            if cut {
+                net.a.set_offloads(true, 44 * 1448);
+                net.device = Some(1448);
+            }
             let mut drops = Rng(seed * 7919);
             // The first copy that survived the drop decision will arrive, even
             // if its ACK is lost. Count retries of those ranges separately.
@@ -864,6 +927,7 @@ fn time_through_loss(loss: u64, rough: bool) -> Vec<Run> {
                 secs: (net.now - start) as f64 / SECOND as f64,
                 redundant: redundant.get(),
                 reductions: net.window_reductions.saturating_sub(undone),
+                polls: net.a_polls,
             }
         })
         .collect()
@@ -912,5 +976,29 @@ fn reordering_alone_is_learned_not_paid_for() {
     for (r, c) in time_through_loss(0, true).iter().zip(&clean) {
         assert!(r.reductions <= 6 && r.redundant <= 50, "{r:?}");
         assert!(r.secs < c.secs * 1.1, "{r:?} against {c:?} on a clean path");
+    }
+}
+
+#[test]
+fn an_interface_that_cuts_and_sums_carries_the_same_bytes_in_fewer_segments() {
+    // Every byte arrives (checked inside), in the same time or less, on a
+    // clean path, with 2% loss, and on the interop path's impairments,
+    // when A gives its interface segments of up to 44 MSS to cut and only
+    // the pseudo-header's sum to finish.
+    for (loss, rough) in [(0, false), (2, false), (2, true)] {
+        let whole = time_through(loss, rough, false, true);
+        let cut = time_through(loss, rough, true, true);
+        let worst = |runs: &[Run]| runs.iter().map(|r| r.secs).fold(0.0, f64::max);
+        eprintln!(
+            "{loss}% loss, reordered {rough}: {:.3} s and {} segments given, cut: {:.3} s and {} given",
+            worst(&whole),
+            whole[0].polls,
+            worst(&cut),
+            cut[0].polls
+        );
+        assert!(worst(&cut) <= worst(&whole) * 1.1, "{whole:?} against {cut:?}");
+        if loss == 0 {
+            assert!(cut[0].polls * 8 < whole[0].polls, "{} segments given, {} without the offload", cut[0].polls, whole[0].polls);
+        }
     }
 }

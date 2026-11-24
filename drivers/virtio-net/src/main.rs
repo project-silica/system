@@ -6,14 +6,17 @@
 //! frame, and the two queues. Frames are never touched here: the device
 //! reads what it sends from the client's memory and writes what it receives
 //! into it, at the addresses the IOMMU gives it; the driver supplies only
-//! the 12-byte header the device reads before a frame (all zeros: no
-//! offloads) or writes before one it received.
+//! the 12-byte header the device reads before a frame (a transmit's
+//! offloads, one header per transmit slot) or writes before one it received.
 //!
 //! Features accepted: the device's address (`MAC`; without it the driver
 //! makes a locally administered one from the device's identity), its MTU
-//! (`MTU`; else 1500), and the link's state (`STATUS`; else the link is
-//! taken to be up). No checksum or segmentation offloads yet, and one pair
-//! of queues. Receive queue: MSI-X entry 0; transmit queue: 1;
+//! (`MTU`; else 1500), the link's state (`STATUS`; else the link is taken to
+//! be up), and the transmit offloads the class protocol carries: the
+//! checksum (`CSUM`) and TCP over IPv4 segmentation (`HOST_TSO4`), each
+//! offered to the client in `Info::offloads` only when negotiated. Nothing
+//! on receive is offloaded yet, and one pair of queues. Receive queue:
+//! MSI-X entry 0; transmit queue: 1;
 //! configuration changes (the link): 2, or 0 when the device has fewer.
 //!
 //! A frame the device has not sent in [`TX_TIMEOUT_NS`] ends the driver, as
@@ -38,9 +41,18 @@ use silica_rt::{ProcessInfo, println};
 
 silica_rt::main!(main);
 
+/// The device sums a frame's checksum when the header asks (NEEDS_CSUM).
+const F_CSUM: u64 = 1 << 0;
 const F_MTU: u64 = 1 << 3;
 const F_MAC: u64 = 1 << 5;
+/// The device cuts TCP over IPv4 frames (`gso_type` TCPV4; needs F_CSUM).
+const F_HOST_TSO4: u64 = 1 << 11;
 const F_STATUS: u64 = 1 << 16;
+/// The header's flag: sum from `csum_start`, store at `csum_offset` past it.
+const NEEDS_CSUM: u8 = 1;
+const GSO_TCPV4: u8 = 1;
+/// The longest frame a segmentation request gives: an IPv4 packet's most.
+const SEGMENT_BYTES: u32 = 65535 + silica_net::HEADER;
 const S_LINK_UP: u16 = 1;
 /// The header in front of every frame (`struct virtio_net_hdr`, with
 /// `num_buffers`, as every virtio 1 device has it).
@@ -62,8 +74,9 @@ struct Nic {
     tx: Queue,
     /// A header per receive slot, which the device writes.
     rx_headers: DmaMemory,
-    /// The one header every frame is sent with: zeros, read by the device.
-    tx_header: DmaMemory,
+    /// A header per transmit slot, which the device reads: the request's
+    /// offloads, or zeros.
+    tx_headers: DmaMemory,
     /// The request in each slot while the device has it (transmits with
     /// when they were started).
     rx_slots: Vec<Option<Ticket>>,
@@ -120,7 +133,19 @@ impl silica_net::service::Device for Nic {
             }
             Op::Transmit => {
                 let Some(slot) = self.tx_free.pop() else { return Err(Refusal::Busy) };
-                let header = Buffer { address: self.tx_header.device_address(), len: HEADER, device_writes: false };
+                // struct virtio_net_hdr: flags, gso_type, hdr_len, gso_size,
+                // csum_start, csum_offset (num_buffers is the device's).
+                // The service checked the offloads against `info`, which
+                // has only those negotiated.
+                let o = r.offload;
+                let h = self.tx_headers.shared();
+                let at = slot as usize * 16;
+                let flags = if o.checksum { NEEDS_CSUM } else { 0 };
+                let gso = if o.segmentation { GSO_TCPV4 } else { 0 };
+                h.write32(at, u32::from(flags) | u32::from(gso) << 8 | u32::from(o.header_bytes) << 16);
+                h.write32(at + 4, u32::from(o.segment) | u32::from(o.checksum_start) << 16);
+                h.write32(at + 8, u32::from(o.checksum_offset));
+                let header = Buffer { address: self.tx_headers.device_address() + at as u64, len: HEADER, device_writes: false };
                 let data = Buffer { address, len: r.length, device_writes: false };
                 if self.tx.add(&[header, data], slot as u64).is_err() {
                     self.tx_free.push(slot);
@@ -213,7 +238,14 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let device = Device::take(info)?;
     let dma = Dma::new(&device)?;
     let transport = Transport::new(&device)?;
-    let features = transport.negotiate(&dma, F_MTU | F_MAC | F_STATUS, 0)?;
+    let features = transport.negotiate(&dma, F_CSUM | F_HOST_TSO4 | F_MTU | F_MAC | F_STATUS, 0)?;
+    let mut offloads = 0;
+    if features & F_CSUM != 0 {
+        offloads |= silica_net::OFFLOAD_CHECKSUM;
+        if features & F_HOST_TSO4 != 0 {
+            offloads |= silica_net::OFFLOAD_TCP4_SEGMENT;
+        }
+    }
     if transport.queues() < 2 {
         return Err(DeviceError::Missing("a receive and a transmit queue"));
     }
@@ -276,14 +308,22 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let tx_count = (tx.size() / 2) as usize;
     let mut nic = Nic {
         rx_headers: dma.memory(12, true)?,
-        tx_header: dma.memory(12, false)?,
+        // 16 bytes a transmit slot, at most 128 slots: one page.
+        tx_headers: dma.memory(12, false)?,
         rx_slots: (0..rx_count).map(|_| None).collect(),
         tx_slots: (0..tx_count).map(|_| None).collect(),
         rx_free: (0..rx_count as u16).rev().collect(),
         tx_free: (0..tx_count as u16).rev().collect(),
         // (Each receive descriptor bounds what the device writes: a buffer
         // the size of the largest frame is enough.)
-        info: Info { address, mtu, link_up: true, receive_bytes: mtu + silica_net::HEADER },
+        info: Info {
+            address,
+            mtu,
+            link_up: true,
+            receive_bytes: mtu + silica_net::HEADER,
+            offloads,
+            segment_bytes: if offloads & silica_net::OFFLOAD_TCP4_SEGMENT != 0 { SEGMENT_BYTES } else { 0 },
+        },
         status_feature: features & F_STATUS != 0,
         transport,
         dma,

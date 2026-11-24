@@ -222,6 +222,15 @@ pub fn seal(seg: &mut [u8], src: Ipv4, dst: Ipv4) {
     seg[16..18].copy_from_slice(&sum.to_be_bytes());
 }
 
+/// For an interface that sums the checksum (`silica.net.Device`'s checksum
+/// offload): only the pseudo-header's folded sum goes in the field, not
+/// complemented, as the device adds the segment's bytes and complements.
+/// `len` is the whole segment's TCP length, also when the device cuts it.
+pub fn seal_partial(seg: &mut [u8], src: Ipv4, dst: Ipv4) {
+    let sum = !Sum::new().pseudo(src, dst, crate::ipv4::TCP, seg.len() as u16).finish();
+    seg[16..18].copy_from_slice(&sum.to_be_bytes());
+}
+
 /// Write a whole segment carrying `data`; returns its length.
 pub fn build(out: &mut [u8], src: Ipv4, dst: Ipv4, h: &Header, options: &Options, data: &[u8]) -> Option<usize> {
     let n = header(out, h, options)?;

@@ -88,7 +88,14 @@ impl Load {
     }
 
     fn offer(&mut self, tag: u64) -> Result<(), &'static str> {
-        let r = Request { op: Op::Receive, memory: 0, offset: (tag as u32 - 1) * BUFFER, length: BUFFER, tag };
+        let r = Request {
+            op: Op::Receive,
+            memory: 0,
+            offset: (tag as u32 - 1) * BUFFER,
+            length: BUFFER,
+            tag,
+            offload: silica_net::Offload::NONE,
+        };
         self.nic.submit(&r).map_err(|_| "cannot offer a receive buffer")
     }
 
@@ -106,7 +113,8 @@ impl Load {
         let sum = checksum(&self.m, o + 34, 8);
         self.put(o + 36, &sum.to_be_bytes());
         self.tx += 1;
-        let r = Request { op: Op::Transmit, memory: 0, offset: o as u32, length: 60, tag: SENT + self.tx };
+        let r =
+            Request { op: Op::Transmit, memory: 0, offset: o as u32, length: 60, tag: SENT + self.tx, offload: silica_net::Offload::NONE };
         self.nic.submit(&r).map_err(|_| "cannot send")?;
         self.nic.kick();
         Ok(())
@@ -148,7 +156,9 @@ fn run() -> Result<(), &'static str> {
     l.put(o + 32, &[0; 6]);
     l.put(o + 38, &GATEWAY);
     l.tx += 1;
-    l.nic.submit(&Request { op: Op::Transmit, memory: 0, offset: OUT, length: 60, tag: SENT + l.tx }).map_err(|_| "cannot send")?;
+    l.nic
+        .submit(&Request { op: Op::Transmit, memory: 0, offset: OUT, length: 60, tag: SENT + l.tx, offload: silica_net::Offload::NONE })
+        .map_err(|_| "cannot send")?;
     l.nic.kick();
     let clock = silica_rt::clock();
     loop {

@@ -56,8 +56,13 @@ const DEVICES: Cap = Cap(slots::FIRST_GRANT + 1);
 const BUFFERS: u64 = 16;
 const BUFFER: usize = 2048;
 const SLOTS: usize = 8;
-/// Transmit tags: `SENT + slot`.
+/// Transmit tags: `SENT + slot`, then `SENT + SLOTS + burst`.
 const SENT: u64 = 1 << 32;
+/// Transmit buffers for TCP segments the interface cuts (its segmentation
+/// offload): `BURSTS` of `BURST` bytes in memory 1, registered only with an
+/// interface that cuts. A frame of 64 KiB holds 45 segments of 1448 bytes.
+const BURSTS: usize = 4;
+const BURST: usize = 1 << 16;
 /// Neighbours remembered, and for how long.
 const NEIGHBOURS: usize = 16;
 const NEIGHBOUR_LIFE: u64 = 300 * SECOND;
@@ -160,6 +165,25 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
     }
     let memory = Memory::new(16).map_err(|_| "no memory for frames")?;
     nic.add_memory(0, &memory, true).map_err(|_| "cannot register memory with the driver")?;
+    // The interface's offloads: TCP's checksums summed by it, and segments
+    // of up to a burst buffer cut by it.
+    let checksum_offload = info.offloads & silica_net::OFFLOAD_CHECKSUM != 0;
+    let cuts = checksum_offload && info.offloads & silica_net::OFFLOAD_TCP4_SEGMENT != 0 && info.segment_bytes as usize >= 2 * BUFFER;
+    let burst_memory = if cuts {
+        let m = Memory::new(BURST.trailing_zeros() as u8 + BURSTS.trailing_zeros() as u8).map_err(|_| "no memory for frames")?;
+        nic.add_memory(1, &m, false).map_err(|_| "cannot register memory with the driver")?;
+        Some(m)
+    } else {
+        None
+    };
+    // Data a cut segment may carry: its frame within a burst buffer and
+    // the interface's most, behind Ethernet, IPv4 and the longest TCP header.
+    let most_payload = if cuts { (info.segment_bytes as usize).min(BURST) - ether::HEADER - ipv4::HEADER - 60 } else { 0 };
+    println!(
+        "netd: offloads: checksums {}, TCP segmentation {}",
+        if checksum_offload { "on" } else { "off" },
+        if cuts { "on" } else { "off" }
+    );
     let now = silica_rt::clock().now();
     // The lease an earlier instance held on this boot, if it is this
     // interface's and has not ended: held again at once (`Client::resume`).
@@ -190,6 +214,8 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         m: memory.shared(),
         mac,
         free: (1 << SLOTS) - 1,
+        bursts: burst_memory.as_ref().map(|m| m.shared()),
+        bursts_free: (1 << BURSTS) - 1,
         dhcp,
         lease,
         keep,
@@ -200,7 +226,7 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         out: [0; BUFFER],
         probe: None,
         dropped: Dropped::default(),
-        tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records)),
+        tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
         resets,
         time: TimeClient::new(clock, now),
         caller: 0,
@@ -392,6 +418,10 @@ struct Stack {
     mac: Mac,
     /// Free transmit slots, a bit each.
     free: u32,
+    /// The burst buffers (memory 1) and which are free, with an interface
+    /// that cuts TCP segments.
+    bursts: Option<Mmio>,
+    bursts_free: u32,
     dhcp: Client,
     lease: Option<Lease>,
     /// The page kept across restarts (`slots::KEEP`), the lease in it.
@@ -419,7 +449,14 @@ struct Stack {
 
 impl Stack {
     fn offer(&mut self, tag: u64) -> Result<(), &'static str> {
-        let r = Request { op: Op::Receive, memory: 0, offset: (tag as usize - 1) as u32 * BUFFER as u32, length: BUFFER as u32, tag };
+        let r = Request {
+            op: Op::Receive,
+            memory: 0,
+            offset: (tag as usize - 1) as u32 * BUFFER as u32,
+            length: BUFFER as u32,
+            tag,
+            offload: silica_net::Offload::NONE,
+        };
         self.nic.submit(&r).map_err(|_| "cannot offer a receive buffer")
     }
 
@@ -436,7 +473,14 @@ impl Stack {
         let len = ether::pad(&mut self.out, len);
         let at = (BUFFERS as usize + slot) * BUFFER;
         self.m.write_bytes(at, &self.out[..len]);
-        let r = Request { op: Op::Transmit, memory: 0, offset: at as u32, length: len as u32, tag: SENT + slot as u64 };
+        let r = Request {
+            op: Op::Transmit,
+            memory: 0,
+            offset: at as u32,
+            length: len as u32,
+            tag: SENT + slot as u64,
+            offload: silica_net::Offload::NONE,
+        };
         if self.nic.submit(&r).is_err() {
             self.free |= 1 << slot;
             self.dropped.no_slot += 1;
@@ -473,7 +517,12 @@ impl Stack {
             }
             if c.tag >= SENT {
                 // A failed send is the network's to lose, as a dropped frame is.
-                self.free |= 1 << (c.tag - SENT);
+                let k = c.tag - SENT;
+                if k < SLOTS as u64 {
+                    self.free |= 1 << k;
+                } else if k - (SLOTS as u64) < BURSTS as u64 {
+                    self.bursts_free |= 1 << (k - SLOTS as u64);
+                }
                 continue;
             }
             if let Ok(n) = c.result {
@@ -495,7 +544,11 @@ impl Stack {
         let blocked = tcp.pump(now, self);
         let asleep = tcp.sleep();
         self.tcp = Some(tcp);
-        self.more = (blocked && self.free != 0) || !asleep || !self.nic.sleep();
+        // Blocked for want of a buffer: look again only if one is free now,
+        // else wait for the interface to give one back (looking again at
+        // once, with only burst buffers short, kept a processor from the
+        // driver that was to give them back).
+        self.more = (blocked && tcp::Out::room(self)) || !asleep || !self.nic.sleep();
     }
 
     /// The soonest of what waits for a time.
@@ -755,6 +808,87 @@ impl Stack {
         }
     }
 
+    /// A TCP segment whose checksum the interface finishes (it holds the
+    /// pseudo-header's sum), and that it cuts when it carries more than
+    /// `mss` bytes of data: its Ethernet and IPv4 headers and the segment
+    /// written straight into a transmit buffer, a burst buffer for one to
+    /// cut. A segment whose next hop is not known yet is finished here and
+    /// held as any packet; one to cut is dropped and counted (TCP sends it
+    /// again), as is one with no buffer free.
+    fn send_tcp(&mut self, dst: Ipv4, segment: &[u8], mss: u16) {
+        let Some(l) = self.lease else { return };
+        let hop = if l.address.same_subnet(dst, l.prefix) {
+            dst
+        } else if let Some(r) = l.router {
+            r
+        } else {
+            self.dropped.unresolved += 1;
+            return;
+        };
+        let header = usize::from(segment[12] >> 4) * 4;
+        let cut = segment.len() - header > usize::from(mss);
+        let Some(mac) = self.neighbour(hop, silica_rt::clock().now()) else {
+            if cut || segment.len() > BUFFER - ether::HEADER - ipv4::HEADER {
+                self.dropped.unresolved += 1;
+                return;
+            }
+            let mut whole = [0u8; BUFFER];
+            let s = &mut whole[..segment.len()];
+            s.copy_from_slice(segment);
+            silica_inet::tcp::seal(s, l.address, dst);
+            return self.send_ip(dst, ipv4::TCP, s);
+        };
+        let mut head = [0u8; ether::HEADER + ipv4::HEADER];
+        let id = self.next_id();
+        let _ = ether::header(&mut head, mac, self.mac, ether::IPV4);
+        if ipv4::header_only(&mut head[ether::HEADER..], l.address, dst, ipv4::TCP, id, segment.len()).is_none() {
+            return;
+        }
+        let len = head.len() + segment.len();
+        let (memory, at, tag, m) = if len <= BUFFER && !cut {
+            if self.free == 0 {
+                self.dropped.no_slot += 1;
+                return;
+            }
+            let slot = self.free.trailing_zeros() as usize;
+            self.free &= !(1 << slot);
+            (0, (BUFFERS as usize + slot) * BUFFER, SENT + slot as u64, &self.m)
+        } else {
+            let Some(m) = self.bursts.as_ref().filter(|_| self.bursts_free != 0 && len <= BURST) else {
+                self.dropped.no_slot += 1;
+                return;
+            };
+            let burst = self.bursts_free.trailing_zeros() as usize;
+            self.bursts_free &= !(1 << burst);
+            (1, burst * BURST, SENT + (SLOTS + burst) as u64, m)
+        };
+        m.write_bytes(at, &head);
+        m.write_bytes(at + head.len(), segment);
+        // The shortest frame: zeros behind, which add nothing to the sum.
+        let length = len.max(ether::MIN_FRAME);
+        if length > len {
+            m.write_bytes(at + len, &[0u8; ether::MIN_FRAME][..length - len]);
+        }
+        let start = head.len() as u16;
+        let offload = silica_net::Offload {
+            checksum: true,
+            segmentation: cut,
+            checksum_start: start,
+            checksum_offset: 16,
+            segment: if cut { mss } else { 0 },
+            header_bytes: if cut { start + header as u16 } else { 0 },
+        };
+        let r = Request { op: Op::Transmit, memory, offset: at as u32, length: length as u32, tag, offload };
+        if self.nic.submit(&r).is_err() {
+            if memory == 0 {
+                self.free |= 1 << (tag - SENT);
+            } else {
+                self.bursts_free |= 1 << (tag - SENT - SLOTS as u64);
+            }
+            self.dropped.no_slot += 1;
+        }
+    }
+
     fn frame_out(&mut self, dst: Mac, packet: &[u8]) {
         let mac = self.mac;
         let Some(p) = ether::header(&mut self.out, dst, mac, ether::IPV4) else { return };
@@ -932,11 +1066,18 @@ impl Stack {
 
 impl tcp::Out for Stack {
     fn room(&self) -> bool {
-        self.free != 0
+        // A connection polled may give a segment to cut: a burst buffer must
+        // be free too, or it waits (dropping it here was TCP's loss to
+        // repair: 64 connections at once took 444 ms, not 37).
+        self.free != 0 && (self.bursts.is_none() || self.bursts_free != 0)
     }
 
-    fn send(&mut self, remote: Ipv4, segment: &[u8]) {
-        self.send_ip(remote, ipv4::TCP, segment);
+    fn send(&mut self, remote: Ipv4, segment: &[u8], partial: bool, mss: u16) {
+        if partial {
+            self.send_tcp(remote, segment, mss);
+        } else {
+            self.send_ip(remote, ipv4::TCP, segment);
+        }
     }
 }
 
