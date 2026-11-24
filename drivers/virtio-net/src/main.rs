@@ -132,6 +132,17 @@ impl silica_net::service::Device for Nic {
         Ok(())
     }
 
+    fn holding(&self) -> usize {
+        self.rx_slots.iter().flatten().count() + self.tx_slots.iter().flatten().count()
+    }
+
+    fn forget_client(&mut self) -> ! {
+        // Virtio takes back buffers it was given only by resetting the
+        // queue (RING_RESET, not taken) or the device.
+        println!("virtio-net: its last client ended with {} requests in the device; starting again to take them back", self.holding());
+        silica_rt::exit(3)
+    }
+
     fn kick(&mut self) {
         self.rx.notify();
         self.tx.notify();

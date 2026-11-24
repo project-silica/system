@@ -384,6 +384,16 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.ends
     }
 
+    /// The sequence number past everything sent: what a reset of this
+    /// connection carries when the stack that had it is gone and the next
+    /// one resets it from its record (`netd`'s kept page). A peer that
+    /// finds it outside its window answers with a challenge ACK (RFC
+    /// 5961), whose acknowledgement the reset to an unknown connection
+    /// then carries exactly.
+    pub fn sent_to(&self) -> u32 {
+        self.snd_max
+    }
+
     /// Why the connection ended, if it did otherwise than by closing.
     pub fn error(&self) -> Option<Error> {
         self.error

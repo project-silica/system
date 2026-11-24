@@ -129,6 +129,12 @@ struct Manager {
     /// The endpoint of each service that provides a protocol.
     endpoints: Vec<Option<Object>>,
     running: Vec<Running>,
+    /// Each service's own notification (`slots::EVENTS`), the same object
+    /// for every start of it, and a capability to signal it for each of
+    /// its needs (badge bit `n`: the provider of need `n` started again).
+    events: Vec<(Object, Vec<Handle>)>,
+    /// The page each service that `keeps` is given at every start.
+    kept: Vec<Option<Object>>,
     /// The order services were started in, for stopping them in reverse.
     order: Vec<usize>,
     /// What `list` answers with, rebuilt for each call.
@@ -255,10 +261,15 @@ impl Manager {
         let image = ramdisk::find(self.root.archive, s.program).ok_or("its program is not in the boot archive")?;
         let (grants, args) = self.grants(i)?;
         let log = self.log.as_ref().and_then(|l| Some((l.rings.get(i)?.as_ref()?.cap(), l.note.cap())));
+        // Nothing a last instance was told is news to this one.
+        let events = self.events[i].0.cap();
+        let _ = sys::recv(events, Wait::Poll);
         let program = Program {
             grants: &grants,
             args,
             log,
+            events: Some(events),
+            keep: self.kept[i].as_ref().map(|p| p.cap()),
             mem_bits: s.memory,
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
@@ -319,6 +330,23 @@ impl Manager {
         Some((i, if fault { None } else { Some(m.words[0] as i64) }))
     }
 
+    /// Service `p` was started again after its last instance ended: every
+    /// running service that needs what it provides is told (its events,
+    /// the need's bit), for whatever it held of the last one is gone.
+    fn started_again(&self, p: usize) {
+        let Some(protocol) = self.services[p].provides else { return };
+        for (c, s) in self.services.iter().enumerate() {
+            if c == p || self.running[c].child.is_none() {
+                continue;
+            }
+            if let Some(n) = s.needs.iter().position(|need| *need == protocol)
+                && let Some(note) = self.events[c].1.get(n)
+            {
+                let _ = sys::signal(note.cap());
+            }
+        }
+    }
+
     /// Service `i` ended with `status` (`None`: it faulted): say so, and
     /// start it again if it asks to be.
     fn after(&mut self, i: usize, status: Option<i64>) {
@@ -338,6 +366,7 @@ impl Manager {
             println!("ERROR: init: {name}: {e}");
         } else {
             println!("init: {name} started again");
+            self.started_again(i);
         }
     }
 
@@ -419,6 +448,7 @@ impl manager::Server<Handle> for Manager {
         self.end(i, child);
         Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
         println!("init: {name} restarted, as asked");
+        self.started_again(i);
         Ok(manager::RestartReply {})
     }
 
@@ -566,6 +596,26 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         });
     }
     let running = services.iter().map(|_| Running { child: None, given: Vec::new(), starts: 0, failures: 0, stopped: false }).collect();
+    // Each service's events, and a capability per need to tell it.
+    let mut events = Vec::new();
+    for s in &services {
+        let note = Object::new(ObjectType::Notification, 0).unwrap_or_else(|_| fail!("no memory for {}'s events", s.name));
+        let mut needs = Vec::new();
+        for n in 0..s.needs.len().min(32) {
+            let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for {}'s events", s.name));
+            if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, note.cap(), Rights::WRITE, 1 << n).is_err() {
+                fail!("cannot make {}'s events", s.name);
+            }
+            needs.push(Handle::new(sys::Cap(to)));
+        }
+        events.push((note, needs));
+    }
+    // The pages services keep across their restarts: zero at boot (a new
+    // frame is).
+    let kept = services
+        .iter()
+        .map(|s| s.keeps.then(|| Object::new(ObjectType::Frame, 12).unwrap_or_else(|_| fail!("no memory for {}'s page", s.name))))
+        .collect();
     // The log, when a service provides it: a ring for every other service,
     // made before anything starts; the log starts first.
     let mut order = order;
@@ -596,6 +646,8 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         services,
         endpoints,
         running,
+        events,
+        kept,
         order: order.clone(),
         listed: Vec::new(),
         described: String::new(),

@@ -13,6 +13,9 @@ needs = ["silica.device.Manager"]
 memory = 25
 start = "boot"
 restart = "always"
+# Its lease, kept across its restarts (slots::KEEP): a stack started again
+# answers on its address at once.
+keeps = true
 
 [[bin]]
 name = "netd"

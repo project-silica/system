@@ -146,11 +146,24 @@ pub mod slots {
     pub const LOG: Cap = Cap(8);
     /// What tells the log there is text in the ring.
     pub const LOG_WAKE: Cap = Cap(9);
+    /// The program's own notification, made by its parent, when the
+    /// parent gives one (the service manager gives every service one): the
+    /// parent signals it, bit `n`, when the provider of the program's `n`th
+    /// need was started again after it ended (whatever the program held of
+    /// that provider's is gone with it). The bits from 32 up are never the
+    /// parent's: the program and its libraries share them out (as
+    /// `silica_net::tcp::Tcp::on` takes some).
+    pub const EVENTS: Cap = Cap(10);
+    /// A page of 4 KiB that outlives the program, when its parent gives one
+    /// (a service that `keeps`: the service manager keeps it across the
+    /// service's restarts, zeroed at boot): what the next instance needs to
+    /// pick up where this one was.
+    pub const KEEP: Cap = Cap(11);
     /// The first capability the parent granted beyond these. Slots from
     /// here to 64 that the parent did not fill are left empty, for
     /// capabilities the program is given later; the program's own
     /// allocations start above them.
-    pub const FIRST_GRANT: u64 = 10;
+    pub const FIRST_GRANT: u64 = 12;
 }
 
 /// `ProcessInfo::magic`.

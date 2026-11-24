@@ -399,6 +399,13 @@ impl StreamConsumer {
         self.s.word(STREAM_WANTS_ROOM).swap(0, Ordering::SeqCst) != 0
     }
 
+    /// Whether the producer closed the stream, and with what reason,
+    /// whether or not its bytes were all taken: what a program that only
+    /// writes looks at to learn that its connection failed.
+    pub fn ended(&self) -> Option<u32> {
+        (self.s.word(STREAM_CLOSED).load(Ordering::Acquire) != 0).then(|| self.s.word(STREAM_REASON).load(Ordering::Relaxed))
+    }
+
     /// Before waiting for bytes: say so. Returns whether to wait: `false`
     /// when bytes (or the end) arrived meanwhile, or the stream is broken.
     pub fn sleep(&mut self) -> bool {

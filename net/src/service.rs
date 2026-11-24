@@ -85,6 +85,17 @@ pub trait Device {
 
     /// The deadline passed.
     fn timeout(&mut self, _done: &mut Completions<'_>) {}
+
+    /// How many requests the device holds: started, not finished.
+    fn holding(&self) -> usize;
+
+    /// The device holds requests of a client that has ended (receive
+    /// buffers it would fill, its memory gone: each would swallow a frame
+    /// meant for the next client). Take them back before another client
+    /// is served. A device that can take back what it was given only by a
+    /// reset (virtio without `RING_RESET`) ends its driver, so that the
+    /// device manager resets it by starting the driver again.
+    fn forget_client(&mut self) -> !;
 }
 
 /// Where a driver reports a finished request: its ticket, and the frame's
@@ -193,6 +204,13 @@ impl<D: Device> device::Server<Handle> for Service<D> {
     }
 
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<ConnectReply<Handle>, Error> {
+        // A client that ended left requests in the device: they go first
+        // (a network stack started again would otherwise lose its first
+        // frames to the buffers of the one that ended, its ARP answers
+        // among them).
+        if !self.session.has_client() && self.device.holding() > 0 {
+            self.device.forget_client();
+        }
         let requests = self.session.connect(self.caller, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
         Ok(ConnectReply { requests })
     }

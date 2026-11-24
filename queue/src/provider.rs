@@ -163,6 +163,11 @@ impl<M> Session<M> {
         }
     }
 
+    /// Whether a client is connected and still there.
+    pub fn has_client(&self) -> bool {
+        self.connections.iter().flatten().any(Connection::alive)
+    }
+
     fn of(&mut self, caller: u64) -> Option<&mut Connection<M>> {
         self.connections.iter_mut().flatten().find(|c| c.client == caller)
     }

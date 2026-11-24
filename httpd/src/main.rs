@@ -41,7 +41,9 @@ struct Conn {
 }
 
 fn main(_info: &'static ProcessInfo) -> i64 {
-    let mut tcp = match Tcp::new(silica_rt::sys::Cap(slots::FIRST_GRANT), 22) {
+    // On its events: the stack is its need 0 (bit 0), so a restart of the
+    // stack is seen and its listener set up again; its own bits from 32.
+    let mut tcp = match Tcp::on(silica_rt::sys::Cap(slots::FIRST_GRANT), 22, slots::EVENTS, 32, 1) {
         Ok(t) => t,
         Err(e) => {
             println!("ERROR: httpd: no TCP: {e:?}");
@@ -121,9 +123,21 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             }
         }
         if may_sleep {
-            tcp.wait(None);
+            let _ = tcp.wait(None);
         }
     }
+}
+
+/// The connection failed (reset by the peer, or the stack started again):
+/// nothing more is sent or read, and it is let go of.
+fn failed(c: &mut Conn) -> bool {
+    c.head.clear();
+    c.head_sent = 0;
+    c.body = 0;
+    c.body_sent = 0;
+    c.finished = true;
+    c.peer_done = true;
+    true
 }
 
 fn sending(c: &Conn) -> bool {
@@ -136,7 +150,7 @@ fn step(c: &mut Conn, buf: &mut [u8], served: &mut u64) -> bool {
     // Send what is being sent.
     while sending(c) {
         if c.head_sent < c.head.len() {
-            let n = c.s.write(&c.head[c.head_sent..]);
+            let Ok(n) = c.s.write(&c.head[c.head_sent..]) else { return failed(c) };
             if n == 0 {
                 return progress;
             }
@@ -149,7 +163,7 @@ fn step(c: &mut Conn, buf: &mut [u8], served: &mut u64) -> bool {
         for (k, b) in buf[..want].iter_mut().enumerate() {
             *b = ((at + k as u64) % 251) as u8;
         }
-        let n = c.s.write(&buf[..want]);
+        let Ok(n) = c.s.write(&buf[..want]) else { return failed(c) };
         if n == 0 {
             return progress;
         }
@@ -186,6 +200,10 @@ fn step(c: &mut Conn, buf: &mut [u8], served: &mut u64) -> bool {
         let request: Vec<u8> = c.input.drain(..end + 4).collect();
         answer(c, &request);
         *served += 1;
+        // A line now and then: how far a test's load got (and when to act).
+        if (*served).is_multiple_of(1000) {
+            println!("httpd: {served} answers");
+        }
         progress = true;
     } else if c.input.len() > HEAD {
         // A head longer than any client sends: answered and closed.

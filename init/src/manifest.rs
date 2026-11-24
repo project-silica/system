@@ -5,7 +5,7 @@
 //! ```text
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
-//!        [restart=always|never] [seed]
+//!        [restart=always|never] [seed] [keeps]
 //! ```
 //!
 //! - `provides`: the protocol it serves; the service manager makes its
@@ -31,6 +31,10 @@
 //!   `args[4..8]`, with `args[3]` saying which trusted sources went into
 //!   the boot's (`RootInfo::entropy_sources`; 0: timing jitter alone). The
 //!   entropy service is seeded so.
+//! - `keeps`: it is given a page of 4 KiB (`slots::KEEP`), zeroed at boot,
+//!   that the service manager keeps across its restarts: what a service
+//!   started again needs to pick up where the last one was (the network
+//!   stack's lease, so that it answers on its address at once).
 
 use silica_rt::alloc::vec::Vec;
 
@@ -55,6 +59,7 @@ pub struct Service {
     pub needs: Vec<&'static str>,
     pub machine: bool,
     pub seed: bool,
+    pub keeps: bool,
     pub start: Start,
     pub restart: bool,
 }
@@ -73,6 +78,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             needs: Vec::new(),
             machine: false,
             seed: false,
+            keeps: false,
             start: Start::Boot,
             restart: false,
         };
@@ -87,6 +93,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("needs", n) => s.needs = n.split(',').filter(|p| !p.is_empty()).collect(),
                 ("machine", "") => s.machine = true,
                 ("seed", "") => s.seed = true,
+                ("keeps", "") => s.keeps = true,
                 ("start", "boot") => s.start = Start::Boot,
                 ("start", c) if c.starts_with("check:") => s.start = Start::Check(&c[6..]),
                 ("restart", "always") => s.restart = true,

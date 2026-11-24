@@ -28,9 +28,10 @@ use silica_net::client::Interface;
 use silica_net::{Completion, LINK, Op, Request};
 use silica_protocols::device::manager;
 use silica_protocols::net::tcp as proto;
+use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::Events;
 use silica_rt::ipc::{Channel, Handle, free_slot, release_slot};
-use silica_rt::mem::{Memory, Object};
+use silica_rt::mem::{self, Memory, Object};
 use silica_rt::mmio::Mmio;
 use silica_rt::sys::{self, Cap, ObjectType, Rights, Wait};
 use silica_rt::{ProcessInfo, println, slots};
@@ -148,13 +149,26 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
     let memory = Memory::new(16).map_err(|_| "no memory for frames")?;
     nic.add_memory(0, &memory, true).map_err(|_| "cannot register memory with the driver")?;
     let now = silica_rt::clock().now();
+    // The lease an earlier instance held on this boot, if it is this
+    // interface's and has not ended: held again at once (`Client::resume`).
+    let keep = mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
+    let kept = keep.as_ref().and_then(|k| kept_lease(k, mac));
+    let dhcp = match kept {
+        Some(l) => Client::resume(mac, l, now),
+        None => Client::new(mac, now),
+    };
+    let lease = dhcp.lease().copied();
+    // Connection records after the lease (`tcp`): the last stack's, reset.
+    let records = keep.as_ref().and_then(|k| k.part(128, 4096 - 128));
+    let resets = records.as_ref().map(tcp::kept_connections).unwrap_or_default();
     let mut s = Stack {
         nic,
         m: memory.shared(),
         mac,
         free: (1 << SLOTS) - 1,
-        dhcp: Client::new(mac, now),
-        lease: None,
+        dhcp,
+        lease,
+        keep,
         neighbours: [Neighbour::EMPTY; NEIGHBOURS],
         held: None,
         ip_id: (silica_rt::random::u64() & 0xFFFF) as u16,
@@ -162,14 +176,60 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
         out: [0; BUFFER],
         probe: None,
         dropped: Dropped::default(),
-        tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16)),
+        tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records)),
+        resets,
         caller: 0,
         more: true,
     };
     for tag in 1..=BUFFERS {
         s.offer(tag)?;
     }
+    if let Some(l) = lease {
+        println!(
+            "netd: {}/{} kept from before it started again; {} connections of the stack before it to reset",
+            l.address,
+            l.prefix,
+            s.resets.len()
+        );
+        // Its router's Ethernet address, before the first answer needs it.
+        if let Some(r) = l.router {
+            s.ping(now, r);
+        }
+    }
     silica_rt::ipc::serve_events(ENDPOINT, note.cap(), &mut s)
+}
+
+/// The mark of a lease in the page kept across restarts.
+const KEPT_LEASE: u64 = 0x4553_4145_4c5f_4454; // "TD_LEASE"
+
+/// The lease an earlier instance kept in `k`, if there is one, for the
+/// interface `mac`.
+fn kept_lease(k: &Mmio, mac: Mac) -> Option<Lease> {
+    if k.read64(0) != KEPT_LEASE {
+        return None;
+    }
+    let m = k.read64(8).to_le_bytes();
+    if m[..6] != mac.0 {
+        return None;
+    }
+    let lo = |w: u64| Ipv4::from_u32(w as u32);
+    let hi = |w: u64| Ipv4::from_u32((w >> 32) as u32);
+    let (a, r, d, e) = (k.read64(16), k.read64(24), k.read64(32), k.read64(40));
+    let prefix = (a >> 32) as u8;
+    if prefix > 32 {
+        return None;
+    }
+    Some(Lease {
+        address: lo(a),
+        prefix,
+        router: ((a >> 40) & 1 != 0).then(|| lo(r)),
+        dns: [lo(d), hi(d), lo(e)],
+        server: hi(r),
+        seconds: (e >> 32) as u32,
+        renew_at: k.read64(48),
+        rebind_at: k.read64(56),
+        expires_at: k.read64(64),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -222,6 +282,8 @@ struct Stack {
     free: u32,
     dhcp: Client,
     lease: Option<Lease>,
+    /// The page kept across restarts (`slots::KEEP`), the lease in it.
+    keep: Option<Mmio>,
     neighbours: [Neighbour; NEIGHBOURS],
     held: Option<Held>,
     ip_id: u16,
@@ -234,6 +296,9 @@ struct Stack {
     tcp: Option<tcp::Tcp>,
     /// The badge of the call being answered.
     caller: u64,
+    /// Resets owed to the peers of the last stack's connections, sent once
+    /// their next hop's address is known.
+    resets: Vec<tcp::Kept>,
     /// Work is left (a completion there, segments with no transmit slot):
     /// look again at once rather than wait.
     more: bool,
@@ -314,6 +379,7 @@ impl Stack {
                 silica_rt::exit(1);
             }
         }
+        self.send_resets(now);
         let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
         let blocked = tcp.pump(now, self);
         let asleep = tcp.sleep();
@@ -374,21 +440,78 @@ impl Stack {
                 let lease = if l.seconds == u32::MAX { "for ever".into() } else { silica_rt::alloc::format!("{} s", l.seconds) };
                 println!("netd: {}/{} from DHCP server {}, router {router}, DNS {servers}, lease {lease}", l.address, l.prefix, l.server);
                 self.lease = Some(l);
+                self.keep_lease();
                 if let Some(r) = l.router {
                     self.ping(now, r);
                 }
             }
-            Some(Event::Renewed(l)) => self.lease = Some(l),
+            Some(Event::Renewed(l)) => {
+                self.lease = Some(l);
+                self.keep_lease();
+            }
             Some(Event::Lost) => {
                 if let Some(l) = self.lease.take() {
                     println!("netd: the lease of {} ended; asking again", l.address);
                 }
+                self.keep_lease();
             }
             None => {}
         }
         if let Some(m) = step.send {
             self.send_dhcp(m);
         }
+    }
+
+    /// Reset the connections the last stack had (`tcp::kept_connections`),
+    /// once the lease is held and the first hop's Ethernet address known.
+    fn send_resets(&mut self, now: u64) {
+        let Some(l) = self.lease else { return };
+        if self.resets.is_empty() {
+            return;
+        }
+        let hop = |r: Ipv4| if l.address.same_subnet(r, l.prefix) { Some(r) } else { l.router };
+        let mut sent = 0;
+        while let Some(k) = self.resets.last() {
+            let Some(h) = hop(k.remote) else { break };
+            if self.neighbour(h, now).is_none() || self.free == 0 {
+                break;
+            }
+            let k = self.resets.pop().expect("looked at");
+            let header = silica_inet::tcp::Header {
+                src_port: k.local_port,
+                dst_port: k.remote_port,
+                seq: k.sequence,
+                ack: 0,
+                flags: silica_inet::tcp::RST,
+                window: 0,
+            };
+            let mut seg = [0u8; 64];
+            if let Some(n) = silica_inet::tcp::build(&mut seg, l.address, k.remote, &header, &silica_inet::tcp::Options::default(), &[]) {
+                self.send_ip(k.remote, ipv4::TCP, &seg[..n]);
+                sent += 1;
+            }
+        }
+        if sent > 0 && self.resets.is_empty() {
+            println!("netd: the connections of the stack before it are reset");
+        }
+    }
+
+    /// Put the lease held (or none) in the page kept across restarts.
+    fn keep_lease(&mut self) {
+        let Some(k) = self.keep else { return };
+        // The mark first out and last in: a lease half written is no lease.
+        k.write64(0, 0);
+        let Some(l) = self.lease else { return };
+        let ip = |a: Ipv4| a.to_u32() as u64;
+        k.write64(8, u64::from_le_bytes([self.mac.0[0], self.mac.0[1], self.mac.0[2], self.mac.0[3], self.mac.0[4], self.mac.0[5], 0, 0]));
+        k.write64(16, ip(l.address) | (l.prefix as u64) << 32 | (l.router.is_some() as u64) << 40);
+        k.write64(24, ip(l.router.unwrap_or(Ipv4::UNSPECIFIED)) | ip(l.server) << 32);
+        k.write64(32, ip(l.dns[0]) | ip(l.dns[1]) << 32);
+        k.write64(40, ip(l.dns[2]) | (l.seconds as u64) << 32);
+        k.write64(48, l.renew_at);
+        k.write64(56, l.rebind_at);
+        k.write64(64, l.expires_at);
+        k.write64(0, KEPT_LEASE);
     }
 
     fn send_dhcp(&mut self, m: dhcp_client::Send) {

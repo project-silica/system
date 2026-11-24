@@ -18,6 +18,14 @@
 //! are; every connection is looked at after any signal (a few hundred
 //! connections are a few microseconds of looking).
 //!
+//! Each connection has a record in the page the service manager keeps
+//! across the stack's restarts (`slots::KEEP`, after the lease): its peer,
+//! its ports and how far it has sent, so that a stack started again resets
+//! every connection the last one had at once ([`kept_connections`]) rather
+//! than leave each peer waiting for an answer that will not come (a peer
+//! that is waiting sends nothing, so it would not learn otherwise). 248
+//! records fit; a connection past them is not recorded.
+//!
 //! What it does not do yet: IPv6, more than one address, a connection's
 //! memory taken back while it runs other than by the program ending, and
 //! sending from the program's memory in place (G14).
@@ -75,6 +83,8 @@ struct Streams {
 
 struct Conn {
     id: u32,
+    /// Its record in the kept page, if it has one.
+    record: Option<usize>,
     /// The badge of the program it is, or of the listener's program while
     /// it waits to be accepted.
     owner: u64,
@@ -105,6 +115,9 @@ pub trait Out {
 }
 
 pub struct Tcp {
+    /// The records of connections in the kept page, and which are used.
+    records: Option<Mmio>,
+    recorded: Vec<bool>,
     clients: Vec<Client>,
     listeners: Vec<Listener>,
     conns: Vec<Conn>,
@@ -115,6 +128,40 @@ pub struct Tcp {
     mtu: u16,
     scratch: Vec<u8>,
     segment: Vec<u8>,
+}
+
+/// Bytes of a connection's record in the kept page: its peer's address,
+/// the two ports, how far it sent, and whether the record is in use.
+pub const RECORD: usize = 16;
+
+/// A connection an earlier stack had, from its record: its peer, its
+/// ports, and the sequence number a reset of it carries.
+pub struct Kept {
+    pub remote: Ipv4,
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub sequence: u32,
+}
+
+/// The connections an earlier stack recorded in `records`, taken out (the
+/// records are cleared for this stack's own).
+pub fn kept_connections(records: &Mmio) -> Vec<Kept> {
+    let mut kept = Vec::new();
+    for i in 0..records.len() / RECORD {
+        let at = i * RECORD;
+        if records.read32(at + 12) != 1 {
+            continue;
+        }
+        let ports = records.read32(at + 4);
+        kept.push(Kept {
+            remote: Ipv4::from_u32(records.read32(at)),
+            remote_port: ports as u16,
+            local_port: (ports >> 16) as u16,
+            sequence: records.read32(at + 8),
+        });
+        records.write32(at + 12, 0);
+    }
+    kept
 }
 
 /// The block of 2^`bits` bytes at `offset` in `memory`, as its two streams.
@@ -152,8 +199,11 @@ fn reason(e: Option<Failure>) -> u32 {
 }
 
 impl Tcp {
-    pub fn new(note: Cap, mtu: u16) -> Tcp {
+    pub fn new(note: Cap, mtu: u16, records: Option<Mmio>) -> Tcp {
+        let slots = records.as_ref().map_or(0, |r| r.len() / RECORD);
         Tcp {
+            records,
+            recorded: vec![false; slots],
             clients: Vec::new(),
             listeners: Vec::new(),
             conns: Vec::new(),
@@ -163,6 +213,22 @@ impl Tcp {
             scratch: vec![0; 16 << 10],
             segment: vec![0; 1600],
         }
+    }
+
+    /// A record for a new connection `c`, if one is free.
+    fn record(&mut self, c: &Connection<Vec<u8>>) -> Option<usize> {
+        let r = self.records.as_ref()?;
+        let i = self.recorded.iter().position(|u| !u)?;
+        self.recorded[i] = true;
+        let e = c.endpoints();
+        let at = i * RECORD;
+        // Valid last: a stack that ends half way leaves no half a record.
+        r.write32(at + 12, 0);
+        r.write32(at, e.remote.to_u32());
+        r.write32(at + 4, e.remote_port as u32 | (e.local_port as u32) << 16);
+        r.write32(at + 8, c.sent_to());
+        r.write32(at + 12, 1);
+        Some(i)
     }
 
     fn number(&mut self) -> u32 {
@@ -198,7 +264,8 @@ impl Tcp {
             {
                 let tcp = Connection::accept(ends, s, silica_rt::random::u64() as u32, self.mtu, buffers);
                 let id = self.number();
-                self.conns.push(Conn { id, owner, tcp, streams: None, listener: Some(lid), announced: false, released: false });
+                let record = self.record(&tcp);
+                self.conns.push(Conn { id, record, owner, tcp, streams: None, listener: Some(lid), announced: false, released: false });
                 return None;
             }
         }
@@ -295,9 +362,25 @@ impl Tcp {
             if !out.room() {
                 more = true;
             }
+            // How far it has sent, for a reset of it by the next stack.
+            if let (Some(i), Some(r)) = (c.record, self.records.as_ref()) {
+                r.write32(i * RECORD + 8, c.tcp.sent_to());
+            }
         }
         // Done: closed, and let go of (or never accepted).
-        self.conns.retain(|c| !(c.tcp.is_closed() && (c.released || (c.listener.is_some() && c.streams.is_none()))));
+        let mut i = 0;
+        while i < self.conns.len() {
+            let c = &self.conns[i];
+            if c.tcp.is_closed() && (c.released || (c.listener.is_some() && c.streams.is_none())) {
+                if let (Some(r), Some(records)) = (c.record, self.records.as_ref()) {
+                    records.write32(r * RECORD + 12, 0);
+                    self.recorded[r] = false;
+                }
+                self.conns.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
         more
     }
 
@@ -431,7 +514,8 @@ impl Tcp {
         let id = self.number();
         let requests = self.requests(id)?;
         let streams = Streams { rx, tx, wake, offset, bits, rx_closed: false, tx_closed: false };
-        self.conns.push(Conn { id, owner: badge, tcp, streams: Some(streams), listener: None, announced: true, released: false });
+        let record = self.record(&tcp);
+        self.conns.push(Conn { id, record, owner: badge, tcp, streams: Some(streams), listener: None, announced: true, released: false });
         Ok(proto::ConnectReply { connection: id, requests })
     }
 

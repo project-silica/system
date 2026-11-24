@@ -111,6 +111,20 @@ impl Client {
     }
 
     /// When [`Client::step`] must be called next if nothing arrives.
+    /// A client for `mac` that holds `lease`, given to an earlier instance
+    /// of the stack on this boot (its times are this boot's clock): bound
+    /// at once, renewing when the lease says, as if it had never stopped. A
+    /// lease that has expired is not held: the client starts with none.
+    /// What a network stack started again does, so that it answers on its
+    /// address at once instead of after a new exchange, while peers back
+    /// off their retransmissions.
+    pub fn resume(mac: Mac, lease: Lease, now: u64) -> Client {
+        if now >= lease.expires_at {
+            return Client::new(mac, now);
+        }
+        Client { mac, state: State::Bound, xid: 0, tries: 0, since: now, deadline: lease.renew_at, lease: Some(lease) }
+    }
+
     pub fn deadline(&self) -> u64 {
         self.deadline
     }
@@ -315,6 +329,20 @@ mod tests {
         let s = c.step(2, Some(&reply(Kind::Ack, 7, Some(seconds))), 0);
         assert!(matches!(s.event, Some(Event::Bound(l)) if l.address == ADDRESS && l.prefix == 24 && l.server == SERVER));
         c
+    }
+
+    #[test]
+    fn a_resumed_lease_is_held_and_renewed_on_time_and_an_expired_one_is_not() {
+        let l = *bound(600).lease().unwrap();
+        let mut c = Client::resume(MAC, l, 10 * SECOND);
+        assert_eq!(c.lease(), Some(&l), "held at once");
+        assert_eq!(c.deadline(), l.renew_at, "nothing to do until renewal");
+        let s = c.step(l.renew_at, None, 9 << 32);
+        assert!(matches!(s.send.unwrap().ask, Ask::Renew { address } if address == ADDRESS), "renewed with its server");
+        assert_eq!(s.send.unwrap().to, To::Server(SERVER));
+        let mut c = Client::resume(MAC, l, l.expires_at);
+        assert_eq!(c.lease(), None, "an expired lease is not held");
+        assert_eq!(c.step(l.expires_at, None, 7 << 32).send.unwrap().ask, Ask::Discover, "and the client asks anew");
     }
 
     #[test]
