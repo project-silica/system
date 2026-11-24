@@ -265,6 +265,9 @@ pub struct Connection<S> {
     ts_recent: u32,
     /// Peer understands SACK blocks.
     sack: bool,
+    /// The highest edge the peer's SACK blocks reported (snd_una when none
+    /// above it): an acknowledgement that moves it is a duplicate.
+    sack_high: u32,
     /// The peer's SYN carried a window scale (so both sides scale).
     scaling: bool,
     /// A reset to send, at this sequence number, with an ACK or without.
@@ -326,6 +329,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             ts_offset: iss,
             ts_recent: 0,
             sack: true,
+            sack_high: iss,
             scaling: false,
             reset: None,
             answered_invalid_at: None,
@@ -967,7 +971,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         let acked = ack.wrapping_sub(self.snd_una);
         if acked == 0 {
             let flight = self.snd_max.wrapping_sub(self.snd_una);
-            let duplicate = s.data.is_empty() && !s.has(SYN | FIN) && flight > 0 && window == self.snd_wnd;
+            // RFC 6675: an acknowledgement that SACKs data not SACKed before
+            // is a duplicate whatever its window. A receiver's window grows
+            // as its program reads (Linux's with nearly every one), so RFC
+            // 5681's duplicate, the same window, never came from it, and a
+            // loss waited for the timer.
+            let sacks_new = self.sacked_more(s);
+            let duplicate = s.data.is_empty() && !s.has(SYN | FIN) && flight > 0 && (window == self.snd_wnd || sacks_new);
             if duplicate {
                 self.duplicate_ack();
             }
@@ -985,6 +995,22 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             self.retransmit_at = None;
             self.retries = 0;
         }
+    }
+
+    /// Whether `s`'s SACK blocks report data above any reported before (a
+    /// block outside what was sent and not acknowledged says nothing).
+    fn sacked_more(&mut self, s: &Segment<'_>) -> bool {
+        if !self.sack {
+            return false;
+        }
+        let mut more = false;
+        for &(l, r) in &s.options.sack[..usize::from(s.options.sack_len).min(SACK_BLOCKS)] {
+            if before(self.snd_una, l) && before(l, r) && before_eq(r, self.snd_max) && before(self.sack_high, r) {
+                self.sack_high = r;
+                more = true;
+            }
+        }
+        more
     }
 
     fn duplicate_ack(&mut self) {
@@ -1009,6 +1035,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         let fin = (self.fin_sent.is_some() && !self.fin_acked() && before(self.fin_seq(), ack)) as u32;
         self.send.consume((acked - syn - fin) as usize);
         self.snd_una = ack;
+        if before(self.sack_high, ack) {
+            self.sack_high = ack;
+        }
         if before(self.snd_nxt, ack) {
             self.snd_nxt = ack;
         }

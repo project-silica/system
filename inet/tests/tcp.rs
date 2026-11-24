@@ -642,3 +642,48 @@ fn time_wait_without_its_buffers_still_answers_a_repeated_fin() {
     assert!(net.a.is_closed() && net.a.error().is_none(), "the repeated FIN was acknowledged from TIME-WAIT");
     assert_eq!(net.b().state(), State::TimeWait);
 }
+
+/// Like `forge`, an acknowledgement from B with a window and SACK blocks.
+fn forge_sack(net: &mut Net, seq: u32, ack: u32, window: u16, sack: &[(u32, u32)]) {
+    let h = Header { src_port: 80, dst_port: 40000, seq, ack, flags: ACK, window };
+    let mut o = Options::default();
+    o.sack[..sack.len()].copy_from_slice(sack);
+    o.sack_len = sack.len() as u8;
+    let mut b = [0u8; 1600];
+    let n = tcp::build(&mut b, B, A, &h, &o, &[]).unwrap();
+    net.log.clear();
+    let s = tcp::parse(&b[..n], B, A).unwrap();
+    net.a.on_segment(net.now, &s);
+    net.flush();
+}
+
+#[test]
+fn duplicates_that_sack_new_data_count_though_the_window_grows() {
+    // Linux's receive window grows with almost every acknowledgement, so the
+    // duplicate RFC 5681 counts (the same window) never came from it and a
+    // loss waited for the 200 ms timer: 67 times in the interop suite's
+    // 16 MiB on its lossy path. RFC 6675: an acknowledgement that SACKs data
+    // not SACKed before is a duplicate.
+    let mut net = Net::new((64 << 10, 64 << 10), (64 << 10, 64 << 10));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    net.wire.clear();
+    let rcv_nxt = net.log.iter().rev().find(|l| l.0).unwrap().1.ack;
+    // A sends ten segments, and none reaches B.
+    net.drop = Box::new(|_, s| !s.data.is_empty());
+    let mss = net.a.mss();
+    assert_eq!(net.a.send(&pattern(10 * mss as usize)), 10 * mss as usize);
+    net.log.clear();
+    net.flush();
+    let first = net.log.iter().find(|l| l.0 && l.3 > 0).unwrap().1.seq;
+    for k in 1..=2u32 {
+        // B has the second segment on, the window larger each time.
+        forge_sack(&mut net, rcv_nxt, first, 1000 + k as u16, &[(first.wrapping_add(mss), first.wrapping_add(mss * (k + 1)))]);
+        assert!(!net.log.iter().any(|l| l.0 && l.3 > 0 && l.1.seq == first), "resent after {k} duplicates");
+    }
+    forge_sack(&mut net, rcv_nxt, first, 1003, &[(first.wrapping_add(mss), first.wrapping_add(mss * 4))]);
+    assert!(
+        net.log.iter().any(|l| l.0 && l.3 > 0 && l.1.seq == first),
+        "the first segment resent on the third duplicate that SACKs new data: {:?}",
+        net.log
+    );
+}
