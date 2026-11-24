@@ -60,6 +60,11 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     println!("httpd: listening on port {PORT}");
     let mut conns: Vec<Conn> = Vec::new();
     let mut buf = [0u8; 16384];
+    // The body's bytes from any offset, as one slice: the pattern repeats
+    // every 251 bytes. Computing them per write cost a division a byte,
+    // spent again on every wake-up that found the stream with little room
+    // (a reader paced to 50 MB/s kept a processor 74% busy, 2026-11-24).
+    let pattern: Vec<u8> = (0..251 + buf.len()).map(|i| (i % 251) as u8).collect();
     let mut served = 0u64;
     loop {
         let mut progress = false;
@@ -92,7 +97,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             }
         }
         for c in conns.iter_mut() {
-            progress |= step(c, &mut buf, &mut served);
+            progress |= step(c, &mut buf, &pattern, &mut served);
         }
         // Done with: the answer sent and finished, and the peer done too.
         let mut i = 0;
@@ -147,7 +152,7 @@ fn sending(c: &Conn) -> bool {
 }
 
 /// Read, answer and send for one connection; whether anything moved.
-fn step(c: &mut Conn, buf: &mut [u8], served: &mut u64) -> bool {
+fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool {
     let mut progress = false;
     // Send what is being sent.
     while sending(c) {
@@ -161,11 +166,9 @@ fn step(c: &mut Conn, buf: &mut [u8], served: &mut u64) -> bool {
             continue;
         }
         let at = c.body_sent;
-        let want = (c.body - at).min(buf.len() as u64) as usize;
-        for (k, b) in buf[..want].iter_mut().enumerate() {
-            *b = ((at + k as u64) % 251) as u8;
-        }
-        let Ok(n) = c.s.write(&buf[..want]) else { return failed(c) };
+        let from = (at % 251) as usize;
+        let want = (c.body - at).min((pattern.len() - from) as u64) as usize;
+        let Ok(n) = c.s.write(&pattern[from..from + want]) else { return failed(c) };
         if n == 0 {
             return progress;
         }

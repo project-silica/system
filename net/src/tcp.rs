@@ -349,8 +349,12 @@ impl Tcp {
         let b = w * 64 + self.free[w].trailing_zeros() as usize;
         self.free[w] &= !(1 << (b % 64));
         let offset = (b as u64) << self.block_bits;
+        // The two headers start the streams at position 0; the data areas
+        // are read only up to the positions published (the protocol's
+        // rule). Zeroing the whole block was 2^k stores on every accept
+        // that found nothing waiting, which is most of a server's calls.
         let m = self.memory.shared();
-        for at in (offset as usize..(offset as usize + (1 << self.block_bits))).step_by(8) {
+        for at in (offset as usize..offset as usize + 2 * STREAM_HEADER).step_by(8) {
             m.write64(at, 0);
         }
         Ok((b, offset))

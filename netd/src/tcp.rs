@@ -380,6 +380,8 @@ impl Tcp {
             if let Some(s) = c.streams.as_mut() {
                 // The program's bytes to TCP.
                 let mut took = false;
+                // Bytes put in the program's receive stream, or its end.
+                let mut gave = false;
                 while !s.tx_closed {
                     if may_grow(&c.tcp, grown) && s.tx.available().is_ok_and(|n| n > 0) {
                         let capacity = c.tcp.send_capacity();
@@ -411,6 +413,7 @@ impl Tcp {
                             if !s.rx_closed {
                                 s.rx.close(Reason::Broken.raw());
                                 s.rx_closed = true;
+                                gave = true;
                             }
                         }
                     }
@@ -423,15 +426,23 @@ impl Tcp {
                     }
                     let n = c.tcp.recv(&mut scratch[..room]);
                     s.rx.write(&scratch[..n]);
+                    gave |= n > 0;
                 }
                 if !s.rx_closed && (c.tcp.at_end() || (c.tcp.state() == State::Closed && c.tcp.readable() == 0)) {
                     s.rx.close(reason(c.tcp.error()));
                     s.rx_closed = true;
+                    gave = true;
                 }
                 // The last of a finished stream taken: its program may be
                 // waiting to close it (`close` answered `would_block`).
                 let drained = took && s.tx.ended().is_some() && s.tx.available() == Ok(0);
-                let woken = (took && (s.tx.room_needed() || drained)) | s.rx.wake_needed();
+                // Each side's flag is asked only after this pass changed that
+                // stream: asking takes the flag, so asking on every pass woke
+                // a program waiting for its next request every time the stack
+                // looked, and its wake-up made the stack look again (httpd and
+                // netd kept a processor busy between them while a connection
+                // was open and quiet, 2026-11-24).
+                let woken = (took && (s.tx.room_needed() || drained)) | (gave && s.rx.wake_needed());
                 if woken {
                     let _ = sys::signal(s.wake.cap.cap());
                 }
