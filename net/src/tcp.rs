@@ -213,8 +213,11 @@ impl Tcp {
     pub fn accept(&mut self, listener: u32) -> Result<Option<Stream>, Failure> {
         match self.accept_once(listener) {
             // A listener this program has, unknown to the stack: the stack
-            // was started again before its notice was seen.
-            Err(Failure::Refused(Error::NoSuch)) if (listener as usize) < self.listening.len() && self.recover() => {
+            // was started again before its notice was seen. Or the stack
+            // ended during the call (a transport failure): `recover` does
+            // nothing if it is the same stack, which keeps this program's
+            // memory and refuses it again (httpd once ended on this).
+            Err(Failure::Refused(Error::NoSuch) | Failure::Stack) if (listener as usize) < self.listening.len() && self.recover() => {
                 self.accept_once(listener)
             }
             r => r,
