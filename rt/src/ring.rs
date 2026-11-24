@@ -300,6 +300,12 @@ impl StreamProducer {
         self.s.between(head, self.tail).map_or(0, |used| (self.s.capacity - used) as usize)
     }
 
+    /// How many bytes written the consumer has not taken yet (all of the
+    /// stream when its position makes no sense).
+    pub fn unread(&self) -> usize {
+        self.s.capacity as usize - self.room()
+    }
+
     /// Add as much of `bytes` as fits; returns how much did. After the
     /// last write, [`StreamProducer::wake_needed`].
     pub fn write(&mut self, bytes: &[u8]) -> usize {

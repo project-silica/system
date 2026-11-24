@@ -174,7 +174,8 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                     sessions.push(session);
                 }
                 Ok(None) => break,
-                Err(silica_net::tcp::Failure::NoRoom) => break,
+                // Out of room, here or in the stack: the waiting ones wait.
+                Err(silica_net::tcp::Failure::NoRoom | silica_net::tcp::Failure::Refused(silica_net::tcp::Error::NoRoom)) => break,
                 Err(e) => {
                     println!("ERROR: remote: accept: {e:?}");
                     return 1;

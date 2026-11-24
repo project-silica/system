@@ -1,0 +1,27 @@
+[package]
+name = "proc-fuzz"
+description = "Coverage-guided fuzz target for the program loader's checks: any bytes as a program sent to the service manager (run by tools/fuzz.sh)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+silica-proc = { path = ".." }
+
+[[bin]]
+name = "image"
+path = "fuzz_targets/image.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the system workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[profile.release]
+debug = 1

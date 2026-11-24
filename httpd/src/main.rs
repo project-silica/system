@@ -81,8 +81,10 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                     });
                 }
                 Ok(None) => break,
-                // Every block in use: the waiting ones wait.
-                Err(silica_net::tcp::Failure::NoRoom) => break,
+                // Every block in use, or the stack short of room for one more:
+                // the waiting ones wait, and are taken when this program next
+                // looks (a refusal is a moment's shortage, not an end).
+                Err(silica_net::tcp::Failure::NoRoom | silica_net::tcp::Failure::Refused(silica_net::tcp::Error::NoRoom)) => break,
                 Err(e) => {
                     println!("ERROR: httpd: accept: {e:?}");
                     return 1;

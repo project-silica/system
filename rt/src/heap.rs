@@ -2,8 +2,12 @@
 //!
 //! Small requests (up to 2 KiB) come from size classes, powers of two from
 //! 16 bytes, each a list of free pieces refilled 64 KiB at a time. Larger
-//! ones are whole frames of a power-of-two size, kept by size when freed
-//! and used again for the next request of that size. Memory once taken from
+//! ones are blocks of a power-of-two size, kept by size when freed and used
+//! again for the next request of that size: up to 64 KiB cut from the same
+//! chunks as the small pieces, past that a frame each. (A frame costs two
+//! capability slots; a program holding many medium buffers, as the network
+//! stack holds two of 32 KiB per connection, would run its CapSpace out
+//! long before its memory.) Memory once taken from
 //! the program's Untyped stays with the heap: a program that must return
 //! memory to its parent holds it as [`crate::mem::Memory`] instead.
 //!
@@ -33,6 +37,23 @@ struct Lists {
     /// A chunk being cut into pieces: the next unused byte and the end.
     chunk: (usize, usize),
     chunks: u8,
+}
+
+impl Lists {
+    /// The next 64 KiB of the current chunk, aligned to 64 KiB, taking a new
+    /// chunk when it is used up (chunks are 64 KiB to 2 MiB, mapped at a
+    /// multiple of their size).
+    fn unit(&mut self) -> Option<usize> {
+        if self.chunk.0 == self.chunk.1 {
+            let bits = (CHUNK_BITS + self.chunks / 4).min(CHUNK_MAX_BITS);
+            let chunk = Memory::new(bits).ok()?;
+            self.chunk = (chunk.addr(), chunk.addr() + chunk.len());
+            self.chunks = self.chunks.saturating_add(1);
+        }
+        let base = self.chunk.0;
+        self.chunk.0 += 1 << CHUNK_BITS;
+        Some(base)
+    }
 }
 
 /// The heap. `silica_rt` installs one as the program's global allocator.
@@ -92,17 +113,10 @@ unsafe impl GlobalAlloc for Heap {
         self.with(|l| {
             if let Some(c) = class(layout) {
                 if l.small[c].is_null() {
-                    // 64 KiB of the current chunk (or what is left of it),
-                    // cut into pieces of this class.
-                    if l.chunk.0 == l.chunk.1 {
-                        let bits = (CHUNK_BITS + l.chunks / 4).min(CHUNK_MAX_BITS);
-                        let Ok(chunk) = Memory::new(bits) else { return null_mut() };
-                        l.chunk = (chunk.addr(), chunk.addr() + chunk.len());
-                        l.chunks = l.chunks.saturating_add(1);
-                    }
-                    let (base, piece) = (l.chunk.0, 1usize << (c as u32 + MIN_SHIFT));
-                    let len = (l.chunk.1 - base).min(1 << CHUNK_BITS);
-                    l.chunk.0 += len;
+                    // 64 KiB of the current chunk, cut into pieces of this
+                    // class.
+                    let Some(base) = l.unit() else { return null_mut() };
+                    let (piece, len) = (1usize << (c as u32 + MIN_SHIFT), 1usize << CHUNK_BITS);
                     for at in (0..len).step_by(piece).rev() {
                         let p = (base + at) as *mut u8;
                         // SAFETY: a piece of fresh memory this heap owns,
@@ -123,6 +137,23 @@ unsafe impl GlobalAlloc for Heap {
                 // SAFETY: as for the pieces.
                 *kept = unsafe { p.cast::<*mut u8>().read() };
                 return p;
+            }
+            if bits <= CHUNK_BITS {
+                // Up to 64 KiB: a 64 KiB piece of the current chunk, cut into
+                // blocks of this size, the first given now and the rest kept
+                // as freed ones are. A frame each would cost two capability
+                // slots apiece: the network stack's 32 KiB connection buffers
+                // ran its 1,024 slots out at about 240 connections.
+                let Some(base) = l.unit() else { return null_mut() };
+                let piece = 1usize << bits;
+                for at in (piece..1 << CHUNK_BITS).step_by(piece).rev() {
+                    let p = (base + at) as *mut u8;
+                    // SAFETY: as for the pieces: fresh memory this heap owns,
+                    // aligned to its size (units are 64 KiB-aligned).
+                    unsafe { p.cast::<*mut u8>().write(l.frames[bits as usize - 12]) };
+                    l.frames[bits as usize - 12] = p;
+                }
+                return base as *mut u8;
             }
             Memory::new(bits).map_or(null_mut(), |m| m.addr() as *mut u8)
         })

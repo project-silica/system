@@ -242,6 +242,10 @@ fn a_connection_opens_carries_data_both_ways_and_closes() {
     net.run_until(SECOND, |n| n.a.is_closed());
     assert!(net.a.is_closed() && net.a.error().is_none(), "A closed second: no TIME-WAIT, no error");
     assert_eq!(net.b().state(), State::TimeWait, "B closed first and waits");
+    let shed = net.b().shed().expect("TIME-WAIT gives its buffers back");
+    assert_eq!((shed.send.len(), shed.receive.len()), (4096, 4096));
+    assert!(net.b().shed().is_none(), "once");
+    assert!(net.a.shed().is_some(), "and so does a closed connection");
     assert_eq!(net.a.send(b"x"), 0, "nothing is taken after closing");
     net.run_until(120 * SECOND, |n| n.b.as_ref().is_some_and(|b| b.is_closed()));
     assert!(net.b().is_closed() && net.b().error().is_none(), "TIME-WAIT ends");
@@ -609,4 +613,32 @@ fn both_ways_through_random_loss_duplication_and_reordering_every_byte_arrives_i
         }
     }
     assert!(resets <= 3, "{resets} of 300 connections ended in a reset after their data");
+}
+
+#[test]
+fn time_wait_without_its_buffers_still_answers_a_repeated_fin() {
+    let mut net = Net::new((4096, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    assert_eq!(net.b().send(b"bye"), 3);
+    net.b().close();
+    net.run_until(SECOND, |n| n.a.at_end());
+    let mut buf = [0u8; 8];
+    assert_eq!(net.a.recv(&mut buf), 3);
+    // A's FIN arrives at B, and B's acknowledgement of it is lost once: A
+    // sends its FIN again into B's TIME-WAIT, whose buffers are gone.
+    let mut dropped = false;
+    net.drop = Box::new(move |_, seg| {
+        let from_b = seg.header.src_port == 80;
+        let lose = from_b && !dropped && seg.header.flags == ACK && seg.data.is_empty();
+        dropped |= lose;
+        lose
+    });
+    net.a.close();
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::TimeWait));
+    assert!(net.b().shed().is_some());
+    net.run_until(10 * SECOND, |n| n.a.is_closed());
+    let fins = net.log.iter().filter(|(to_b, h, _, _)| *to_b && h.flags & FIN != 0).count();
+    assert_eq!(fins, 2, "A sent its FIN again after the lost acknowledgement");
+    assert!(net.a.is_closed() && net.a.error().is_none(), "the repeated FIN was acknowledged from TIME-WAIT");
+    assert_eq!(net.b().state(), State::TimeWait);
 }

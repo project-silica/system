@@ -128,6 +128,9 @@ pub struct Tcp {
     /// stack is not its to close.
     generation: u32,
     listening: Vec<Listening>,
+    /// Streams closed while the stack still had bytes of theirs to take
+    /// (`close`): kept, their blocks with them, until it took them.
+    closing: Vec<Stream>,
 }
 
 /// A connection.
@@ -176,7 +179,8 @@ impl Tcp {
         for b in 0..blocks {
             free[b / 64] |= 1 << (b % 64);
         }
-        let mut tcp = Tcp { stack, memory, block_bits, free, note, first, restarted, generation: 0, listening: Vec::new() };
+        let mut tcp =
+            Tcp { stack, memory, block_bits, free, note, first, restarted, generation: 0, listening: Vec::new(), closing: Vec::new() };
         tcp.lend_memory()?;
         Ok(tcp)
     }
@@ -252,12 +256,33 @@ impl Tcp {
     /// Let go of a connection: reset unless both ends finished in order.
     /// Its block is free again.
     pub fn close(&mut self, s: Stream) -> Result<(), Failure> {
-        self.give_back(s.offset);
         if s.generation != self.generation {
             // The stack it was made on is gone, and its connections with it.
+            self.give_back(s.offset);
             return Ok(());
         }
-        self.stack.close(s.id).map(|_| ()).map_err(Into::into)
+        match self.stack.close(s.id) {
+            // The stack has bytes of it still to take (a program that
+            // finished and closed at once): its block stays this stream's
+            // until the stack took them, and the close is made again then
+            // (`wait`).
+            Err(silica_idl_rt::CallError::Error(Error::WouldBlock)) => {
+                self.closing.push(s);
+                Ok(())
+            }
+            r => {
+                self.give_back(s.offset);
+                r.map(|_| ()).map_err(Into::into)
+            }
+        }
+    }
+
+    /// Close again what the stack could not let go of yet (it signals the
+    /// stream's bit when it has taken the last of a finished stream's bytes).
+    fn close_pending(&mut self) {
+        for s in core::mem::take(&mut self.closing) {
+            let _ = self.close(s);
+        }
     }
 
     /// Wait until the stack signals (a connection changed, or one is
@@ -267,6 +292,7 @@ impl Tcp {
     /// started again, the new one is set up first (see the module's
     /// documentation).
     pub fn wait(&mut self, deadline: Option<u64>) -> u64 {
+        self.close_pending();
         let bits = match sys::recv(self.note.cap(), deadline.map_or(Wait::Forever, Wait::Until)) {
             Ok(m) => m.badge,
             Err(_) => 0,

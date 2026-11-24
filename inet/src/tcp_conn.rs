@@ -380,6 +380,34 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.state
     }
 
+    /// Give back the buffers once nothing can go into or out of them: in
+    /// TIME-WAIT, and once closed, a connection does no more than answer a
+    /// peer's repeated FIN, which takes no data. A server that closes first
+    /// keeps each connection there for a minute (RFC 9293 section 3.6.1),
+    /// so its buffers must not stay with it: a server answering a thousand
+    /// connections a second would hold four gigabytes in buffers nobody can
+    /// use (Linux keeps a small time-wait record for the same reason).
+    /// Returns them for the caller to free; `None` in any other state, or
+    /// when they were given back already.
+    pub fn shed(&mut self) -> Option<Buffers<S>>
+    where
+        S: Default + AsRef<[u8]>,
+    {
+        if !matches!(self.state, State::TimeWait | State::Closed)
+            || self.send.buf.as_ref().is_empty() && self.receive.buf.as_ref().is_empty()
+        {
+            return None;
+        }
+        let send = core::mem::take(&mut self.send.buf);
+        let receive = core::mem::take(&mut self.receive.buf);
+        for r in [&mut self.send, &mut self.receive] {
+            r.start = 0;
+            r.len = 0;
+        }
+        self.holes_len = 0;
+        Some(Buffers { send, receive })
+    }
+
     pub fn endpoints(&self) -> Endpoints {
         self.ends
     }

@@ -134,8 +134,15 @@ struct Watched {
 
 impl Watched {
     fn new(cap: Handle, note: Cap) -> Result<Watched, Error> {
-        let notice = Handle::new(Cap(free_slot().ok_or(Error::NoRoom)?));
-        sys::cap_notice(cap.cap(), note, notice.cap(), GONE).map_err(|_| Error::NoRoom)?;
+        let Some(slot) = free_slot() else {
+            silica_rt::println!("netd: no capability slot left to watch a program's notification");
+            return Err(Error::NoRoom);
+        };
+        let notice = Handle::new(Cap(slot));
+        if let Err(e) = sys::cap_notice(cap.cap(), note, notice.cap(), GONE) {
+            silica_rt::println!("netd: cannot watch a program's notification (slot {}): {e:?}", cap.cap().0);
+            return Err(Error::NoRoom);
+        }
         Ok(Watched { _notice: notice, cap })
     }
 }
@@ -388,7 +395,10 @@ impl Tcp {
                     s.rx.close(reason(c.tcp.error()));
                     s.rx_closed = true;
                 }
-                let woken = (took && s.tx.room_needed()) | s.rx.wake_needed();
+                // The last of a finished stream taken: its program may be
+                // waiting to close it (`close` answered `would_block`).
+                let drained = took && s.tx.ended().is_some() && s.tx.available() == Ok(0);
+                let woken = (took && (s.tx.room_needed() || drained)) | s.rx.wake_needed();
                 if woken {
                     let _ = sys::signal(s.wake.cap.cap());
                 }
@@ -418,6 +428,14 @@ impl Tcp {
             if let (Some(i), Some(r)) = (c.record, self.records.as_ref()) {
                 r.write32(i * RECORD + 8, c.tcp.sent_to());
                 r.write32(i * RECORD + 12, c.tcp.received_to());
+            }
+        }
+        // In TIME-WAIT nothing more is sent or read: a connection's buffers
+        // go now, not a minute later when it ends (`Connection::shed`),
+        // unless its program has still to read what arrived.
+        for c in self.conns.iter_mut() {
+            if c.released || c.tcp.readable() == 0 {
+                let _ = c.tcp.shed();
             }
         }
         // Done: closed, and let go of (or never accepted).
@@ -465,9 +483,13 @@ impl Tcp {
     /// A program's notification capability, for its connection `id` to
     /// signal the stack.
     fn requests(&self, id: u32) -> Result<Handle, Error> {
-        let slot = free_slot().ok_or(Error::NoRoom)?;
+        let Some(slot) = free_slot() else {
+            silica_rt::println!("netd: no capability slot left for connection {id}");
+            return Err(Error::NoRoom);
+        };
         let bit = 1u64 << (FIRST_BIT + id % BITS);
-        if sys::cap_derive(slots::SPACE, slot, self.note, Rights::WRITE, bit).is_err() {
+        if let Err(e) = sys::cap_derive(slots::SPACE, slot, self.note, Rights::WRITE, bit) {
+            silica_rt::println!("netd: cannot make connection {id}'s capability in slot {slot}: {e:?}");
             release_slot(slot);
             return Err(Error::NoRoom);
         }
@@ -620,9 +642,49 @@ impl Tcp {
 
     pub fn close(&mut self, badge: u64, connection: u32) -> Result<proto::CloseReply, Error> {
         let c = self.conns.iter_mut().find(|c| c.id == connection && c.owner == badge && !c.released).ok_or(Error::NoSuch)?;
-        // Ended in order both ways: TCP finishes on its own (its last
-        // acknowledgements, TIME-WAIT). Otherwise a reset.
-        let orderly = c.streams.as_ref().is_some_and(|s| s.tx_closed && s.rx_closed) && c.tcp.error().is_none();
+        // What the program wrote and has not been taken yet is taken now:
+        // a program that finishes and closes at once must not lose its last
+        // bytes (httpd did, under a small window: the interop suite). What
+        // does not fit TCP's buffer yet waits, and the program with it.
+        if let Some(s) = c.streams.as_mut()
+            && !s.tx_closed
+        {
+            let mut scratch = [0u8; 2048];
+            loop {
+                match s.tx.available() {
+                    // Only its end may be left: taken, the FIN follows the data.
+                    Ok(0) => {
+                        if let Ok(Read::Closed(_)) = s.tx.read(&mut scratch) {
+                            c.tcp.close();
+                            s.tx_closed = true;
+                        }
+                        break;
+                    }
+                    Ok(_) => {
+                        let room = c.tcp.writable().min(scratch.len());
+                        if room == 0 {
+                            // Worth waiting for only if the program finished
+                            // (else it is reset anyway) and TCP can still send.
+                            if s.tx.ended().is_some() && c.tcp.error().is_none() {
+                                return Err(Error::WouldBlock);
+                            }
+                            break;
+                        }
+                        let Ok(Read::Bytes(n)) = s.tx.read(&mut scratch[..room]) else { break };
+                        c.tcp.send(&scratch[..n]);
+                    }
+                    // A broken stream: a reset, below.
+                    Err(_) => break,
+                }
+            }
+        }
+        // Ended in order on this side, with nothing received left unread:
+        // TCP finishes on its own (its FIN after the data, its last
+        // acknowledgements, TIME-WAIT), as a socket closed on Linux does.
+        // Otherwise (the program never finished, or left bytes unread: RFC
+        // 9293 section 3.6, RFC 1122 4.2.2.13) a reset.
+        let unread = c.tcp.readable() > 0 || c.streams.as_ref().is_some_and(|s| s.rx.unread() > 0);
+        let orderly = c.streams.as_ref().is_some_and(|s| s.tx_closed) && !unread && c.tcp.error().is_none();
         if !orderly {
             c.tcp.abort();
         }
