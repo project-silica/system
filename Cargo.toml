@@ -34,6 +34,7 @@ members = [
     "drivers/framework",
     "drivers/virtio-blk",
     "drivers/virtio-net",
+    "drivers/e1000e",
     "drivers/virtio-rogue",
     "drivers/nvme",
     "drivers/virtio-input",

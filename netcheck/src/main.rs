@@ -161,6 +161,10 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
     let a = info.address.to_le_bytes();
     let mac = [a[0], a[1], a[2], a[3], a[4], a[5]];
     println!("netcheck: MTU {}, link {}", info.mtu, if info.link_up { "up" } else { "down" });
+    if info.receive_bytes > BUFFER {
+        println!("netcheck: the interface needs receive buffers of {} bytes, more than {BUFFER}", info.receive_bytes);
+        return Err("the interface needs larger receive buffers");
+    }
     if silica_rt::option("link") == Some("cycle") {
         println!("netcheck: ready for link down");
         for up in [false, true] {

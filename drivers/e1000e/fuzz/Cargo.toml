@@ -1,0 +1,28 @@
+[package]
+name = "e1000e-fuzz"
+description = "Coverage-guided fuzz target for what an 82574 writes back into its descriptor rings and the e1000e driver reads (run by tools/fuzz.sh)."
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+e1000e = { path = ".." }
+silica-rt = { path = "../../../rt" }
+
+[[bin]]
+name = "e1000e_device"
+path = "fuzz_targets/e1000e_device.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the system workspace: cargo-fuzz builds it on its own.
+[workspace]
+
+[profile.release]
+debug = 1

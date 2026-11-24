@@ -281,7 +281,9 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         tx_slots: (0..tx_count).map(|_| None).collect(),
         rx_free: (0..rx_count as u16).rev().collect(),
         tx_free: (0..tx_count as u16).rev().collect(),
-        info: Info { address, mtu, link_up: true },
+        // (Each receive descriptor bounds what the device writes: a buffer
+        // the size of the largest frame is enough.)
+        info: Info { address, mtu, link_up: true, receive_bytes: mtu + silica_net::HEADER },
         status_feature: features & F_STATUS != 0,
         transport,
         dma,

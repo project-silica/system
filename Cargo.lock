@@ -46,6 +46,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "e1000e"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-net",
+ "silica-rt",
+]
+
+[[package]]
 name = "echo-client"
 version = "0.0.0"
 dependencies = [

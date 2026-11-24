@@ -127,7 +127,11 @@ fn run() -> Result<(), &'static str> {
         silica_rt::sys::yield_now();
     };
     let mut nic = Interface::open(Cap(slots::FIRST_GRANT), id).map_err(|_| "cannot open the interface")?;
-    let a = nic.info().map_err(|_| "no info")?.address.to_le_bytes();
+    let info = nic.info().map_err(|_| "no info")?;
+    if info.receive_bytes > BUFFER {
+        return Err("the interface needs larger receive buffers than netload offers");
+    }
+    let a = info.address.to_le_bytes();
     let memory = Memory::new(17).map_err(|_| "no memory")?;
     nic.add_memory(0, &memory, true).map_err(|_| "cannot register memory")?;
     let mut l = Load { nic, m: memory.shared(), mac: [a[0], a[1], a[2], a[3], a[4], a[5]], gateway: [0; 6], tx: 0 };

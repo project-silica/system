@@ -7,8 +7,9 @@
 //! block driver does with `silica_block::service`. The service checks every
 //! request before the driver sees it: a transmit's frame lies in a
 //! registered frame and is from [`HEADER`] bytes to the MTU plus 14; a
-//! receive's buffer lies in writable registered memory and holds the
-//! largest frame. `address` is the device address of the first byte.
+//! receive's buffer lies in writable registered memory and has the
+//! interface's `receive_bytes` (at least the largest frame: what the device
+//! may write into it). `address` is the device address of the first byte.
 //!
 //! `start` returns [`Refusal::Busy`] when the device's queue is full (the
 //! request is offered again after the next completion). Every ticket it
@@ -158,6 +159,8 @@ impl<D: Device> Service<D> {
         let (session, device) = (&mut self.session, &mut self.device);
         let info = device.info();
         let largest = info.mtu.saturating_add(HEADER);
+        // What the device may write into a receive buffer (Info::receive_bytes).
+        let receive = info.receive_bytes.max(largest);
         let broken = session.take(|raw, ticket, region, _client| {
             let invalid = provider::Refusal::Fail(Status::Invalid as u32);
             let r = Request::decode(raw).ok_or(invalid)?;
@@ -165,7 +168,7 @@ impl<D: Device> Service<D> {
             let fits = (r.offset as u64).checked_add(r.length as u64).is_some_and(|end| end <= m.bytes);
             let ok = match r.op {
                 Op::Transmit => (HEADER..=largest).contains(&r.length),
-                Op::Receive => m.writable && r.length >= largest,
+                Op::Receive => m.writable && r.length >= receive,
             };
             if !(fits && ok) {
                 return Err(invalid);

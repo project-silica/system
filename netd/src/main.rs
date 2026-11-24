@@ -151,6 +151,10 @@ fn use_interface(id: u32) -> Result<core::convert::Infallible, &'static str> {
     let a = info.address.to_le_bytes();
     let mac = Mac([a[0], a[1], a[2], a[3], a[4], a[5]]);
     println!("netd: {mac}, MTU {}, link {}", info.mtu, if info.link_up { "up" } else { "down" });
+    if info.receive_bytes as usize > BUFFER {
+        println!("netd: the interface needs receive buffers of {} bytes; netd's are {BUFFER}", info.receive_bytes);
+        return Err("the interface needs larger receive buffers than netd offers");
+    }
     let memory = Memory::new(16).map_err(|_| "no memory for frames")?;
     nic.add_memory(0, &memory, true).map_err(|_| "cannot register memory with the driver")?;
     let now = silica_rt::clock().now();
