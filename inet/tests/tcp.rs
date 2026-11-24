@@ -38,6 +38,8 @@ type Dropper = Box<dyn FnMut(u64, &Segment<'_>) -> bool>;
 
 /// Two connections and the wire between them.
 struct Net {
+    sender_timeouts: usize,
+    window_reductions: usize,
     now: u64,
     a: Conn,
     b: Option<Conn>,
@@ -46,6 +48,9 @@ struct Net {
     delay: u64,
     /// Drop the nth segment sent (counting from 1) when `drop(n)` says so.
     drop: Dropper,
+    /// A segment's way, when a test varies it: its one-way delay, and
+    /// whether it arrives twice.
+    vary: Option<Box<dyn FnMut() -> (u64, bool)>>,
     sent: u64,
     /// Every segment sent, to look at afterwards: (to B, header, data length).
     log: Vec<(bool, Header, Options, usize)>,
@@ -55,7 +60,20 @@ struct Net {
 impl Net {
     fn new(a_buffers: (usize, usize), b_buffers: (usize, usize)) -> Net {
         let a = Connection::connect(ends(A, 40000, B, 80), 0xFFFF_FF00, 1500, buffers(a_buffers.0, a_buffers.1));
-        Net { now: 0, a, b: None, wire: Vec::new(), delay: 5 * MS, drop: Box::new(|_, _| false), sent: 0, log: Vec::new(), b_buffers }
+        Net {
+            sender_timeouts: 0,
+            window_reductions: 0,
+            now: 0,
+            a,
+            b: None,
+            wire: Vec::new(),
+            delay: 5 * MS,
+            drop: Box::new(|_, _| false),
+            vary: None,
+            sent: 0,
+            log: Vec::new(),
+            b_buffers,
+        }
     }
 
     /// Everything each side has to send goes on the wire.
@@ -101,7 +119,11 @@ impl Net {
         if (self.drop)(self.sent, &s) {
             return;
         }
-        self.wire.push(Flight { at: self.now + self.delay, fresh: true, to_b, bytes });
+        let (delay, twice) = self.vary.as_mut().map_or((self.delay, false), |v| v());
+        if twice {
+            self.wire.push(Flight { at: self.now + delay + self.delay, fresh: false, to_b, bytes: bytes.clone() });
+        }
+        self.wire.push(Flight { at: self.now + delay, fresh: true, to_b, bytes });
     }
 
     /// Deliver what arrives next, or fire the next timer; false when
@@ -112,16 +134,20 @@ impl Net {
         let next_timer = [self.a.deadline(), self.b.as_ref().and_then(|b| b.deadline())].into_iter().flatten().min();
         let Some(t) = [next_wire, next_timer].into_iter().flatten().min() else { return false };
         self.now = self.now.max(t);
+        let previous_window = self.a.info().cwnd;
         if next_wire == Some(t) {
             let i = self.wire.iter().position(|f| f.at == t).unwrap();
             let f = self.wire.remove(i);
             self.deliver(f);
         } else {
+            let retries = self.a.info().retries;
             self.a.on_time(self.now);
+            self.sender_timeouts += usize::from(self.a.info().retries > retries);
             if let Some(b) = self.b.as_mut() {
                 b.on_time(self.now);
             }
         }
+        self.window_reductions += usize::from(self.a.info().cwnd < previous_window);
         self.flush();
         true
     }
@@ -452,8 +478,11 @@ fn closing_at_once_from_both_sides_ends_both() {
 fn an_abort_sends_a_reset_the_peer_takes() {
     let mut net = Net::new((4096, 4096), (4096, 4096));
     net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
-    net.a.send(b"unsent");
+    net.a.send(b"in flight");
+    net.flush();
+    assert!(net.a.deadline().is_some());
     net.a.abort();
+    assert_eq!(net.a.deadline(), None);
     assert_eq!(net.a.error(), Some(Error::Aborted));
     net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.is_closed()));
     assert_eq!(net.b().error(), Some(Error::Reset), "B took A's reset");
@@ -658,32 +687,111 @@ fn forge_sack(net: &mut Net, seq: u32, ack: u32, window: u16, sack: &[(u32, u32)
 }
 
 #[test]
-fn duplicates_that_sack_new_data_count_though_the_window_grows() {
-    // Linux's receive window grows with almost every acknowledgement, so the
-    // duplicate RFC 5681 counts (the same window) never came from it and a
-    // loss waited for the 200 ms timer: 67 times in the interop suite's
-    // 16 MiB on its lossy path. RFC 6675: an acknowledgement that SACKs data
-    // not SACKed before is a duplicate.
+fn a_loss_is_found_by_time_from_one_sack_whatever_the_window() {
+    for segments in [2, 8] {
+        first_loss_from_one_sack(segments);
+    }
+}
+
+fn first_loss_from_one_sack(segments: usize) {
+    // Linux's receive window grows with almost every acknowledgement, and a
+    // small window leaves fewer than three segments after a loss: counting
+    // duplicates (RFC 5681) waited for the 200 ms timer, 67 times in the
+    // interop suite's 16 MiB on its lossy path. RACK (RFC 8985): once a
+    // segment sent after it is SACKed, a segment not heard of for that
+    // one's round trip and a reordering window is lost.
     let mut net = Net::new((64 << 10, 64 << 10), (64 << 10, 64 << 10));
     net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
     net.wire.clear();
     let rcv_nxt = net.log.iter().rev().find(|l| l.0).unwrap().1.ack;
-    // A sends ten segments, and none reaches B.
+    // Only the second will be SACKed. With eight segments, six unmarked
+    // segments still count in flight when the window falls to four.
     net.drop = Box::new(|_, s| !s.data.is_empty());
     let mss = net.a.mss();
-    assert_eq!(net.a.send(&pattern(10 * mss as usize)), 10 * mss as usize);
+    let size = segments * mss as usize;
+    assert_eq!(net.a.send(&pattern(size)), size);
     net.log.clear();
     net.flush();
     let first = net.log.iter().find(|l| l.0 && l.3 > 0).unwrap().1.seq;
-    for k in 1..=2u32 {
-        // B has the second segment on, the window larger each time.
-        forge_sack(&mut net, rcv_nxt, first, 1000 + k as u16, &[(first.wrapping_add(mss), first.wrapping_add(mss * (k + 1)))]);
-        assert!(!net.log.iter().any(|l| l.0 && l.3 > 0 && l.1.seq == first), "resent after {k} duplicates");
+    // A round trip later B SACKs the second, with a window of its own.
+    net.now += 2 * MS;
+    forge_sack(&mut net, rcv_nxt, first, 1001, &[(first.wrapping_add(mss), first.wrapping_add(2 * mss))]);
+    let resent = |net: &Net| net.log.iter().any(|l| l.0 && l.3 > 0 && l.1.seq == first);
+    if !resent(&net) {
+        // The reordering window: the first goes when it has passed.
+        let at = net.a.deadline().expect("a timer for the reordering window");
+        assert!(at < net.now + 2 * MS, "the reordering window is a fraction of a round trip, not the timeout");
+        net.now = at;
+        net.a.on_time(net.now);
+        net.log.clear();
+        net.flush();
     }
-    forge_sack(&mut net, rcv_nxt, first, 1003, &[(first.wrapping_add(mss), first.wrapping_add(mss * 4))]);
-    assert!(
-        net.log.iter().any(|l| l.0 && l.3 > 0 && l.1.seq == first),
-        "the first segment resent on the third duplicate that SACKs new data: {:?}",
-        net.log
-    );
+    assert!(resent(&net), "the first segment resent within a round trip of the SACK: {:?}", net.log);
+}
+
+/// Seconds of simulated time to move 4 MiB from A to B over a 2 ms round
+/// trip with 64 KiB buffers, when `loss` percent of segments are lost each
+/// way and, with `rough`, the path the interop suite's netem makes: 10% of
+/// segments overtake the others (no delay instead of 1 ms) and 1% arrive
+/// twice; for each of five seeds.
+fn time_through_loss(loss: u64, rough: bool) -> Vec<f64> {
+    (1..=5u64)
+        .map(|seed| {
+            let mut net = Net::new((65536, 65536), (65536, 65536));
+            net.delay = MS;
+            let mut drops = Rng(seed * 7919);
+            // The first copy that survived the drop decision will arrive, even
+            // if its ACK is lost. Count retries of those ranges separately.
+            let redundant = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = redundant.clone();
+            let mut on_wire = std::collections::HashSet::new();
+            net.drop = Box::new(move |_, s| {
+                let lost = drops.below(100) < loss;
+                if !s.data.is_empty() {
+                    let range = (s.header.seq, s.data.len());
+                    if on_wire.contains(&range) {
+                        count.set(count.get() + 1);
+                    }
+                    if !lost {
+                        on_wire.insert(range);
+                    }
+                }
+                lost
+            });
+            if rough {
+                let mut r = Rng(seed * 104729);
+                net.vary = Some(Box::new(move || (if r.below(100) < 10 { 0 } else { MS }, r.below(100) < 1)));
+            }
+            let data = pattern(4 << 20);
+            let start = net.now;
+            let got = transfer(&mut net, &data, 600 * SECOND);
+            if loss > 0 {
+                let mut sent = std::collections::HashSet::new();
+                let repeats = net.log.iter().filter(|(to_b, h, _, len)| *to_b && *len > 0 && !sent.insert((h.seq, *len))).count();
+                let dsacks = net.log.iter().filter(|(to_b, h, opt, _)| {
+                    !to_b && opt.sack_len > 0 && (opt.sack[0].1.wrapping_sub(h.ack) as i32) <= 0
+                }).count();
+                eprintln!("seed {seed}, reordered {rough}: {repeats} retransmissions ({} redundant), {dsacks} DSACKs, {} window reductions, {} timeouts",
+                    redundant.get(), net.window_reductions, net.sender_timeouts);
+            }
+            assert!(got == data, "seed {seed}: {} of {} bytes arrived in order", got.len(), data.len());
+            (net.now - start) as f64 / SECOND as f64
+        })
+        .collect()
+}
+
+#[test]
+fn loss_is_repaired_without_waiting_for_the_timer() {
+    // The interop suite's lossy path (2% each way, 2 ms) moved 16 MiB in 22 s
+    // under NewReno, where Linux takes 0.1 to 1.1 s: a hole a round trip, and
+    // the 200 ms timer whenever a repair was lost. A clean path takes about
+    // 0.13 s here (the window over the round trip).
+    let clean = time_through_loss(0, false);
+    let lossy = time_through_loss(2, false);
+    let rough = time_through_loss(2, true);
+    eprintln!("4 MiB: clean {clean:.3?} s; 2% loss each way {lossy:.3?} s; and reordered, duplicated {rough:.3?} s");
+    for (what, t) in [("2% loss", &lossy), ("2% loss, reordering and duplication", &rough)] {
+        let worst = t.iter().copied().fold(0.0, f64::max);
+        assert!(worst < 1.0, "4 MiB through {what} took up to {worst:.2} s");
+    }
 }

@@ -14,13 +14,13 @@
 //! 6582: slow start from ten segments (RFC 6928), fast retransmit on the
 //! third duplicate acknowledgement, recovery until everything sent before it
 //! is acknowledged); window scaling and timestamps (RFC 7323: round-trip
-//! times from echoed timestamps, old segments refused by PAWS); SACK blocks
-//! for what arrived out of order (RFC 2018); a zero window probed; and the
+//! times from echoed timestamps, old segments refused by PAWS); SACK and
+//! DSACK feedback, time-based loss detection and tail probes (RFCs 2018,
+//! 2883 and 8985); a zero window probed; and the
 //! defences of RFC 5961 against blind resets and SYNs (a reset or SYN that
 //! is not exactly where it must be only draws a challenge acknowledgement).
 //!
-//! What it does not do yet: SACK-based loss recovery (RFC 6675), CUBIC and
-//! BBR, ECN, keepalive, path MTU discovery.
+//! Open features include CUBIC, BBR, ECN, keepalive and path MTU discovery.
 //!
 //! Its buffers are given to it ([`Buffers`]); it does not allocate.
 
@@ -50,8 +50,37 @@ const DEFAULT_MSS: u16 = 536;
 /// answer each other for ever, and a blind sender could make this end
 /// send an ACK for every segment it forges.
 const INVALID_ANSWER_GAP: u64 = 500 * MS;
-/// Ranges held beyond a gap in what arrived.
-const HOLES: usize = SACK_BLOCKS;
+/// Ranges held beyond a gap that a connection keeps track of; SACK reports
+/// the newest [`SACK_BLOCKS`] (three beside timestamps). Fewer, as when it
+/// kept only what one SACK option holds, and data it had SACKed was
+/// forgotten with more holes than that (reneging, RFC 2018 section 8): a
+/// sender that trusts SACKs then waits for its timeout to send it again.
+const HOLES: usize = 32;
+/// Segments in flight a connection keeps track of (RACK's scoreboard): new
+/// data waits while it is full. 64 segments of 1,448 bytes is more than a
+/// 64 KiB window.
+const SEGS: usize = 64;
+/// The shortest wait for a tail loss probe (RFC 8985 section 7.2 asks for
+/// two round trips; on a path of a few hundred microseconds that is shorter
+/// than a peer's acknowledgement takes to come).
+const PTO_MIN: u64 = 2 * MS;
+
+/// One segment sent and not yet acknowledged: where it ends (it starts
+/// where the one before it ends), when it last went, and what is known of
+/// it (RFC 8985's per-segment state).
+#[derive(Clone, Copy, Default)]
+struct Sent {
+    end: u32,
+    at: u64,
+    flags: u8,
+}
+
+/// The peer SACKed it.
+const SACKED: u8 = 1;
+/// Taken for lost: it goes again as soon as the window allows.
+const LOST: u8 = 2;
+/// It went more than once.
+const RETRANS: u8 = 4;
 
 /// Where the connection is (RFC 9293's states; LISTEN is the stack's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,8 +251,13 @@ pub struct Connection<S> {
     fin_queued: bool,
     /// Where the FIN went, once it was sent: it stays there.
     fin_sent: Option<u32>,
-    /// Send one segment from `snd_una` without going back (fast retransmit).
-    resend_first: bool,
+    /// The segments in flight, oldest first: `segs_len` of them in a ring
+    /// from `segs_head`, the first starting at `segs_start` (each where the
+    /// one before it ends).
+    segs: [Sent; SEGS],
+    segs_head: usize,
+    segs_len: usize,
+    segs_start: u32,
 
     // Receiving: the receive ring holds what arrived in order and was not
     // read; what arrived beyond a gap lies past it, in `holes`' ranges.
@@ -252,11 +286,30 @@ pub struct Connection<S> {
     retries: u32,
     time_wait_until: Option<u64>,
 
-    // Congestion (NewReno).
+    // Congestion: RFC 5681's window, halved once a round trip of losses;
+    // `recover` is where the recovery from them ends. Duplicates count
+    // only with a peer that does not SACK.
     cwnd: u32,
+    /// Bytes acknowledged toward one window of congestion avoidance.
+    avoidance_bytes: u32,
     ssthresh: u32,
     dupacks: u32,
     recover: Option<u32>,
+    first_repair: bool,
+
+    // RACK (RFC 8985): the newest-sent segment the peer has (when it went,
+    // where it ends) and its round trip, the smallest round trip seen,
+    // reordering windows to wait (grown by DSACKs), when to look again for
+    // losses a reordering window still hides; and the tail loss probe's
+    // time and whether it is due.
+    rack_at: u64,
+    rack_end: u32,
+    rack_rtt: u64,
+    min_rtt: u64,
+    reo_mult: u32,
+    reorder_at: Option<u64>,
+    probe_at: Option<u64>,
+    tlp_due: bool,
 
     // Timestamps: the offset this connection's are taken from, and the
     // peer's latest (RFC 7323), when both sides use them.
@@ -265,9 +318,6 @@ pub struct Connection<S> {
     ts_recent: u32,
     /// Peer understands SACK blocks.
     sack: bool,
-    /// The highest edge the peer's SACK blocks reported (snd_una when none
-    /// above it): an acknowledgement that moves it is a duplicate.
-    sack_high: u32,
     /// The peer's SYN carried a window scale (so both sides scale).
     scaling: bool,
     /// A reset to send, at this sequence number, with an ACK or without.
@@ -276,6 +326,10 @@ pub struct Connection<S> {
     answered_invalid_at: Option<u64>,
     /// The persist timer fired: probe the shut window.
     probe_due: bool,
+    /// A segment that arrived again, all of it already in order: reported
+    /// first in the next acknowledgement's SACK blocks (a DSACK, RFC 2883),
+    /// which tells the peer its retransmission was not needed.
+    dsack: Option<(u32, u32)>,
 }
 
 impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
@@ -304,7 +358,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             send: Ring { buf: buffers.send, start: 0, len: 0 },
             fin_queued: false,
             fin_sent: None,
-            resend_first: false,
+            segs: [Sent::default(); SEGS],
+            segs_head: 0,
+            segs_len: 0,
+            segs_start: iss,
             rcv_nxt: 0,
             rcv_scale: scale,
             receive: Ring { buf: buffers.receive, start: 0, len: 0 },
@@ -322,18 +379,28 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             retries: 0,
             time_wait_until: None,
             cwnd: 10 * mss,
+            avoidance_bytes: 0,
             ssthresh: u32::MAX,
             dupacks: 0,
             recover: None,
+            first_repair: false,
+            rack_at: 0,
+            rack_end: iss,
+            rack_rtt: 0,
+            min_rtt: u64::MAX,
+            reo_mult: 1,
+            reorder_at: None,
+            probe_at: None,
+            tlp_due: false,
             timestamps: true,
             ts_offset: iss,
             ts_recent: 0,
             sack: true,
-            sack_high: iss,
             scaling: false,
             reset: None,
             answered_invalid_at: None,
             probe_due: false,
+            dsack: None,
         }
     }
 
@@ -520,16 +587,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.state = State::Closed;
         self.error = self.error.or(error);
         self.retransmit_at = None;
+        self.reorder_at = None;
+        self.probe_at = None;
         self.time_wait_until = None;
         self.send.consume(self.send.len);
     }
 
     /// When [`Connection::on_time`] wants to run next.
     pub fn deadline(&self) -> Option<u64> {
-        match (self.retransmit_at, self.time_wait_until) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [self.retransmit_at, self.time_wait_until, self.reorder_at, self.probe_at].into_iter().flatten().min()
     }
 
     /// The time is `now`: retransmit, probe or give up if it is time.
@@ -537,6 +603,18 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         if self.time_wait_until.is_some_and(|t| now >= t) {
             self.end(None);
             return;
+        }
+        if self.reorder_at.is_some_and(|t| now >= t) && self.detect_losses(now) {
+            self.losses_found();
+        }
+        if self.probe_at.is_some_and(|t| now >= t) {
+            self.probe_at = None;
+            if self.snd_max != self.snd_una && self.recover.is_none() {
+                // The tail went unanswered for two round trips: a probe
+                // (`poll_data`), and the timeout after it (RFC 8985 7.3).
+                self.tlp_due = true;
+                self.retransmit_at = Some(now + self.rto);
+            }
         }
         let Some(at) = self.retransmit_at else { return };
         if now < at {
@@ -558,14 +636,29 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             return;
         }
         // RFC 5681 on a timeout: half what was in flight is the threshold,
-        // one segment the window; everything not acknowledged goes again.
+        // one segment the window; everything not acknowledged or SACKed is
+        // taken for lost and goes again as the window grows (RFC 8985 6.3).
         self.ssthresh = (flight / 2).max(2 * self.mss);
         self.cwnd = self.mss;
-        self.recover = None;
+        self.first_repair = false;
+        self.avoidance_bytes = 0;
         self.dupacks = 0;
-        self.snd_nxt = self.snd_una;
         self.timing = None;
+        self.tlp_due = false;
+        self.probe_at = None;
         self.rto = (self.rto * 2).min(RTO_MAX);
+        if matches!(self.state, State::SynSent | State::SynReceived) {
+            // The SYN goes again (`poll`).
+            self.recover = None;
+            self.snd_nxt = self.snd_una;
+            return;
+        }
+        self.recover = Some(self.snd_max);
+        // A receiver may let go of what it SACKed (RFC 2018 section 8: after
+        // a timeout the SACKed marks are cleared): everything goes again.
+        for k in 0..self.segs_len {
+            self.seg_mut(k).flags = (self.seg(k).flags & !SACKED) | LOST;
+        }
     }
 
     /// The window to advertise, and keep its right edge from moving left.
@@ -584,17 +677,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     }
 
     /// The options of a segment that is not a SYN.
-    fn options(&self, now: u64) -> Options {
+    fn options(&mut self, now: u64) -> Options {
         let mut o = Options::default();
         if self.timestamps {
             o.timestamps = Some((self.ts_now(now), self.ts_recent));
         }
-        if self.sack && self.holes_len > 0 {
+        let dsack = self.dsack.take().filter(|_| self.sack);
+        if self.sack && (self.holes_len > 0 || dsack.is_some()) {
             let room = if self.timestamps { 3 } else { 4 };
-            for (i, h) in self.holes[..self.holes_len.min(room)].iter().enumerate() {
-                o.sack[i] = *h;
+            let blocks = dsack.into_iter().chain(self.holes[..self.holes_len].iter().copied()).take(room);
+            for (i, b) in blocks.enumerate() {
+                o.sack[i] = b;
+                o.sack_len = i as u8 + 1;
             }
-            o.sack_len = self.holes_len.min(room) as u8;
         }
         o
     }
@@ -686,31 +781,45 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.emit(out, h, &o, None)
     }
 
-    /// The next data or FIN segment allowed, if any.
+    /// The next data or FIN segment allowed, if any: a segment taken for
+    /// lost first, then a tail loss probe that is due, then new data, each
+    /// as the windows allow.
     fn poll_data(&mut self, now: u64, out: &mut [u8]) -> Option<usize> {
-        let (start, resend) = if self.resend_first { (self.snd_una, true) } else { (self.snd_nxt, false) };
+        let pipe = self.pipe();
+        if let Some(k) = (0..self.segs_len).find(|&k| self.seg(k).flags & LOST != 0)
+            && (self.first_repair || pipe < self.cwnd)
+        {
+            self.first_repair = false;
+            return self.resend(now, out, k);
+        }
+        let start = self.snd_nxt;
         let base = self.send_base();
         let offset = start.wrapping_sub(base) as usize;
         let waiting = self.send.len.saturating_sub(offset);
         let fin_seq = self.fin_seq();
         let fin_waits = self.fin_queued && !self.fin_acked() && before_eq(start, fin_seq);
+        let peer_room = self.snd_una.wrapping_add(self.snd_wnd).wrapping_sub(start);
+        let peer_room = if (peer_room as i32) < 0 { 0 } else { peer_room };
+        let probing = core::mem::take(&mut self.tlp_due);
+        if probing {
+            // RFC 8985 section 7.3: new data if the peer's window takes it,
+            // else the last segment again; either draws an acknowledgement
+            // that shows what was lost at the tail.
+            let new = (waiting > 0 || fin_waits) && peer_room > 0 && self.segs_len < SEGS;
+            if !new && self.segs_len > 0 {
+                return self.resend(now, out, self.segs_len - 1);
+            }
+        }
         if waiting == 0 && !fin_waits {
-            self.resend_first = false;
             return None;
         }
-        // What the peer's window and the congestion window allow, from
-        // snd_una; a retransmission of the first segment goes regardless.
-        let flight = start.wrapping_sub(self.snd_una);
-        let limit = self.snd_wnd.min(self.cwnd);
-        let mut room = if resend { self.mss } else { limit.saturating_sub(flight) };
-        if room == 0 && start == self.snd_una && self.snd_max != self.snd_una {
-            // Going back after a timeout: the first segment not
-            // acknowledged goes whatever the window says (as Linux). A
-            // stale window (a zero reordered behind the update that
-            // reopened it) would otherwise leave data in flight with
-            // nothing to send it again.
-            room = self.mss;
+        if self.segs_len == SEGS {
+            // The scoreboard is full: what is in flight must be heard of first.
+            return None;
         }
+        // What the peer's window and the congestion window allow (a probe:
+        // the peer's alone).
+        let room = if probing { peer_room } else { peer_room.min(self.cwnd.saturating_sub(pipe)) };
         if room == 0 && self.snd_wnd == 0 && self.snd_max == self.snd_una {
             // A shut window with nothing in flight: the persist timer
             // probes it with a segment just behind the window (as Linux),
@@ -729,19 +838,6 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
         let n = (waiting as u32).min(self.mss).min(room);
         let fin = fin_waits && n as usize == waiting && (n < room || waiting == 0);
-        // A retransmission carries what was sent and nothing new: a byte
-        // (or FIN) past snd_max that went out here would be acknowledged by
-        // the peer, and that acknowledgement refused as one for data never
-        // sent, both ends then waiting on each other until they time out
-        // (seed 113 of the loss test). New data goes through `sent`.
-        let (n, fin) = if resend {
-            let fin_sent = self.fin_sent.is_some();
-            let data = self.snd_max.wrapping_sub(start).saturating_sub(fin_sent as u32);
-            let n = n.min(data);
-            (n, fin && fin_sent && n as usize == waiting)
-        } else {
-            (n, fin)
-        };
         if n == 0 && !fin {
             return None;
         }
@@ -758,19 +854,204 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         if fin {
             self.fin_sent = Some(fin_seq);
         }
-        if resend || before(start, self.snd_max) {
-            self.resent_ts = Some(self.ts_now(now));
+        self.record(start, start.wrapping_add(len), now);
+        self.sent(now, len);
+        self.emit(out, h, &o, Some((offset, n as usize)))
+    }
+
+    /// Send segment `k` of the scoreboard again, as it went the first time.
+    fn resend(&mut self, now: u64, out: &mut [u8], k: usize) -> Option<usize> {
+        let start = self.seg_start(k);
+        let seg = *self.seg(k);
+        let fin = self.fin_sent.is_some() && seg.end == self.fin_seq().wrapping_add(1);
+        let n = seg.end.wrapping_sub(start) - fin as u32;
+        let offset = start.wrapping_sub(self.send_base()) as usize;
+        let mut flags = ACK;
+        if fin {
+            flags |= FIN;
         }
-        if resend {
-            self.resend_first = false;
-            self.timing = None;
-            if self.retransmit_at.is_none() {
-                self.retransmit_at = Some(now + self.rto);
-            }
-        } else {
-            self.sent(now, len);
+        if k + 1 == self.segs_len && n > 0 {
+            flags |= PSH;
+        }
+        let h = self.header(start, flags);
+        let o = self.options(now);
+        let s = self.seg_mut(k);
+        s.flags = (s.flags | RETRANS) & !LOST;
+        s.at = now;
+        // An echo older than this may be of the first sending (Karn).
+        self.resent_ts = Some(self.ts_now(now));
+        self.timing = None;
+        if self.retransmit_at.is_none() {
+            self.retransmit_at = Some(now + self.rto);
         }
         self.emit(out, h, &o, Some((offset, n as usize)))
+    }
+
+    fn seg(&self, k: usize) -> &Sent {
+        &self.segs[(self.segs_head + k) % SEGS]
+    }
+
+    fn seg_mut(&mut self, k: usize) -> &mut Sent {
+        &mut self.segs[(self.segs_head + k) % SEGS]
+    }
+
+    /// Where segment `k` of the scoreboard starts.
+    fn seg_start(&self, k: usize) -> u32 {
+        if k == 0 { self.segs_start } else { self.seg(k - 1).end }
+    }
+
+    /// Put a segment just sent on the scoreboard.
+    fn record(&mut self, start: u32, end: u32, now: u64) {
+        if self.segs_len == 0 {
+            self.segs_start = start;
+        }
+        let i = (self.segs_head + self.segs_len) % SEGS;
+        self.segs[i] = Sent { end, at: now, flags: 0 };
+        self.segs_len += 1;
+    }
+
+    /// Bytes in flight as RFC 6675 counts them: sent, and neither
+    /// acknowledged, SACKed nor taken for lost.
+    fn pipe(&self) -> u32 {
+        (0..self.segs_len)
+            .filter(|&k| self.seg(k).flags & (SACKED | LOST) == 0)
+            .map(|k| self.seg(k).end.wrapping_sub(self.seg_start(k)))
+            .sum()
+    }
+
+    /// Everything before `ack` arrived: those segments leave the
+    /// scoreboard, each delivered.
+    fn acked_to(&mut self, now: u64, ack: u32) {
+        while self.segs_len > 0 {
+            let s = *self.seg(0);
+            if before(ack, s.end) {
+                // Part of it (a peer that acknowledges inside a segment).
+                if before(self.segs_start, ack) {
+                    self.segs_start = ack;
+                }
+                return;
+            }
+            if s.flags & SACKED == 0 {
+                self.delivered(now, s);
+            }
+            self.segs_start = s.end;
+            self.segs_head = (self.segs_head + 1) % SEGS;
+            self.segs_len -= 1;
+        }
+    }
+
+    /// The SACK blocks of `s`: each segment one covers whole is SACKed, and
+    /// delivered. A block wholly below what is acknowledged is a DSACK (RFC
+    /// 2883): the peer had a segment twice, so a retransmission was not
+    /// needed and reordering is wider than the window waited; it widens.
+    /// Whether any segment was SACKed now.
+    fn sacked(&mut self, now: u64, s: &Segment<'_>) -> bool {
+        if !self.sack {
+            return false;
+        }
+        let mut any = false;
+        for &(l, r) in &s.options.sack[..usize::from(s.options.sack_len).min(SACK_BLOCKS)] {
+            if !before(l, r) || before(self.snd_max, r) {
+                continue;
+            }
+            if before_eq(r, s.header.ack) {
+                self.reo_mult = (self.reo_mult + 1).min(16);
+                continue;
+            }
+            let mut start = self.segs_start;
+            for k in 0..self.segs_len {
+                let seg = *self.seg(k);
+                if seg.flags & SACKED == 0 && before_eq(l, start) && before_eq(seg.end, r) {
+                    self.seg_mut(k).flags = (seg.flags | SACKED) & !LOST;
+                    self.delivered(now, seg);
+                    any = true;
+                }
+                start = seg.end;
+            }
+        }
+        any
+    }
+
+    /// Segment `s` reached the peer: the newest-sent one that did is what
+    /// RACK judges the others by (RFC 8985 section 6.2).
+    fn delivered(&mut self, now: u64, s: Sent) {
+        let rtt = now.saturating_sub(s.at);
+        if s.flags & RETRANS != 0 {
+            // Faster than any round trip: this was the first sending.
+            if rtt < self.min_rtt {
+                return;
+            }
+        } else if rtt != 0 {
+            // A send and its ACK in the same clock tick give no measurable
+            // round trip. A zero minimum would disable DSACK adaptation
+            // for the rest of the connection.
+            self.min_rtt = self.min_rtt.min(rtt);
+        }
+        if s.at > self.rack_at || (s.at == self.rack_at && before(self.rack_end, s.end)) {
+            self.rack_at = s.at;
+            self.rack_end = s.end;
+            // Two events with the same clock reading still establish
+            // delivery order. Keep the last measurable duration for the
+            // loss timer when this ACK supplies only that order.
+            if rtt != 0 {
+                self.rack_rtt = rtt;
+            }
+        }
+    }
+
+    /// RACK's loss detection (RFC 8985 section 6.2): a segment sent before
+    /// one the peer has, longer ago than that one's round trip and the
+    /// reordering window, is lost. Arms the timer for those the window
+    /// still covers. Whether any was newly taken for lost.
+    fn detect_losses(&mut self, now: u64) -> bool {
+        self.reorder_at = None;
+        if self.rack_at == 0 {
+            return false;
+        }
+        let reo = if self.min_rtt == u64::MAX { 0 } else { (self.min_rtt / 4 * u64::from(self.reo_mult)).min(self.srtt.max(1)) };
+        let mut lost = false;
+        for k in 0..self.segs_len {
+            let s = *self.seg(k);
+            let older = s.at < self.rack_at || (s.at == self.rack_at && before(s.end, self.rack_end));
+            if s.flags & (SACKED | LOST) != 0 || !older {
+                continue;
+            }
+            let due = s.at + self.rack_rtt + reo;
+            if now >= due {
+                self.seg_mut(k).flags |= LOST;
+                lost = true;
+            } else {
+                // RFC 8985 section 6.4 waits until the whole group is
+                // due. Each intervening ACK can still reveal losses.
+                self.reorder_at = Some(self.reorder_at.map_or(due, |t| t.max(due)));
+            }
+        }
+        lost
+    }
+
+    /// Losses were found: the window is halved, once a round trip (RFC
+    /// 5681, RFC 6675): `recover` is where that round trip ends.
+    fn losses_found(&mut self) {
+        if self.recover.is_none() {
+            let flight = self.snd_max.wrapping_sub(self.snd_una);
+            self.ssthresh = (flight / 2).max(2 * self.mss);
+            self.cwnd = self.ssthresh;
+            self.avoidance_bytes = 0;
+            self.recover = Some(self.snd_max);
+            // RFC 6675 section 5, step 4.3: the first repair goes upon
+            // entering recovery. Packets still counted in flight may
+            // exceed the reduced window and draw no further ACK.
+            self.first_repair = true;
+            self.timing = None;
+        }
+    }
+
+    /// The tail loss probe's time: two round trips after the last thing
+    /// heard or sent, while data is in flight outside a recovery (RFC
+    /// 8985 section 7.2), once a round trip was measured.
+    fn arm_probe(&mut self, now: u64) {
+        self.probe_at = (self.sack && self.snd_max != self.snd_una && self.recover.is_none() && self.srtt != 0)
+            .then(|| now + (2 * self.srtt).max(PTO_MIN));
     }
 
     /// `len` of sequence space went out at snd_nxt.
@@ -785,6 +1066,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
         if self.retransmit_at.is_none() {
             self.retransmit_at = Some(now + self.rto);
+        }
+        if self.probe_at.is_none() {
+            self.arm_probe(now);
         }
         if self.state == State::Established && self.fin_queued && end == self.fin_seq().wrapping_add(1) {
             self.state = State::FinWait1;
@@ -880,7 +1164,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             return;
         }
         if !self.acceptable(s) {
+            let len = s.data.len() as u32;
             if !s.has(RST) {
+                if self.sack && !s.has(SYN) && len > 0 && before_eq(h.seq.wrapping_add(len), self.rcv_nxt) {
+                    // Report the duplicate on the next ACK (RFC 2883).
+                    // The existing rate limit also covers these replies.
+                    self.dsack = Some((h.seq, h.seq.wrapping_add(len)));
+                }
                 self.answer_invalid(now);
             }
             return;
@@ -969,20 +1259,31 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
         let window = u32::from(h.window) << self.snd_scale;
         let acked = ack.wrapping_sub(self.snd_una);
+        // With SACK, losses are found by time (RACK, RFC 8985): a segment
+        // sent before one the peer has, and longer ago than that one's round
+        // trip and a reordering window. Counting duplicates, as RFC 5681
+        // does, missed a loss with fewer than three segments after it (a
+        // small window, the tail) and one whose duplicates each carried a
+        // new window (Linux's grows with nearly every acknowledgement), and
+        // either waited for the 200 ms timer: 67 times in 16 MiB on the
+        // interop suite's lossy path. A peer without SACK is still judged
+        // by duplicates.
+        let sacked = self.sacked(now, s);
         if acked == 0 {
             let flight = self.snd_max.wrapping_sub(self.snd_una);
-            // RFC 6675: an acknowledgement that SACKs data not SACKed before
-            // is a duplicate whatever its window. A receiver's window grows
-            // as its program reads (Linux's with nearly every one), so RFC
-            // 5681's duplicate, the same window, never came from it, and a
-            // loss waited for the timer.
-            let sacks_new = self.sacked_more(s);
-            let duplicate = s.data.is_empty() && !s.has(SYN | FIN) && flight > 0 && (window == self.snd_wnd || sacks_new);
-            if duplicate {
+            let duplicate = s.data.is_empty() && !s.has(SYN | FIN) && flight > 0 && window == self.snd_wnd;
+            if duplicate && !self.sack {
                 self.duplicate_ack();
             }
         } else {
             self.new_ack(now, s, acked);
+        }
+        if self.sack && (sacked || acked > 0) {
+            if self.detect_losses(now) {
+                self.losses_found();
+            }
+            self.tlp_due = false;
+            self.arm_probe(now);
         }
         // The window comes from the newest segment (RFC 9293 3.10.7.4).
         if before(self.snd_wl1, h.seq) || (self.snd_wl1 == h.seq && before_eq(self.snd_wl2, ack)) {
@@ -997,34 +1298,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
     }
 
-    /// Whether `s`'s SACK blocks report data above any reported before (a
-    /// block outside what was sent and not acknowledged says nothing).
-    fn sacked_more(&mut self, s: &Segment<'_>) -> bool {
-        if !self.sack {
-            return false;
-        }
-        let mut more = false;
-        for &(l, r) in &s.options.sack[..usize::from(s.options.sack_len).min(SACK_BLOCKS)] {
-            if before(self.snd_una, l) && before(l, r) && before_eq(r, self.snd_max) && before(self.sack_high, r) {
-                self.sack_high = r;
-                more = true;
-            }
-        }
-        more
-    }
-
+    /// A duplicate from a peer without SACK: the third takes the first
+    /// segment for lost (RFC 5681 fast retransmit).
     fn duplicate_ack(&mut self) {
-        self.dupacks += 1;
-        if self.recover.is_some() {
-            // Each one is a segment that left the network (RFC 6582).
-            self.cwnd += self.mss;
-        } else if self.dupacks == 3 {
-            let flight = self.snd_max.wrapping_sub(self.snd_una);
-            self.ssthresh = (flight / 2).max(2 * self.mss);
-            self.cwnd = self.ssthresh + 3 * self.mss;
-            self.recover = Some(self.snd_max);
-            self.resend_first = true;
-            self.timing = None;
+        self.dupacks = self.dupacks.saturating_add(1);
+        if self.dupacks == 3 && self.recover.is_none() && self.segs_len > 0 {
+            self.seg_mut(0).flags |= LOST;
+            self.losses_found();
         }
     }
 
@@ -1035,9 +1315,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         let fin = (self.fin_sent.is_some() && !self.fin_acked() && before(self.fin_seq(), ack)) as u32;
         self.send.consume((acked - syn - fin) as usize);
         self.snd_una = ack;
-        if before(self.sack_high, ack) {
-            self.sack_high = ack;
-        }
+        self.acked_to(now, ack);
         if before(self.snd_nxt, ack) {
             self.snd_nxt = ack;
         }
@@ -1066,17 +1344,27 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         // Congestion.
         match self.recover {
             Some(r) if before(ack, r) => {
-                // A partial acknowledgement: the next hole goes at once,
-                // and the window deflates by what was acknowledged.
-                self.cwnd = self.cwnd.saturating_sub(acked).max(self.mss) + self.mss;
-                self.resend_first = true;
+                // A partial acknowledgement from a peer without SACK: the
+                // next hole is the next segment (RFC 6582).
+                if !self.sack && self.segs_len > 0 {
+                    self.seg_mut(0).flags |= LOST;
+                }
             }
             Some(_) => {
-                self.cwnd = self.ssthresh.min(self.snd_max.wrapping_sub(self.snd_una).max(self.mss) + self.mss);
+                self.cwnd = self.ssthresh;
                 self.recover = None;
+                self.first_repair = false;
             }
             None if self.cwnd < self.ssthresh => self.cwnd += acked.min(self.mss),
-            None => self.cwnd += (self.mss * self.mss / self.cwnd).max(1),
+            None => {
+                // RFC 5681 section 3.1: one MSS per window of bytes
+                // delivered, independent of how the peer groups its ACKs.
+                self.avoidance_bytes = self.avoidance_bytes.saturating_add(acked);
+                if self.avoidance_bytes >= self.cwnd {
+                    self.avoidance_bytes -= self.cwnd;
+                    self.cwnd = self.cwnd.saturating_add(self.mss);
+                }
+            }
         }
         self.dupacks = 0;
         if fin == 1 {
@@ -1143,6 +1431,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         if !data.is_empty() {
             self.ack_due = true;
         }
+        // All of it arrived before: the peer is told (a DSACK).
+        if !data.is_empty() && before_eq(seq.wrapping_add(data.len() as u32), self.rcv_nxt) {
+            self.dsack = Some((seq, seq.wrapping_add(data.len() as u32)));
+        }
         // Trim what already arrived.
         if before(seq, self.rcv_nxt) {
             let skip = (self.rcv_nxt.wrapping_sub(seq) as usize).min(data.len());
@@ -1194,9 +1486,16 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
                 if before(end, e) {
                     end = e;
                 }
-            } else if k < HOLES - 1 {
+            } else {
                 kept[k] = (s, e);
                 k += 1;
+            }
+            if k == HOLES {
+                // Full: the range furthest from what is in order is let go
+                // of (its bytes come again; the one just arrived is kept).
+                let far = (0..k).max_by_key(|&j| kept[j].0.wrapping_sub(self.rcv_nxt)).unwrap_or(0);
+                kept.copy_within(far + 1..k, far);
+                k -= 1;
             }
         }
         self.holes[0] = (start, end);
