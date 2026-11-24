@@ -31,15 +31,24 @@
 //! [`TX_TIMEOUT_NS`]; the device manager starts it again, which resets the
 //! device, and the client offers its buffers and frames again.
 //!
+//! The five device faults of `silica_driver::inject` are committed where an
+//! 82574 would commit them: `garbage`, the oldest receive descriptor written
+//! back done with a length past its buffer and no end of frame; `stuck`, a
+//! transmit the device never sees (the transmit tail no longer advanced; on
+//! a receive buffer it waits for the next transmit, as a ring would stop
+//! receiving altogether); `spurious`, an interrupt with nothing done;
+//! `missed`, a look at the rings skipped as if the interrupt never came;
+//! `reset`, the device reset (CTRL.RST) as a transmit is handed over.
+//!
 //! Not yet: checksum and segmentation offloads, more than one queue pair,
-//! interrupt moderation (ITR), fault injection (`silica_driver::inject`, as
-//! the virtio drivers have it), and a watched receive queue
+//! interrupt moderation (ITR), and a watched receive queue
 //! (`Interrupt::watch`).
 #![no_std]
 #![no_main]
 
-use e1000e::{DESC, RECEIVE_BYTES, RING, Ring, TX_EOP, TX_IFCS, TX_RS, receive};
+use e1000e::{DD, DESC, RECEIVE_BYTES, RING, Ring, TX_EOP, TX_IFCS, TX_RS, receive};
 use silica_driver::dma::{self, Dma, DmaMemory, Shared};
+use silica_driver::inject::{self, Fault};
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::{Device, DeviceError, grant, granted};
 use silica_net::device::{Error, Info};
@@ -131,10 +140,12 @@ struct Nic {
     dma: Dma,
     rx: Ring<Ticket>,
     tx: Ring<Ticket>,
-    /// The rings' memory, kept while the device has it.
-    _rings: [DmaMemory; 2],
+    /// The rings' memory (receive, transmit), kept while the device has it.
+    rings: [DmaMemory; 2],
     info: Info,
     _interrupts: Vec<Interrupt>,
+    /// An injected `stuck`: the device no longer sees transmits.
+    stuck: bool,
 }
 
 impl Nic {
@@ -185,13 +196,26 @@ impl silica_net::service::Device for Nic {
     }
 
     fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Refusal> {
+        // An injected fault comes due with the nth request offered.
+        inject::due();
         match r.op {
             // The device writes the length back; the buffer is RECEIVE_BYTES
             // (the service checked the request has that many).
             Op::Receive => self.rx.add(address, 0, 0, ticket, now()).then_some(()).ok_or(Refusal::Busy),
             Op::Transmit => {
                 let length = u16::try_from(r.length).map_err(|_| Refusal::Fail(Status::Invalid))?;
-                self.tx.add(address, length, TX_EOP | TX_IFCS | TX_RS, ticket, now()).then_some(()).ok_or(Refusal::Busy)
+                if !self.tx.add(address, length, TX_EOP | TX_IFCS | TX_RS, ticket, now()) {
+                    return Err(Refusal::Busy);
+                }
+                // A device that stops seeing transmits, or resets itself as
+                // one is handed over (injected).
+                if inject::pending(Fault::Stuck) {
+                    self.stuck = true;
+                }
+                if inject::pending(Fault::Reset) {
+                    self.regs.write32(CTRL, self.regs.read32(CTRL) | CTRL_RST);
+                }
+                Ok(())
             }
         }
     }
@@ -216,21 +240,30 @@ impl silica_net::service::Device for Nic {
             self.regs.write32(RDT, self.rx.tail as u32);
             self.rx.added = false;
         }
-        if self.tx.added {
+        if self.tx.added && !self.stuck {
             self.regs.write32(TDT, self.tx.tail as u32);
-            self.tx.added = false;
         }
+        self.tx.added = false;
     }
 
     fn signals(&mut self, bits: u64, done: &mut Completions<'_>, link: &mut dyn FnMut(bool)) {
-        while let Some(d) = self.rx.pop() {
+        // Injected: the oldest receive descriptor written back done, with a
+        // length past its buffer and no end of frame; or this interrupt
+        // missed (what it reports is found at the next).
+        if self.rx.holding() > 0 && inject::pending(Fault::Garbage) {
+            let words = self.rings[0].shared();
+            words.write16(self.rx.next * DESC + 8, u16::MAX);
+            words.write8(self.rx.next * DESC + 12, DD);
+        }
+        let missed = bits != 0 && inject::pending(Fault::Missed);
+        while let Some(d) = if missed { None } else { self.rx.pop() } {
             match receive(&d) {
                 Ok(Ok(length)) => done(d.ticket, Ok(length)),
                 Ok(Err(())) => done(d.ticket, Err(Status::Io)),
                 Err(broken) => self.give_up(DeviceError::Protocol(broken.why())),
             }
         }
-        while let Some(d) = self.tx.pop() {
+        while let Some(d) = if missed { None } else { self.tx.pop() } {
             done(d.ticket, Ok(0));
         }
         // The queues whose interrupt came were masked when it was sent:
@@ -255,7 +288,8 @@ impl silica_net::service::Device for Nic {
     }
 
     fn deadline(&self) -> Option<u64> {
-        self.tx.given().map(|t| t + TX_TIMEOUT_NS).min()
+        let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { TX_TIMEOUT_NS };
+        self.tx.given().map(|t| t + limit).min()
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -343,6 +377,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         IVAR_VALID | IVAR_VALID << 8 | IVAR_VALID << 16
     };
     regs.write32(IVAR, ivar | IVAR_TX_EVERY);
+    // Where an injected spurious interrupt goes.
+    inject::interrupts(signals.sender(RX | TX)?);
     regs.write32(CTRL_EXT, regs.read32(CTRL_EXT) | CTRL_EXT_PBA_CLR);
     // A queue's cause clears itself when its message is sent, and the queue
     // is masked until the driver has looked at it (`signals` unmasks it):
@@ -373,8 +409,9 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         dma,
         rx,
         tx,
-        _rings: [rx_memory, tx_memory],
+        rings: [rx_memory, tx_memory],
         _interrupts: interrupts,
+        stuck: false,
     };
     nic.info.link_up = nic.link_up();
     let a = address.to_le_bytes();
