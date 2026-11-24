@@ -10,7 +10,9 @@
 //!   fails with `Gone` or `BadCap` is made again. It then asks the server
 //!   for its count and exits 0 if nothing was lost: every ping the client
 //!   saw answered was answered once, and the server answered no more than
-//!   the client sent.
+//!   the client sent. With `args[3]` set, the grant `args[3]` slots after
+//!   its first is a notification it signals every [`TOLD_EVERY`] answers:
+//!   its progress, by which systest tells a slow run from a stuck one.
 //! - [`REVOKER`]: grants a capability derived from its first grant into
 //!   slot `FIRST_GRANT` of the CapSpace that is its second grant, leaves it
 //!   there for `args[1]` nanoseconds, revokes it, and starts again.
@@ -32,6 +34,8 @@ pub const ONE_CALL: u64 = 4;
 
 const PING: u64 = 1;
 const COUNT: u64 = 2;
+/// How many answers a client gets between signals of its progress.
+pub const TOLD_EVERY: u64 = 4096;
 
 silica_rt::main!(main);
 
@@ -39,7 +43,7 @@ fn main(info: &'static ProcessInfo) -> i64 {
     let grant = Cap(slots::FIRST_GRANT);
     match info.args[0] {
         SERVER => server(grant),
-        CLIENT => client(grant, info.args[1], info.args[2] != 0),
+        CLIENT => client(grant, info.args[1], info.args[2] != 0, (info.args[3] != 0).then(|| Cap(slots::FIRST_GRANT + info.args[3]))),
         REVOKER => revoker(grant, Cap(slots::FIRST_GRANT + 1), info.args[1]),
         HOG => hog(),
         ONE_CALL => match sys::call(grant, MsgInfo::new(PING, 1), [41, 0, 0, 0]) {
@@ -72,7 +76,7 @@ fn server(endpoint: Cap) -> i64 {
     }
 }
 
-fn client(endpoint: Cap, count: u64, expect_revocation: bool) -> i64 {
+fn client(endpoint: Cap, count: u64, expect_revocation: bool, progress: Option<Cap>) -> i64 {
     let (mut answered, mut failed) = (0u64, 0u64);
     // A call that fails because the capability was away is made again.
     let call = |label: u64, word: u64, failed: &mut u64| loop {
@@ -87,7 +91,16 @@ fn client(endpoint: Cap, count: u64, expect_revocation: bool) -> i64 {
     };
     while answered < count {
         match call(PING, answered, &mut failed) {
-            Ok(v) if v == answered + 1 => answered += 1,
+            Ok(v) if v == answered + 1 => {
+                answered += 1;
+                if answered % TOLD_EVERY == 0
+                    && let Some(p) = progress
+                    && sys::signal(p).is_err()
+                {
+                    println!("stress client: cannot signal its progress after {answered} pings");
+                    return 6;
+                }
+            }
             Ok(v) => {
                 println!("stress client: ping {answered} was answered with {v}");
                 return 2;

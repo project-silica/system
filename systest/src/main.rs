@@ -32,7 +32,23 @@ struct Tests {
     children: [Option<Child>; 16],
     caps: [Option<Cap>; 16],
     objects: [Option<Object>; 8],
+    /// How long this machine took for a million round trips on one
+    /// processor (0 until that test has run): its pace, which the limits
+    /// on the tests after it follow ([`Tests::patience`]).
+    pace: u64,
 }
+
+/// The pace the limits are sized for: a million round trips on one
+/// processor took 14.4 s emulating aarch64 on the reference host
+/// (2026-11-24), far less under KVM, where the limits stay as written. On a
+/// hosted runner the same took 44 s, and the tests across processors up to
+/// 31 times their time here: a limit that does not follow the machine fails
+/// a slow run as if it were a hung one.
+const REFERENCE_PACE_NS: u64 = 15 * SECOND;
+
+/// How often a wait says it is still waiting (the harness ends a guest that
+/// says nothing for a minute: `tools/qemu.sh --quiet`).
+const SAY_NS: u64 = 10 * SECOND;
 
 type Outcome = Result<(), &'static str>;
 
@@ -40,11 +56,17 @@ impl Tests {
     /// Start `stress` in `role` on processor `cpu` (modulo how many there
     /// are). Returns the program and the badge its exit report will carry.
     fn start(&mut self, role: u64, args: [u64; 2], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
+        self.start_with(role, [args[0], args[1], 0], cpu, grants)
+    }
+
+    /// [`Tests::start`] with a third argument (a client's: where its
+    /// progress notification is among its grants).
+    fn start_with(&mut self, role: u64, args: [u64; 3], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
         self.next_id += 1;
         let place = self.children.iter_mut().find(|c| c.is_none()).ok_or("a test starts too many programs")?;
         let prog = Program {
             grants,
-            args: [role, args[0], args[1], 0, 0, 0, 0, 0],
+            args: [role, args[0], args[1], args[2], 0, 0, 0, 0],
             cpu: (cpu % self.root.parent.cpus) as usize,
             ..Program::new(self.stress, self.next_id)
         };
@@ -55,9 +77,59 @@ impl Tests {
         Ok((place.insert(child), self.next_id))
     }
 
-    /// The next exit report, as (badge, status).
+    /// A limit written for the reference pace, for this machine's: longer
+    /// in proportion where the machine is slower, never shorter.
+    fn patience(&self, within: u64) -> u64 {
+        // (In 128 bits: two times in nanoseconds multiplied pass 2^64.)
+        let scaled = u128::from(within) * u128::from(self.pace.max(REFERENCE_PACE_NS)) / u128::from(REFERENCE_PACE_NS);
+        u64::try_from(scaled).unwrap_or(u64::MAX)
+    }
+
+    /// The next exit report, as (badge, status), within `within` at the
+    /// reference pace ([`Tests::patience`]), saying every [`SAY_NS`] that
+    /// it still waits.
     fn next_exit(&self, within: u64) -> Result<(u64, i64), &'static str> {
-        let Ok(m) = sys::recv(self.root.parent.exit, Wait::Until(silica_rt::clock().now() + within)) else {
+        self.next_exit_watching(within, None)
+    }
+
+    /// [`Tests::next_exit`], where the programs signal `progress` as they
+    /// get somewhere: then `within` is the longest without progress, not
+    /// the longest in all, and a slow machine is told from a stuck one.
+    fn next_exit_watching(&self, within: u64, progress: Option<Cap>) -> Result<(u64, i64), &'static str> {
+        let limit = self.patience(within);
+        let began = silica_rt::clock().now();
+        let (mut moved, mut said, mut signals) = (began, began, 0u64);
+        let m = loop {
+            let now = silica_rt::clock().now();
+            // Said every SAY_NS whatever woke it (progress wakes it often).
+            if now - said >= SAY_NS {
+                println!(
+                    "systest:   waiting for its programs: {} s, the last progress {} s ago ({signals} signals; the limit {} s without)",
+                    (now - began) / SECOND,
+                    (now - moved) / SECOND,
+                    limit / SECOND
+                );
+                said = now;
+            }
+            if now >= moved + limit {
+                break None;
+            }
+            let until = (moved + limit).min(said + SAY_NS);
+            let got = match progress {
+                Some(p) => sys::recv_listening(self.root.parent.exit, p, Wait::Until(until)),
+                None => sys::recv(self.root.parent.exit, Wait::Until(until)),
+            };
+            match got {
+                Ok(m) if m.signals().is_some() => {
+                    moved = silica_rt::clock().now();
+                    signals += 1;
+                }
+                Ok(m) => break Some(m),
+                Err(Error::Timeout) => {}
+                Err(_) => break None,
+            }
+        };
+        let Some(m) = m else {
             // Say where everyone is: the owner's first question.
             for c in self.children.iter().flatten() {
                 match sys::inspect_thread(c.thread()) {
@@ -83,9 +155,18 @@ impl Tests {
     }
 
     fn endpoint(&mut self) -> Result<Cap, &'static str> {
-        let object = Object::new(ObjectType::Endpoint, 0).map_err(|_| "cannot create an endpoint")?;
+        self.object(ObjectType::Endpoint)
+    }
+
+    fn notification(&mut self) -> Result<Cap, &'static str> {
+        self.object(ObjectType::Notification)
+    }
+
+    /// An object of type `ty` for the running test, destroyed when it ends.
+    fn object(&mut self, ty: ObjectType) -> Result<Cap, &'static str> {
+        let object = Object::new(ty, 0).map_err(|_| "cannot create an endpoint or notification")?;
         let cap = object.cap();
-        *self.objects.iter_mut().find(|o| o.is_none()).ok_or("a test makes too many endpoints")? = Some(object);
+        *self.objects.iter_mut().find(|o| o.is_none()).ok_or("a test makes too many objects")? = Some(object);
         Ok(cap)
     }
 
@@ -121,15 +202,23 @@ impl Tests {
     /// their own; pair `i` runs on processors `cpus(i)`.
     fn round_trips(&mut self, pairs: u64, count: u64, cpus: impl Fn(u64) -> (u64, u64)) -> Outcome {
         let mut clients = [0u64; 8];
+        // The clients signal it as they go (every 4096 round trips): the
+        // limit is on a stretch without progress, not on the whole run. On
+        // an emulated machine with fewer host processors than it has, a
+        // round trip across processors waits for the host to schedule both
+        // (four pairs on eight emulated processors, two host ones: over
+        // eleven times one pair's time, 2026-11-24).
+        let progress = self.notification()?;
         for i in 0..pairs {
             let ep = self.endpoint()?;
             let (server_cpu, client_cpu) = cpus(i);
             self.start(SERVER, [0, 0], server_cpu, &[Grant::lend(ep, Rights::READ)])?;
-            (_, clients[i as usize]) = self.start(CLIENT, [count, 0], client_cpu, &[Grant::badged(ep, SEND, 1)])?;
+            let grants = [Grant::badged(ep, SEND, 1), Grant::lend(progress, Rights::WRITE)];
+            (_, clients[i as usize]) = self.start_with(CLIENT, [count, 0, 1], client_cpu, &grants)?;
         }
         // Clients finish in any order.
         for _ in 0..pairs {
-            let (who, status) = self.next_exit(120 * SECOND)?;
+            let (who, status) = self.next_exit_watching(120 * SECOND, Some(progress))?;
             if !clients[..pairs as usize].contains(&who) {
                 return Err("a server exited");
             }
@@ -150,6 +239,7 @@ impl Tests {
         let (client, id) = self.start(CLIENT, [200_000, 0], 2, &[Grant::badged(ep, SEND, 1)])?;
         let client = client.thread();
         let (start, mut moves) = (silica_rt::clock().now(), 0u64);
+        let (limit, mut said) = (self.patience(120 * SECOND), start);
         loop {
             match sys::recv(self.root.parent.exit, Wait::Until(silica_rt::clock().now() + 50_000)) {
                 Ok(m) if m.badge == id && m.words[0] == 0 => break,
@@ -160,8 +250,14 @@ impl Tests {
                 Err(Error::Timeout) => {}
                 Err(_) => return Err("cannot receive exit reports"),
             }
-            if silica_rt::clock().now() - start > 120 * SECOND {
-                return Err("the round trips did not finish within 120 s");
+            let now = silica_rt::clock().now();
+            if now - start > limit {
+                println!("systest:   the pair was moved {moves} times in {} s", limit / SECOND);
+                return Err("the round trips did not finish in time (120 s at the reference pace)");
+            }
+            if now - said >= SAY_NS {
+                println!("systest:   moving the pair: {moves} moves, {} s", (now - start) / SECOND);
+                said = now;
             }
             moves += 1;
             for (thread, k) in [(client, 0), (server, 3)] {
@@ -317,7 +413,7 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         finish(false)
     };
     let cpus = root.parent.cpus;
-    let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8] };
+    let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
     let tests: [(&str, Test); 9] = [
@@ -336,8 +432,12 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
         let began = silica_rt::clock().now();
         // Whatever the test made is taken back before the next one starts.
         let outcome = test(&mut t).and(t.clean()).or_else(|e| t.clean().and(Err(e)).or(Err(e)));
+        let took = silica_rt::clock().now() - began;
+        if name == "a_million_round_trips_on_one_processor" && outcome.is_ok() {
+            t.pace = took;
+        }
         match outcome {
-            Ok(()) => println!("TEST {name} PASS ({} ms)", (silica_rt::clock().now() - began) / 1_000_000),
+            Ok(()) => println!("TEST {name} PASS ({} ms)", took / 1_000_000),
             Err(why) => {
                 println!("ERROR: systest: {name}: {why}");
                 failed = true;
