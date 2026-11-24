@@ -564,6 +564,27 @@ impl<C: Control> Queue<C> {
     /// The next completion (or provider's event: a tag from [`EVENTS`]
     /// up), if one is there.
     pub fn poll(&mut self) -> Result<Option<Completion>, Error> {
+        if let Some(c) = self.take()? {
+            return Ok(Some(c));
+        }
+        // Nothing completed: a driver's end may have been noticed meanwhile.
+        // A queue with a notification of its own takes what is there without
+        // waiting (a client that only polls hears of the end here); one that
+        // shares its caller's is told by the caller (`signalled`). (Not in
+        // `wait` and `kick_wait`, which receive from it themselves: there it
+        // was a system call more per request, 147 ns of a 3.8 us block read.)
+        if self._own_note.is_some()
+            && let Ok(m) = sys::recv(self.note, Wait::Poll)
+            && m.badge & self.bits.gone(self.generation) != 0
+        {
+            self.disconnect();
+        }
+        Ok(None)
+    }
+
+    /// The next completion if one is there, connecting again first if the
+    /// driver ended.
+    fn take(&mut self) -> Result<Option<Completion>, Error> {
         if let Some(c) = self.ready.pop_front() {
             if c.tag < EVENTS {
                 self.in_flight.remove(c.tag);
@@ -592,16 +613,6 @@ impl<C: Control> Queue<C> {
                 Err(_) => return Err(Error::Protocol),
             }
         }
-        // Nothing completed: a driver's end may have been noticed meanwhile.
-        // A queue with a notification of its own takes what is there without
-        // waiting (a client that only polls hears of the end here); one that
-        // shares its caller's is told by the caller (`signalled`).
-        if self._own_note.is_some()
-            && let Ok(m) = sys::recv(self.note, Wait::Poll)
-            && m.badge & self.bits.gone(self.generation) != 0
-        {
-            self.disconnect();
-        }
         Ok(None)
     }
 
@@ -613,7 +624,7 @@ impl<C: Control> Queue<C> {
     pub fn kick_wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
         let mut kick = true;
         loop {
-            if let Some(c) = self.poll()? {
+            if let Some(c) = self.take()? {
                 if kick {
                     self.kick();
                 }
@@ -641,7 +652,7 @@ impl<C: Control> Queue<C> {
     /// `deadline` (nanoseconds; `None`: for ever).
     pub fn wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
         loop {
-            if let Some(c) = self.poll()? {
+            if let Some(c) = self.take()? {
                 return Ok(c);
             }
             let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
