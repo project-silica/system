@@ -401,9 +401,6 @@ impl Stack {
             self.dhcp_step(now, step);
         }
         self.timers(now);
-        if self.nic.deadline().is_some_and(|d| d <= now) {
-            self.nic.tick();
-        }
         let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
         tcp.on_time(now);
         self.tcp = Some(tcp);
@@ -454,9 +451,6 @@ impl Stack {
         let mut d = self.dhcp.deadline();
         if let Some(t) = self.tcp.as_ref().and_then(|t| t.deadline()) {
             d = d.min(t);
-        }
-        if let Some(n) = self.nic.deadline() {
-            d = d.min(n);
         }
         if let Some(h) = &self.held {
             d = d.min(h.asked + SECOND).min(h.since + RESOLVE_WAIT);

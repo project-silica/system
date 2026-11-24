@@ -88,16 +88,6 @@ impl Interface {
         self.queue.sleep()
     }
 
-    /// When to call [`Interface::tick`] (`open_on`), if at all.
-    pub fn deadline(&self) -> Option<u64> {
-        self.queue.deadline()
-    }
-
-    /// At [`Interface::deadline`]: look whether the driver is still there.
-    pub fn tick(&mut self) {
-        self.queue.tick()
-    }
-
     /// Ask the current driver for the interface's address, MTU and link state.
     pub fn info(&mut self) -> Result<Info, Error> {
         Ok(self.queue.control()?.control.info()?.info)

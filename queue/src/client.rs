@@ -2,10 +2,12 @@
 //! the provider.
 //!
 //! A driver can end at any moment: it fails, or its owner restarts it. The
-//! client hears of it at once (the device manager signals the client's
-//! notification, `open`'s `gone`) or, when the device manager ended too and
-//! its notice with it, within [`Queue::LIVENESS_NS`] of a request waiting
-//! (the client's capability to the driver is gone), opens the driver that replaces it,
+//! client hears of it at once: the device manager signals the client's
+//! notification (`open`'s `gone`), and so does the kernel when the client's
+//! capability to the driver's wake-up goes with the driver's objects
+//! (`libsys::cap_notice`), which covers the device manager ending too and
+//! taking its drivers with it. Nothing is polled: a client waiting for
+//! frames that may never come wakes for nothing else. It opens the driver that replaces it,
 //! registers its memory again, and sends again every request that had not
 //! completed. Completions the old driver had already written are still
 //! delivered. To the program, a driver's end is a delay; a request is never
@@ -227,6 +229,11 @@ struct Link<C> {
     control: C,
     requests: Producer<REQUEST_BYTES>,
     completions: Consumer<COMPLETION_BYTES>,
+    /// The kernel's notice of `wake` going (`cap_notice`). Declared before
+    /// `wake`, so dropped first: a link the client ends is no driver's end,
+    /// and deleting `wake` while watched would wake the client for nothing.
+    /// (Already empty when the driver's end fired it.)
+    _notice: Handle,
     /// Signalled when the driver must look at the request ring.
     wake: Handle,
 }
@@ -274,8 +281,6 @@ pub struct Queue<C: Control> {
     reconnected_at: u64,
     tries: u32,
     recovered_in: Option<Recovery>,
-    /// When the driver was last looked for (`LIVENESS_NS`).
-    checked_at: u64,
 }
 
 /// A capability of this program's own, derived from `cap` with `rights`
@@ -292,10 +297,6 @@ impl<C: Control> Queue<C> {
     /// How long a driver that ended has to come back before requests fail
     /// with [`Error::Gone`].
     pub const RECONNECT_NS: u64 = 5_000_000_000;
-    /// How often a client with requests in flight and none completing
-    /// looks whether its driver is still there, for the end no notice
-    /// reports: the device manager's own, which takes its drivers with it.
-    pub const LIVENESS_NS: u64 = 10_000_000;
 
     /// Open the device with identity `id` through the device manager behind
     /// `devices` (a capability to its endpoint; the queue keeps it to find
@@ -316,10 +317,9 @@ impl<C: Control> Queue<C> {
     /// `first + SHARED_BITS - 1` (from 0 to 56): for a program that waits
     /// for more than this queue at once (a server that is also a driver's
     /// client), in its own wait. It hands the queue every signal on those
-    /// bits ([`Queue::signalled`]), asks it before waiting
-    /// ([`Queue::sleep`]), and calls [`Queue::tick`] at its
-    /// [`Queue::deadline`]; [`Queue::wait`] and [`Queue::kick_wait`] are
-    /// not for such a queue.
+    /// bits ([`Queue::signalled`], which is how it hears of a driver's end)
+    /// and asks it before waiting ([`Queue::sleep`]); [`Queue::wait`] and
+    /// [`Queue::kick_wait`] are not for such a queue.
     pub fn open_on(devices: Cap, id: u32, note: Cap, first: u32) -> Result<Queue<C>, Error> {
         if first > 64 - SHARED_BITS {
             return Err(Error::BadArgument);
@@ -348,7 +348,6 @@ impl<C: Control> Queue<C> {
             reconnected_at: 0,
             tries: 0,
             recovered_in: None,
-            checked_at: 0,
         };
         q.connect()?;
         Ok(q)
@@ -372,7 +371,12 @@ impl<C: Control> Queue<C> {
         let (Some(requests), Some(completions)) = (Producer::new(req, QUEUE), Consumer::new(cpl, QUEUE)) else {
             return Err(Error::Protocol);
         };
-        let mut link = Box::new(Link { control, requests, completions, wake });
+        // The kernel says when the driver's wake-up goes (the driver ended,
+        // or the device manager and every driver with it), with this
+        // connection's death notice.
+        let notice = Handle::new(Cap(free_slot().ok_or(Error::NoMemory)?));
+        sys::cap_notice(wake.cap(), self.note, notice.cap(), self.bits.gone(self.generation))?;
+        let mut link = Box::new(Link { control, requests, completions, _notice: notice, wake });
         for (id, m) in self.memories.iter().enumerate() {
             if let Some((frame, writable)) = *m {
                 let rights = Rights(Rights::READ.0 | if writable { Rights::WRITE.0 } else { 0 });
@@ -387,33 +391,6 @@ impl<C: Control> Queue<C> {
         self.link = Some(link);
         self.kick();
         Ok(())
-    }
-
-    /// With requests in flight, every [`Self::LIVENESS_NS`]: whether the
-    /// driver is still there. A driver's objects go with it, and with them
-    /// every capability the client was given to them (the slot empties).
-    fn look(&mut self) {
-        let now = silica_rt::clock().now();
-        if self.in_flight.len == 0 || now - self.checked_at < Self::LIVENESS_NS {
-            return;
-        }
-        self.checked_at = now;
-        if self.link.as_ref().is_some_and(|l| !matches!(sys::inspect_slot(slots::SPACE, l.wake.cap().0), Ok(Some(_)))) {
-            self.disconnect();
-        }
-    }
-
-    /// The deadline of a wait: the caller's, or sooner while requests are
-    /// in flight, so that a driver's unannounced end is seen.
-    fn until(&self, deadline: Option<u64>) -> (Wait, bool) {
-        if self.in_flight.len == 0 {
-            return (deadline.map_or(Wait::Forever, Wait::Until), false);
-        }
-        let look = silica_rt::clock().now() + Self::LIVENESS_NS;
-        match deadline {
-            Some(d) if d <= look => (Wait::Until(d), false),
-            _ => (Wait::Until(look), true),
-        }
     }
 
     /// Keep published results before dropping the consumer. Their tags
@@ -584,18 +561,6 @@ impl<C: Control> Queue<C> {
         }
     }
 
-    /// When the client is to call [`Queue::tick`] (`None`: no need): with
-    /// requests in flight, the queue looks whether its driver is still
-    /// there every [`Self::LIVENESS_NS`].
-    pub fn deadline(&self) -> Option<u64> {
-        (self.in_flight.len != 0).then(|| self.checked_at + Self::LIVENESS_NS)
-    }
-
-    /// At [`Queue::deadline`]: look whether the driver is still there.
-    pub fn tick(&mut self) {
-        self.look();
-    }
-
     /// The next completion (or provider's event: a tag from [`EVENTS`]
     /// up), if one is there.
     pub fn poll(&mut self) -> Result<Option<Completion>, Error> {
@@ -627,7 +592,16 @@ impl<C: Control> Queue<C> {
                 Err(_) => return Err(Error::Protocol),
             }
         }
-        self.look();
+        // Nothing completed: a driver's end may have been noticed meanwhile.
+        // A queue with a notification of its own takes what is there without
+        // waiting (a client that only polls hears of the end here); one that
+        // shares its caller's is told by the caller (`signalled`).
+        if self._own_note.is_some()
+            && let Ok(m) = sys::recv(self.note, Wait::Poll)
+            && m.badge & self.bits.gone(self.generation) != 0
+        {
+            self.disconnect();
+        }
         Ok(None)
     }
 
@@ -651,11 +625,9 @@ impl<C: Control> Queue<C> {
             }
             let w = self.link.as_ref().filter(|l| kick && l.requests.wake_needed()).map_or(Cap::NONE, |l| l.wake.cap());
             kick = false;
-            let (until, mine) = self.until(deadline);
-            match sys::signal_recv(w, self.note, Cap::NONE, until) {
+            match sys::signal_recv(w, self.note, Cap::NONE, deadline.map_or(Wait::Forever, Wait::Until)) {
                 Ok(m) if m.badge & self.bits.gone(self.generation) != 0 => self.disconnect(),
                 Ok(_) => {}
-                Err(sys::Error::Timeout) if mine => self.look(),
                 // The wake-up failed, and nothing was received: the
                 // driver's notification is gone with it (its death notice
                 // follows).
@@ -676,11 +648,9 @@ impl<C: Control> Queue<C> {
             if !asleep {
                 continue;
             }
-            let (until, mine) = self.until(deadline);
-            match sys::recv(self.note, until) {
+            match sys::recv(self.note, deadline.map_or(Wait::Forever, Wait::Until)) {
                 Ok(m) if m.badge & self.bits.gone(self.generation) != 0 => self.disconnect(),
                 Ok(_) => {}
-                Err(sys::Error::Timeout) if mine => self.look(),
                 Err(_) => return Err(Error::Timeout),
             }
         }
