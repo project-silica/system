@@ -184,24 +184,22 @@ fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool 
     if !c.peer_done {
         match c.s.read(buf) {
             Ok(Read::Bytes(n)) => {
-                c.input.extend_from_slice(&buf[..n]);
+                if !c.finished {
+                    c.input.extend_from_slice(&buf[..n]);
+                }
                 progress = true;
             }
             Ok(Read::Empty) => {}
             Ok(Read::Closed(_)) | Err(_) => {
                 c.peer_done = true;
-                if !c.finished && !sending(c) {
-                    c.s.finish();
-                    c.finished = true;
-                }
                 progress = true;
             }
         }
     }
-    if !sending(c)
-        && !c.finished
-        && let Some(end) = c.input.windows(4).position(|w| w == b"\r\n\r\n")
-    {
+    if c.finished {
+        return progress;
+    }
+    if let Some(end) = c.input.windows(4).position(|w| w == b"\r\n\r\n") {
         let request: Vec<u8> = c.input.drain(..end + 4).collect();
         answer(c, &request);
         *served += 1;
@@ -214,6 +212,12 @@ fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool 
         // A head longer than any client sends: answered and closed.
         c.input.clear();
         respond(c, 431, 0, true);
+        progress = true;
+    } else if c.peer_done {
+        // FIN follows all the peer's requests, including those already in
+        // input. Finish only after the last complete request was answered.
+        c.s.finish();
+        c.finished = true;
         progress = true;
     }
     progress
