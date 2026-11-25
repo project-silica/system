@@ -557,7 +557,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     }
     let info_out = Info { block_size: 1 << ns.block_bits, blocks: ns.blocks, read_only: ns.read_only, write_cache, max_blocks };
     println!(
-        "nvme: {}: namespace {}, {} blocks of {} bytes, {} I/O entries, MSI-X {}, write cache {}",
+        "nvme: {}: namespace {}, {} blocks of {} bytes, {} I/O entries, MSI-X {}, write cache {}, max {} blocks per request",
         core::str::from_utf8(&model).unwrap_or("?").trim_end(),
         ns.id,
         info_out.blocks,
@@ -565,6 +565,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         io_entries,
         if io_irq.is_some() { "0 and 1" } else { "0 only" },
         if write_cache { "on" } else { "off" },
+        info_out.max_blocks,
     );
 
     let prp = dma.memory(bits_for(io_entries as usize * PRP_LIST_BYTES), false)?;

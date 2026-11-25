@@ -62,19 +62,30 @@ fn table(id: u32) -> Result<Vec<Part>, &'static str> {
     let bs = disk.info().block_size as usize;
     let disk_blocks = disk.info().blocks;
     let memory = Memory::new(16).map_err(|_| "no memory")?;
+    let max_blocks = memory.len().checked_div(bs).unwrap_or(0).min(disk.info().max_blocks as usize);
+    if max_blocks == 0 {
+        return Err("its transfer limits do not allow a block to be read");
+    }
     disk.add_memory(0, &memory, true).map_err(|_| "its driver takes no memory")?;
     let m = memory.shared();
-    let read = |disk: &mut Disk, block: u64, blocks: u32| -> Result<Vec<u8>, &'static str> {
-        let r = Request { op: Op::Read, memory: 0, block, offset: 0, blocks, tag: block };
-        disk.run(&r, Some(silica_rt::clock().now() + 5 * SECOND)).map_err(|_| "a read failed")?;
-        Ok((0..blocks as usize * bs).map(|i| m.read8(i)).collect())
+    let read = |disk: &mut Disk, mut block: u64, bytes: usize| -> Result<Vec<u8>, &'static str> {
+        if block.checked_add(bytes.div_ceil(bs) as u64).is_none_or(|end| end > disk_blocks) {
+            return Err("its GPT read would extend beyond the disk");
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(bytes).map_err(|_| "no memory for its GPT")?;
+        while data.len() < bytes {
+            let left = bytes - data.len();
+            let blocks = left.div_ceil(bs).min(max_blocks);
+            let r = Request { op: Op::Read, memory: 0, block, offset: 0, blocks: blocks as u32, tag: block };
+            disk.run(&r, Some(silica_rt::clock().now() + 5 * SECOND)).map_err(|_| "a read failed")?;
+            data.extend((0..left.min(blocks * bs)).map(|i| m.read8(i)));
+            block += blocks as u64;
+        }
+        Ok(data)
     };
-    let Some(header) = gpt::header(&read(&mut disk, 1, 1)?, disk_blocks)? else { return Ok(Vec::new()) };
-    let blocks = header.entries_len().div_ceil(bs) as u32;
-    if blocks as usize * bs > memory.len() {
-        return Err("its GPT's entries do not fit the memory read into");
-    }
-    let entries = read(&mut disk, header.entries_at, blocks)?;
+    let Some(header) = gpt::header(&read(&mut disk, 1, bs)?, disk_blocks)? else { return Ok(Vec::new()) };
+    let entries = read(&mut disk, header.entries_at, header.entries_len())?;
     let parts = gpt::entries(&header, &entries, |i, why| println!("partitions: disk {id:#x}: entry {i} left out: {why}"))?;
     // A partition is named by its disk and its index in a byte.
     for e in parts.iter().filter(|e| e.index > 0xFF) {
