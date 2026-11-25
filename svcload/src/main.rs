@@ -119,16 +119,11 @@ impl Load {
 fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), String> {
     let refused = |what: &str, r: Result<(), system::Error>| match r {
         Err(system::Error::Refused) => Ok(()),
-        other => Err(format!("{what} with observe+control only: {other:?}, not refused")),
+        other => Err(format!("{what} with observe+control+logs only: {other:?}, not refused")),
     };
     refused("stage", system.stage(0, b"\x7fELF").map(|_| ()).map_err(err))?;
     refused("update", system.update("httpd", 4).map(|_| ()).map_err(err))?;
     refused("revert", system.revert("httpd").map(|_| ()).map_err(err))?;
-    let ring = Memory::new(silica_rt::log::BITS).map_err(|e| format!("no memory for a ring: {e:?}"))?;
-    let lent = Handle::new(Cap(silica_rt::ipc::free_slot().ok_or("no slot")?));
-    silica_rt::sys::cap_derive(slots::SPACE, lent.cap().0, ring.frame(), silica_rt::sys::Rights(3), 0)
-        .map_err(|e| format!("deriving the ring: {e:?}"))?;
-    refused("add_log", system.add_log("svcload-forged", lent).map(|_| ()).map_err(err))?;
     refused("shutdown", system.shutdown(false).map(|_| ()).map_err(err))?;
     // The scopes are in the capability's badge, which the service manager
     // chose: a holder cannot derive itself one with more.
@@ -138,7 +133,36 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
         return Err(String::from("a capability to the service manager was given a badge of every scope by its holder"));
     }
     silica_rt::ipc::release_slot(slot);
-    println!("svcload: the service manager refuses stage, update, revert, add_log and shutdown to a holder of observe+control");
+    println!("svcload: the service manager refuses stage, update, revert and shutdown to a holder of observe+control+logs");
+    Ok(())
+}
+
+/// One service asks for logs until it is refused: it gets at most half the
+/// machine's (32 of 64), so the device manager restarted afterwards (the
+/// `devmgr` round) still gets its drivers' logs. Before (the 2026-11-24
+/// audit), the 64 were first come first served and never given back: one
+/// holder could leave every later driver and service without a log.
+fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<(), String> {
+    let mut rings = silica_rt::alloc::vec::Vec::new();
+    let mut given = 0;
+    for n in 0..40 {
+        let ring = Memory::new(silica_rt::log::BITS).map_err(|e| format!("no memory for a ring: {e:?}"))?;
+        let lent = Handle::new(Cap(silica_rt::ipc::free_slot().ok_or("no slot")?));
+        silica_rt::sys::cap_derive(slots::SPACE, lent.cap().0, ring.frame(), silica_rt::sys::Rights(3), 0)
+            .map_err(|e| format!("deriving a ring: {e:?}"))?;
+        match system.add_log(&format!("flood{n}"), lent) {
+            Ok(_) => given += 1,
+            Err(silica_idl_rt::CallError::Error(system::Error::Refused)) => break,
+            Err(e) => return Err(format!("add_log {n}: {e:?}")),
+        }
+        rings.push(ring);
+    }
+    if given > 32 {
+        return Err(format!("one service was given {given} logs, more than half of the machine's 64"));
+    }
+    println!("svcload: one service is given {given} logs and refused the next");
+    // The rings stay this program's while it runs (their places stay taken).
+    core::mem::forget(rings);
     Ok(())
 }
 
@@ -159,6 +183,7 @@ fn run() -> Result<(), String> {
     // other, and only a leak changes the sum.
     let total = |m: system::MemoryReply| m.free + m.held;
     let before = total(load.system.memory().map_err(|e| format!("memory: {e:?}"))?);
+    logs_bounded(&mut load.system)?;
     partitions(&mut load)?;
     devmgr(&mut load)?;
     logd(&mut load)?;

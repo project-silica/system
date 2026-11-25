@@ -8,7 +8,7 @@ publish.workspace = true
 
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
-needs = ["silica.system.Manager:observe+control", "silica.block.Partitions:list+open", "silica.log.Reader", "silica.console.Terminal", "silica.device.Manager:block+network+display+port+input+entropy+control"]
+needs = ["silica.system.Manager:observe+control+logs", "silica.block.Partitions:list+open", "silica.log.Reader", "silica.console.Terminal", "silica.device.Manager:block+network+display+port+input+entropy+control"]
 memory = 22
 start = "check:services"
 
