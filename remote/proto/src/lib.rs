@@ -134,11 +134,13 @@ pub fn key_text(key: &[u8; 32]) -> [u8; 64] {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadLine(pub usize);
 
-/// The owners an owners file names: each line a public key, space, and the
-/// owner's name (no spaces in it); blank lines and lines from `#` are
-/// skipped. The first line that is neither is an error naming it (from 1),
+/// The owners an owners file names: each line a public key, space, the
+/// owner's name (no spaces in it), and optionally what the owner may do
+/// (`silica.system.Manager` scopes joined with `+`, as a service
+/// declaration gives them: `observe+control`; without them, all the
+/// remote service has); blank lines and lines from `#` are skipped. The first line that is neither is an error naming it (from 1),
 /// so that a mistyped key is never silently nobody.
-pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str), BadLine>> {
+pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str, Option<&str>), BadLine>> {
     text.lines().enumerate().filter_map(|(n, line)| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -147,8 +149,9 @@ pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str), BadLi
         let mut words = line.split_ascii_whitespace();
         let key = words.next().and_then(parse_key);
         let name = words.next();
+        let scopes = words.next();
         Some(match (key, name, words.next()) {
-            (Some(k), Some(name), None) => Ok((k, name)),
+            (Some(k), Some(name), None) => Ok((k, name, scopes)),
             _ => Err(BadLine(n + 1)),
         })
     })
@@ -202,8 +205,11 @@ mod tests {
             let mut it = owners(&text);
             [it.next().unwrap(), it.next().unwrap()]
         };
-        assert_eq!(got[0], Ok(([0; 32], "alice@laptop")));
-        assert_eq!(got[1], Ok(([0x11; 32], "ci")));
+        assert_eq!(got[0], Ok(([0; 32], "alice@laptop", None)));
+        assert_eq!(got[1], Ok(([0x11; 32], "ci", None)));
+        let scoped = std::format!("{a} watcher observe\n");
+        assert_eq!(owners(&scoped).next(), Some(Ok(([0; 32], "watcher", Some("observe")))));
+        assert_eq!(owners(&std::format!("{a} x observe more\n")).next(), Some(Err(BadLine(1))));
         assert_eq!(owners(&text).count(), 2);
         assert_eq!(owners("# none\n\n").count(), 0);
         assert_eq!(owners("abc name\n").next(), Some(Err(BadLine(1))));
