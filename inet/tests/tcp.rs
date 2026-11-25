@@ -98,7 +98,7 @@ fn device_cuts(seg: &[u8], mss: usize) -> Vec<Vec<u8>> {
 
 impl Net {
     fn new(a_buffers: (usize, usize), b_buffers: (usize, usize)) -> Net {
-        let a = Connection::connect(ends(A, 40000, B, 80), 0xFFFF_FF00, 1500, buffers(a_buffers.0, a_buffers.1));
+        let a = Connection::connect(ends(A, 40000, B, 80), 0xFFFF_FF00, 0x1234_5678, 1500, buffers(a_buffers.0, a_buffers.1));
         Net {
             sender_timeouts: 0,
             window_reductions: 0,
@@ -216,7 +216,7 @@ impl Net {
                 // The listener: a SYN makes the connection.
                 _ if s.has(SYN) && !s.has(ACK) => {
                     let (sb, rb) = self.b_buffers;
-                    self.b = Some(Connection::accept(ends(B, 80, A, 40000), &s, 0x7000_0000, 1500, buffers(sb, rb)));
+                    self.b = Some(Connection::accept(ends(B, 80, A, 40000), &s, 0x7000_0000, 0x0BAD_F00D, 1500, buffers(sb, rb)));
                 }
                 // No connection: the stack answers with a reset.
                 _ => self.reset(false, &s),
@@ -318,7 +318,7 @@ fn a_connection_opens_carries_data_both_ways_and_closes() {
     assert_eq!(&buf[..18], b"GET / HTTP/1.1\r\n\r\n");
     assert_eq!(net.b().send(b"HTTP/1.1 200 OK\r\n\r\nhi"), 21);
     net.b().close();
-    net.run_until(SECOND, |n| n.a.at_end());
+    net.run_until(SECOND, |n| n.a.state() == State::CloseWait && n.b.as_ref().is_some_and(|b| b.state() == State::FinWait2));
     assert_eq!(net.a.recv(&mut buf), 21);
     assert!(net.a.at_end(), "B's FIN read as the end");
     assert_eq!(net.a.state(), State::CloseWait);
@@ -433,7 +433,7 @@ fn a_connection_to_nobody_times_out_and_a_refused_one_says_so() {
     assert!(net.now < 200 * SECOND && net.now > 60 * SECOND, "given up after {} s", net.now / SECOND);
 
     // A refusal: a reset that acknowledges the SYN.
-    let mut a: Conn = Connection::connect(ends(A, 40001, B, 81), 1000, 1500, buffers(4096, 4096));
+    let mut a: Conn = Connection::connect(ends(A, 40001, B, 81), 1000, 77, 1500, buffers(4096, 4096));
     let mut out = [0u8; 1600];
     let n = a.poll(0, &mut out).unwrap();
     let syn = tcp::parse(&out[..n], A, B).unwrap();
@@ -724,7 +724,7 @@ fn time_wait_without_its_buffers_still_answers_a_repeated_fin() {
     net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
     assert_eq!(net.b().send(b"bye"), 3);
     net.b().close();
-    net.run_until(SECOND, |n| n.a.at_end());
+    net.run_until(SECOND, |n| n.a.state() == State::CloseWait);
     let mut buf = [0u8; 8];
     assert_eq!(net.a.recv(&mut buf), 3);
     // A's FIN arrives at B, and B's acknowledgement of it is lost once: A
@@ -1016,4 +1016,166 @@ fn an_interface_that_cuts_and_sums_carries_the_same_bytes_in_fewer_segments() {
             assert!(cut[0].polls * 8 < whole[0].polls, "{} segments given, {} without the offload", cut[0].polls, whole[0].polls);
         }
     }
+}
+
+// The hostile paths the 2026-11-24 audit found untested: a peer (or anyone
+// who knows the ports) holding a connection for ever, drawing answers
+// without limit, or learning the machine's uptime.
+
+/// RFC 1122 4.2.2.17: a peer that answers every probe of its shut window
+/// is there, and keeps the connection as long as it likes. Before, answered
+/// probes counted toward giving up, and a live peer that kept its window
+/// shut some ten to fifteen minutes was reset.
+#[test]
+fn a_live_peer_may_keep_its_window_shut_for_as_long_as_it_answers() {
+    let mut net = Net::new((64 << 10, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    let data = pattern(40_000);
+    net.a.send(&data);
+    net.run_until(45 * 60 * SECOND, |n| n.a.is_closed());
+    assert!(!net.a.is_closed(), "A gave up on a peer that answered every probe: {:?}", net.a.error());
+    assert_eq!(net.b().readable(), 4096);
+    let probes = net.log.iter().filter(|l| l.0 && l.3 == 0 && l.1.flags == ACK).count();
+    assert!(probes >= 20, "the window was probed all along ({probes})");
+}
+
+/// A peer that stops answering the probes is given up on, as before.
+#[test]
+fn a_peer_that_stops_answering_a_shut_window_is_given_up_on() {
+    let mut net = Net::new((64 << 10, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    net.a.send(&pattern(40_000));
+    net.run_until(30 * SECOND, |_| false);
+    net.drop = Box::new(|_, seg| seg.header.src_port == 80);
+    net.run_until(4 * 3600 * SECOND, |n| n.a.is_closed());
+    assert_eq!(net.a.error(), Some(Error::TimedOut));
+}
+
+/// A connection A has closed first, in TIME-WAIT.
+fn in_time_wait() -> Net {
+    let mut net = Net::new((4096, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    net.a.close();
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::CloseWait));
+    net.b().close();
+    net.run_until(SECOND, |n| n.a.state() == State::TimeWait && n.b.as_ref().is_some_and(|b| b.is_closed()));
+    assert_eq!(net.a.state(), State::TimeWait);
+    net
+}
+
+/// Only the peer's own FIN sent again restarts TIME-WAIT, no more often
+/// than a challenge is answered and never past four times its length. A
+/// FIN anyone could send knowing the ports (any sequence number) is an
+/// out-of-window segment: answered at most twice a second, the wait not
+/// restarted. Before, any FIN restarted it and drew an acknowledgement,
+/// so a spoofer kept the entry for ever and drew answers without limit.
+#[test]
+fn time_wait_is_restarted_only_by_the_peers_own_fin_and_not_for_ever() {
+    let mut net = in_time_wait();
+    let (entered, rcv_nxt) = (net.now, net.log.iter().rev().find(|l| l.0).unwrap().1.ack);
+    let mut answers = 0;
+    // A spoofer's FINs, a hundred a second for two minutes.
+    while net.now < entered + 120 * SECOND && net.a.state() == State::TimeWait {
+        forge(&mut net, rcv_nxt.wrapping_add(7777), 0, FIN | ACK, b"");
+        answers += net.log.len();
+        net.now += 10 * MS;
+        net.a.on_time(net.now);
+    }
+    assert!(net.a.is_closed(), "TIME-WAIT outlived its minute under spoofed FINs");
+    assert!(net.now <= entered + 61 * SECOND, "ended {} ms after it began", (net.now - entered) / MS);
+    assert!(answers <= 125, "{answers} answers to spoofed FINs in a minute");
+
+    // The peer's own FIN, again and again: acknowledged, the wait restarted,
+    // and still over within four minutes.
+    let mut net = in_time_wait();
+    let entered = net.now;
+    let fin = net.log.iter().rev().find(|l| l.0).unwrap().1.ack.wrapping_sub(1);
+    while net.now < entered + 600 * SECOND && net.a.state() == State::TimeWait {
+        forge(&mut net, fin, 0, FIN | ACK, b"");
+        net.now += SECOND;
+        net.a.on_time(net.now);
+    }
+    assert!(net.a.is_closed(), "the peer's repeated FIN held TIME-WAIT for ever");
+    assert!(net.now <= entered + 241 * SECOND, "TIME-WAIT lasted {} s", (net.now - entered) / SECOND);
+}
+
+/// A connection its program has let go of, closed on this side, whose
+/// peer neither closes nor sends: ended a minute after it last heard from
+/// the peer. One its program still holds is a half-close and waits on.
+#[test]
+fn fin_wait_2_ends_when_nobody_holds_it_and_the_peer_is_silent() {
+    for released in [false, true] {
+        let mut net = Net::new((4096, 4096), (4096, 4096));
+        net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+        net.a.close();
+        net.run_until(SECOND, |n| n.a.state() == State::FinWait2);
+        assert_eq!(net.a.state(), State::FinWait2);
+        if released {
+            net.a.release(net.now);
+        }
+        // B sends a little at first, then nothing at all.
+        net.b().send(b"still here");
+        net.run_until(20 * SECOND, |_| false);
+        let heard = net.now;
+        net.drop = Box::new(|_, seg| seg.header.src_port == 80);
+        net.run_until(10 * 60 * SECOND, |n| n.a.is_closed());
+        if released {
+            assert_eq!(net.a.error(), Some(Error::TimedOut), "a silent peer held a connection nobody holds");
+            assert!(net.now <= heard + 61 * SECOND);
+        } else {
+            assert_eq!(net.a.state(), State::FinWait2, "a held half-close was ended");
+        }
+    }
+}
+
+/// The timestamps a connection sends do not tell its peer the machine's
+/// uptime: the offset they count from is not the initial sequence number
+/// (which the peer sees in the same SYN), so the clock cannot be read back
+/// from the two.
+#[test]
+fn timestamps_do_not_reveal_uptime() {
+    let mut net = Net::new((4096, 4096), (4096, 4096));
+    net.now = 3 * 3600 * SECOND;
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    let (_, syn, o, _) = net.log.iter().find(|l| l.0 && l.1.flags == SYN).unwrap();
+    let (val, _) = o.timestamps.expect("timestamps on");
+    let read_back = val.wrapping_sub(syn.seq) as u64;
+    assert!(read_back.abs_diff(net.now / MS) > 1000, "the SYN's timestamp minus its sequence number is the clock");
+}
+
+/// SACK blocks that name nothing this side sent (beyond what was sent,
+/// before what was acknowledged, the wrong way round, wrapped) change
+/// nothing: no segment taken for received or lost, and the transfer
+/// finishes with every byte.
+#[test]
+fn bogus_sack_blocks_change_nothing() {
+    let mut net = Net::new((64 << 10, 64 << 10), (64 << 10, 64 << 10));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    let data = pattern(30_000);
+    let mut sent = net.a.send(&data);
+    net.wire.clear();
+    let una = net.a.sent_to();
+    let max = net.log.iter().filter(|l| l.0).map(|l| l.1.seq.wrapping_add(l.3 as u32)).max().unwrap();
+    let ack = net.log.iter().rev().find(|l| l.0).unwrap().1.ack;
+    for blocks in [
+        &[(max.wrapping_add(1000), max.wrapping_add(5000))][..],
+        &[(una.wrapping_sub(9000), una.wrapping_sub(100))],
+        &[(una.wrapping_add(4000), una.wrapping_add(1000))],
+        &[(max.wrapping_sub(10), una.wrapping_add(10))],
+        &[(0, u32::MAX), (u32::MAX - 5, 3), (una, una)],
+    ] {
+        forge_sack(&mut net, ack, una, 1000, blocks);
+        assert!(!net.a.is_closed(), "bogus SACK blocks {blocks:x?} ended the connection");
+    }
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    while got.len() < data.len() && net.now < 60 * SECOND {
+        sent += net.a.send(&data[sent..]);
+        let n = net.b().recv(&mut buf);
+        got.extend_from_slice(&buf[..n]);
+        if !net.step() {
+            break;
+        }
+    }
+    assert!(got == data, "{} of {} bytes after bogus SACK blocks", got.len(), data.len());
 }

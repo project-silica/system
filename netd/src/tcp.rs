@@ -358,7 +358,8 @@ impl Tcp {
                 && self.conns.len() < CONNECTIONS
                 && let Some(buffers) = buffers()
             {
-                let mut tcp = Connection::accept(ends, s, silica_rt::random::u64() as u32, self.mtu, buffers);
+                let r = silica_rt::random::u64();
+                let mut tcp = Connection::accept(ends, s, r as u32, (r >> 32) as u32, self.mtu, buffers);
                 tcp.set_offloads(self.checksum_offload, self.most_payload);
                 let id = self.number();
                 let record = self.record(&tcp);
@@ -691,7 +692,8 @@ impl Tcp {
             .ok_or(Error::NoRoom)?;
         let ends = Endpoints { local, local_port: port, remote, remote_port: peer.port };
         let buffers = buffers().ok_or(Error::NoRoom)?;
-        let mut tcp = Connection::connect(ends, silica_rt::random::u64() as u32, self.mtu, buffers);
+        let r = silica_rt::random::u64();
+        let mut tcp = Connection::connect(ends, r as u32, (r >> 32) as u32, self.mtu, buffers);
         tcp.set_offloads(self.checksum_offload, self.most_payload);
         let id = self.number();
         let requests = self.requests(id)?;
@@ -750,6 +752,7 @@ impl Tcp {
         if !orderly {
             c.tcp.abort();
         }
+        c.tcp.release(silica_rt::clock().now());
         c.released = true;
         c.streams = None;
         Ok(proto::CloseReply {})

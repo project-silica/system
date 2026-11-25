@@ -42,6 +42,13 @@ const SYN_RETRIES: u32 = 6;
 /// How long a connection closed from this side stays to answer its peer's
 /// last segments (twice the maximum segment lifetime, as Linux).
 const TIME_WAIT: u64 = 60 * SECOND;
+/// The longest a connection stays in TIME-WAIT, however often the peer's
+/// FIN comes again.
+const TIME_WAIT_MOST: u64 = 4 * TIME_WAIT;
+/// How long a connection in FIN-WAIT-2 (this side has finished, the peer
+/// has not) that its program has let go of waits with nothing from the
+/// peer before it is ended ([`Connection::release`]).
+const FIN_WAIT_2_IDLE: u64 = 60 * SECOND;
 /// The segment size assumed of a peer that names none (RFC 9293).
 const DEFAULT_MSS: u16 = 536;
 /// Least time between answers to segments outside the window, challenges
@@ -309,6 +316,10 @@ pub struct Connection<S> {
     retransmit_at: Option<u64>,
     retries: u32,
     time_wait_until: Option<u64>,
+    /// When TIME-WAIT must end however often the peer's FIN comes again.
+    time_wait_most: Option<u64>,
+    /// Its program let go of it ([`Connection::release`]).
+    released: bool,
 
     // Congestion: RFC 5681's window, halved once a round trip of losses;
     // `recover` is where the recovery from them ends. Duplicates count
@@ -374,7 +385,7 @@ pub struct Connection<S> {
 }
 
 impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
-    fn new(ends: Endpoints, state: State, iss: u32, mtu: u16, buffers: Buffers<S>) -> Connection<S> {
+    fn new(ends: Endpoints, state: State, iss: u32, ts_offset: u32, mtu: u16, buffers: Buffers<S>) -> Connection<S> {
         let cap = buffers.receive.as_ref().len().min(1 << 30);
         // The smallest shift that lets the whole receive buffer be offered.
         let mut scale = 0u8;
@@ -420,6 +431,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             retransmit_at: None,
             retries: 0,
             time_wait_until: None,
+            time_wait_most: None,
+            released: false,
             cwnd: 10 * mss,
             avoidance_bytes: 0,
             ssthresh: u32::MAX,
@@ -441,7 +454,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             probe_at: None,
             tlp_due: false,
             timestamps: true,
-            ts_offset: iss,
+            ts_offset,
             ts_recent: 0,
             sack: true,
             scaling: false,
@@ -453,16 +466,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     }
 
     /// Open a connection to `ends.remote`: its SYN goes out on the next
-    /// [`Connection::poll`]. `iss` is its initial sequence number (the
-    /// stack's, from a keyed hash: RFC 6528); `mtu` the interface's.
-    pub fn connect(ends: Endpoints, iss: u32, mtu: u16, buffers: Buffers<S>) -> Connection<S> {
-        Connection::new(ends, State::SynSent, iss, mtu, buffers)
+    /// [`Connection::poll`]. `iss` is its initial sequence number and
+    /// `ts_offset` what its timestamps count from, each unpredictable and
+    /// unrelated to the other (RFC 6528, RFC 7323 section 5.4: with the one
+    /// derived from the other, as they once were, a peer that sees both in
+    /// the SYN learns the machine's uptime); `mtu` the interface's.
+    pub fn connect(ends: Endpoints, iss: u32, ts_offset: u32, mtu: u16, buffers: Buffers<S>) -> Connection<S> {
+        Connection::new(ends, State::SynSent, iss, ts_offset, mtu, buffers)
     }
 
     /// Answer `syn`, which arrived for a listening port: the SYN-ACK goes
     /// out on the next [`Connection::poll`].
-    pub fn accept(ends: Endpoints, syn: &Segment<'_>, iss: u32, mtu: u16, buffers: Buffers<S>) -> Connection<S> {
-        let mut c = Connection::new(ends, State::SynReceived, iss, mtu, buffers);
+    pub fn accept(ends: Endpoints, syn: &Segment<'_>, iss: u32, ts_offset: u32, mtu: u16, buffers: Buffers<S>) -> Connection<S> {
+        let mut c = Connection::new(ends, State::SynReceived, iss, ts_offset, mtu, buffers);
         c.take_syn(syn);
         c
     }
@@ -680,6 +696,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
     }
 
+    /// Its program has let go of it (after [`Connection::close`]): nothing
+    /// more is read from it, so in FIN-WAIT-2 a peer that sends nothing for
+    /// [`FIN_WAIT_2_IDLE`] ends it, as an orphaned socket's on Linux. While
+    /// a program holds it, FIN-WAIT-2 is a half-close and lasts as long as
+    /// the peer likes; once nobody does, a peer that goes silent no longer
+    /// holds it for ever.
+    pub fn release(&mut self, now: u64) {
+        self.released = true;
+        if self.state == State::FinWait2 && self.time_wait_until.is_none() {
+            self.time_wait_until = Some(now + FIN_WAIT_2_IDLE);
+        }
+    }
+
     /// End the connection now with a reset; what was not sent is dropped.
     pub fn abort(&mut self) {
         let synchronized = !matches!(self.state, State::SynSent | State::Closed | State::TimeWait);
@@ -708,7 +737,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     /// The time is `now`: retransmit, probe or give up if it is time.
     pub fn on_time(&mut self, now: u64) {
         if self.time_wait_until.is_some_and(|t| now >= t) {
-            self.end(None);
+            // TIME-WAIT is over; or FIN-WAIT-2 heard nothing from the peer
+            // for [`FIN_WAIT_2_IDLE`], and gives up on its FIN.
+            let silent = self.state == State::FinWait2;
+            self.end(silent.then_some(Error::TimedOut));
             return;
         }
         if self.reorder_at.is_some_and(|t| now >= t) && self.detect_losses(now) {
@@ -1333,9 +1365,19 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     fn on_synchronized(&mut self, now: u64, s: &Segment<'_>) {
         let h = &s.header;
         if self.state == State::TimeWait && s.has(FIN) && !s.has(RST) {
-            // Its FIN again: our acknowledgement was lost.
-            self.ack_due = true;
-            self.time_wait_until = Some(now + TIME_WAIT);
+            // Its FIN again (it ends where what it sent ended): our
+            // acknowledgement was lost; acknowledged again, and the wait
+            // starts again, no more than a challenge is answered, and never
+            // past [`TIME_WAIT_MOST`] in all. Any other FIN (a guess at the
+            // ports, not the sequence) is a segment outside the window: a
+            // spoofer kept the entry, and drew acknowledgements, for ever.
+            let again = s.header.seq.wrapping_add(s.len()) == self.rcv_nxt;
+            let answered = self.answered_invalid_at;
+            self.answer_invalid(now);
+            if again && self.answered_invalid_at != answered {
+                let most = self.time_wait_most.get_or_insert(now + TIME_WAIT_MOST);
+                self.time_wait_until = Some((now + TIME_WAIT).min(*most));
+            }
             return;
         }
         // PAWS (RFC 7323): a segment whose timestamp is older than the
@@ -1566,7 +1608,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.dupacks = 0;
         if fin == 1 {
             match self.state {
-                State::FinWait1 => self.state = State::FinWait2,
+                State::FinWait1 => {
+                    self.state = State::FinWait2;
+                    if self.released {
+                        self.time_wait_until = Some(now + FIN_WAIT_2_IDLE);
+                    }
+                }
                 State::Closing => self.enter_time_wait(now),
                 State::LastAck => self.end(None),
                 _ => {}
@@ -1638,6 +1685,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             let skip = (self.rcv_nxt.wrapping_sub(seq) as usize).min(data.len());
             data = &data[skip..];
             seq = seq.wrapping_add(skip as u32);
+        }
+        if self.state == State::FinWait2 && self.released && !data.is_empty() {
+            // The peer is still sending: FIN-WAIT-2 waits on.
+            self.time_wait_until = Some(now + FIN_WAIT_2_IDLE);
         }
         if seq == self.rcv_nxt {
             let n = self.receive.push(data);
