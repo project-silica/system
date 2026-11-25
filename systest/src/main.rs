@@ -347,7 +347,9 @@ impl Tests {
             return match m.words[0] as i64 {
                 0 if answered >= CYCLES << (BITS - 12) => Ok(()),
                 0 => Err("the borrower touched fewer pages than it was taken back from"),
-                _ => Err("the borrower read lent memory after it was taken back, or mapped a lend at fresh addresses (its line says which)"),
+                _ => {
+                    Err("the borrower read lent memory after it was taken back, or mapped a lend at fresh addresses (its line says which)")
+                }
             };
         }
     }

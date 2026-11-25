@@ -161,6 +161,17 @@ pub fn tag(key: &[u8; 32], message: &[u8]) -> [u8; 16] {
     p.finish()
 }
 
+impl Drop for Poly1305 {
+    /// Its key (`r`, `s`, `pad`) and what it computed are secret: wiped.
+    fn drop(&mut self) {
+        crate::wipe_words(&mut self.r);
+        crate::wipe_words(&mut self.s);
+        crate::wipe_words(&mut self.h);
+        crate::wipe_words(&mut self.pad);
+        crate::wipe(&mut self.buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -131,6 +131,14 @@ struct Symmetric {
     k: Option<Cipher>,
 }
 
+impl Drop for Symmetric {
+    /// The chaining key, with the ephemeral keys a party saw, gives the
+    /// session's keys: wiped however the handshake ends.
+    fn drop(&mut self) {
+        crate::wipe(&mut self.ck);
+    }
+}
+
 impl Symmetric {
     fn new(prologue: &[u8]) -> Self {
         // NAME is longer than HASHLEN: hashed.
@@ -314,8 +322,18 @@ impl Responder {
         let ee = x25519::exchange(&e, &self.re);
         let se = x25519::exchange(&e, &self.rs);
         crate::wipe(&mut e);
-        self.sym.mix_key(ee?);
-        self.sym.mix_key(se?);
+        let (mut ee, mut se) = match (ee, se) {
+            (Ok(ee), Ok(se)) => (ee, se),
+            (Ok(mut x), Err(l)) | (Err(l), Ok(mut x)) => {
+                crate::wipe(&mut x);
+                return Err(l.into());
+            }
+            (Err(l), Err(_)) => return Err(l.into()),
+        };
+        self.sym.mix_key(ee);
+        self.sym.mix_key(se);
+        crate::wipe(&mut ee);
+        crate::wipe(&mut se);
         out[32..len - TAG].copy_from_slice(payload);
         self.sym.encrypt_and_hash(&mut out[32..len])?;
         let (i2r, r2i, hash) = self.sym.split();

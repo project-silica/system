@@ -562,7 +562,10 @@ impl Tcp {
         // Too many in TIME-WAIT (and let go of): the nearest its end goes.
         let waiting = |c: &Conn| c.released && c.tcp.state() == State::TimeWait;
         while self.conns.iter().filter(|c| waiting(c)).count() > TIME_WAITING {
-            let Some(i) = self.conns.iter().enumerate().filter(|(_, c)| waiting(c)).min_by_key(|(_, c)| c.tcp.deadline()).map(|(i, _)| i) else { break };
+            let Some(i) = self.conns.iter().enumerate().filter(|(_, c)| waiting(c)).min_by_key(|(_, c)| c.tcp.deadline()).map(|(i, _)| i)
+            else {
+                break;
+            };
             self.drop_conn(i);
         }
         more

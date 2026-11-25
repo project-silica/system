@@ -116,8 +116,11 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                         let scopes = match (silica_protocols::scope::names(protocol), spec) {
                             (None, "") => 0,
                             (None, _) => return Err("a need gives scopes to a protocol that has none"),
-                            (Some(_), "") => return Err("a need of a protocol with scopes does not say which (`<protocol>:<scope>+<scope>`)"),
-                            (Some(_), spec) => silica_protocols::scope::parse(protocol, spec).map_err(|_| "a need names a scope its protocol does not have")?,
+                            (Some(_), "") => {
+                                return Err("a need of a protocol with scopes does not say which (`<protocol>:<scope>+<scope>`)");
+                            }
+                            (Some(_), spec) => silica_protocols::scope::parse(protocol, spec)
+                                .map_err(|_| "a need names a scope its protocol does not have")?,
                         };
                         s.needs.push(protocol);
                         s.scopes.push(scopes);

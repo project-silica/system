@@ -51,10 +51,12 @@ pub fn block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
 pub fn apply(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
     for (n, chunk) in data.chunks_mut(64).enumerate() {
         let counter = counter.checked_add(n as u32).expect("ChaCha20's block counter would wrap");
-        let ks = block(key, counter, nonce);
+        let mut ks = block(key, counter, nonce);
         for (d, k) in chunk.iter_mut().zip(ks.iter()) {
             *d ^= k;
         }
+        // The keystream is as secret as the key.
+        crate::wipe(&mut ks);
     }
 }
 

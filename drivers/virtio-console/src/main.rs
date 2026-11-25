@@ -222,8 +222,17 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let rx = transport.queue(&dma, 0, RX_BUFFERS, Some(0))?;
     let tx = transport.queue(&dma, 1, TX_BUFFERS as u16, Some(0))?;
     let (rx_mem, tx_mem) = (dma.memory(12, true)?, dma.memory(12, false)?);
-    let mut port =
-        Port { rx, rx_mem, tx, tx_mem, tx_busy: [false; TX_BUFFERS], client: None, mapped: None, held: VecDeque::new(), _interrupt: interrupt };
+    let mut port = Port {
+        rx,
+        rx_mem,
+        tx,
+        tx_mem,
+        tx_busy: [false; TX_BUFFERS],
+        client: None,
+        mapped: None,
+        held: VecDeque::new(),
+        _interrupt: interrupt,
+    };
     for slot in 0..RX_BUFFERS.min(port.rx.size()) {
         port.offer(slot);
     }

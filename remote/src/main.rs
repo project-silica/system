@@ -118,8 +118,18 @@ struct Machine {
 }
 
 fn main(_info: &'static ProcessInfo) -> i64 {
-    let key = match read_file(KEY_FILE).as_deref().and_then(silica_remote::parse_key) {
-        Some(k) => Keypair::new(k),
+    // The key's text is as secret as the key: wiped once read.
+    let mut text = read_file(KEY_FILE);
+    let parsed = text.as_deref().and_then(silica_remote::parse_key);
+    if let Some(t) = text.take() {
+        silica_crypto::wipe(&mut t.into_bytes());
+    }
+    let key = match parsed {
+        Some(mut k) => {
+            let pair = Keypair::new(k);
+            silica_crypto::wipe(&mut k);
+            pair
+        }
         None => {
             println!("remote: no machine key (the boot archive's remote.key): remote management is off");
             return 0;
@@ -132,7 +142,9 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                 Ok((k, name, spec)) => {
                     let all = scope::SYSTEM_OBSERVE | scope::SYSTEM_CONTROL | scope::SYSTEM_UPDATE | scope::SYSTEM_POWER;
                     let Ok(may) = spec.map_or(Ok(all), |s| scope::parse(manager::NAME, s)) else {
-                        println!("ERROR: remote: {name} in remote.owners is given a scope the service manager does not have; remote management is off");
+                        println!(
+                            "ERROR: remote: {name} in remote.owners is given a scope the service manager does not have; remote management is off"
+                        );
                         return 1;
                     };
                     owners.push((k, String::from(name), may & all));
@@ -479,7 +491,8 @@ impl Session {
                     let (status, n) = forward(&mut m.manager, request, reply);
                     // The lock is this session's once a piece is staged, and
                     // until the update is answered: not when staging failed.
-                    let ok = status == Status::Reply && silica_idl_rt::Header::decode(&reply[..n]).is_ok_and(|h| h.status == silica_idl_rt::Status::Ok);
+                    let ok = status == Status::Reply
+                        && silica_idl_rt::Header::decode(&reply[..n]).is_ok_and(|h| h.status == silica_idl_rt::Status::Ok);
                     if ordinal == manager::StageRequest::ORDINAL && ok {
                         m.stager = Some((self.id, now));
                     } else if ordinal == manager::UpdateRequest::ORDINAL && m.stager.is_some_and(|(s, _)| s == self.id) {

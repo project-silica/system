@@ -1033,7 +1033,11 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         let now = silica_rt::clock().now();
         let due = m.functions[function].restarts.failed(now);
         if due > now {
-            println!("devmgr: {driver} for {device} has failed {} times in a row; started again in {} ms", m.functions[function].restarts.streak, (due - now) / 1_000_000);
+            println!(
+                "devmgr: {driver} for {device} has failed {} times in a row; started again in {} ms",
+                m.functions[function].restarts.streak,
+                (due - now) / 1_000_000
+            );
             m.functions[function].waiting = Some(driver);
             continue;
         }

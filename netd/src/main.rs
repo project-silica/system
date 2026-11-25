@@ -1114,7 +1114,11 @@ impl Stack {
                     }
                     Err(e) => self.dropped.malformed(e),
                 },
-                Ok(d) if ours && self.time.asked.is_some_and(|(_, _, from)| from == d.dst_port) && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) => {
+                Ok(d)
+                    if ours
+                        && self.time.asked.is_some_and(|(_, _, from)| from == d.dst_port)
+                        && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) =>
+                {
                     match ntp::parse(d.data) {
                         Ok(r) => self.time_answer(now, &r),
                         Err(e) => self.dropped.malformed(e),

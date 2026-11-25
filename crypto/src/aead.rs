@@ -13,9 +13,10 @@ pub const TAG: usize = 16;
 pub struct Forged;
 
 fn mac(key: &[u8; 32], nonce: &[u8; 12], ad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
-    let block = chacha20::block(key, 0, nonce);
+    let mut block = chacha20::block(key, 0, nonce);
     let mut otk = [0u8; 32];
     otk.copy_from_slice(&block[..32]);
+    crate::wipe(&mut block);
     let mut p = Poly1305::new(&otk);
     crate::wipe(&mut otk);
     p.update(ad);
