@@ -1480,11 +1480,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             self.snd_wnd = window;
             self.snd_wl1 = h.seq;
             self.snd_wl2 = ack;
-        }
-        if self.snd_wnd > 0 && self.snd_max == self.snd_una && self.send.len > 0 {
-            // The window opened after a probe: stop probing.
-            self.retransmit_at = None;
-            self.retries = 0;
+            if self.snd_max == self.snd_una && self.retransmit_at.is_some() {
+                // Nothing is in flight. A current window report answers the
+                // persist probe even when the receiver still has no room.
+                self.retries = 0;
+                if window > 0 {
+                    self.retransmit_at = None;
+                    self.probe_due = false;
+                }
+            }
         }
     }
 

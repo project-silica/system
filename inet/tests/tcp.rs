@@ -502,9 +502,12 @@ fn a_shut_window_is_probed_and_the_transfer_resumes_when_it_opens() {
     let probes = net.log.iter().filter(|l| l.0 && l.3 == 0 && l.1.flags == ACK).count();
     assert!(probes >= 3, "the shut window was probed while it stayed shut ({probes})");
     assert!(!net.a.is_closed(), "probing a shut window does not give up within 30 s");
+    net.run_until(3600 * SECOND, |_| false);
+    assert_eq!(net.a.state(), State::Established, "B kept answering probes for an hour");
     let mut got = Vec::new();
     let mut buf = vec![0u8; 8192];
-    while got.len() < data.len() && net.now < 120 * SECOND {
+    let deadline = net.now + 90 * SECOND;
+    while got.len() < data.len() && net.now < deadline {
         sent += net.a.send(&data[sent..]);
         let n = net.b().recv(&mut buf);
         got.extend_from_slice(&buf[..n]);
@@ -513,6 +516,18 @@ fn a_shut_window_is_probed_and_the_transfer_resumes_when_it_opens() {
         }
     }
     assert!(got == data, "{} of {} after the window opened", got.len(), data.len());
+}
+
+#[test]
+fn a_silent_receiver_with_a_shut_window_times_out() {
+    let mut net = Net::new((64 << 10, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    net.a.send(&pattern(40_000));
+    net.run_until(30 * SECOND, |_| false);
+    assert_eq!(net.b().readable(), 4096);
+    net.drop = Box::new(|_, _| true);
+    net.run_until(3600 * SECOND, |n| n.a.is_closed());
+    assert_eq!(net.a.error(), Some(Error::TimedOut));
 }
 
 #[test]
