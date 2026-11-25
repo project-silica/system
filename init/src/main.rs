@@ -408,7 +408,7 @@ impl Manager {
         if status != Some(0) && self.on_trial(i) && !self.running[i].stopped {
             println!("init: {name}'s new program failed within {} s of its update; it is started on the program before it", TRIAL / SECOND);
             self.undo_update(i);
-            self.start_again(i);
+            self.start_again(i, " on the program before its update");
             return;
         }
         if status == Some(silica_rt::EXIT_AGAIN)
@@ -416,7 +416,7 @@ impl Manager {
             && self.running[i].restarts.may_start_again(silica_rt::clock().now())
         {
             // It asked to be started again: a start, not a failure.
-            self.start_again(i);
+            self.start_again(i, "");
             return;
         }
         if status == Some(0) || !self.services[i].restart || self.running[i].stopped {
@@ -429,15 +429,15 @@ impl Manager {
             println!("init: {name} has failed {} times in a row; it is started again in {} ms", r.streak, (due - now) / 1_000_000);
             return;
         }
-        self.start_again(i);
+        self.start_again(i, "");
     }
 
     /// Start service `i` again after a failure; one that cannot be started
     /// is tried again later, as if it had failed again.
-    fn start_again(&mut self, i: usize) {
+    fn start_again(&mut self, i: usize, how: &str) {
         let name = self.services[i].name;
         match self.start(i) {
-            Ok(()) => println!("init: {name} started again"),
+            Ok(()) => println!("init: {name} started again{how}"),
             Err(e) => {
                 let now = silica_rt::clock().now();
                 let due = self.running[i].restarts.failed(now);
@@ -453,7 +453,7 @@ impl Manager {
         for i in 0..self.services.len() {
             let r = &self.running[i];
             if r.restarts.due != 0 && r.restarts.due <= now && r.child.is_none() && !r.stopped {
-                self.start_again(i);
+                self.start_again(i, "");
             }
         }
         self.running.iter().filter(|r| r.restarts.due != 0 && r.child.is_none() && !r.stopped).map(|r| r.restarts.due).min()

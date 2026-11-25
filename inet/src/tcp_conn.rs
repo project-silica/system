@@ -698,7 +698,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
 
     /// Its program has let go of it (after [`Connection::close`]): nothing
     /// more is read from it, so in FIN-WAIT-2 a peer that sends nothing for
-    /// [`FIN_WAIT_2_IDLE`] ends it, as an orphaned socket's on Linux. While
+    /// `FIN_WAIT_2_IDLE` ends it, as an orphaned socket's on Linux. While
     /// a program holds it, FIN-WAIT-2 is a half-close and lasts as long as
     /// the peer likes; once nobody does, a peer that goes silent no longer
     /// holds it for ever.
@@ -738,7 +738,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     pub fn on_time(&mut self, now: u64) {
         if self.time_wait_until.is_some_and(|t| now >= t) {
             // TIME-WAIT is over; or FIN-WAIT-2 heard nothing from the peer
-            // for [`FIN_WAIT_2_IDLE`], and gives up on its FIN.
+            // for `FIN_WAIT_2_IDLE`, and gives up on its FIN.
             let silent = self.state == State::FinWait2;
             self.end(silent.then_some(Error::TimedOut));
             return;
