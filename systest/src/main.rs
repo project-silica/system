@@ -20,6 +20,8 @@ const CLIENT: u64 = 1;
 const REVOKER: u64 = 2;
 const HOG: u64 = 3;
 const ONE_CALL: u64 = 4;
+const TIME_WRITER: u64 = 5;
+const TIME_READER: u64 = 6;
 
 const SECOND: u64 = 1_000_000_000;
 const SEND: Rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
@@ -155,16 +157,16 @@ impl Tests {
     }
 
     fn endpoint(&mut self) -> Result<Cap, &'static str> {
-        self.object(ObjectType::Endpoint)
+        self.object(ObjectType::Endpoint, 0)
     }
 
     fn notification(&mut self) -> Result<Cap, &'static str> {
-        self.object(ObjectType::Notification)
+        self.object(ObjectType::Notification, 0)
     }
 
     /// An object of type `ty` for the running test, destroyed when it ends.
-    fn object(&mut self, ty: ObjectType) -> Result<Cap, &'static str> {
-        let object = Object::new(ty, 0).map_err(|_| "cannot create an endpoint or notification")?;
+    fn object(&mut self, ty: ObjectType, bits: u8) -> Result<Cap, &'static str> {
+        let object = Object::new(ty, bits).map_err(|_| "cannot create a test object")?;
         let cap = object.cap();
         *self.objects.iter_mut().find(|o| o.is_none()).ok_or("a test makes too many objects")? = Some(object);
         Ok(cap)
@@ -300,6 +302,19 @@ impl Tests {
         copied.map_err(|_| "cannot use the last slot of the allocated CapSpace")
     }
 
+    fn abandoned_time_page(&mut self) -> Outcome {
+        let page = self.object(ObjectType::Frame, 12)?;
+        let (_, writer) = self.start(TIME_WRITER, [0, 0], 0, &[Grant::lend(page, Rights(Rights::READ.0 | Rights::WRITE.0))])?;
+        if self.next_exit(SECOND)? != (writer, 0) {
+            return Err("writer failed before leaving the time page mid-update");
+        }
+        let (_, reader) = self.start(TIME_READER, [0, 0], 0, &[Grant::lend(page, Rights::READ)])?;
+        if self.next_exit(SECOND)? != (reader, 0) {
+            return Err("reader accepted an unfinished time update");
+        }
+        Ok(())
+    }
+
     /// A program that uses up its memory gets an error; a pair running
     /// beside it is not affected, and the memory comes back with the program.
     fn exhaustion(&mut self) -> Outcome {
@@ -418,8 +433,9 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 9] = [
+    let tests: [(&str, Test); 10] = [
         ("runtime_allocates_capspace_storage", Tests::object_storage),
+        ("time_reader_survives_its_writer", Tests::abandoned_time_page),
         ("a_million_round_trips_on_one_processor", |t| t.round_trips(1, 1_000_000, |_| (1, 1))),
         ("a_million_round_trips_across_processors", |t| t.round_trips(1, 1_000_000, |_| (1, 2))),
         ("four_pairs_on_eight_processors", |t| t.round_trips(4, 250_000, |i| (2 * i, 2 * i + 1))),

@@ -23,7 +23,8 @@ pub fn from_unix_ns(ns: u64) -> u64 {
     secs << 32 | frac
 }
 
-/// Nanoseconds since 1970 of the NTP timestamp `t` (0: no time).
+/// Nanoseconds since 1970. A missing timestamp or a date before 1970
+/// has no value in the system's unsigned wall clock.
 pub fn to_unix_ns(t: u64) -> Option<u64> {
     if t == 0 {
         return None;
@@ -33,7 +34,7 @@ pub fn to_unix_ns(t: u64) -> Option<u64> {
         secs += 1 << 32; // the era after 2036
     }
     let frac = ((t & 0xFFFF_FFFF) * NS) >> 32;
-    Some((secs - UNIX_EPOCH) * NS + frac)
+    Some(secs.checked_sub(UNIX_EPOCH)? * NS + frac)
 }
 
 /// A client's question, sent at `transmit` (an NTP timestamp the answer
@@ -94,6 +95,14 @@ pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> (i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_time_starts_at_the_unix_epoch() {
+        let epoch = UNIX_EPOCH << 32;
+        assert_eq!(to_unix_ns(epoch - 1), None);
+        assert_eq!(to_unix_ns(epoch), Some(0));
+        assert_eq!(to_unix_ns(epoch + (1 << 31)), Some(NS / 2));
+    }
 
     #[test]
     fn timestamps_round_trip_and_wrap_in_2036() {
