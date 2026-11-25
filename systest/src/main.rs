@@ -9,7 +9,7 @@ use libsys::root::RootInfo;
 use libsys::{self as sys, Cap, Error, MsgInfo, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
-use silica_proc::{Child, Grant, Program, report, spawn};
+use silica_proc::{Child, FAULT_BADGE, Grant, Program, report, spawn};
 use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, print, println};
@@ -22,6 +22,7 @@ const HOG: u64 = 3;
 const ONE_CALL: u64 = 4;
 const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
+const BORROWER: u64 = 7;
 
 const SECOND: u64 = 1_000_000_000;
 const SEND: Rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
@@ -315,6 +316,42 @@ impl Tests {
         Ok(())
     }
 
+    /// A program that maps lent memory from lender after lender, each taking
+    /// it back while it is mapped and the program then touching every page,
+    /// is answered with zeros every time, never stopped, and maps each lend
+    /// where the last one was (`silica_rt::mem::Lent`). Before, its 65th
+    /// page of zeros was taken for a fault of its own and it was destroyed
+    /// (a service, by clients ending with memory lent to it), and every
+    /// lend took address space never used again.
+    fn lent_memory_taken_back_any_number_of_times(&mut self) -> Outcome {
+        const CYCLES: u64 = 200;
+        const BITS: u64 = 16;
+        let slot = self.children.iter().position(Option::is_none).ok_or("a test starts too many programs")?;
+        let (_, id) = self.start_with(BORROWER, [CYCLES, BITS, 0], 0, &[])?;
+        let deadline = silica_rt::clock().now() + self.patience(60 * SECOND);
+        let mut answered = 0u64;
+        loop {
+            let m = sys::recv(self.root.parent.exit, Wait::Until(deadline)).map_err(|_| "the borrower did not finish in time")?;
+            if m.badge == id | FAULT_BADGE {
+                if !self.children[slot].as_mut().is_some_and(|c| c.answer_peer_fault(&m)) {
+                    println!("systest:   the borrower faulted at {:#x} after {answered} pages of zeros", m.words[1]);
+                    return Err("the borrower was stopped for touching lent memory taken back");
+                }
+                answered += 1;
+                continue;
+            }
+            if m.badge != id || m.info.label() != EXIT_LABEL {
+                return Err("something other than the borrower's faults and exit arrived");
+            }
+            println!("systest:   {answered} pages of zeros answered over {CYCLES} lends");
+            return match m.words[0] as i64 {
+                0 if answered >= CYCLES << (BITS - 12) => Ok(()),
+                0 => Err("the borrower touched fewer pages than it was taken back from"),
+                _ => Err("the borrower read lent memory after it was taken back, or mapped a lend at fresh addresses (its line says which)"),
+            };
+        }
+    }
+
     fn failed_spawn_returns_grants(&mut self) -> Outcome {
         let endpoint = self.endpoint()?;
         let memory = self.object(ObjectType::Untyped, 12)?;
@@ -451,6 +488,10 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             finish(false)
         }
     };
+    // Its programs' faults come where their exits do: a fault on lent
+    // memory taken back is answered (`lent_memory_taken_back_any_number_of_times`),
+    // any other ends the test that made the program.
+    let root = Root { parent: silica_proc::Parent { fault: root.parent.exit, ..root.parent }, ..root };
     let Some(stress) = ramdisk::find(root.archive, "stress") else {
         println!("ERROR: systest: the ramdisk has no program named stress");
         finish(false)
@@ -459,7 +500,8 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 11] = [
+    let tests: [(&str, Test); 12] = [
+        ("lent_memory_taken_back_any_number_of_times", Tests::lent_memory_taken_back_any_number_of_times),
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("time_reader_survives_its_writer", Tests::abandoned_time_page),
         ("failed_spawn_returns_grants", Tests::failed_spawn_returns_grants),

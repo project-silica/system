@@ -566,6 +566,10 @@ impl Stack {
         if self.time.server(self.lease.as_ref()).is_some() && self.time.page.is_some() {
             d = d.min(self.time.next);
         }
+        // The interface's driver is restarting: its next try.
+        if let Some(t) = self.nic.retry_at() {
+            d = d.min(t);
+        }
         d
     }
 

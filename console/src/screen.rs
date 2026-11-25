@@ -92,7 +92,7 @@ impl Display {
     /// Attach a strip of this program's memory to the display `driver` and
     /// size a grid for it.
     pub fn new(driver: Handle) -> Option<(Display, u32, u32)> {
-        let mut client = Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+        let mut client = Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         let mode = client.mode().ok()?.mode;
         let (columns, rows) = (mode.width / WIDTH as u32, mode.height / HEIGHT as u32);
         if columns == 0 || rows == 0 {

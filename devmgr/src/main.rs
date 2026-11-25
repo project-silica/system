@@ -23,8 +23,9 @@
 //! A driver that faults or ends with a failure is taken down, its device
 //! is silenced (no bus mastering; the kernel has already cut it off from
 //! memory, which happens when the driver's device address space goes), and
-//! the driver is started again, at most [`MAX_RESTARTS`] times; the driver
-//! is told how many times it has been started. A driver may be replaced:
+//! the driver is started again (at once the first time, then backing off,
+//! never for good: `silica_proc::Restarts`); the driver is told how many
+//! times it has been started. A driver may be replaced:
 //! `driver=<vendor>:<device>=<program>` on the kernel command line (four
 //! hexadecimal digits each) starts `<program>` from the boot archive for
 //! that kind of device instead of the driver the device manager would pick.
@@ -67,7 +68,7 @@ use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use phys::DeviceMemory;
 use silica_driver::pci::{self, Config};
 use silica_formats::{acpi, ramdisk};
-use silica_proc::{Child, FAULT_BADGE, Grant, Parent, Program, spawn};
+use silica_proc::{Child, FAULT_BADGE, Grant, Parent, Program, Restarts, spawn};
 use silica_rt::alloc::collections::BTreeMap;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, Listener, free_slot, release_slot};
@@ -76,6 +77,7 @@ use silica_rt::mmio::Mmio;
 use silica_rt::{EXIT_LABEL, ProcessInfo, println, slots};
 
 use silica_protocols::device::{PciAddress, manager};
+use silica_protocols::scope;
 
 silica_rt::main!(main);
 
@@ -92,9 +94,6 @@ const GRANT_FIRST_RAMDISK: u64 = 6;
 pub const CLIENTS: u64 = 1 << 32;
 /// Interrupt lines one device gets at most.
 const LINES_PER_DEVICE: u32 = 8;
-/// How often a driver that failed is started again before its device is
-/// left alone.
-const MAX_RESTARTS: u32 = 3;
 
 fn granted(n: u64) -> Cap {
     Cap(slots::FIRST_GRANT + n)
@@ -116,9 +115,11 @@ struct Function {
     lines: Option<(u32, u32)>,
     /// How many times a driver has been started for it.
     starts: u32,
-    /// How many times its driver failed (faulted, or ended with a failure);
-    /// an owner's restart is not a failure.
-    failures: u32,
+    /// Its driver's failures (faulted, or ended with a failure; an owner's
+    /// restart is not one) and when it is started again
+    /// (`silica_proc::Restarts`), and the driver waiting to be.
+    restarts: Restarts,
+    waiting: Option<&'static str>,
     /// Its drivers' log (`silica.system.Manager`'s `add_log`): the ring and
     /// what its writer signals, made when its first driver starts and
     /// handed to every one after it.
@@ -135,7 +136,7 @@ struct Running<'a> {
     /// The endpoint its clients call it on.
     service: Object,
     /// What clients asked to have signalled when this driver ends.
-    gone: Vec<Handle>,
+    gone: Vec<(u64, Handle)>,
 }
 
 struct Manager {
@@ -168,7 +169,23 @@ struct Manager {
     configs: BTreeMap<u32, (Config, Cap)>,
     /// What clients asked to have signalled when a device of a class gains
     /// or loses its driver (`watch`).
-    watchers: Vec<(manager::Class, Handle)>,
+    watchers: Vec<(u64, manager::Class, Handle)>,
+    /// The badge of the call being answered: whose capability, and its
+    /// scopes (`silica_protocols::scope`).
+    caller: u64,
+}
+
+/// The scope a caller needs for devices of `class`.
+fn scope_of(class: manager::Class) -> u64 {
+    match class {
+        manager::Class::Block => scope::DEVICE_BLOCK,
+        manager::Class::Network => scope::DEVICE_NETWORK,
+        manager::Class::Display => scope::DEVICE_DISPLAY,
+        manager::Class::Port => scope::DEVICE_PORT,
+        manager::Class::Input => scope::DEVICE_INPUT,
+        manager::Class::Entropy => scope::DEVICE_ENTROPY,
+        _ => 0,
+    }
 }
 
 /// A function as found, its BARs probed.
@@ -191,7 +208,8 @@ fn function_of(id: u32, config: Config, config_frame: Cap) -> Function {
         vectors: config.msix().map_or(0, |m| m.vectors),
         lines: None,
         starts: 0,
-        failures: 0,
+        restarts: Restarts::default(),
+        waiting: None,
         log: None,
     }
 }
@@ -214,6 +232,9 @@ fn class_of(f: &Function) -> Option<manager::Class> {
 impl manager::Server<Handle> for Manager {
     fn list<'a>(&'a mut self, class: manager::Class) -> manager::ListReply<'a, Handle> {
         self.listing.clear();
+        if scope_of(class) == 0 || !scope::has(self.caller, scope_of(class)) {
+            return manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing) };
+        }
         for r in &self.running {
             let f = &self.functions[r.function];
             if class_of(f) == Some(class) {
@@ -224,23 +245,32 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<manager::OpenReply<Handle>, manager::Error> {
-        let functions = &self.functions;
+        let (functions, caller) = (&self.functions, self.caller);
         let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
-        if let Some(g) = gone {
-            // Kept until the driver ends; a notice nobody can signal is dropped then.
-            r.gone.push(g);
+        let class = class_of(&functions[r.function]);
+        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+            return Err(manager::Error::Refused);
         }
-        let slot = free_slot().ok_or(manager::Error::NoSuchDevice)?;
+        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
         self.next_client += 1;
         let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
         if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, self.next_client).is_err() {
             release_slot(slot);
-            return Err(manager::Error::NoSuchDevice);
+            return Err(manager::Error::NoRoom);
+        }
+        if let Some(g) = gone {
+            // Kept until the driver ends, one for each caller: a caller's
+            // later notice (its reconnecting) replaces its earlier one.
+            r.gone.retain(|(c, _)| *c != caller);
+            r.gone.push((caller, g));
         }
         Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
     }
 
     fn restart(&mut self, id: u32) -> Result<manager::RestartReply, manager::Error> {
+        if !scope::has(self.caller, scope::DEVICE_CONTROL) {
+            return Err(manager::Error::Refused);
+        }
         let at = self.running.iter().position(|r| self.functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
         let r = self.running.remove(at);
         let (driver, function) = (r.name, r.function);
@@ -256,11 +286,18 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn watch(&mut self, class: manager::Class, changed: Handle) -> manager::WatchReply {
-        self.watchers.push((class, changed));
+        if scope_of(class) != 0 && scope::has(self.caller, scope_of(class)) {
+            let caller = self.caller;
+            self.watchers.retain(|(c, k, _)| (*c, *k) != (caller, class));
+            self.watchers.push((caller, class, changed));
+        }
         manager::WatchReply {}
     }
 
     fn describe<'a>(&'a mut self, id: u32, from: u32) -> Result<manager::DescribeReply<'a>, manager::Error> {
+        if !scope::has(self.caller, scope::DEVICE_CONTROL) {
+            return Err(manager::Error::Refused);
+        }
         let functions = &self.functions;
         let r = self.running.iter().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
         let name = silica_rt::alloc::format!("{}@{}", r.name, PciAddress(id));
@@ -530,7 +567,41 @@ impl Manager {
             }
             println!("devmgr: {} was taken out; {driver} ended", PciAddress(id));
         }
+        // Nothing is started again for a device that is gone.
+        for f in self.functions.iter_mut().filter(|f| PciAddress(f.id).on_buses(segment, first..=last)) {
+            f.waiting = None;
+        }
         self.ports[k].0.power(false);
+    }
+
+    /// Start a driver for function `index` again after a failure; one that
+    /// cannot be started is tried again later, as if it had failed again.
+    fn start_again(&mut self, index: usize, driver: &'static str) {
+        let device = PciAddress(self.functions[index].id);
+        match self.start(index, driver) {
+            Ok(()) => println!("devmgr: {driver} for {device} started again"),
+            Err(e) => {
+                let now = silica_rt::clock().now();
+                let due = self.functions[index].restarts.failed(now);
+                self.functions[index].waiting = Some(driver);
+                println!("ERROR: devmgr: {device} is not driven: {e}; tried again in {} ms", (due - now) / 1_000_000);
+            }
+        }
+    }
+
+    /// Start the drivers whose restart is due; returns when the next one is.
+    fn restart_due(&mut self) -> Option<u64> {
+        let now = silica_rt::clock().now();
+        for index in 0..self.functions.len() {
+            let f = &self.functions[index];
+            if let Some(driver) = f.waiting
+                && f.restarts.due <= now
+            {
+                self.functions[index].waiting = None;
+                self.start_again(index, driver);
+            }
+        }
+        self.functions.iter().filter(|f| f.waiting.is_some()).map(|f| f.restarts.due).min()
     }
 
     /// Find every function on `bus` and behind its bridges.
@@ -675,6 +746,8 @@ impl Manager {
             self.next_line += lines;
         }
         f.starts += 1;
+        f.restarts.started(silica_rt::clock().now());
+        f.waiting = None;
         self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, gone: Vec::new() });
         self.changed(index);
         Ok(())
@@ -687,7 +760,7 @@ impl Manager {
     /// (its holder ended) is forgotten.
     fn changed(&mut self, index: usize) {
         let Some(class) = class_of(&self.functions[index]) else { return };
-        self.watchers.retain(|(c, n)| *c != class || sys::signal(n.cap()).is_ok());
+        self.watchers.retain(|(_, c, n)| *c != class || sys::signal(n.cap()).is_ok());
     }
 
     /// The log of the drivers of function `index` (`driver` names it with
@@ -722,7 +795,7 @@ impl Manager {
         }
         let ok = r.child.destroy().is_ok();
         // Its clients hear of it now, not on their next call.
-        for g in r.gone {
+        for (_, g) in r.gone {
             let _ = sys::signal(g.cap());
         }
         self.changed(r.function);
@@ -821,6 +894,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         table: drivers(archive),
         configs: BTreeMap::new(),
         watchers: Vec::new(),
+        caller: 0,
     };
     m.enumerate()?;
     let cmdline = m.cmdline;
@@ -884,7 +958,12 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     // From here on: clients' calls, drivers that end, the button and the slots.
     let mut listener = Listener::new(events);
     loop {
-        let got = listener.recv_listening(happened.cap(), Wait::Forever);
+        // Drivers whose restart is due, and when the next one is.
+        let next = m.restart_due();
+        let got = listener.recv_listening(happened.cap(), next.map_or(Wait::Forever, Wait::Until));
+        if matches!(got, Err(sys::Error::Timeout)) {
+            continue;
+        }
         let Ok(msg) = got else { return Err("its endpoint was taken away") };
         if let Some(bits) = msg.signals() {
             if bits & hotplug::HOTPLUG != 0 {
@@ -905,6 +984,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         // Clients' badges are from CLIENTS up; a fault report's has
         // FAULT_BADGE, above them, which no client is given.
         if msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 {
+            m.caller = msg.badge;
             listener.answer(&msg, |request, caps, reply, reply_caps| manager::dispatch(&mut m, request, caps, reply, reply_caps));
             continue;
         }
@@ -942,13 +1022,13 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         if ended_well {
             continue;
         }
-        m.functions[function].failures += 1;
-        if m.functions[function].failures > MAX_RESTARTS {
-            println!("ERROR: devmgr: {driver} for {device} failed {} times; the device is left alone", m.functions[function].failures);
-        } else if let Err(e) = m.start(function, driver) {
-            println!("ERROR: devmgr: {device} is not driven: {e}");
-        } else {
-            println!("devmgr: {driver} for {device} started again");
+        let now = silica_rt::clock().now();
+        let due = m.functions[function].restarts.failed(now);
+        if due > now {
+            println!("devmgr: {driver} for {device} has failed {} times in a row; started again in {} ms", m.functions[function].restarts.streak, (due - now) / 1_000_000);
+            m.functions[function].waiting = Some(driver);
+            continue;
         }
+        m.start_again(function, driver);
     }
 }

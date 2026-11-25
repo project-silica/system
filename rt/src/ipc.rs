@@ -213,17 +213,36 @@ fn dispatch(
     }
 }
 
+/// How long a service waits for a driver's answer to a call ([`Channel::within`]):
+/// a driver answers in microseconds, and one that has not answered in a
+/// second has hung (the device manager restarts a driver that ends; one
+/// that hangs without ending must not take the services that call it, and
+/// their clients, with it).
+pub const DRIVER_CALL_LIMIT: u64 = 1_000_000_000;
+
 /// The client side of a connection: an endpoint capability to a provider.
 /// Generated clients wrap one (`Client::from(Channel::new(endpoint))`).
 pub struct Channel {
     endpoint: Cap,
+    /// The longest a call may take, in nanoseconds (0: no limit).
+    limit: u64,
 }
 
 impl Channel {
     /// A channel through the endpoint capability `endpoint`, which must
     /// allow sending (and passing capabilities, if the protocol does).
     pub fn new(endpoint: Cap) -> Channel {
-        Channel { endpoint }
+        Channel { endpoint, limit: 0 }
+    }
+
+    /// As [`Channel::new`], each call ending with `cancelled` if its answer
+    /// has not come within `limit_ns` nanoseconds, whether the provider has
+    /// received it or not (`libsys::call_within`); an answer sent after
+    /// that goes nowhere. A program calls one it trusts less than itself
+    /// (a service calling a driver) this way, so a provider that hangs
+    /// without ending holds it, and its own clients, for no longer.
+    pub fn within(endpoint: Cap, limit_ns: u64) -> Channel {
+        Channel { endpoint, limit: limit_ns }
     }
 }
 
@@ -239,11 +258,17 @@ impl Transport<Handle> for Channel {
         let buf = buffer();
         let (slots, sent) = give(&buf, &mut caps);
         let words = pack(&buf, request);
-        let result = sys::call(self.endpoint, info(len, sent), words);
+        let result = if self.limit == 0 {
+            sys::call(self.endpoint, info(len, sent), words)
+        } else {
+            sys::call_within(self.endpoint, info(len, sent), words, self.limit)
+        };
         given(slots, sent);
         let m = result.map_err(|e| match e {
             // The endpoint, or the provider holding the call, went away.
             Error::Gone => TransportError::PeerGone,
+            // Its time limit passed: the call is given up.
+            Error::Timeout => TransportError::Cancelled,
             // BadCap, NoRights, WrongType: this capability does not reach a provider.
             _ => TransportError::Revoked,
         })?;

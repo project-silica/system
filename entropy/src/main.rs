@@ -52,7 +52,7 @@ impl Service {
         let ids: [Option<u32>; 4] = core::array::from_fn(|i| listed.devices.iter().nth(i).map(|d| d.id));
         for id in ids.into_iter().flatten() {
             let Ok(opened) = self.devices.open(id, None) else { continue };
-            let mut device = rng::Client::<Channel, Handle>::from(Channel::new(opened.driver.cap()));
+            let mut device = rng::Client::<Channel, Handle>::from(Channel::within(opened.driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
             if let Ok(r) = device.read(FROM_DEVICE) {
                 self.pool.mix(r.data);
                 self.device_bytes += r.data.len() as u64;

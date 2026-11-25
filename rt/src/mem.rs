@@ -17,7 +17,7 @@ use crate::ipc::{free_slot, release_slot};
 use crate::mmio::Mmio;
 use crate::slots;
 use crate::sys::{self, Cap, Error, ObjectType};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Untyped capabilities blocks are made from, as `slot | bits << 56`,
 /// smallest first (0: none, at the end).
@@ -274,6 +274,118 @@ pub fn peer(frame: Cap, bits: u8, rights: sys::Rights) -> Result<Mmio, Error> {
     // other mapping ever takes: accesses there reach this frame, or zeros.
     #[allow(unsafe_code)]
     Ok(unsafe { Mmio::new(at, 1 << bits) })
+}
+
+/// Lent memory a provider maps for one client at a time and lets go of when
+/// that client goes: the network stack's programs' memory, a queue's
+/// rings, a display's pixels. [`peer`] never gives its addresses to
+/// anything else, which costs a fresh range for every client a provider
+/// ever had (512 GiB of them, so a client lending 256 MiB and ending in a
+/// loop ran a provider out after about two thousand); a `Lent` gives its
+/// addresses back when it is dropped, emptied first of whatever is mapped
+/// there (the frame, if its lender has not taken it back, and any page of
+/// zeros the supervisor put in its place), and the next `Lent` of the same
+/// size takes them.
+///
+/// What its region reads before the drop is the lender's memory, or zeros
+/// once the lender takes it back, as with [`peer`]. A copy of the region
+/// (`Mmio` is `Copy`) kept past the drop reaches whatever is lent next at
+/// the same addresses: keep the region, and every part of it, in the same
+/// structure as the `Lent`, so that they go together.
+#[derive(Debug)]
+pub struct Lent {
+    region: Mmio,
+}
+
+impl Lent {
+    /// Map `frame`, of `2^bits` bytes, lent by another program, with
+    /// `rights`.
+    pub fn map(frame: Cap, bits: u8, rights: sys::Rights) -> Result<Lent, Error> {
+        let size = 1usize.checked_shl(bits as u32).ok_or(Error::BadArg)?;
+        let at = match reused(bits) {
+            Some(at) => at,
+            None => {
+                let align = (size as u64).min(1 << sys::LARGE_BITS);
+                let mut at = PEER_RESERVED.load(Ordering::Relaxed);
+                loop {
+                    let start = (at + align - 1) & !(align - 1);
+                    let end = start.checked_add(size as u64).filter(|e| *e <= PEER_END).ok_or(Error::NoMemory)?;
+                    match PEER_RESERVED.compare_exchange_weak(at, end, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break start as usize,
+                        Err(now) => at = now,
+                    }
+                }
+            }
+        };
+        if let Err(e) = sys::map(slots::ASPACE, frame, at, rights) {
+            give_back(at, bits);
+            return Err(e);
+        }
+        // SAFETY: just mapped among lent memory, whose range no other
+        // mapping takes until this value is dropped (see above).
+        #[allow(unsafe_code)]
+        Ok(Lent { region: unsafe { Mmio::new(at, size) } })
+    }
+
+    /// The memory, read and written one access at a time (its lender may be
+    /// writing it too); see [`Lent`] for how long it may be used.
+    pub fn region(&self) -> Mmio {
+        self.region
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        let (at, len) = (self.region.addr(), self.region.len());
+        // SAFETY: the range is this value's alone, and it is going.
+        #[allow(unsafe_code)]
+        let cleared = unsafe { sys::unmap_range(slots::ASPACE, at, len) };
+        // A range that could not be emptied is not used again.
+        if cleared.is_ok() {
+            give_back(at, len.trailing_zeros() as u8);
+        }
+    }
+}
+
+/// Ranges of lent memory let go of, for the next [`Lent`] of the same
+/// size: `address | bits` (addresses are page-aligned), 0 for none. A
+/// range that does not fit is not used again (address space, not memory).
+const FREE_RANGES: usize = 256;
+struct Ranges {
+    lock: AtomicBool,
+    at: core::cell::UnsafeCell<[u64; FREE_RANGES]>,
+}
+// SAFETY: `at` is touched only holding `lock`.
+#[allow(unsafe_code)]
+unsafe impl Sync for Ranges {}
+static RANGES: Ranges = Ranges { lock: AtomicBool::new(false), at: core::cell::UnsafeCell::new([0; FREE_RANGES]) };
+
+fn ranges<R>(f: impl FnOnce(&mut [u64; FREE_RANGES]) -> R) -> R {
+    while RANGES.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    // SAFETY: the lock is held, so this is the only reference.
+    #[allow(unsafe_code)]
+    let r = f(unsafe { &mut *RANGES.at.get() });
+    RANGES.lock.store(false, Ordering::Release);
+    r
+}
+
+fn reused(bits: u8) -> Option<usize> {
+    ranges(|r| {
+        let k = r.iter().position(|e| *e != 0 && *e & 0xFFF == bits as u64)?;
+        let at = r[k] & !0xFFF;
+        r[k] = 0;
+        Some(at as usize)
+    })
+}
+
+fn give_back(at: usize, bits: u8) {
+    ranges(|r| {
+        if let Some(e) = r.iter_mut().find(|e| **e == 0) {
+            *e = at as u64 | bits as u64;
+        }
+    })
 }
 
 /// Map `frame`, of `2^bits` bytes, somewhere in this program with `rights`,

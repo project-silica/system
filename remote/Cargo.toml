@@ -12,7 +12,7 @@ publish.workspace = true
 # its owners from the boot archive, as provisioned for this machine. With
 # neither, it says so and ends: remote management is off.
 [package.metadata.silica.service]
-needs = ["silica.net.Tcp", "silica.system.Manager", "silica.log.Reader"]
+needs = ["silica.net.Tcp", "silica.system.Manager:observe+control+update+power", "silica.log.Reader"]
 files = ["remote.key", "remote.owners"]
 memory = 23
 start = "boot"

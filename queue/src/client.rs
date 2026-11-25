@@ -281,7 +281,20 @@ pub struct Queue<C: Control> {
     reconnected_at: u64,
     tries: u32,
     recovered_in: Option<Recovery>,
+    /// While there is no driver: when to try the next one, and the wait
+    /// before that (doubling from [`FIRST_TRY_NS`] to [`LAST_TRY_NS`]).
+    next_try: u64,
+    backoff: u64,
+    /// What a call that cannot go on without a driver sleeps on between
+    /// tries: signalled by nobody.
+    nap: Object,
 }
+
+/// How long after a failed try to connect again, at first and at most: a
+/// driver takes from a millisecond to some tens to come back, and nothing
+/// tells the queue when it has (the waiting is a sleep, not a spin).
+const FIRST_TRY_NS: u64 = 50_000;
+const LAST_TRY_NS: u64 = 4_000_000;
 
 /// A capability of this program's own, derived from `cap` with `rights`
 /// and `badge`, to give away.
@@ -348,6 +361,9 @@ impl<C: Control> Queue<C> {
             reconnected_at: 0,
             tries: 0,
             recovered_in: None,
+            next_try: 0,
+            backoff: 0,
+            nap: Object::new(ObjectType::Notification, 0)?,
         };
         q.connect()?;
         Ok(q)
@@ -410,37 +426,77 @@ impl<C: Control> Queue<C> {
         }
     }
 
-    fn recover(&mut self) -> Result<(), Error> {
+    /// One try to connect to the next driver, if one is due: `true` once
+    /// connected (or never disconnected), `false` when the next try is at
+    /// [`Queue::retry_at`], `Gone` once [`Queue::RECONNECT_NS`] have passed
+    /// without one. Never waits: a service that is also a driver's client
+    /// goes on serving its own clients while the driver restarts.
+    fn try_recover(&mut self) -> Result<bool, Error> {
+        if self.link.is_some() {
+            return Ok(true);
+        }
         // Keep room for the next driver's entire completion ring. An
         // application doing only control calls across repeated restarts
         // must consume queued events before they grow without bound.
         if self.ready.len() >= QUEUE as usize {
             return Err(Error::Full);
         }
-        let clock = silica_rt::clock();
+        let now = silica_rt::clock().now();
         if self.lost_at == 0 {
-            self.lost_at = clock.now();
+            self.lost_at = now;
         }
-        let deadline = self.lost_at + Self::RECONNECT_NS;
-        loop {
-            self.tries += 1;
-            match self.connect() {
-                Ok(()) => {
-                    let now = clock.now();
-                    self.reconnected_at = now;
-                    // Nothing was sent to the new driver again (every
-                    // request in flight had its result saved): there is no
-                    // completion to wait for, so the recovery ends here.
-                    if self.in_flight.iter().all(|r| self.ready.iter().any(|c| c.tag == tag_of(r))) {
-                        self.recovered(now);
-                    }
-                    return Ok(());
+        if now < self.next_try {
+            return Ok(false);
+        }
+        self.tries += 1;
+        match self.connect() {
+            Ok(()) => {
+                let now = silica_rt::clock().now();
+                self.reconnected_at = now;
+                (self.next_try, self.backoff) = (0, 0);
+                // Nothing was sent to the new driver again (every
+                // request in flight had its result saved): there is no
+                // completion to wait for, so the recovery ends here.
+                if self.in_flight.iter().all(|r| self.ready.iter().any(|c| c.tag == tag_of(r))) {
+                    self.recovered(now);
                 }
-                // Not back yet: the device manager is starting it again.
-                Err(Error::Gone) if clock.now() < deadline => sys::yield_now(),
-                Err(e) => return Err(e),
+                Ok(true)
             }
+            // Not back yet: the device manager is starting it again.
+            Err(Error::Gone) if now < self.lost_at + Self::RECONNECT_NS => {
+                self.backoff = (self.backoff * 2).clamp(FIRST_TRY_NS, LAST_TRY_NS);
+                self.next_try = now + self.backoff;
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
+    }
+
+    /// Wait for the next driver: for what cannot go on without one (a
+    /// control call, registering memory). Sleeps between tries.
+    fn recover(&mut self) -> Result<(), Error> {
+        while !self.try_recover()? {
+            let _ = sys::recv(self.nap.cap(), Wait::Until(self.next_try));
+        }
+        Ok(())
+    }
+
+    /// With no driver: sleep until the next try, or `deadline` (then
+    /// `Timeout`), whichever comes first.
+    fn nap_until(&mut self, deadline: Option<u64>) -> Result<(), Error> {
+        let until = deadline.map_or(self.next_try, |d| d.min(self.next_try));
+        if deadline.is_some_and(|d| silica_rt::clock().now() >= d) {
+            return Err(Error::Timeout);
+        }
+        let _ = sys::recv(self.nap.cap(), Wait::Until(until));
+        Ok(())
+    }
+
+    /// While the driver is away and its successor not yet connected: when
+    /// to look again ([`Queue::poll`] tries then). A client on its own
+    /// notification ([`Queue::open_on`]) waits no later than this.
+    pub fn retry_at(&self) -> Option<u64> {
+        self.link.is_none().then_some(self.next_try)
     }
 
     /// A recovery in progress ended at `now`: keep how it went.
@@ -522,6 +578,12 @@ impl<C: Control> Queue<C> {
         if self.in_flight.len as u32 >= QUEUE || tag >= EVENTS || self.in_flight.contains(tag) {
             return Err(Error::Full);
         }
+        if !self.try_recover()? {
+            // The next driver is on its way: the request waits with those
+            // in flight, all sent to it when it connects.
+            self.in_flight.insert(*request);
+            return Ok(());
+        }
         self.link()?.requests.push(request).map_err(|_| Error::Full)?;
         self.in_flight.insert(*request);
         Ok(())
@@ -556,8 +618,9 @@ impl<C: Control> Queue<C> {
         }
         match self.link.as_mut() {
             Some(link) => link.completions.sleep(),
-            // Connecting again happens in `poll`.
-            None => false,
+            // Connecting again happens in `poll`, at `retry_at`, which the
+            // client waits no later than.
+            None => true,
         }
     }
 
@@ -591,8 +654,8 @@ impl<C: Control> Queue<C> {
             }
             return Ok(Some(c));
         }
-        if self.link.is_none() {
-            self.recover()?;
+        if !self.try_recover()? {
+            return Ok(None);
         }
         let Some(link) = self.link.as_mut() else { return Ok(None) };
         loop {
@@ -630,6 +693,10 @@ impl<C: Control> Queue<C> {
                 }
                 return Ok(c);
             }
+            if self.link.is_none() {
+                self.nap_until(deadline)?;
+                continue;
+            }
             let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
             if !asleep {
                 continue;
@@ -654,6 +721,10 @@ impl<C: Control> Queue<C> {
         loop {
             if let Some(c) = self.take()? {
                 return Ok(c);
+            }
+            if self.link.is_none() {
+                self.nap_until(deadline)?;
+                continue;
             }
             let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
             if !asleep {

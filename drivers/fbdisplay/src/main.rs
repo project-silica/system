@@ -30,7 +30,7 @@ struct Display {
     framebuffer: Mmio,
     /// The client's frame and where it is mapped (read only, among lent
     /// memory: a client that takes it back leaves zeros, not a fault).
-    attached: Option<(Handle, Mmio)>,
+    attached: Option<(Handle, mem::Lent)>,
 }
 
 impl device::Server<Handle> for Display {
@@ -39,20 +39,26 @@ impl device::Server<Handle> for Display {
     }
 
     fn attach(&mut self, pixels: Handle) -> Result<AttachReply, Error> {
-        // The last frame goes: deleting its capability unmaps it.
+        // One client draws: another may attach only once the last frame
+        // has gone (its client took it back, or ended, and the capability
+        // with it).
+        if self.attached.as_ref().is_some_and(|(f, _)| matches!(sys::inspect_slot(slots::SPACE, f.cap().0), Ok(Some(_)))) {
+            return Err(Error::InUse);
+        }
         self.attached = None;
         let bits = match sys::inspect_slot(slots::SPACE, pixels.cap().0) {
             Ok(Some(s)) if s.ty == sys::ObjectType::Frame => s.bits,
             _ => return Err(Error::BadMemory),
         };
         // Among lent memory: taking it back leaves zeros, never a fault.
-        let region = mem::peer(pixels.cap(), bits, Rights::READ).map_err(|_| Error::BadMemory)?;
+        let region = mem::Lent::map(pixels.cap(), bits, Rights::READ).map_err(|_| Error::BadMemory)?;
         self.attached = Some((pixels, region));
         Ok(AttachReply {})
     }
 
     fn present(&mut self, rect: Rect, offset: u64, stride: u32) -> Result<PresentReply, Error> {
-        let Some((_, from)) = &self.attached else { return Err(Error::NotAttached) };
+        let Some((_, lent)) = &self.attached else { return Err(Error::NotAttached) };
+        let from = lent.region();
         let Rect { x, y, width, height } = rect;
         let (x, y, w, h, stride) = (x as u64, y as u64, width as u64, height as u64, stride as u64);
         if w == 0 || h == 0 {
@@ -60,7 +66,9 @@ impl device::Server<Handle> for Display {
         }
         let on_screen = x + w <= self.mode.width as u64 && y + h <= self.mode.height as u64;
         let last = offset.checked_add(((h - 1) * stride + w) * 4);
-        if !on_screen || stride < w || last.is_none_or(|l| l > from.len() as u64) {
+        // Pixels start at multiples of 4: an offset between them is refused
+        // (read as words, it would stop the driver).
+        if !on_screen || stride < w || !offset.is_multiple_of(4) || last.is_none_or(|l| l > from.len() as u64) {
             return Err(Error::Outside);
         }
         let to = &self.framebuffer;

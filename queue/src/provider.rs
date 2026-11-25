@@ -94,6 +94,9 @@ struct Connection<M> {
     client: u64,
     /// The frame of the rings: gone when the client is.
     rings: Handle,
+    /// Where they are mapped, with `requests` and `completions` in it: let
+    /// go of with them when the connection ends.
+    _mapped: mem::Lent,
     requests: Consumer<REQUEST_BYTES>,
     completions: Producer<COMPLETION_BYTES>,
     /// What to signal when completions were added and the client sleeps.
@@ -103,6 +106,29 @@ struct Connection<M> {
     stalled: Option<Raw>,
     /// Completions were added since the client was last told.
     completed: bool,
+    /// Requests taken and not yet completed.
+    in_flight: u32,
+    /// Events not yet in the completion ring (one per tag, the latest):
+    /// an event takes a slot only beyond those the client's requests
+    /// will need, so no completion is ever crowded out.
+    events: Vec<Completion>,
+}
+
+impl<M> Connection<M> {
+    /// Completion slots the client's requests still need: those taken and
+    /// not completed, those waiting in its ring, a stalled one.
+    fn owed(&self) -> u32 {
+        self.in_flight + self.requests.waiting_now() + u32::from(self.stalled.is_some())
+    }
+
+    /// Put waiting events into the completion ring where they fit.
+    fn post_events(&mut self) {
+        while !self.events.is_empty() && self.completions.room() > self.owed() {
+            let e = self.events.remove(0);
+            let _ = self.completions.push(&e.encode());
+            self.completed = true;
+        }
+    }
 }
 
 impl<M> Connection<M> {
@@ -114,9 +140,31 @@ impl<M> Connection<M> {
     }
 }
 
+/// Memory of an ended connection that requests on the device still use.
+struct Draining<M> {
+    slot: u16,
+    connection: u32,
+    id: u32,
+    /// Requests using it still on the device.
+    busy: u32,
+    mapping: M,
+    /// The client's frame, kept: the device's mapping is made from it.
+    _frame: Handle,
+}
+
 /// A service's connections to its clients.
 pub struct Session<M> {
     connections: Vec<Option<Connection<M>>>,
+    /// Memory of connections that ended while requests using it were on
+    /// the device: kept reachable until the last of them completes, so a
+    /// client that breaks its ring cannot pull memory from under the
+    /// device (where DMA is confined the device would fault, on a device
+    /// other clients share; where it is not, it would write memory reused
+    /// by then).
+    draining: Vec<Draining<M>>,
+    /// Mappings whose last request has completed, to give back
+    /// ([`Session::unmap_finished`]).
+    finished: Vec<M>,
     /// Counts connections.
     generation: u32,
     /// The capability clients are given to wake the service.
@@ -133,7 +181,7 @@ impl<M> Session<M> {
     pub fn new(wake: Cap) -> Session<M> {
         let mut connections = Vec::new();
         connections.resize_with(CONNECTIONS, || None);
-        Session { connections, generation: 0, wake, next: 0, exclusive: false }
+        Session { connections, draining: Vec::new(), finished: Vec::new(), generation: 0, wake, next: 0, exclusive: false }
     }
 
     /// As [`Session::new`], for a device that serves one client at a time:
@@ -145,12 +193,33 @@ impl<M> Session<M> {
         Session { exclusive: true, ..Session::new(wake) }
     }
 
-    /// End connection `slot`: the device loses the client's memory.
+    /// End connection `slot`: the device loses the client's memory, each
+    /// piece once no request using it is on the device.
     fn close_slot(&mut self, slot: usize, mapper: &mut impl Mapper<Mapping = M>) {
         if let Some(c) = self.connections.get_mut(slot).and_then(Option::take) {
-            for m in c.memories.into_iter().flatten() {
-                mapper.unmap(m.mapping);
+            for (id, m) in c.memories.into_iter().enumerate() {
+                match m {
+                    Some(m) if m.busy != 0 => self.draining.push(Draining {
+                        slot: slot as u16,
+                        connection: c.generation,
+                        id: id as u32,
+                        busy: m.busy,
+                        mapping: m.mapping,
+                        _frame: m.frame,
+                    }),
+                    Some(m) => mapper.unmap(m.mapping),
+                    None => {}
+                }
             }
+        }
+    }
+
+    /// Give back the mappings of ended connections whose last request on
+    /// the device has completed. The service calls it after it has given
+    /// the device's completions to [`Session::complete`].
+    pub fn unmap_finished(&mut self, mapper: &mut impl Mapper<Mapping = M>) {
+        for m in self.finished.drain(..) {
+            mapper.unmap(m);
         }
     }
 
@@ -207,7 +276,8 @@ impl<M> Session<M> {
         }
         // If the client takes it back, the range reads as zeros, which the
         // rings report as a broken ring.
-        let region = mem::peer(rings.cap(), RINGS_BITS, Rights(3)).map_err(|_| Refused::NoRoom)?;
+        let mapped = mem::Lent::map(rings.cap(), RINGS_BITS, Rights(3)).map_err(|_| Refused::NoRoom)?;
+        let region = mapped.region();
         let (Some(req), Some(cpl)) = (region.part(0, COMPLETIONS_AT), region.part(COMPLETIONS_AT, region.len() - COMPLETIONS_AT)) else {
             return Err(Refused::BadMemory);
         };
@@ -230,12 +300,15 @@ impl<M> Session<M> {
             generation: self.generation,
             client: caller,
             rings,
+            _mapped: mapped,
             requests,
             completions: completions_ring,
             done: completions,
             memories,
             stalled: None,
             completed: false,
+            in_flight: 0,
+            events: Vec::new(),
         });
         Ok(Handle::new(Cap(wake)))
     }
@@ -318,6 +391,7 @@ impl<M> Session<M> {
                 let region = c.memories.get(memory as usize).and_then(Option::as_ref).map(|m| m.region);
                 match start(&raw, ticket, region, c.client) {
                     Ok(t) => {
+                        c.in_flight += 1;
                         if let Some(m) = c.memories.get_mut(t.memory as usize).and_then(Option::as_mut) {
                             m.busy += 1;
                         }
@@ -343,6 +417,15 @@ impl<M> Session<M> {
     pub fn complete(&mut self, ticket: Ticket, status: u32, value: u32) {
         let Some(c) = self.connections.get_mut(ticket.slot as usize).and_then(Option::as_mut).filter(|c| c.generation == ticket.connection)
         else {
+            // Its connection ended: the memory it used may now go.
+            let of = |d: &Draining<M>| (d.slot, d.connection, d.id) == (ticket.slot, ticket.connection, ticket.memory);
+            if let Some(k) = self.draining.iter().position(of) {
+                self.draining[k].busy -= 1;
+                if self.draining[k].busy == 0 {
+                    let d = self.draining.swap_remove(k);
+                    self.finished.push(d.mapping);
+                }
+            }
             return;
         };
         if let Some(m) = c.memories.get_mut(ticket.memory as usize).and_then(Option::as_mut) {
@@ -352,14 +435,20 @@ impl<M> Session<M> {
         // that does loses the completions that do not fit.
         let _ = c.completions.push(&Completion { tag: ticket.tag, status, value }.encode());
         c.completed = true;
+        c.in_flight = c.in_flight.saturating_sub(1);
+        c.post_events();
     }
 
     /// Add a record that answers no request (a class's event, such as a
     /// link coming up) for every client, with `tag` a value no request uses.
     pub fn event(&mut self, tag: u64, status: u32, value: u32) {
         for c in self.connections.iter_mut().flatten() {
-            let _ = c.completions.push(&Completion { tag, status, value }.encode());
-            c.completed = true;
+            // The latest of a kind replaces one not yet posted.
+            c.events.retain(|e| e.tag != tag);
+            if c.events.len() < 8 {
+                c.events.push(Completion { tag, status, value });
+            }
+            c.post_events();
         }
     }
 

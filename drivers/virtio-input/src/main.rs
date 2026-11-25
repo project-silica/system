@@ -43,6 +43,8 @@ struct Keyboard {
     name_len: usize,
     /// The client's ring and what to signal, once connected.
     client: Option<(Handle, Producer<8>, Handle)>,
+    /// Where the client's ring is mapped: let go of with the client.
+    mapped: Option<mem::Lent>,
     /// Keys that came before any client, oldest first.
     early: [[u8; 8]; EARLY],
     early_len: usize,
@@ -55,13 +57,18 @@ impl device::Server<Handle> for Keyboard {
     }
 
     fn connect(&mut self, ring: Handle, events: Handle) -> Result<ConnectReply, Error> {
+        // One client: another may take over only once it has gone.
+        self.forget_gone_client();
+        if self.client.is_some() {
+            return Err(Error::InUse);
+        }
         match sys::inspect_slot(slots::SPACE, ring.cap().0) {
             Ok(Some(s)) if s.ty == ObjectType::Frame && s.bits == 12 && s.rights.has(Rights(3)) => {}
             _ => return Err(Error::BadMemory),
         }
         // Where lent memory goes: memory the client takes back reads as zeros.
-        let region = mem::peer(ring.cap(), 12, Rights(3)).map_err(|_| Error::BadMemory)?;
-        let mut producer = Producer::new(region, RING).ok_or(Error::BadMemory)?;
+        let mapped = mem::Lent::map(ring.cap(), 12, Rights(3)).map_err(|_| Error::BadMemory)?;
+        let mut producer = Producer::new(mapped.region(), RING).ok_or(Error::BadMemory)?;
         // What was typed before anyone listened goes first, in order.
         let mut added = false;
         for record in &self.early[..self.early_len] {
@@ -72,6 +79,7 @@ impl device::Server<Handle> for Keyboard {
             let _ = sys::signal(events.cap());
         }
         self.client = Some((ring, producer, events));
+        self.mapped = Some(mapped);
         Ok(ConnectReply {})
     }
 }
@@ -86,6 +94,7 @@ impl Keyboard {
             && !matches!(sys::inspect_slot(slots::SPACE, ring.cap().0), Ok(Some(_)))
         {
             self.client = None;
+            self.mapped = None;
         }
     }
 
@@ -176,7 +185,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     }
     let events = dma.memory(12, true)?;
     let mut keyboard =
-        Keyboard { queue, events, name, name_len, client: None, early: [[0; 8]; EARLY], early_len: 0, _interrupt: interrupt };
+        Keyboard { queue, events, name, name_len, client: None, mapped: None, early: [[0; 8]; EARLY], early_len: 0, _interrupt: interrupt };
     for slot in 0..BUFFERS.min(keyboard.queue.size()) {
         keyboard.offer(slot);
     }

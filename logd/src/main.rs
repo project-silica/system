@@ -62,6 +62,8 @@ struct Source {
     /// Made once, at start, and kept as long as the program runs.
     name: &'static str,
     ring: Consumer<RECORD>,
+    /// Where the ring is mapped: replaced with it.
+    _mapped: mem::Lent,
     kept: VecDeque<u8>,
     written: u64,
     /// Its ring made no sense, and that was said.
@@ -281,12 +283,12 @@ impl Log {
             }
             // Not there (its maker already ended): looked at again with the
             // next change.
-            let Some(ring) = ring_in(ring_slot(entry)) else { continue };
+            let Some((ring, mapped)) = ring_in(ring_slot(entry)) else { continue };
             match known {
                 // Read on from the new ring under the same source, its text kept.
                 Some(i) => {
                     let s = &mut self.sources[i];
-                    (s.ring, s.broken, s.generation) = (ring, false, generation);
+                    (s.ring, s._mapped, s.broken, s.generation) = (ring, mapped, false, generation);
                 }
                 None => {
                     let name = String::from_utf8_lossy(&name[..n]);
@@ -295,6 +297,7 @@ impl Log {
                     self.sources.push(Source {
                         name,
                         ring,
+                        _mapped: mapped,
                         kept: VecDeque::new(),
                         written: 0,
                         broken: false,
@@ -370,15 +373,15 @@ impl Events for Log {
 }
 
 /// The log ring in the frame `cap`, mapped, if it is one.
-fn ring_in(cap: Cap) -> Option<Consumer<RECORD>> {
+fn ring_in(cap: Cap) -> Option<(Consumer<RECORD>, mem::Lent)> {
     let Ok(Some(slot)) = sys::inspect_slot(slots::SPACE, cap.0) else { return None };
     if slot.ty != ObjectType::Frame || slot.bits != BITS {
         return None;
     }
-    let region = mem::peer(cap, BITS, Rights(Rights::READ.0 | Rights::WRITE.0)).ok()?;
-    let mut ring = Consumer::new(region, RECORDS)?;
+    let mapped = mem::Lent::map(cap, BITS, Rights(Rights::READ.0 | Rights::WRITE.0)).ok()?;
+    let mut ring = Consumer::new(mapped.region(), RECORDS)?;
     let _ = ring.sleep();
-    Some(ring)
+    Some((ring, mapped))
 }
 
 /// The slot holding directory entry `entry`'s ring.

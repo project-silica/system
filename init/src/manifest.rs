@@ -14,7 +14,9 @@
 //! - `needs`: protocols it calls, each a grant in that order, after its own
 //!   endpoint if it has one (a capability to the provider's endpoint,
 //!   badged for this service, from 2^32 up). `silica.system.Manager` is the
-//!   service manager's own.
+//!   service manager's own. A protocol with scopes
+//!   (`silica_protocols::scope`) is needed as `<protocol>:<scope>+<scope>`:
+//!   what of it the service may call, carried in the capability's badge.
 //! - `machine`: it is given the machine, as grants after those: its
 //!   description, the device authority, the interrupt lines, the I/O ports
 //!   (an empty slot where there are none), the boot archive's frames, and
@@ -25,7 +27,9 @@
 //! - `start=boot` runs at every boot; `start=check:<c>` only when the
 //!   command line's `checks=` names `c`, and the boot waits for it to end
 //!   with status 0.
-//! - `restart=always`: started again when it fails (at most three times).
+//! - `restart=always`: started again when it fails (`silica_proc::Restarts`:
+//!   at once the first time, then backing off to a try a minute; never given
+//!   up on for good).
 //! - `seed`: it is given a secret of its own for every start, derived from
 //!   the boot's entropy (`silica_proc::seed` over its name and the start):
 //!   `args[4..8]`, with `args[3]` saying which trusted sources went into
@@ -66,6 +70,8 @@ pub struct Service {
     pub memory: u8,
     pub provides: Option<&'static str>,
     pub needs: Vec<&'static str>,
+    /// For each need, the scopes its capability carries (`silica_protocols::scope`).
+    pub scopes: Vec<u64>,
     pub machine: bool,
     pub seed: bool,
     pub keeps: bool,
@@ -87,6 +93,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             memory: 22,
             provides: None,
             needs: Vec::new(),
+            scopes: Vec::new(),
             machine: false,
             seed: false,
             keeps: false,
@@ -103,7 +110,19 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                     s.memory = m.parse().ok().filter(|b| (20..=40).contains(b)).ok_or("a service's memory is not 20 to 40 bits")?
                 }
                 ("provides", p) if !p.is_empty() => s.provides = Some(p),
-                ("needs", n) => s.needs = n.split(',').filter(|p| !p.is_empty()).collect(),
+                ("needs", n) => {
+                    for need in n.split(',').filter(|p| !p.is_empty()) {
+                        let (protocol, spec) = need.split_once(':').unwrap_or((need, ""));
+                        let scopes = match (silica_protocols::scope::names(protocol), spec) {
+                            (None, "") => 0,
+                            (None, _) => return Err("a need gives scopes to a protocol that has none"),
+                            (Some(_), "") => return Err("a need of a protocol with scopes does not say which (`<protocol>:<scope>+<scope>`)"),
+                            (Some(_), spec) => silica_protocols::scope::parse(protocol, spec).map_err(|_| "a need names a scope its protocol does not have")?,
+                        };
+                        s.needs.push(protocol);
+                        s.scopes.push(scopes);
+                    }
+                }
                 ("machine", "") => s.machine = true,
                 ("seed", "") => s.seed = true,
                 ("keeps", "") => s.keeps = true,

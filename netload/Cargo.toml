@@ -8,7 +8,7 @@ publish.workspace = true
 
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
-needs = ["silica.device.Manager"]
+needs = ["silica.device.Manager:network+control"]
 memory = 23
 start = "check:netload"
 

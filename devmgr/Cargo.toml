@@ -9,7 +9,7 @@ publish.workspace = true
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
 provides = "silica.device.Manager"
-needs = ["silica.system.Manager"]
+needs = ["silica.system.Manager:logs+power"]
 machine = true
 memory = 26
 start = "boot"

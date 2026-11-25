@@ -35,7 +35,7 @@ pub struct Net {
 
 impl Control for Net {
     fn open(driver: Handle) -> Result<Net, client::Error> {
-        let control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+        let control = device::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         Ok(Net { _endpoint: driver, control })
     }
 
@@ -75,6 +75,12 @@ impl Interface {
     /// the network stack, which also serves its programs).
     pub fn open_on(devices: Cap, id: u32, note: Cap, first: u32) -> Result<Interface, Error> {
         Ok(Interface { queue: Queue::<Net>::open_on(devices, id, note, first)? })
+    }
+
+    /// While the driver is away (`open_on`): when to look again with
+    /// [`Interface::poll`]; the caller waits no later than this.
+    pub fn retry_at(&self) -> Option<u64> {
+        self.queue.retry_at()
     }
 
     /// The caller received `bits` on its notification (`open_on`).

@@ -20,6 +20,11 @@
 //!   exits 0 if the refusal was `NoMemory` and it could still work after.
 //! - [`ONE_CALL`]: makes one call through its first grant and exits with
 //!   the kernel's status of that call (0: answered).
+//! - `BORROWER`: maps `args[1]` frames of `2^args[2]` bytes one after
+//!   another as lent memory (`silica_rt::mem::Lent`), each taken away while
+//!   mapped, every page then touched (its supervisor answers with zeros),
+//!   and let go of; exits 0 if every page read zeros and every frame after
+//!   the first was mapped where the first was.
 #![no_std]
 #![no_main]
 
@@ -33,6 +38,7 @@ pub const HOG: u64 = 3;
 pub const ONE_CALL: u64 = 4;
 const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
+const BORROWER: u64 = 7;
 
 const PING: u64 = 1;
 const COUNT: u64 = 2;
@@ -58,6 +64,7 @@ fn main(info: &'static ProcessInfo) -> i64 {
             let Ok(page) = silica_rt::mem::peer(grant, 12, Rights::READ) else { return -1 };
             i64::from(silica_rt::time::read(&page) != (0, silica_rt::time::Source::None))
         }
+        BORROWER => borrower(info.args[1], info.args[2] as u8),
         ONE_CALL => match sys::call(grant, MsgInfo::new(PING, 1), [41, 0, 0, 0]) {
             Ok(_) => 0,
             Err(e) => e as i64,
@@ -178,4 +185,37 @@ fn hog() -> i64 {
     // Out of memory is an error to this program and nothing else: it still runs.
     println!("stress hog: {frames} frames, then {refusal:?}");
     if refusal == Some(Error::NoMemory) && frames > 0 { 0 } else { 1 }
+}
+
+/// See [`BORROWER`] in the module's documentation.
+fn borrower(cycles: u64, bits: u8) -> i64 {
+    use silica_rt::mem::{Lent, Object};
+    let mut first = None;
+    for cycle in 0..cycles {
+        let Ok(frame) = Object::new(ObjectType::Frame, bits) else { return 10 };
+        let Ok(lent) = Lent::map(frame.cap(), bits, Rights(Rights::READ.0 | Rights::WRITE.0)) else { return 11 };
+        let region = lent.region();
+        if *first.get_or_insert(region.addr()) != region.addr() {
+            println!("stress borrower: cycle {cycle} mapped at {:#x}, not where the first was", region.addr());
+            return 12;
+        }
+        region.write64(8, cycle + 1);
+        if region.read64(8) != cycle + 1 {
+            return 13;
+        }
+        // The lender takes it back: the mapping goes with the frame.
+        // SAFETY: nothing but `region` refers to it, and that reads zeros now.
+        #[allow(unsafe_code)]
+        unsafe {
+            frame.destroy()
+        };
+        for page in (0..region.len()).step_by(4096) {
+            if region.read64(page + 8) != 0 {
+                println!("stress borrower: cycle {cycle} read lent memory after it was taken back");
+                return 14;
+            }
+        }
+        drop(lent);
+    }
+    0
 }

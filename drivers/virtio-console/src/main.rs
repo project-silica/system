@@ -50,6 +50,8 @@ struct Port {
     tx_busy: [bool; TX_BUFFERS],
     /// The client's ring and what to signal, once connected.
     client: Option<(Handle, Producer<8>, Handle)>,
+    /// Where the client's ring is mapped: let go of with the client.
+    mapped: Option<mem::Lent>,
     held: VecDeque<u8>,
     _interrupt: Interrupt,
 }
@@ -119,14 +121,20 @@ impl Port {
 
 impl port::Server<Handle> for Port {
     fn connect(&mut self, ring: Handle, arrived: Handle) -> Result<ConnectReply, Error> {
+        // One client: another may take over only once it has gone (its
+        // ring's capability goes with it).
+        if self.client.as_ref().is_some_and(|(r, _, _)| matches!(sys::inspect_slot(slots::SPACE, r.cap().0), Ok(Some(_)))) {
+            return Err(Error::InUse);
+        }
         match sys::inspect_slot(slots::SPACE, ring.cap().0) {
             Ok(Some(s)) if s.ty == ObjectType::Frame && s.bits == 12 && s.rights.has(Rights(3)) => {}
             _ => return Err(Error::BadMemory),
         }
         // Where lent memory goes: memory the client takes back reads as zeros.
-        let region = mem::peer(ring.cap(), 12, Rights(3)).map_err(|_| Error::BadMemory)?;
-        let producer = Producer::new(region, RING).ok_or(Error::BadMemory)?;
+        let mapped = mem::Lent::map(ring.cap(), 12, Rights(3)).map_err(|_| Error::BadMemory)?;
+        let producer = Producer::new(mapped.region(), RING).ok_or(Error::BadMemory)?;
         self.client = Some((ring, producer, arrived));
+        self.mapped = Some(mapped);
         let held: silica_rt::alloc::vec::Vec<u8> = self.held.drain(..).collect();
         if self.deliver(&held)
             && let Some((_, ring, arrived)) = &self.client
@@ -215,7 +223,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let tx = transport.queue(&dma, 1, TX_BUFFERS as u16, Some(0))?;
     let (rx_mem, tx_mem) = (dma.memory(12, true)?, dma.memory(12, false)?);
     let mut port =
-        Port { rx, rx_mem, tx, tx_mem, tx_busy: [false; TX_BUFFERS], client: None, held: VecDeque::new(), _interrupt: interrupt };
+        Port { rx, rx_mem, tx, tx_mem, tx_busy: [false; TX_BUFFERS], client: None, mapped: None, held: VecDeque::new(), _interrupt: interrupt };
     for slot in 0..RX_BUFFERS.min(port.rx.size()) {
         port.offer(slot);
     }

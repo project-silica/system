@@ -22,6 +22,7 @@ use silica_block::partitions::{self, Error, ListReply, OpenReply, Partition};
 use silica_block::{Op, Request};
 use silica_idl_rt::{Array, CapList};
 use silica_protocols::device::manager;
+use silica_protocols::scope;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, serve};
@@ -50,6 +51,9 @@ struct Server {
     devices: manager::Client<Channel, Handle>,
     parts: Vec<Part>,
     listed: Vec<Partition<'static>>,
+    /// The badge of the call being answered: its scopes
+    /// (`silica_protocols::scope`).
+    caller: u64,
 }
 
 fn keep(s: String) -> &'static str {
@@ -101,6 +105,10 @@ fn table(id: u32) -> Result<Vec<Part>, &'static str> {
 impl partitions::Server<Handle> for Server {
     fn list<'a>(&'a mut self) -> ListReply<'a, Handle> {
         self.listed.clear();
+        // Nothing to a caller not given `list`.
+        if !scope::has(self.caller, scope::PARTITIONS_LIST) {
+            return ListReply { partitions: Array::new(&self.listed) };
+        }
         for p in &self.parts {
             self.listed.push(Partition { id: p.id, disk: p.disk, first: p.first, blocks: p.blocks, kind: p.kind, name: p.name });
         }
@@ -108,9 +116,12 @@ impl partitions::Server<Handle> for Server {
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<OpenReply<Handle>, Error> {
+        if !scope::has(self.caller, scope::PARTITIONS_OPEN) {
+            return Err(Error::Refused);
+        }
         let p = self.parts.iter().find(|p| p.id == id).ok_or(Error::NoSuchPartition)?;
         let driver = self.devices.open(p.disk, gone).map_err(|_| Error::Gone)?.driver;
-        let mut control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+        let mut control = device::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         let narrowed = control.narrow(p.first, p.blocks).map_err(|_| Error::Gone)?.device;
         Ok(OpenReply { device: narrowed })
     }
@@ -156,8 +167,9 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             Err(e) => println!("partitions: disk {id:#x}: {e}; offered whole only"),
         }
     }
-    let mut server = Server { devices, parts, listed: Vec::new() };
-    serve(ENDPOINT, |_badge, request, caps: CapList<Handle>, reply, reply_caps| {
+    let mut server = Server { devices, parts, listed: Vec::new(), caller: 0 };
+    serve(ENDPOINT, |badge, request, caps: CapList<Handle>, reply, reply_caps| {
+        server.caller = badge;
         partitions::dispatch(&mut server, request, caps, reply, reply_caps)
     })
 }

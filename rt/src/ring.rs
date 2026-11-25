@@ -149,6 +149,12 @@ impl<const N: usize> Consumer<N> {
         if n > self.ring.mask + 1 { Err(Broken) } else { Ok(n) }
     }
 
+    /// How many records wait to be taken (a producer that claims more than
+    /// the ring holds: as many as it holds).
+    pub fn waiting_now(&self) -> u32 {
+        self.waiting().unwrap_or(self.ring.mask + 1)
+    }
+
     /// Take the next record, copied out of the shared memory.
     pub fn pop(&mut self) -> Result<Option<[u8; N]>, Broken> {
         if self.waiting()? == 0 {

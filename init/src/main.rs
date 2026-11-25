@@ -41,7 +41,8 @@ use libsys::{self as sys, ObjectType, Rights, Wait};
 use manifest::{Service, Start};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
-use silica_proc::{Child, FAULT_BADGE, Grant, Program, spawn};
+use silica_proc::{Child, FAULT_BADGE, Grant, Program, Restarts, spawn};
+use silica_protocols::scope;
 use silica_protocols::system::manager;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
@@ -105,8 +106,6 @@ const SECOND: u64 = 1_000_000_000;
 const CONSUMERS: u64 = 1 << 32;
 /// Service `i` runs with the program identifier `SERVICE_IDS + i`.
 const SERVICE_IDS: u64 = 1000;
-/// How often a failing service is started again.
-const MAX_RESTARTS: u32 = 3;
 /// How long an updated service's new program is on trial: failing within
 /// it puts the program before it back (`update`).
 const TRIAL: u64 = 10 * SECOND;
@@ -124,7 +123,8 @@ struct Running {
     given: Vec<(u64, u64)>,
     /// How many times it was started: what its seed is derived for.
     starts: u64,
-    failures: u32,
+    /// When it failed and when it is started again (`restart=always`).
+    restarts: Restarts,
     /// Stopped by the owner: not started again until asked.
     stopped: bool,
     /// The program it runs, when an `update` gave it one; `None`: the boot
@@ -211,14 +211,15 @@ impl Manager {
             grants.push(Grant::lend(ep.cap(), Rights::ALL));
         }
         // Then what it needs, a capability badged for it to each provider.
-        for need in &s.needs {
+        for (n, need) in s.needs.iter().enumerate() {
             let ep = if *need == manifest::ROOT_PROTOCOL {
                 self.root.parent.exit
             } else {
                 let p = self.services.iter().position(|p| p.provides == Some(*need)).ok_or("a need with no provider")?;
                 self.endpoints[p].as_ref().ok_or("a provider without an endpoint")?.cap()
             };
-            grants.push(Grant::badged(ep, Rights(Rights::WRITE.0 | Rights::GRANT.0), CONSUMERS + i as u64));
+            let scopes = s.scopes.get(n).copied().unwrap_or(0) << silica_protocols::scope::SHIFT;
+            grants.push(Grant::badged(ep, Rights(Rights::WRITE.0 | Rights::GRANT.0), CONSUMERS | scopes | i as u64));
         }
         // The archive's files it is given, read-only, after its needs.
         for f in &self.running[i].files {
@@ -322,6 +323,7 @@ impl Manager {
             "it could not be started"
         })?;
         self.running[i].starts += 1;
+        self.running[i].restarts.started(silica_rt::clock().now());
         // An update's trial runs from its program's first start.
         if let Some((_, until @ 0)) = &mut self.running[i].trial {
             *until = silica_rt::clock().now() + TRIAL;
@@ -405,25 +407,47 @@ impl Manager {
         if status != Some(0) && self.on_trial(i) && !self.running[i].stopped {
             println!("init: {name}'s new program failed within {} s of its update; it is started on the program before it", TRIAL / SECOND);
             self.undo_update(i);
-            match self.start(i) {
-                Ok(()) => {
-                    println!("init: {name} started again on the program before its update");
-                }
-                Err(e) => println!("ERROR: init: {name}: {e}"),
-            }
+            self.start_again(i);
             return;
         }
         if status == Some(0) || !self.services[i].restart || self.running[i].stopped {
             return;
         }
-        self.running[i].failures += 1;
-        if self.running[i].failures > MAX_RESTARTS {
-            println!("ERROR: init: {name} failed {MAX_RESTARTS} times; it is not started again");
-        } else if let Err(e) = self.start(i) {
-            println!("ERROR: init: {name}: {e}");
-        } else {
-            println!("init: {name} started again");
+        let now = silica_rt::clock().now();
+        let due = self.running[i].restarts.failed(now);
+        if due > now {
+            let r = self.running[i].restarts;
+            println!("init: {name} has failed {} times in a row; it is started again in {} ms", r.streak, (due - now) / 1_000_000);
+            return;
         }
+        self.start_again(i);
+    }
+
+    /// Start service `i` again after a failure; one that cannot be started
+    /// is tried again later, as if it had failed again.
+    fn start_again(&mut self, i: usize) {
+        let name = self.services[i].name;
+        match self.start(i) {
+            Ok(()) => println!("init: {name} started again"),
+            Err(e) => {
+                let now = silica_rt::clock().now();
+                let due = self.running[i].restarts.failed(now);
+                println!("ERROR: init: {name}: {e}; tried again in {} ms", (due - now) / 1_000_000);
+            }
+        }
+    }
+
+    /// Start the services whose restart is due; returns when the next one
+    /// is (`None`: none waits).
+    fn restart_due(&mut self) -> Option<u64> {
+        let now = silica_rt::clock().now();
+        for i in 0..self.services.len() {
+            let r = &self.running[i];
+            if r.restarts.due != 0 && r.restarts.due <= now && r.child.is_none() && !r.stopped {
+                self.start_again(i);
+            }
+        }
+        self.running.iter().filter(|r| r.restarts.due != 0 && r.child.is_none() && !r.stopped).map(|r| r.restarts.due).min()
     }
 
     /// Take one message from the endpoint: a call of `silica.system.Manager`
@@ -449,6 +473,7 @@ impl Manager {
     /// Stop service `i` at once, as if it had failed, but for good.
     fn stop(&mut self, i: usize) -> bool {
         self.running[i].stopped = true;
+        self.running[i].restarts.cancel();
         match self.running[i].child.take() {
             Some(child) => {
                 self.end(i, child);
@@ -518,16 +543,35 @@ impl Manager {
     }
 }
 
+impl Manager {
+    /// Whether the current caller's capability carries `want`
+    /// (`silica_protocols::scope`): `refused` when it does not.
+    fn may(&self, want: u64) -> Result<(), manager::Error> {
+        if scope::has(self.caller, want) { Ok(()) } else { Err(manager::Error::Refused) }
+    }
+
+    /// The service the current caller is (its capability's badge holds its
+    /// number below the scopes).
+    fn calling(&self) -> Option<&Service> {
+        (self.caller & CONSUMERS != 0).then_some(self.caller & 0xFFFF_FFFF).and_then(|i| self.services.get(i as usize))
+    }
+}
+
 impl manager::Server<Handle> for Manager {
     fn list<'a>(&'a mut self) -> manager::ListReply<'a, Handle> {
         self.listed.clear();
+        // Nothing to a caller not given `observe`.
+        if self.may(scope::SYSTEM_OBSERVE).is_err() {
+            return manager::ListReply { services: silica_idl_rt::Array::new(&self.listed) };
+        }
         for i in 0..self.services.len() {
             let program = self.hash(i);
             let _ = self.on_trial(i);
             let (s, r) = (&self.services[i], &self.running[i]);
             let state = if r.child.is_some() {
                 manager::State::Running
-            } else if s.restart && r.failures > MAX_RESTARTS {
+            } else if s.restart && r.restarts.due != 0 && !r.stopped {
+                // Failed, and waiting to be started again.
                 manager::State::Failed
             } else {
                 manager::State::Stopped
@@ -535,7 +579,7 @@ impl manager::Server<Handle> for Manager {
             self.listed.push(manager::Service {
                 name: s.name,
                 state,
-                failures: r.failures,
+                failures: r.restarts.total,
                 provides: s.provides.unwrap_or(""),
                 program,
                 updated: r.program.is_some(),
@@ -545,6 +589,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn stop(&mut self, name: &str) -> Result<manager::StopReply, manager::Error> {
+        self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
         if self.services[i].machine || self.running[i].child.is_none() {
             return Err(manager::Error::Refused);
@@ -555,6 +600,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn restart(&mut self, name: &str) -> Result<manager::RestartReply, manager::Error> {
+        self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
         let child = self.running[i].child.take().ok_or(manager::Error::Refused)?;
         self.end(i, child);
@@ -564,11 +610,15 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn memory(&mut self) -> manager::MemoryReply {
+        if self.may(scope::SYSTEM_OBSERVE).is_err() {
+            return manager::MemoryReply { free: 0, held: 0 };
+        }
         let held = self.services.iter().zip(&self.running).filter(|(_, r)| r.child.is_some()).map(|(s, _)| 1u64 << s.memory).sum();
         manager::MemoryReply { free: silica_rt::mem::available(), held }
     }
 
     fn start(&mut self, name: &str) -> Result<manager::StartReply, manager::Error> {
+        self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
         if self.running[i].child.is_none() {
             self.running[i].stopped = false;
@@ -579,6 +629,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn describe<'a>(&'a mut self, name: &str, from: u32) -> Result<manager::DescribeReply<'a>, manager::Error> {
+        self.may(scope::SYSTEM_OBSERVE)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
         let child = self.running[i].child.as_ref().ok_or(manager::Error::Refused)?;
         let mut all = String::new();
@@ -598,6 +649,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn shutdown(&mut self, reboot: bool) -> Result<manager::ShutdownReply, manager::Error> {
+        self.may(scope::SYSTEM_POWER)?;
         flush_log();
         println!("init: shutting down{}", if reboot { " to reset" } else { "" });
         for &i in self.order.clone().iter().rev() {
@@ -612,6 +664,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn stage(&mut self, at: u64, data: &[u8]) -> Result<manager::StageReply, manager::Error> {
+        self.may(scope::SYSTEM_UPDATE)?;
         let end = at.checked_add(data.len() as u64).filter(|e| *e <= MAX_PROGRAM).ok_or(manager::Error::TooLarge)?;
         let caller = self.caller;
         let k = match self.staged.iter().position(|(c, _)| *c == caller) {
@@ -640,6 +693,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn update(&mut self, name: &str, length: u64) -> Result<manager::UpdateReply, manager::Error> {
+        self.may(scope::SYSTEM_UPDATE)?;
         let i = self.find(name)?;
         let caller = self.caller;
         let k = self.staged.iter().position(|(c, _)| *c == caller).ok_or(manager::Error::TooLarge)?;
@@ -676,6 +730,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn revert(&mut self, name: &str) -> Result<manager::RevertReply, manager::Error> {
+        self.may(scope::SYSTEM_UPDATE)?;
         let i = self.find(name)?;
         if self.running[i].program.is_none() {
             return Ok(manager::RevertReply {});
@@ -692,7 +747,8 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn add_log(&mut self, name: &str, ring: Handle) -> Result<manager::AddLogReply<Handle>, manager::Error> {
-        let caller = self.caller.checked_sub(CONSUMERS).and_then(|i| self.services.get(i as usize)).ok_or(manager::Error::Refused)?;
+        self.may(scope::SYSTEM_LOGS)?;
+        let caller = self.calling().ok_or(manager::Error::Refused)?;
         let source = silica_rt::alloc::format!("{}/{name}", caller.name);
         let log = self.log.as_mut().ok_or(manager::Error::Refused)?;
         // A name given before keeps its place only while its ring lives: a
@@ -807,7 +863,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             child: None,
             given: Vec::new(),
             starts: 0,
-            failures: 0,
+            restarts: Restarts::default(),
             stopped: false,
             program: None,
             trial: None,
@@ -971,8 +1027,11 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     // No checks: the system stays up, and its services are looked after.
     flush_log();
     println!("BOOT OK");
+    let mut next = None;
     loop {
-        let _ = m.step(&mut listener, Wait::Forever, None);
+        let wait = next.map_or(Wait::Forever, Wait::Until);
+        let _ = m.step(&mut listener, wait, None);
+        next = m.restart_due();
     }
 }
 

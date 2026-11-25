@@ -332,7 +332,7 @@ fn input_ring() -> Option<(Consumer<8>, Memory)> {
 /// The keyboard, connected: its ring and the notification it signals.
 fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option<(Consumer<8>, Memory, Handle)> {
     let driver = open(devices, manager::Class::Input, note, KEYBOARD_GONE)?;
-    let mut kb = input::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+    let mut kb = input::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
     let (consumer, ring) = input_ring()?;
     kb.connect(lend(ring.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, KEYS)?).ok()?;
     Some((consumer, ring, driver))
@@ -341,7 +341,7 @@ fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option
 /// The console port, connected: its ring, and the driver it came from.
 fn console_port(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option<Port> {
     let handle = open(devices, manager::Class::Port, note, PORT_GONE)?;
-    let mut driver = port::Client::<Channel, Handle>::from(Channel::new(handle.cap()));
+    let mut driver = port::Client::<Channel, Handle>::from(Channel::within(handle.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
     let (ring, memory) = input_ring()?;
     driver.connect(lend(memory.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, PORT_BYTES)?).ok()?;
     Some(Port { ring, _memory: memory, driver, _handle: handle, after_cr: false })

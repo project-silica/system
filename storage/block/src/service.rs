@@ -375,6 +375,8 @@ impl<D: Device> Service<D> {
             Some(bits) => self.device.signals(bits, &mut done),
             None => self.device.timeout(&mut done),
         }
+        // Memory of ended connections whose last request has completed.
+        self.session.unmap_finished(&mut Map(&mut self.device));
     }
 }
 

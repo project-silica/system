@@ -84,7 +84,9 @@ const EPHEMERAL: core::ops::Range<u16> = 49152..65535;
 /// A program that added memory: the badge it calls with, its memory.
 struct Client {
     badge: u64,
-    memory: Mmio,
+    /// Where its memory is mapped: its connections' streams are parts of
+    /// it, let go of (`forget`) before it is.
+    memory: mem::Lent,
     /// The capability to the memory, kept while it is mapped: its slot is
     /// empty once the program ended. (A mapped Frame cannot be watched:
     /// its slot links its mappings. The program's notifications, which
@@ -569,7 +571,7 @@ impl Tcp {
         if overlaps {
             return Err(Error::BadMemory);
         }
-        streams_in(&client.memory, offset, bits).ok_or(Error::BadMemory)
+        streams_in(&client.memory.region(), offset, bits).ok_or(Error::BadMemory)
     }
 
     /// A program lends its memory once. A second `add_memory` from the same
@@ -588,7 +590,7 @@ impl Tcp {
         if info.ty != ObjectType::Frame || !MEMORY_BITS.contains(&info.bits) {
             return Err(Error::BadMemory);
         }
-        let region = mem::peer(memory.cap(), info.bits, Rights(Rights::READ.0 | Rights::WRITE.0)).map_err(|_| Error::BadMemory)?;
+        let region = mem::Lent::map(memory.cap(), info.bits, Rights(Rights::READ.0 | Rights::WRITE.0)).map_err(|_| Error::BadMemory)?;
         self.clients.push(Client { badge, memory: region, frame: memory });
         Ok(proto::AddMemoryReply {})
     }

@@ -72,3 +72,94 @@ pub mod net {
 pub mod remote {
     include!(concat!(env!("OUT_DIR"), "/silica_remote_session.rs"));
 }
+
+/// What a service's capability to a provider lets it do. A declaration
+/// says it for each protocol it needs, `needs=<protocol>:<scope>+<scope>`
+/// (a protocol listed below must be given at least one), and the service
+/// manager puts those bits in the badge of the capability it hands out
+/// (from [`scope::SHIFT`] up, beside the consumer's number). The provider
+/// reads them from the badge of each call and refuses a method the
+/// caller's capability was not given for: the endpoint is the protocol,
+/// the scope is how much of it. (Before, every holder of an endpoint could
+/// call every method: the device manager, which parses hostile device
+/// data, could replace any service's program.)
+pub mod scope {
+    /// The scopes' first bit in a consumer's badge, and how many there are.
+    pub const SHIFT: u32 = 40;
+    const COUNT: u32 = 22;
+
+    /// The scopes in a caller's `badge`.
+    pub const fn of(badge: u64) -> u64 {
+        (badge >> SHIFT) & ((1 << COUNT) - 1)
+    }
+
+    /// Whether `badge` carries every scope in `want`.
+    pub const fn has(badge: u64, want: u64) -> bool {
+        of(badge) & want == want
+    }
+
+    /// `silica.system.Manager`: `list`, `describe` and `memory`.
+    pub const SYSTEM_OBSERVE: u64 = 1 << 0;
+    /// `silica.system.Manager`: `start`, `stop` and `restart`.
+    pub const SYSTEM_CONTROL: u64 = 1 << 1;
+    /// `silica.system.Manager`: `stage`, `update` and `revert`.
+    pub const SYSTEM_UPDATE: u64 = 1 << 2;
+    /// `silica.system.Manager`: `shutdown`.
+    pub const SYSTEM_POWER: u64 = 1 << 3;
+    /// `silica.system.Manager`: `add_log`.
+    pub const SYSTEM_LOGS: u64 = 1 << 4;
+
+    /// `silica.device.Manager`: `list`, `open` and `watch` of one class.
+    pub const DEVICE_BLOCK: u64 = 1 << 0;
+    pub const DEVICE_NETWORK: u64 = 1 << 1;
+    pub const DEVICE_DISPLAY: u64 = 1 << 2;
+    pub const DEVICE_PORT: u64 = 1 << 3;
+    pub const DEVICE_INPUT: u64 = 1 << 4;
+    pub const DEVICE_ENTROPY: u64 = 1 << 5;
+    /// `silica.device.Manager`: `restart` and `describe` of any device.
+    pub const DEVICE_CONTROL: u64 = 1 << 6;
+
+    /// `silica.block.Partitions`: `list`.
+    pub const PARTITIONS_LIST: u64 = 1 << 0;
+    /// `silica.block.Partitions`: `open`, of any partition of any disk (a
+    /// program that needs one partition is given the block capability
+    /// `open` returns, not this).
+    pub const PARTITIONS_OPEN: u64 = 1 << 1;
+
+    /// The scopes protocol `protocol` defines, by the names declarations
+    /// use; `None` for a protocol without scopes (a capability to it
+    /// allows all of it).
+    pub fn names(protocol: &str) -> Option<&'static [(&'static str, u64)]> {
+        Some(match protocol {
+            "silica.system.Manager" => &[
+                ("observe", SYSTEM_OBSERVE),
+                ("control", SYSTEM_CONTROL),
+                ("update", SYSTEM_UPDATE),
+                ("power", SYSTEM_POWER),
+                ("logs", SYSTEM_LOGS),
+            ],
+            "silica.device.Manager" => &[
+                ("block", DEVICE_BLOCK),
+                ("network", DEVICE_NETWORK),
+                ("display", DEVICE_DISPLAY),
+                ("port", DEVICE_PORT),
+                ("input", DEVICE_INPUT),
+                ("entropy", DEVICE_ENTROPY),
+                ("control", DEVICE_CONTROL),
+            ],
+            "silica.block.Partitions" => &[("list", PARTITIONS_LIST), ("open", PARTITIONS_OPEN)],
+            _ => return None,
+        })
+    }
+
+    /// The bits of `spec`, a `+`-separated list of scope names of
+    /// `protocol`, or the first name it does not define.
+    pub fn parse<'a>(protocol: &str, spec: &'a str) -> Result<u64, &'a str> {
+        let known = names(protocol).unwrap_or(&[]);
+        let mut bits = 0;
+        for name in spec.split('+') {
+            bits |= known.iter().find(|(n, _)| *n == name).ok_or(name)?.1;
+        }
+        Ok(bits)
+    }
+}

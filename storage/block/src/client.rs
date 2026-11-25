@@ -86,7 +86,7 @@ pub struct Block {
 
 impl Control for Block {
     fn open(driver: Handle) -> Result<Block, client::Error> {
-        let mut control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+        let mut control = device::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         let info = control.info()?.info;
         Ok(Block { _endpoint: driver, control, info })
     }
