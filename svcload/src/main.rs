@@ -111,8 +111,48 @@ impl Load {
     }
 }
 
+/// This program's capability to the service manager carries `observe` and
+/// `control` only (its declaration): everything else the protocol has is
+/// refused, and the capability cannot be given more. Before (the 2026-11-24
+/// audit), every holder could replace any service's program, turn the
+/// machine off or take log slots: this check would have turned it off.
+fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), String> {
+    let refused = |what: &str, r: Result<(), system::Error>| match r {
+        Err(system::Error::Refused) => Ok(()),
+        other => Err(format!("{what} with observe+control only: {other:?}, not refused")),
+    };
+    refused("stage", system.stage(0, b"\x7fELF").map(|_| ()).map_err(err))?;
+    refused("update", system.update("httpd", 4).map(|_| ()).map_err(err))?;
+    refused("revert", system.revert("httpd").map(|_| ()).map_err(err))?;
+    let ring = Memory::new(silica_rt::log::BITS).map_err(|e| format!("no memory for a ring: {e:?}"))?;
+    let lent = Handle::new(Cap(silica_rt::ipc::free_slot().ok_or("no slot")?));
+    silica_rt::sys::cap_derive(slots::SPACE, lent.cap().0, ring.frame(), silica_rt::sys::Rights(3), 0)
+        .map_err(|e| format!("deriving the ring: {e:?}"))?;
+    refused("add_log", system.add_log("svcload-forged", lent).map(|_| ()).map_err(err))?;
+    refused("shutdown", system.shutdown(false).map(|_| ()).map_err(err))?;
+    // The scopes are in the capability's badge, which the service manager
+    // chose: a holder cannot derive itself one with more.
+    let slot = silica_rt::ipc::free_slot().ok_or("no slot")?;
+    let all = silica_protocols::scope::of(u64::MAX) << silica_protocols::scope::SHIFT;
+    if silica_rt::sys::cap_derive(slots::SPACE, slot, grant(0), silica_rt::sys::Rights::WRITE, (1 << 32) | all).is_ok() {
+        return Err(String::from("a capability to the service manager was given a badge of every scope by its holder"));
+    }
+    silica_rt::ipc::release_slot(slot);
+    println!("svcload: the service manager refuses stage, update, revert, add_log and shutdown to a holder of observe+control");
+    Ok(())
+}
+
+/// A call's error, transport failures included, as the method's.
+fn err(e: silica_idl_rt::CallError<system::Error>) -> system::Error {
+    match e {
+        silica_idl_rt::CallError::Error(e) => e,
+        silica_idl_rt::CallError::Transport(_) => system::Error::Unknown(u32::MAX),
+    }
+}
+
 fn run() -> Result<(), String> {
     let mut load = Load { system: system::Client::from(Channel::new(grant(0))), slowest: 0 };
+    scopes_hold(&mut load.system)?;
     // What the service manager can give out and what its running services
     // hold: a service that ends by itself meanwhile (the remote service on
     // a machine without its keys, at boot) moves memory from one to the
