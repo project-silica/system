@@ -68,7 +68,8 @@ static FLUSHED: AtomicU64 = AtomicU64::new(0);
 const FLUSH: u64 = 2;
 /// The bit of the log's notification that says logs were added (`add_log`).
 const ADDED: u64 = 4;
-/// The most logs services give their programs (`add_log`).
+/// The most logs services give their programs (`add_log`), half of them at
+/// most to any one service.
 const MAX_LOGS: usize = 64;
 
 /// Whether the ring `h` names is still there: one whose maker ended is gone,
@@ -506,6 +507,31 @@ impl Manager {
         if let Some((before, _)) = self.running[i].trial.take() {
             self.running[i].program = before;
             self.running[i].hash = None;
+            self.fresh_keep(i);
+        }
+    }
+
+    /// Service `i` runs another program from its next start: the page it
+    /// keeps across restarts starts empty, so nothing a program wrote there
+    /// is read by one installed in its place (a compromised instance's
+    /// data trusted by its replacement). The old page goes at once: each
+    /// caller ends the running instance next.
+    fn fresh_keep(&mut self, i: usize) {
+        if self.kept[i].is_some() {
+            match Object::new(ObjectType::Frame, 12) {
+                Ok(page) => {
+                    if let Some(old) = self.kept[i].replace(page) {
+                        // SAFETY: init never maps it; the instance that has
+                        // it is ended before the next starts (each caller ends
+                        // it next), and reads zeros meanwhile.
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            old.destroy()
+                        };
+                    }
+                }
+                Err(_) => println!("ERROR: init: no memory to give {} an empty page; it keeps the old one", self.services[i].name),
+            }
         }
     }
 
@@ -718,6 +744,7 @@ impl manager::Server<Handle> for Manager {
         self.running[i].program = Some(program);
         self.running[i].trial = Some((before, 0));
         self.running[i].hash = None;
+        self.fresh_keep(i);
         let hash = self.hash(i);
         println!("init: {name} has a new program, {length} bytes, BLAKE2s {}", Hex(&hash[..8]));
         let Some(child) = self.running[i].child.take() else { return Ok(manager::UpdateReply {}) };
@@ -743,6 +770,7 @@ impl manager::Server<Handle> for Manager {
         self.running[i].program = None;
         self.running[i].trial = None;
         self.running[i].hash = None;
+        self.fresh_keep(i);
         println!("init: {name} runs its program from the boot archive again, as asked");
         if let Some(child) = self.running[i].child.take() {
             self.end(i, child);
@@ -753,8 +781,8 @@ impl manager::Server<Handle> for Manager {
 
     fn add_log(&mut self, name: &str, ring: Handle) -> Result<manager::AddLogReply<Handle>, manager::Error> {
         self.may(scope::SYSTEM_LOGS)?;
-        let caller = self.calling().ok_or(manager::Error::Refused)?;
-        let source = silica_rt::alloc::format!("{}/{name}", caller.name);
+        let caller: &'static str = self.calling().ok_or(manager::Error::Refused)?.name;
+        let source = silica_rt::alloc::format!("{caller}/{name}");
         let log = self.log.as_mut().ok_or(manager::Error::Refused)?;
         // A name given before keeps its place only while its ring lives: a
         // ring that is gone (the service that made it restarted, its
@@ -767,21 +795,34 @@ impl manager::Server<Handle> for Manager {
         // A ring of the size every log's writer and reader assume.
         let fits = matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), ring.cap().0),
             Ok(Some(i)) if i.ty == ObjectType::Frame && i.bits == silica_rt::log::BITS);
-        if !fits || (again.is_none() && log.given.len() >= MAX_LOGS) || name.is_empty() || name.len() > 64 || source.len() > directory::NAME
-        {
+        if !fits || name.is_empty() || name.len() > 64 || source.len() > directory::NAME {
             return Err(manager::Error::Refused);
         }
+        // One service has at most half the logs, so no one service can take
+        // them all; and a log whose ring is gone (its maker ended for good)
+        // gives its place to the next new one, anyone's.
+        let mine = log.given.iter().filter(|(n, r)| n.strip_prefix(caller).is_some_and(|n| n.starts_with('/')) && alive(r)).count();
+        let reuse = match again {
+            Some(_) => None,
+            None if mine >= MAX_LOGS / 2 => return Err(manager::Error::Refused),
+            None if log.given.len() < MAX_LOGS => None,
+            None => Some(log.given.iter().position(|(_, r)| !alive(r)).ok_or(manager::Error::Refused)?),
+        };
         let to = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused)?;
         if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, log.note.cap(), Rights::WRITE, 0).is_err() {
             silica_rt::ipc::release_slot(to);
             return Err(manager::Error::Refused);
         }
-        let k = match again {
-            Some(k) => {
+        let k = match (again, reuse) {
+            (Some(k), _) => {
                 log.given[k].1 = ring;
                 k
             }
-            None => {
+            (None, Some(k)) => {
+                log.given[k] = (source, ring);
+                k
+            }
+            (None, None) => {
                 log.given.push((source, ring));
                 log.given.len() - 1
             }

@@ -59,7 +59,10 @@ const FLUSH: u64 = 2;
 const ADDED: u64 = 4;
 
 struct Source {
-    /// Made once, at start, and kept as long as the program runs.
+    /// As the directory names it; an entry reused for another name (a log
+    /// whose maker ended for good gives its place to a new one) starts a
+    /// new source in its place. Each name is kept once (`Log::names`):
+    /// only the device manager names logs, from a bounded set.
     name: &'static str,
     ring: Consumer<RECORD>,
     /// Where the ring is mapped: replaced with it.
@@ -96,6 +99,8 @@ struct Log {
     /// (`slots::KEEP`), with `open` and `cut` and their lines in it.
     keep: Option<silica_rt::mmio::Mmio>,
     listed: Vec<proto::Source<'static>>,
+    /// Every source name seen, each kept once.
+    names: Vec<&'static str>,
     text: String,
 }
 
@@ -284,16 +289,26 @@ impl Log {
             // Not there (its maker already ended): looked at again with the
             // next change.
             let Some((ring, mapped)) = ring_in(ring_slot(entry)) else { continue };
+            let name = String::from_utf8_lossy(&name[..n]);
+            let name: &'static str = match self.names.iter().find(|k| **k == name) {
+                Some(k) => k,
+                None => {
+                    let k: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_owned().into_boxed_str());
+                    self.names.push(k);
+                    k
+                }
+            };
             match known {
                 // Read on from the new ring under the same source, its text kept.
-                Some(i) => {
+                Some(i) if self.sources[i].name == name => {
                     let s = &mut self.sources[i];
                     (s.ring, s._mapped, s.broken, s.generation) = (ring, mapped, false, generation);
                 }
-                None => {
-                    let name = String::from_utf8_lossy(&name[..n]);
-                    // Names last as long as the program: sources are never removed.
-                    let name: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_owned().into_boxed_str());
+                // The entry is another log's now: a new source in its place.
+                known => {
+                    if let Some(i) = known {
+                        self.sources.swap_remove(i);
+                    }
                     self.sources.push(Source {
                         name,
                         ring,
@@ -408,6 +423,7 @@ fn main(info: &'static ProcessInfo) -> i64 {
         flushed: grant(2),
         keep: mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok(),
         listed: Vec::new(),
+        names: Vec::new(),
         text: String::new(),
     };
     // Every ring there is, and what was written before this service
