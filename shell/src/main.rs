@@ -259,7 +259,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         out: String::new(),
     };
     let _ = shell.term.write("Silica. Type help for the commands.\n");
-    loop {
+    'prompt: loop {
         // The console restarted under a call (`peer_gone`): its endpoint is
         // the service manager's, so calling again reaches the new one, and
         // the prompt is shown again on its fresh screen.
@@ -267,10 +267,18 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             Ok(_) | Err(CallError::Transport(TransportError::PeerGone)) => {}
             Err(_) => return 1,
         }
-        let line = match shell.term.read_line() {
-            Ok(r) => String::from(r.line),
-            Err(CallError::Transport(TransportError::PeerGone)) => continue,
-            Err(_) => return 1,
+        let line = loop {
+            match shell.term.read_line() {
+                Ok(r) if !r.busy => break String::from(r.line),
+                Ok(_) => {
+                    // Another program is reading. Wait between attempts,
+                    // without printing another prompt or consuming input.
+                    let until = silica_rt::clock().now() + 1_000_000_000;
+                    let _ = silica_rt::sys::recv(slots::EVENTS, silica_rt::sys::Wait::Until(until));
+                }
+                Err(CallError::Transport(TransportError::PeerGone)) => continue 'prompt,
+                Err(_) => return 1,
+            }
         };
         match shell.run(&line) {
             Ok(()) | Err(CallError::Transport(TransportError::PeerGone)) => {}

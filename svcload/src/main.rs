@@ -302,6 +302,10 @@ fn logd(load: &mut Load) -> Result<(), String> {
 
 fn console(load: &mut Load) -> Result<(), String> {
     let mut term = terminal::Client::<Channel, Handle>::from(Channel::new(grant(3)));
+    let second = term.read_line().map_err(|e| format!("console: second reader: {e:?}"))?;
+    if !second.busy || !second.line.is_empty() {
+        return Err(format!("console: a second reader received a line while the shell was waiting: {:?}", second.line));
+    }
     for _ in 0..ROUNDS {
         let until = now() + EVERY_NS;
         while now() < until {

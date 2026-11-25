@@ -177,7 +177,7 @@ impl Console {
 fn answer_line(p: Parked, line: &str) {
     let mut buf = [0u8; silica_idl_rt::MAX_MESSAGE];
     let mut caps = CapList::new();
-    match (ReadLineReply { line }).encode_message(&mut buf, &mut caps) {
+    match (ReadLineReply { line, busy: false }).encode_message(&mut buf, &mut caps) {
         Ok(n) => p.answer(&buf[..n], caps),
         Err(_) => drop(p),
     }
@@ -197,11 +197,13 @@ impl terminal::Server<Handle> for Console {
                 self.show(&l);
                 self.show("\n");
                 self.line_out = l;
-                ReadLineReply { line: &self.line_out }
+                ReadLineReply { line: &self.line_out, busy: false }
             }
             None => {
                 self.wants_wait = true;
-                ReadLineReply { line: "" }
+                // A parked caller gets the actual line from answer_line.
+                // This immediate reply is sent only if we cannot keep it.
+                ReadLineReply { line: "", busy: true }
             }
         }
     }
@@ -227,7 +229,7 @@ impl Waiting for Console {
         if self.wants_wait && !self.waiting.as_ref().is_some_and(Parked::waiting) {
             // Kept until the next line. A reader whose caller has gone (a
             // shell restarted under its call) gives way to the new one; a
-            // second reader while the first still waits gets an empty line.
+            // second reader while the first still waits gets busy.
             self.waiting = parked.take();
             // Typeahead belongs after the reader's prompt, including a
             // partial line typed while the preceding command was running.
