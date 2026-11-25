@@ -197,6 +197,19 @@ impl Reads {
 }
 
 fn partitions(load: &mut Load) -> Result<(), String> {
+    // Partitions is need 1 in this service's declaration. Check what an
+    // existing client is told when the owner stops and starts its provider.
+    let restarted = || silica_rt::sys::recv(slots::EVENTS, silica_rt::sys::Wait::Poll).is_ok_and(|m| m.badge & (1 << 1) != 0);
+    load.system.stop("partitions").map_err(|e| format!("stopping partitions: {e:?}"))?;
+    let _ = restarted();
+    load.system.start("partitions").map_err(|e| format!("starting partitions: {e:?}"))?;
+    if !restarted() {
+        return Err(String::from("starting partitions did not notify its client"));
+    }
+    load.system.start("partitions").map_err(|e| format!("starting running partitions: {e:?}"))?;
+    if restarted() {
+        return Err(String::from("starting running partitions reported a second instance"));
+    }
     let mut reads = Reads::new()?;
     let mut parts = silica_block::partitions::Client::<Channel, Handle>::from(Channel::new(grant(1)));
     for _ in 0..ROUNDS {
