@@ -328,14 +328,10 @@ impl proto::Server<Handle> for Log {
         let oldest = s.written - s.kept.len() as u64;
         let start = from.clamp(oldest, s.written);
         let skip = (start - oldest) as usize;
-        let bytes: Vec<u8> = s.kept.iter().skip(skip).take(3000).copied().collect();
-        // Whole characters only: a part ends before a cut one.
-        let text = match core::str::from_utf8(&bytes) {
-            Ok(t) => t,
-            Err(e) => core::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or(""),
-        };
-        let next = start + text.len() as u64;
-        self.text = String::from(text);
+        const PAGE_BYTES: usize = 3000;
+        let bytes: Vec<u8> = s.kept.iter().skip(skip).take(PAGE_BYTES + 3).copied().collect();
+        silica_rt::log::read_text(&bytes, PAGE_BYTES, &mut self.text);
+        let next = start + self.text.len() as u64;
         Ok(ReadReply { text: &self.text, next })
     }
 }

@@ -269,13 +269,17 @@ fn logd(load: &mut Load) -> Result<(), String> {
         }
         // A line written after the restart, which the new instance must have.
         let mark = format!("svcload: after restart {round}");
+        let expected = format!("?{mark}");
         let mut written = false;
         load.restart("logd", || {
             if !written {
+                // The next line must remain readable through the log
+                // protocol even if the preceding record is malformed.
+                silica_rt::log::write(&[0xff]);
                 println!("{mark}");
                 written = true;
             }
-            reader.read("svcload", 0).is_ok_and(|r| r.text.contains(mark.as_str()))
+            reader.read("svcload", 0).is_ok_and(|r| r.text.contains(expected.as_str()))
         })?;
     }
     load.said("logd");
