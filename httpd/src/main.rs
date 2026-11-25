@@ -38,7 +38,14 @@ struct Conn {
     finished: bool,
     /// This connection asked the server to end.
     quit: bool,
+    /// When something was last read or sent: a connection idle for
+    /// [`IDLE`] is closed (one that never sends again kept its place, and
+    /// the stack's, for good).
+    last: u64,
 }
+
+/// How long a connection may be idle.
+const IDLE: u64 = 60_000_000_000;
 
 fn main(_info: &'static ProcessInfo) -> i64 {
     // On its events: the stack is its need 0 (bit 0), so a restart of the
@@ -58,6 +65,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         }
     };
     println!("httpd: listening on port {PORT}");
+    let quit_allowed = silica_rt::option("quit") == Some("allowed");
     let mut conns: Vec<Conn> = Vec::new();
     let mut buf = [0u8; 16384];
     // The body's bytes from any offset, as one slice: the pattern repeats
@@ -83,6 +91,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         peer_done: false,
                         finished: false,
                         quit: false,
+                        last: silica_rt::clock().now(),
                     });
                 }
                 Ok(None) => break,
@@ -96,8 +105,15 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                 }
             }
         }
+        let now = silica_rt::clock().now();
         for c in conns.iter_mut() {
-            progress |= step(c, &mut buf, &pattern, &mut served);
+            if step(c, &mut buf, &pattern, &mut served, quit_allowed) {
+                c.last = now;
+                progress = true;
+            } else if now >= c.last + IDLE && !c.finished {
+                // Idle for a minute: let go of, as a failed one is.
+                progress |= failed(c);
+            }
         }
         // Done with: the answer sent and finished, and the peer done too.
         let mut i = 0;
@@ -130,7 +146,8 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             }
         }
         if may_sleep {
-            let _ = tcp.wait(None);
+            let next = conns.iter().filter(|c| !c.finished).map(|c| c.last + IDLE).min();
+            let _ = tcp.wait(next);
         }
     }
 }
@@ -152,7 +169,7 @@ fn sending(c: &Conn) -> bool {
 }
 
 /// Read, answer and send for one connection; whether anything moved.
-fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool {
+fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64, quit_allowed: bool) -> bool {
     let mut progress = false;
     // Send what is being sent.
     while sending(c) {
@@ -175,13 +192,18 @@ fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool 
         c.body_sent += n as u64;
         progress = true;
     }
-    if c.close_after && !c.finished {
+    // The answer is sent: end this side if asked to, or if the peer ended
+    // its side while the answer was going out (it asks nothing more; before,
+    // such a connection was kept for good).
+    let more = c.input.windows(4).any(|w| w == b"\r\n\r\n");
+    if !c.finished && (c.close_after || (c.peer_done && !more)) {
         c.s.finish();
         c.finished = true;
         progress = true;
     }
-    // Read, and answer the next whole request.
-    if !c.peer_done {
+    // Read, and answer the next whole request. Not past a head's length
+    // while an answer goes out: a pipelining client waits its turn.
+    if !c.peer_done && (!sending(c) || c.input.len() <= HEAD) {
         match c.s.read(buf) {
             Ok(Read::Bytes(n)) => {
                 if !c.finished {
@@ -196,12 +218,12 @@ fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool 
             }
         }
     }
-    if c.finished {
+    if sending(c) || c.finished {
         return progress;
     }
     if let Some(end) = c.input.windows(4).position(|w| w == b"\r\n\r\n") {
         let request: Vec<u8> = c.input.drain(..end + 4).collect();
-        answer(c, &request);
+        answer(c, &request, quit_allowed);
         *served += 1;
         // A line now and then: how far a test's load got (and when to act).
         if (*served).is_multiple_of(1000) {
@@ -223,7 +245,7 @@ fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool 
     progress
 }
 
-fn answer(c: &mut Conn, request: &[u8]) {
+fn answer(c: &mut Conn, request: &[u8], quit_allowed: bool) {
     let text = core::str::from_utf8(request).unwrap_or("");
     let mut lines = text.split("\r\n");
     let mut first = lines.next().unwrap_or("").split(' ');
@@ -239,7 +261,9 @@ fn answer(c: &mut Conn, request: &[u8]) {
     if method != "GET" {
         return respond(c, 405, 0, true);
     }
-    if path == "/quit" {
+    // Only where the boot options allow it (a test that ends the server
+    // through it): otherwise any peer could stop the service.
+    if path == "/quit" && quit_allowed {
         c.quit = true;
         return respond(c, 200, 0, true);
     }
