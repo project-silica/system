@@ -315,6 +315,32 @@ impl Tests {
         Ok(())
     }
 
+    fn failed_spawn_returns_grants(&mut self) -> Outcome {
+        let endpoint = self.endpoint()?;
+        let memory = self.object(ObjectType::Untyped, 12)?;
+        let inspect = |cap: Cap| {
+            sys::inspect_slot(silica_rt::slots::SPACE, cap.0)
+                .map_err(|_| "cannot inspect grant")?
+                .ok_or("failed spawn lost the parent's grant")
+        };
+        let before = (inspect(endpoint)?, inspect(memory)?);
+        let grants =
+            [Grant::lend(endpoint, Rights::READ), Grant::give(memory), Grant::none(), Grant::give(endpoint), Grant::give(endpoint)];
+        let prog = Program { grants: &grants, ..Program::new(self.stress, self.next_id + 1) };
+        match spawn(&self.root.parent, &prog) {
+            Err(silica_proc::SpawnError::Kernel(Error::BadCap)) => {}
+            Err(_) => return Err("spawn failed before the duplicate give"),
+            Ok(child) => {
+                child.destroy().map_err(|_| "cannot destroy unexpected child")?;
+                return Err("gave the same capability twice");
+            }
+        }
+        if before != (inspect(endpoint)?, inspect(memory)?) {
+            return Err("failed spawn changed the parent's grants");
+        }
+        Ok(())
+    }
+
     /// A program that uses up its memory gets an error; a pair running
     /// beside it is not affected, and the memory comes back with the program.
     fn exhaustion(&mut self) -> Outcome {
@@ -433,9 +459,10 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 10] = [
+    let tests: [(&str, Test); 11] = [
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("time_reader_survives_its_writer", Tests::abandoned_time_page),
+        ("failed_spawn_returns_grants", Tests::failed_spawn_returns_grants),
         ("a_million_round_trips_on_one_processor", |t| t.round_trips(1, 1_000_000, |_| (1, 1))),
         ("a_million_round_trips_across_processors", |t| t.round_trips(1, 1_000_000, |_| (1, 2))),
         ("four_pairs_on_eight_processors", |t| t.round_trips(4, 250_000, |i| (2 * i, 2 * i + 1))),
