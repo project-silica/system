@@ -523,6 +523,7 @@ impl Manager {
         if self.kept[i].is_some() {
             match Object::new(ObjectType::Frame, 12) {
                 Ok(page) => {
+                    println!("init: {}'s kept page starts empty for its new program", self.services[i].name);
                     if let Some(old) = self.kept[i].replace(page) {
                         // SAFETY: init never maps it; the instance that has
                         // it is ended before the next starts (each caller ends
