@@ -410,6 +410,11 @@ impl Manager {
             self.start_again(i);
             return;
         }
+        if status == Some(silica_rt::EXIT_AGAIN) && !self.running[i].stopped && self.running[i].restarts.may_start_again(silica_rt::clock().now()) {
+            // It asked to be started again: a start, not a failure.
+            self.start_again(i);
+            return;
+        }
         if status == Some(0) || !self.services[i].restart || self.running[i].stopped {
             return;
         }

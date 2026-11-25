@@ -179,6 +179,14 @@ pub const PROCESS_MAGIC: u64 = 0x4F46_4E49_434F_5250; // "PROCINFO"
 /// is its exit status.
 pub const EXIT_LABEL: u64 = 1;
 
+/// The exit status that asks the program's supervisor to start it again at
+/// once, as a fresh start and not a failure: a driver whose device can be
+/// put back to its first state only by a reset ends with it when its client
+/// changes, and the device manager resets the device by starting the
+/// driver again (`silica_proc::Restarts` does not count it). The service
+/// manager and the device manager both honour it.
+pub const EXIT_AGAIN: i64 = 75;
+
 /// What a program is told when it starts. Read-only, mapped by the parent.
 #[repr(C)]
 pub struct ProcessInfo {

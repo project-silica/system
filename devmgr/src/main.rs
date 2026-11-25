@@ -999,10 +999,12 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         let r = m.running.remove(at);
         let (driver, function) = (r.name, r.function);
         let device = PciAddress(m.functions[function].id);
+        let mut again = false;
         let ended_well = if label == EXIT_LABEL && !fault {
             let status = msg.words[0] as i64;
             println!("devmgr: {driver} for {device} ended with status {status}");
-            status == 0
+            again = status == silica_rt::EXIT_AGAIN && m.functions[function].restarts.may_start_again(silica_rt::clock().now());
+            status == 0 || again
         } else if fault {
             // The kernel's fault message: instruction, address, detail.
             let kind = match label - sys::FAULT_LABEL {
@@ -1018,6 +1020,12 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         };
         if !m.stop(r) {
             println!("ERROR: devmgr: cannot take back the memory of {driver}");
+        }
+        if again {
+            // It asked to be started again (to reset its device): a start,
+            // not a failure.
+            m.start_again(function, driver);
+            continue;
         }
         if ended_well {
             continue;

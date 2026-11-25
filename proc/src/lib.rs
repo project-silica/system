@@ -828,6 +828,14 @@ impl Restarts {
         self.due
     }
 
+    /// Whether a program that asks to be started again (`EXIT_AGAIN`) at
+    /// `now` may be at once: not if it ran less than a second, or a
+    /// program could keep its supervisor starting it (then it is a
+    /// failure, and backs off).
+    pub fn may_start_again(&self, now: u64) -> bool {
+        now.saturating_sub(self.started) >= 1_000_000_000
+    }
+
     /// Not to be started again by itself (its owner stopped it).
     pub fn cancel(&mut self) {
         self.due = 0;
