@@ -61,6 +61,18 @@ const BITS: u32 = 64 - FIRST_BIT;
 /// The most listeners, connections and programs with memory at once.
 const LISTENERS: usize = 32;
 const CONNECTIONS: usize = 256;
+/// Connections in TIME-WAIT, kept beside those: their buffers shed, each
+/// a few hundred bytes, so the side that closes first can open more than
+/// four connections a second for a minute. Past this many the one nearest
+/// its end goes first (as Linux's `tcp_max_tw_buckets`).
+const TIME_WAITING: usize = 1024;
+/// Handshakes a listener has answered and not seen finished, for the
+/// machine: each holds 64 KiB of buffers, so a flood of SYNs from
+/// addresses that never answer could take every connection and 16 MiB.
+/// Past this many the oldest gives its place to the newest (a real
+/// handshake finishes within a round trip; a spoofed one never does).
+/// SYN cookies, which hold nothing until the handshake finishes, are owed.
+const HALF_OPEN: usize = 64;
 const CLIENTS: usize = 32;
 /// Each connection's own buffers: bytes sent and not acknowledged, and
 /// bytes received and not yet in the program's stream.
@@ -176,6 +188,8 @@ pub struct Tcp {
     clients: Vec<Client>,
     listeners: Vec<Listener>,
     conns: Vec<Conn>,
+    /// Where the next pass starts (`pump`).
+    rotor: usize,
     next: u32,
     /// The stack's notification, to give programs a way to signal it.
     note: Cap,
@@ -300,6 +314,7 @@ impl Tcp {
             clients: Vec::new(),
             listeners: Vec::new(),
             conns: Vec::new(),
+            rotor: 0,
             next: 1,
             note,
             mtu,
@@ -308,6 +323,28 @@ impl Tcp {
             scratch: vec![0; 16 << 10],
             segment: vec![0; segment],
         }
+    }
+
+    /// Connections that count against [`CONNECTIONS`]: all but those in
+    /// TIME-WAIT. With `owner`, its alone.
+    fn live(&self, owner: Option<u64>) -> usize {
+        self.conns.iter().filter(|c| c.tcp.state() != State::TimeWait && owner.is_none_or(|o| c.owner == o)).count()
+    }
+
+    /// Whether program `owner` may have one more connection: the table has
+    /// room, and it holds less than half of it (one program, or one remote
+    /// peer through one program's listener, cannot take them all).
+    fn room_for(&self, owner: u64) -> bool {
+        self.live(None) < CONNECTIONS && self.live(Some(owner)) < CONNECTIONS / 2
+    }
+
+    /// Forget connection `i` (closed, or never to be), and its record.
+    fn drop_conn(&mut self, i: usize) {
+        if let (Some(r), Some(records)) = (self.conns[i].record, self.records.as_ref()) {
+            records.write32(r * RECORD, 0);
+            self.recorded[r] = false;
+        }
+        self.conns.swap_remove(i);
     }
 
     /// A record for a new connection `c`, if one is free.
@@ -352,10 +389,17 @@ impl Tcp {
             && !s.has(RST)
             && let Some(l) = self.listeners.iter().find(|l| l.port == h.dst_port)
         {
-            let (lid, owner) = (l.id, l.owner);
+            let (lid, owner, backlog) = (l.id, l.owner, l.backlog);
             let waiting = self.conns.iter().filter(|c| c.listener == Some(lid)).count();
-            if waiting < l.backlog as usize
-                && self.conns.len() < CONNECTIONS
+            // The oldest half-open handshake gives way to this one.
+            let half_open = |c: &Conn| c.tcp.state() == State::SynReceived;
+            if self.conns.iter().filter(|c| half_open(c)).count() >= HALF_OPEN
+                && let Some(oldest) = self.conns.iter().enumerate().filter(|(_, c)| half_open(c)).min_by_key(|(_, c)| c.id).map(|(i, _)| i)
+            {
+                self.drop_conn(oldest);
+            }
+            if waiting < backlog as usize
+                && self.room_for(owner)
                 && let Some(buffers) = buffers()
             {
                 let r = silica_rt::random::u64();
@@ -392,7 +436,14 @@ impl Tcp {
         let mut more = false;
         let mut grown = grown(&self.conns);
         let (scratch, segment) = (&mut self.scratch, &mut self.segment);
-        for c in &mut self.conns {
+        // Each pass starts at the next connection: one with much to send
+        // near the front does not take the interface's room from the rest
+        // every time.
+        let n = self.conns.len();
+        let first = if n == 0 { 0 } else { self.rotor % n };
+        self.rotor = self.rotor.wrapping_add(1);
+        for k in 0..n {
+            let c = &mut self.conns[(first + k) % n];
             if let Some(s) = c.streams.as_mut() {
                 // The program's bytes to TCP.
                 let mut took = false;
@@ -503,14 +554,16 @@ impl Tcp {
         while i < self.conns.len() {
             let c = &self.conns[i];
             if c.tcp.is_closed() && (c.released || (c.listener.is_some() && c.streams.is_none())) {
-                if let (Some(r), Some(records)) = (c.record, self.records.as_ref()) {
-                    records.write32(r * RECORD, 0);
-                    self.recorded[r] = false;
-                }
-                self.conns.swap_remove(i);
+                self.drop_conn(i);
             } else {
                 i += 1;
             }
+        }
+        // Too many in TIME-WAIT (and let go of): the nearest its end goes.
+        let waiting = |c: &Conn| c.released && c.tcp.state() == State::TimeWait;
+        while self.conns.iter().filter(|c| waiting(c)).count() > TIME_WAITING {
+            let Some(i) = self.conns.iter().enumerate().filter(|(_, c)| waiting(c)).min_by_key(|(_, c)| c.tcp.deadline()).map(|(i, _)| i) else { break };
+            self.drop_conn(i);
         }
         more
     }
@@ -679,7 +732,7 @@ impl Tcp {
         if peer.port == 0 || peer.address == 0 {
             return Err(Error::BadArgument);
         }
-        if self.conns.len() >= CONNECTIONS {
+        if !self.room_for(badge) {
             return Err(Error::NoRoom);
         }
         let (rx, tx) = self.block(badge, offset, bits)?;
