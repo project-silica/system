@@ -197,6 +197,19 @@ impl Reads {
 }
 
 fn partitions(load: &mut Load) -> Result<(), String> {
+    // Partitions is need 1 in this service's declaration. Check what an
+    // existing client is told when the owner stops and starts its provider.
+    let restarted = || silica_rt::sys::recv(slots::EVENTS, silica_rt::sys::Wait::Poll).is_ok_and(|m| m.badge & (1 << 1) != 0);
+    load.system.stop("partitions").map_err(|e| format!("stopping partitions: {e:?}"))?;
+    let _ = restarted();
+    load.system.start("partitions").map_err(|e| format!("starting partitions: {e:?}"))?;
+    if !restarted() {
+        return Err(String::from("starting partitions did not notify its client"));
+    }
+    load.system.start("partitions").map_err(|e| format!("starting running partitions: {e:?}"))?;
+    if restarted() {
+        return Err(String::from("starting running partitions reported a second instance"));
+    }
     let mut reads = Reads::new()?;
     let mut parts = silica_block::partitions::Client::<Channel, Handle>::from(Channel::new(grant(1)));
     for _ in 0..ROUNDS {
@@ -269,13 +282,17 @@ fn logd(load: &mut Load) -> Result<(), String> {
         }
         // A line written after the restart, which the new instance must have.
         let mark = format!("svcload: after restart {round}");
+        let expected = format!("?{mark}");
         let mut written = false;
         load.restart("logd", || {
             if !written {
+                // The next line must remain readable through the log
+                // protocol even if the preceding record is malformed.
+                silica_rt::log::write(&[0xff]);
                 println!("{mark}");
                 written = true;
             }
-            reader.read("svcload", 0).is_ok_and(|r| r.text.contains(mark.as_str()))
+            reader.read("svcload", 0).is_ok_and(|r| r.text.contains(expected.as_str()))
         })?;
     }
     load.said("logd");

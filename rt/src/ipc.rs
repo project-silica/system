@@ -126,16 +126,23 @@ fn pack(buf: &IpcBuffer, bytes: &[u8]) -> [u64; 4] {
     let n = bytes.len().min(32);
     head[..n].copy_from_slice(&bytes[..n]);
     if bytes.len() > 32 {
+        if !bytes.len().is_multiple_of(8) {
+            buf.set_word(bytes.len() / 8, 0);
+        }
         buf.copy_in(32, &bytes[32..]);
     }
     core::array::from_fn(|i| u64::from_le_bytes(head[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8])))
 }
 
-/// The bytes of a received message of `len` bytes, into `out`. Returns how many.
-fn unpack(buf: &IpcBuffer, words: [u64; 4], len: usize, out: &mut [u8]) -> usize {
-    let len = len.min(out.len()).min(MAX_MESSAGE);
+/// Copy only a complete IDL envelope whose declared extent agrees with the
+/// number of words delivered by the kernel.
+fn unpack(buf: &IpcBuffer, m: &sys::Message, out: &mut [u8]) -> Option<usize> {
+    let len = usize::try_from(m.info.label()).ok()?;
+    if len > MAX_MESSAGE || len > out.len() || len.div_ceil(8) != m.info.words() {
+        return None;
+    }
     let mut head = [0u8; 32];
-    for (i, w) in words.iter().enumerate() {
+    for (i, w) in m.words.iter().enumerate() {
         head[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
     }
     let n = len.min(32);
@@ -143,7 +150,7 @@ fn unpack(buf: &IpcBuffer, words: [u64; 4], len: usize, out: &mut [u8]) -> usize
     if len > 32 {
         buf.copy_out(32, &mut out[32..len]);
     }
-    len
+    Some(len)
 }
 
 /// List the capabilities of `caps` for sending (they move). Returns the
@@ -187,6 +194,25 @@ fn info(bytes: usize, caps: usize) -> MsgInfo {
     MsgInfo::with_caps(bytes as u64, bytes.div_ceil(8), caps)
 }
 
+fn dispatch(
+    buf: &IpcBuffer,
+    m: &sys::Message,
+    request: &mut [u8],
+    reply: &mut [u8],
+    reply_caps: &mut CapList<Handle>,
+    handle: impl FnOnce(&[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize,
+) -> usize {
+    let mut caps = CapList::new();
+    collect(buf, m.info.caps(), &mut caps);
+    match unpack(buf, m, request) {
+        Some(len) => handle(&request[..len], caps, reply, reply_caps).min(MAX_MESSAGE),
+        None => {
+            let ordinal = if m.info.words() >= 1 && m.info.label() >= 4 { m.words[0] as u32 } else { 0 };
+            silica_idl_rt::status_reply(reply, reply_caps, ordinal, 0, silica_idl_rt::Status::MalformedRequest)
+        }
+    }
+}
+
 /// The client side of a connection: an endpoint capability to a provider.
 /// Generated clients wrap one (`Client::from(Channel::new(endpoint))`).
 pub struct Channel {
@@ -209,7 +235,7 @@ impl Transport<Handle> for Channel {
         mut caps: CapList<Handle>,
         reply_caps: &mut CapList<Handle>,
     ) -> Result<usize, TransportError> {
-        let request = message.get(..len).ok_or(TransportError::TooLarge)?;
+        let request = message.get(..len).filter(|s| s.len() <= MAX_MESSAGE).ok_or(TransportError::TooLarge)?;
         let buf = buffer();
         let (slots, sent) = give(&buf, &mut caps);
         let words = pack(&buf, request);
@@ -222,7 +248,10 @@ impl Transport<Handle> for Channel {
             _ => TransportError::Revoked,
         })?;
         collect(&buf, m.info.caps(), reply_caps);
-        Ok(unpack(&buf, m.words, m.info.label() as usize, message))
+        unpack(&buf, &m, message).ok_or_else(|| {
+            reply_caps.clear();
+            TransportError::MalformedReply
+        })
     }
 }
 
@@ -255,11 +284,8 @@ pub fn serve(endpoint: Cap, mut handle: impl FnMut(u64, &[u8], CapList<Handle>, 
             // The endpoint is gone: there is nobody left to provide for.
             Err(_) => crate::exit(-3),
         };
-        let mut caps = CapList::new();
-        collect(&buf, m.info.caps(), &mut caps);
-        let len = unpack(&buf, m.words, m.info.label() as usize, &mut request);
         let mut reply_caps = CapList::new();
-        let n = handle(m.badge, &request[..len], caps, &mut reply, &mut reply_caps).min(MAX_MESSAGE);
+        let n = dispatch(&buf, &m, &mut request, &mut reply, &mut reply_caps, |req, caps, out, rc| handle(m.badge, req, caps, out, rc));
         let (slots, sent) = give(&buf, &mut reply_caps);
         let words = pack(&buf, &reply[..n]);
         next = sys::reply_recv(endpoint, info(n, sent), words);
@@ -343,11 +369,9 @@ pub fn serve_events(endpoint: Cap, notification: Cap, handler: &mut impl Events)
             next = wake_and_wait(&mut || (handler.take_wake(), handler.deadline()));
             continue;
         }
-        let mut caps = CapList::new();
-        collect(&buf, m.info.caps(), &mut caps);
-        let len = unpack(&buf, m.words, m.info.label() as usize, &mut request);
         let mut reply_caps = CapList::new();
-        let n = handler.call(m.badge, &request[..len], caps, &mut reply, &mut reply_caps).min(MAX_MESSAGE);
+        let n =
+            dispatch(&buf, &m, &mut request, &mut reply, &mut reply_caps, |req, caps, out, rc| handler.call(m.badge, req, caps, out, rc));
         if let Some(w) = handler.take_wake() {
             let _ = sys::signal(w);
         }
@@ -398,11 +422,8 @@ impl Listener {
     /// as [`serve`] would and send the reply.
     pub fn answer(&mut self, m: &sys::Message, handle: impl FnOnce(&[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize) {
         let buf = buffer();
-        let mut caps = CapList::new();
-        collect(&buf, m.info.caps(), &mut caps);
-        let len = unpack(&buf, m.words, m.info.label() as usize, &mut self.request);
         let mut reply_caps = CapList::new();
-        let n = handle(&self.request[..len], caps, &mut self.reply, &mut reply_caps).min(MAX_MESSAGE);
+        let n = dispatch(&buf, m, &mut self.request, &mut self.reply, &mut reply_caps, handle);
         let (slots, sent) = give(&buf, &mut reply_caps);
         let words = pack(&buf, &self.reply[..n]);
         // A caller that has gone is nobody to answer.
@@ -533,9 +554,6 @@ pub fn serve_parked(endpoint: Cap, notification: Cap, handler: &mut impl Waiting
             handler.signals(signals);
             continue;
         }
-        let mut caps = CapList::new();
-        collect(&buf, m.info.caps(), &mut caps);
-        let len = unpack(&buf, m.words, m.info.label() as usize, &mut request);
         // The call is parked when the kernel could park it (it can on the
         // receiving processor, which is where this thread's notifications
         // are); otherwise it waits on this thread and is answered now.
@@ -545,7 +563,9 @@ pub fn serve_parked(endpoint: Cap, notification: Cap, handler: &mut impl Waiting
         }
         let mut token = parked.map(|(index, note)| Parked { index, note });
         let mut reply_caps = CapList::new();
-        let n = handler.call(m.badge, &request[..len], caps, &mut reply, &mut reply_caps, &mut token).min(MAX_MESSAGE);
+        let n = dispatch(&buf, &m, &mut request, &mut reply, &mut reply_caps, |req, caps, out, rc| {
+            handler.call(m.badge, req, caps, out, rc, &mut token)
+        });
         match (parked, token) {
             // Kept for later.
             (Some(_), None) => {}
@@ -558,6 +578,51 @@ pub fn serve_parked(endpoint: Cap, notification: Cap, handler: &mut impl Waiting
                 let _ = sys::reply(info(n, sent), words);
                 given(slots, sent);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inconsistent_receive_extent_leaves_destination_untouched() {
+        let mut page = [0u64; 512];
+        // SAFETY: the aligned test page is exclusive and outlives the buffer.
+        #[allow(unsafe_code)]
+        let buf = unsafe { IpcBuffer::new(page.as_mut_ptr() as usize) };
+        for (bytes, words) in [(33, 4), (8, 2), (4001, 500), (72, 9)] {
+            let msg = sys::Message { badge: 0, info: MsgInfo::new(bytes, words), words: [0; 4] };
+            let mut out = [0x55; 64];
+            assert_eq!(unpack(&buf, &msg, &mut out), None);
+            assert_eq!(out, [0x55; 64]);
+            let mut reply = [0; silica_idl_rt::HEADER_LEN];
+            let n =
+                dispatch(&buf, &msg, &mut out, &mut reply, &mut CapList::new(), |_, _, _, _| panic!("invalid request reached the service"));
+            assert_eq!(silica_idl_rt::Header::decode(&reply[..n]).unwrap().status, silica_idl_rt::Status::MalformedRequest);
+        }
+    }
+
+    #[test]
+    fn outgoing_words_contain_only_message_bytes_and_zero_padding() {
+        let mut page = [u64::MAX; 512];
+        // SAFETY: this test owns the aligned page for the life of the buffer.
+        #[allow(unsafe_code)]
+        let buf = unsafe { IpcBuffer::new(page.as_mut_ptr() as usize) };
+        let message = [0x51; MAX_MESSAGE];
+        for len in 1..=MAX_MESSAGE {
+            let last = (len - 1) / 8;
+            buf.set_word(last, u64::MAX);
+            let head = pack(&buf, &message[..len]);
+            let word = if last < head.len() { head[last] } else { buf.word(last) };
+            let used = len - last * 8;
+            assert_eq!(&word.to_le_bytes()[..used], &message[..used]);
+            assert!(word.to_le_bytes()[used..].iter().all(|&b| b == 0), "length {len}");
+            let msg = sys::Message { info: info(len, 0), words: head, badge: 0 };
+            let mut out = [0; MAX_MESSAGE];
+            assert_eq!(unpack(&buf, &msg, &mut out), Some(len));
+            assert_eq!(out[..len], message[..len]);
         }
     }
 }

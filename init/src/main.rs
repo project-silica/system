@@ -269,7 +269,7 @@ impl Manager {
         }
         if s.seed {
             // A secret of its own for this start (`silica_proc::seed`).
-            let seed = silica_proc::seed(&self.info.entropy, s.name, self.running[i].starts);
+            let seed = silica_proc::seed(&self.root.secret, s.name, self.running[i].starts);
             for (k, word) in seed.as_chunks::<8>().0.iter().enumerate() {
                 args[4 + k] = u64::from_le_bytes(*word);
             }
@@ -292,8 +292,8 @@ impl Manager {
         silica_rt::slots::FIRST_GRANT + self.log_grants() + 3 + entry as u64
     }
 
-    /// Start service `i`.
-    fn start(&mut self, i: usize) -> Result<(), &'static str> {
+    /// Create and record the running instance of service `i`.
+    fn spawn(&mut self, i: usize) -> Result<(), &'static str> {
         let s = &self.services[i];
         let image = match &self.running[i].program {
             Some(p) => p.as_slice(),
@@ -376,11 +376,10 @@ impl Manager {
         Some((i, if fault { None } else { Some(m.words[0] as i64) }))
     }
 
-    /// Service `p` was started again after its last instance ended: every
-    /// running service that needs what it provides is told (its events,
-    /// the need's bit), for whatever it held of the last one is gone.
-    fn started_again(&self, p: usize) {
-        let Some(protocol) = self.services[p].provides else { return };
+    /// Publish a new instance to its running consumers once spawn succeeds.
+    fn start(&mut self, p: usize) -> Result<(), &'static str> {
+        self.spawn(p)?;
+        let Some(protocol) = self.services[p].provides else { return Ok(()) };
         for (c, s) in self.services.iter().enumerate() {
             if c == p || self.running[c].child.is_none() {
                 continue;
@@ -391,6 +390,7 @@ impl Manager {
                 let _ = sys::signal(note.cap());
             }
         }
+        Ok(())
     }
 
     /// Service `i` ended with `status` (`None`: it faulted): say so, and
@@ -408,7 +408,6 @@ impl Manager {
             match self.start(i) {
                 Ok(()) => {
                     println!("init: {name} started again on the program before its update");
-                    self.started_again(i);
                 }
                 Err(e) => println!("ERROR: init: {name}: {e}"),
             }
@@ -424,7 +423,6 @@ impl Manager {
             println!("ERROR: init: {name}: {e}");
         } else {
             println!("init: {name} started again");
-            self.started_again(i);
         }
     }
 
@@ -562,7 +560,6 @@ impl manager::Server<Handle> for Manager {
         self.end(i, child);
         Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
         println!("init: {name} restarted, as asked");
-        self.started_again(i);
         Ok(manager::RestartReply {})
     }
 
@@ -672,11 +669,9 @@ impl manager::Server<Handle> for Manager {
             if let Err(e) = Manager::start(self, i) {
                 println!("ERROR: init: {name}: {e}");
             }
-            self.started_again(i);
             return Err(manager::Error::Refused);
         }
         println!("init: {name} started on its new program");
-        self.started_again(i);
         Ok(manager::UpdateReply {})
     }
 
@@ -692,7 +687,6 @@ impl manager::Server<Handle> for Manager {
         if let Some(child) = self.running[i].child.take() {
             self.end(i, child);
             Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
-            self.started_again(i);
         }
         Ok(manager::RevertReply {})
     }
@@ -753,8 +747,10 @@ impl manager::Server<Handle> for Manager {
 /// Program entry, called by libsys's `_start`.
 // SAFETY: the one definition of the symbol `_start` calls.
 #[unsafe(no_mangle)]
-extern "C" fn silica_main(info: &'static RootInfo) -> ! {
-    let root = match root::start(info) {
+extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3: u64) -> ! {
+    // The boot secret: the four words after the record (libsys::root::secret).
+    let secret = [s0, s1, s2, s3];
+    let root = match root::start(info, secret) {
         Ok(r) => r,
         Err(e) => fail!("{e}"),
     };
@@ -928,7 +924,9 @@ extern "C" fn silica_main(info: &'static RootInfo) -> ! {
             println!("init: {} is off, as the command line asks", m.services[i].name);
             continue;
         }
-        if let Err(e) = m.start(i) {
+        // Boot order puts providers before consumers, so none needs a
+        // notification for this initial instance.
+        if let Err(e) = m.spawn(i) {
             fail!("{}: {e}", m.services[i].name);
         }
     }

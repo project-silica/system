@@ -386,7 +386,8 @@ pub fn check_image(image: &[u8]) -> Result<Vec<(u64, u64)>, SpawnError> {
 }
 
 /// Start `prog`: its first thread runs on `prog.cpu` from its first
-/// instruction.
+/// instruction. A given grant leaves the parent only on success. Keep
+/// its source slot reserved for the duration of this call.
 pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
     let Program { image, mem_bits, cpu, .. } = *prog;
     if cpu as u64 >= p.cpus || !(8..=20).contains(&prog.space_bits) || prog.options.len() > silica_rt::OPTIONS_MAX {
@@ -562,25 +563,42 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     if let Some(events) = prog.events {
         sys::cap_derive(c.space, slots::EVENTS.0, events, Rights::ALL, 0)?;
     }
-    for (i, g) in grants.iter().enumerate() {
-        let to = slots::FIRST_GRANT + i as u64;
-        if g.cap == Cap::NONE {
-            continue;
-        }
-        if g.give {
-            sys::cap_move(c.space, to, g.cap)?;
-        } else {
-            sys::cap_derive(c.space, to, g.cap, g.rights, g.badge)?;
-        }
-    }
     sys::thread_set_cpu(c.thread, cpu)?;
-    // SAFETY: the entry point of an image just loaded into the thread's
-    // address space, on the stack just mapped there.
-    #[allow(unsafe_code)]
-    unsafe {
-        sys::thread_start(c.thread, elf.entry as usize, STACK_VADDR + (1 << STACK_BITS), INFO_VADDR as u64, true)?
-    };
-    Ok(())
+    let mut installed = 0;
+    let result = (|| {
+        for (i, g) in grants.iter().enumerate() {
+            let to = slots::FIRST_GRANT + i as u64;
+            if g.cap != Cap::NONE {
+                if g.give {
+                    sys::cap_move(c.space, to, g.cap)?;
+                } else {
+                    sys::cap_derive(c.space, to, g.cap, g.rights, g.badge)?;
+                }
+            }
+            installed = i + 1;
+        }
+        // SAFETY: the entry point of an image just loaded into the thread's
+        // address space, on the stack just mapped there.
+        #[allow(unsafe_code)]
+        unsafe {
+            sys::thread_start(c.thread, elf.entry as usize, STACK_VADDR + (1 << STACK_BITS), INFO_VADDR as u64, true)
+        }
+    })();
+    if result.is_err() {
+        // The child never ran. Each successful move left its reserved
+        // parent slot empty. Derived grants go away with the child.
+        let mut rollback = Ok(());
+        for (i, g) in grants[..installed].iter().enumerate().rev() {
+            if g.give
+                && g.cap != Cap::NONE
+                && let Err(e) = sys::cap_move_from(p.space, g.cap.0, c.space, slots::FIRST_GRANT + i as u64)
+            {
+                rollback = Err(e);
+            }
+        }
+        rollback?;
+    }
+    result.map_err(Into::into)
 }
 
 /// Copy `data` to the address `to` in the parent's scratch mapping.

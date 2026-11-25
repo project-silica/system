@@ -81,7 +81,7 @@ fn page() -> Option<Mmio> {
 }
 
 /// What time it is, when the program can know: `None` without a time page
-/// or before anyone set it.
+/// or when the page has no consistent time.
 pub fn now() -> Option<Wall> {
     let p = page()?;
     let (offset, source) = read(&p);
@@ -91,9 +91,12 @@ pub fn now() -> Option<Wall> {
     Some(Wall { ns: offset.wrapping_add(crate::clock().now()), source })
 }
 
-/// The offset and source in a time page, read whole.
+/// The offset and source in a time page, read whole. Return the same
+/// unknown time as an unset page if the writer cannot finish an update.
 pub fn read(p: &Mmio) -> (u64, Source) {
-    loop {
+    // Retry once for an update that overlapped the first sample. Readers
+    // can run at higher priority than the writer, or outlive it.
+    for _ in 0..2 {
         let before = p.load_acquire32(0);
         if before & 1 != 0 {
             core::hint::spin_loop();
@@ -106,6 +109,7 @@ pub fn read(p: &Mmio) -> (u64, Source) {
             return (offset, Source::from_raw(source));
         }
     }
+    (0, Source::None)
 }
 
 /// Set the wall clock in a time page mapped writable: `wall_ns` is the
@@ -200,5 +204,12 @@ mod tests {
         assert_eq!(p.read32(0) % 2, 0, "even once written");
         set(&p, 2_000, 1_000, Source::Network);
         assert_eq!(read(&p), (1_000, Source::Network));
+        // The writer stopped after opening the next update. Its partial
+        // offset must never escape, and readers must still return.
+        p.store_release32(0, 5);
+        p.write64(8, 999);
+        assert_eq!(read(&p), (0, Source::None));
+        set(&p, 7_000, 500, Source::Network);
+        assert_eq!(read(&p), (6_500, Source::Network));
     }
 }

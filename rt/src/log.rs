@@ -15,6 +15,9 @@ use crate::sys::{self, ObjectType, Rights};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+mod reader;
+pub use reader::read_text;
+
 /// Bytes in a record: one of length, up to 55 of text.
 pub const RECORD: usize = 56;
 /// Records in the ring.

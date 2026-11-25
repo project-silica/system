@@ -31,6 +31,8 @@ pub const CLIENT: u64 = 1;
 pub const REVOKER: u64 = 2;
 pub const HOG: u64 = 3;
 pub const ONE_CALL: u64 = 4;
+const TIME_WRITER: u64 = 5;
+const TIME_READER: u64 = 6;
 
 const PING: u64 = 1;
 const COUNT: u64 = 2;
@@ -46,6 +48,16 @@ fn main(info: &'static ProcessInfo) -> i64 {
         CLIENT => client(grant, info.args[1], info.args[2] != 0, (info.args[3] != 0).then(|| Cap(slots::FIRST_GRANT + info.args[3]))),
         REVOKER => revoker(grant, Cap(slots::FIRST_GRANT + 1), info.args[1]),
         HOG => hog(),
+        TIME_WRITER => {
+            let Ok(page) = silica_rt::mem::peer(grant, 12, Rights(Rights::READ.0 | Rights::WRITE.0)) else { return -1 };
+            page.store_release32(0, 1);
+            page.write32(16, 2);
+            0
+        }
+        TIME_READER => {
+            let Ok(page) = silica_rt::mem::peer(grant, 12, Rights::READ) else { return -1 };
+            i64::from(silica_rt::time::read(&page) != (0, silica_rt::time::Source::None))
+        }
         ONE_CALL => match sys::call(grant, MsgInfo::new(PING, 1), [41, 0, 0, 0]) {
             Ok(_) => 0,
             Err(e) => e as i64,

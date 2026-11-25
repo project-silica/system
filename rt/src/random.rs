@@ -10,7 +10,7 @@
 //! own generator for each program it starts (`silica_proc::spawn` does it,
 //! and puts them at [`SEED_OFFSET`] of the start-up page, which the runtime
 //! overwrites with zeros once it has them). The root task's generator is
-//! seeded from what the boot loader gathered (`RootInfo::entropy`). No two
+//! seeded from what the boot loader gathered (the boot secret the root thread starts with in its registers, `libsys::root::secret`). No two
 //! programs share a generator, no call to the kernel or to a service is
 //! made for a random number, and there is no `fork` to duplicate one.
 //!

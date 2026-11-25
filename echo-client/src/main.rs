@@ -14,7 +14,20 @@ include!(concat!(env!("OUT_DIR"), "/sample_echo.rs"));
 silica_rt::main!(main);
 
 fn main(_info: &'static ProcessInfo) -> i64 {
-    let mut client = echo::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT)));
+    let endpoint = Cap(slots::FIRST_GRANT);
+    // A complete header for an unknown method, accompanied by a word
+    // outside its declared byte length. The transport must reject the
+    // envelope before method lookup, then serve the ordinary calls below.
+    let ordinal = u32::MAX;
+    let malformed = sys::call(endpoint, sys::MsgInfo::new(16, 3), [ordinal.into(), 1, 0, 0]);
+    if !malformed.is_ok_and(|m| {
+        m.info == sys::MsgInfo::new(16, 2)
+            && m.words[0] == u64::from(ordinal) | (1 << 32) | ((silica_idl_rt::Status::MalformedRequest as u64) << 48)
+    }) {
+        println!("echo-client: the provider did not reject an inconsistent word count");
+        return 9;
+    }
+    let mut client = echo::Client::<Channel, Handle>::from(Channel::new(endpoint));
 
     // Bytes of every length that matters: empty, inside the registers, across
     // into the buffer, and the largest a message can carry.

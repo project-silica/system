@@ -29,7 +29,15 @@ fuzz_target!(|frame: &[u8]| {
     if let Ok(d) = udp::parse(p.payload, p.src, p.dst) {
         inside(p.payload, d.data);
         let _ = dhcp::parse(d.data);
-        let _ = ntp::parse(d.data);
+        if let Ok(reply) = ntp::parse(d.data) {
+            for stamp in [reply.receive, reply.transmit] {
+                if let Some(ns) = ntp::to_unix_ns(stamp) {
+                    // Truncation to a nanosecond loses less than five
+                    // binary fraction ticks, including at an era boundary.
+                    assert!(stamp.wrapping_sub(ntp::from_unix_ns(ns)) <= 5);
+                }
+            }
+        }
     }
     // A UDP payload taken straight as DHCP too: the option walk is the
     // deepest parser and the checksum would hide it from most inputs.
