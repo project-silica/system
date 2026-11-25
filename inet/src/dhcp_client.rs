@@ -160,7 +160,7 @@ impl Client {
         match (self.state, r.kind) {
             (State::Selecting, Kind::Offer) => {
                 let Some(server) = r.server else { return Step::default() };
-                if r.address == Ipv4::UNSPECIFIED || r.address == Ipv4::BROADCAST || r.address.is_multicast() {
+                if !unicast(r.address) || !unicast(server) {
                     return Step::default();
                 }
                 self.state = State::Requesting { address: r.address, server };
@@ -168,6 +168,10 @@ impl Client {
                 self.since = now;
                 self.request(now, random)
             }
+            // Only the server chosen answers: an ACK or NAK from another (anyone
+            // on the link can send one) is not ours.
+            (State::Requesting { server, .. }, Kind::Ack | Kind::Nak) if r.server != Some(server) => Step::default(),
+            (State::Renewing, Kind::Ack | Kind::Nak) if r.server != self.lease.map(|l| l.server) => Step::default(),
             (State::Requesting { address, server }, Kind::Ack) if r.address == address => match lease_of(now, r, server) {
                 Some(l) => self.bind(l, Event::Bound(l)),
                 None => Step::default(),
@@ -177,6 +181,8 @@ impl Client {
                 if r.address != held.address {
                     return Step::default();
                 }
+                // Renewing: from its server (checked above). Rebinding: any
+                // server may extend it (RFC 2131 4.4.5), and is its server then.
                 match lease_of(now, r, r.server.unwrap_or(held.server)) {
                     Some(l) => self.bind(l, Event::Renewed(l)),
                     None => Step::default(),
@@ -272,11 +278,31 @@ fn backoff(tries: u32, random: u64) -> u64 {
 
 /// The lease an acknowledgement gives, or `None` when it says too little
 /// to use (no lease time: RFC 2131 requires one in an answer to a request).
+/// Whether `a` can be a host's unicast address on a network a DHCP server
+/// serves: not unspecified, loopback, link-local (RFC 3927 says no server
+/// gives those), multicast, reserved or broadcast.
+fn unicast(a: Ipv4) -> bool {
+    let [x, y, ..] = a.0;
+    !(a == Ipv4::UNSPECIFIED || a == Ipv4::BROADCAST || x == 0 || x == 127 || (x, y) == (169, 254) || x >= 224)
+}
+
+/// The lease `r` gives, or `None` for one that cannot be used: an address
+/// that is not a host's, a prefix of 0 (every address on-link), a router
+/// that is not a host or is the address itself. Servers of names and time
+/// that are not hosts are dropped.
 fn lease_of(now: u64, r: &Reply, server: Ipv4) -> Option<Lease> {
     let seconds = r.lease?;
-    if seconds == 0 {
+    if seconds == 0 || !unicast(r.address) || r.prefix == Some(0) || r.prefix.is_some_and(|p| p > 32) {
         return None;
     }
+    if r.router.is_some_and(|g| !unicast(g) || g == r.address) {
+        return None;
+    }
+    let mut dns = r.dns;
+    for d in dns.iter_mut().filter(|d| !unicast(**d)) {
+        *d = Ipv4::UNSPECIFIED;
+    }
+    let ntp = r.ntp.filter(|n| unicast(*n));
     let (renew_at, rebind_at, expires_at) = if seconds == u32::MAX {
         (u64::MAX, u64::MAX, u64::MAX)
     } else {
@@ -296,7 +322,7 @@ fn lease_of(now: u64, r: &Reply, server: Ipv4) -> Option<Lease> {
         128..=191 => 16,
         _ => 24,
     });
-    Some(Lease { address: r.address, prefix, router: r.router, dns: r.dns, ntp: r.ntp, server, seconds, renew_at, rebind_at, expires_at })
+    Some(Lease { address: r.address, prefix, router: r.router, dns, ntp, server, seconds, renew_at, rebind_at, expires_at })
 }
 
 #[cfg(test)]
@@ -485,5 +511,70 @@ mod tests {
         assert_eq!((l.renew_at, l.rebind_at), (50 * SECOND, 87 * SECOND + SECOND / 2), "rebinding before renewal: the RFC's times");
         r.prefix = None;
         assert_eq!(lease_of(0, &r, SERVER).unwrap().prefix, 8, "10/8 when the server gives no netmask");
+    }
+
+    /// Anyone on the link can answer: an ACK or NAK that is not from the
+    /// server chosen (while requesting) or the lease's (while renewing) is
+    /// not believed. Before, only the hardware address and transaction were
+    /// matched, so a host on the link could hand out its own router, names
+    /// and time server, or deny the address for ever with NAKs.
+    #[test]
+    fn only_the_chosen_server_acknowledges_or_refuses() {
+        const OTHER: Ipv4 = Ipv4([10, 0, 2, 99]);
+        let from = |kind, xid, server| Reply { server: Some(server), router: Some(OTHER), ..reply(kind, xid, Some(600)) };
+        // Requesting.
+        let mut c = Client::new(MAC, 0);
+        c.step(0, None, 7 << 32);
+        c.step(1, Some(&reply(Kind::Offer, 7, Some(600))), 0);
+        assert_eq!(c.step(2, Some(&from(Kind::Ack, 7, OTHER)), 0).event, None, "another server's ACK");
+        assert_eq!(c.step(2, Some(&from(Kind::Nak, 7, OTHER)), 0).event, None, "another server's NAK");
+        assert!(c.lease().is_none());
+        let s = c.step(3, Some(&reply(Kind::Ack, 7, Some(600))), 0);
+        assert!(matches!(s.event, Some(Event::Bound(l)) if l.router == Some(SERVER)));
+        // Renewing.
+        let held = *c.lease().unwrap();
+        let xid = c.step(held.renew_at, None, 9 << 32).send.unwrap().xid;
+        let s = c.step(held.renew_at + 1, Some(&from(Kind::Nak, xid, OTHER)), 0);
+        assert_eq!(s.event, None, "a NAK from another server while renewing");
+        assert_eq!(c.lease(), Some(&held), "the lease is held");
+        let s = c.step(held.renew_at + 2, Some(&from(Kind::Ack, xid, OTHER)), 0);
+        assert_eq!(s.event, None, "an ACK from another server while renewing");
+        assert!(matches!(c.step(held.renew_at + 3, Some(&reply(Kind::Ack, xid, Some(600))), 0).event, Some(Event::Renewed(_))));
+    }
+
+    /// A lease that cannot be used is not taken: an address that is not a
+    /// host's, every address on-link, a router that is not a host or is
+    /// the address itself. Name and time servers that are not hosts are
+    /// dropped from one that is.
+    #[test]
+    fn leases_that_cannot_be_used_are_not_taken() {
+        let with = |f: &dyn Fn(&mut Reply)| {
+            let mut c = Client::new(MAC, 0);
+            c.step(0, None, 7 << 32);
+            let mut offer = reply(Kind::Offer, 7, Some(600));
+            let mut ack = reply(Kind::Ack, 7, Some(600));
+            f(&mut offer);
+            f(&mut ack);
+            c.step(1, Some(&offer), 0);
+            c.step(2, Some(&ack), 0).event
+        };
+        for (what, f) in [
+            ("loopback", &(|r: &mut Reply| r.address = Ipv4([127, 0, 0, 5])) as &dyn Fn(&mut Reply)),
+            ("link-local", &|r: &mut Reply| r.address = Ipv4([169, 254, 1, 2])),
+            ("reserved", &|r: &mut Reply| r.address = Ipv4([250, 1, 2, 3])),
+            ("a prefix of 0", &|r: &mut Reply| r.prefix = Some(0)),
+            ("a loopback router", &|r: &mut Reply| r.router = Some(Ipv4([127, 0, 0, 1]))),
+            ("itself as router", &|r: &mut Reply| r.router = Some(ADDRESS)),
+            ("a broadcast router", &|r: &mut Reply| r.router = Some(Ipv4::BROADCAST)),
+        ] {
+            assert_eq!(with(f), None, "a lease with {what} was taken");
+        }
+        let e = with(&|r: &mut Reply| {
+            r.dns = [Ipv4([127, 0, 0, 53]), Ipv4([10, 0, 2, 3]), Ipv4([224, 0, 0, 1])];
+            r.ntp = Some(Ipv4([127, 0, 0, 1]));
+        });
+        let Some(Event::Bound(l)) = e else { panic!("{e:?}") };
+        assert_eq!(l.dns, [Ipv4::UNSPECIFIED, Ipv4([10, 0, 2, 3]), Ipv4::UNSPECIFIED]);
+        assert_eq!(l.ntp, None);
     }
 }

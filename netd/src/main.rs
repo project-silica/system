@@ -259,8 +259,17 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
     silica_rt::ipc::serve_events(ENDPOINT, note.cap(), &mut s)
 }
 
-/// The port the time-server client asks from.
-const TIME_PORT: u16 = 50123;
+/// The ports the time-server client asks from: a random one of these for
+/// each question, so that an answer must reach the one it was asked from.
+const TIME_PORTS: core::ops::Range<u16> = 50_000..60_000;
+/// The longest a time server's answer may take to be believed: a longer
+/// round trip leaves too much room for its times to be wrong.
+const TIME_DELAY_MOST: i64 = 1_000_000_000;
+/// The most the clock is moved at once after the network first set it:
+/// past this, an answer is not believed (ntpd's panic threshold). The
+/// first answer of a boot may move it any amount (the firmware's clock
+/// may be years out).
+const TIME_STEP_MOST: u64 = 1000 * SECOND;
 
 /// The time-server client's state (SNTP to one server).
 struct TimeClient {
@@ -269,9 +278,10 @@ struct TimeClient {
     page: Option<Mmio>,
     /// The server the boot options name (`ntp=<address>[:<port>]`).
     configured: Option<(Ipv4, u16)>,
-    /// The question in flight: its transmit timestamp, and its time (ns
-    /// since 1970 by this clock).
-    asked: Option<(u64, u64)>,
+    /// The question in flight: the random number it carried as its
+    /// transmit timestamp, its time (ns since 1970 by this clock), and
+    /// the port it was asked from.
+    asked: Option<(u64, u64, u16)>,
     /// When to ask next, questions sent since the last answer, seconds
     /// between answers, and whether the clock was ever set.
     next: u64,
@@ -675,33 +685,48 @@ impl Stack {
         // the offset is relative to whatever it says).
         let (offset, _) = silica_rt::time::read(&page);
         let t1 = offset.wrapping_add(now);
-        let transmit = ntp::from_unix_ns(t1);
+        // Not the clock (anyone can guess it) but a random number, and a
+        // random port: an answer comes from whoever got the question.
+        let r = silica_rt::random::u64();
+        let nonce = r | 1 << 63;
+        let from = TIME_PORTS.start + (r as u32 % TIME_PORTS.len() as u32) as u16;
         let mut q = [0u8; ntp::LEN];
-        ntp::request(&mut q, transmit);
-        self.time.asked = Some((transmit, t1));
+        ntp::request(&mut q, nonce);
+        self.time.asked = Some((nonce, t1, from));
         self.time.tries += 1;
         self.time.next = if self.time.tries < 3 { now + 2 * SECOND } else { now + self.time.poll * SECOND };
         if self.time.tries >= 3 {
             self.time.tries = 0;
         }
-        self.send_udp(server, TIME_PORT, port, &q);
+        self.send_udp(server, from, port, &q);
     }
 
     /// The time server answered: set the clock if it answers our question.
     fn time_answer(&mut self, now: u64, r: &ntp::Reply) {
         let Some(page) = self.time.page else { return };
-        let Some((transmit, t1)) = self.time.asked else { return };
+        let Some((nonce, t1, _)) = self.time.asked else { return };
         // Only the answer to the question in flight: a blind sender does
-        // not know its time.
-        if r.originate != transmit {
+        // not know its number.
+        if r.originate != nonce {
             return;
         }
         let (Some(t2), Some(t3)) = (ntp::to_unix_ns(r.receive), ntp::to_unix_ns(r.transmit)) else { return };
         self.time.asked = None;
         let (offset, _) = silica_rt::time::read(&page);
         let t4 = offset.wrapping_add(now);
-        let (shift, delay) = ntp::offset(t1, t2, t3, t4);
-        let wall = t4.wrapping_add_signed(shift);
+        let Some((shift, delay)) = ntp::offset(t1, t2, t3, t4) else {
+            println!("netd: a time server's answer gives times that cannot be; not believed");
+            return;
+        };
+        if delay > TIME_DELAY_MOST {
+            println!("netd: a time server's answer took {} ms; not believed", delay / 1_000_000);
+            return;
+        }
+        if self.time.set && shift.unsigned_abs() > TIME_STEP_MOST {
+            println!("netd: a time server would move the clock by {} s; not believed", shift / SECOND as i64);
+            return;
+        }
+        let Some(wall) = t4.checked_add_signed(shift) else { return };
         silica_rt::time::set(&page, wall, now, silica_rt::time::Source::Network);
         if !self.time.set || shift.unsigned_abs() > SECOND {
             let (server, port) = self.time.server(self.lease.as_ref()).unwrap_or((Ipv4::UNSPECIFIED, 0));
@@ -1017,7 +1042,7 @@ impl Stack {
                     }
                     Err(e) => self.dropped.malformed(e),
                 },
-                Ok(d) if ours && d.dst_port == TIME_PORT && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) => {
+                Ok(d) if ours && self.time.asked.is_some_and(|(_, _, from)| from == d.dst_port) && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) => {
                     match ntp::parse(d.data) {
                         Ok(r) => self.time_answer(now, &r),
                         Err(e) => self.dropped.malformed(e),

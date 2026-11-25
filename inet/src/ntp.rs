@@ -37,8 +37,10 @@ pub fn to_unix_ns(t: u64) -> Option<u64> {
     Some(secs.checked_sub(UNIX_EPOCH)? * NS + frac)
 }
 
-/// A client's question, sent at `transmit` (an NTP timestamp the answer
-/// must echo, the client's guard against answers it did not ask for).
+/// A client's question carrying `transmit`, which the answer must echo:
+/// the client's guard against answers it did not ask for, so not its clock
+/// (which anyone can guess) but a random number it keeps (RFC 5905
+/// section 9.1 allows any value; the client keeps its own send time).
 pub fn request(out: &mut [u8; LEN], transmit: u64) {
     out.fill(0);
     out[0] = 4 << 3 | 3; // no leap warning, version 4, client
@@ -84,12 +86,20 @@ pub fn parse(p: &[u8]) -> Result<Reply, Malformed> {
 /// nanoseconds, from the four times (all nanoseconds since 1970): `t1` the
 /// question sent and `t4` the answer received by the client's clock, `t2`
 /// and `t3` the server's (RFC 5905 section 8). The offset is what to add
-/// to the client's clock.
-pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> (i64, i64) {
+/// to the client's clock. `None` for times that cannot be: the server
+/// sending before it received, the answer before the question, a delay
+/// below zero, or an offset past what 64 bits of nanoseconds hold.
+pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> Option<(i64, i64)> {
+    if t3 < t2 || t4 < t1 {
+        return None;
+    }
     let d = |a: u64, b: u64| a as i128 - b as i128;
     let offset = (d(t2, t1) + d(t3, t4)) / 2;
     let delay = d(t4, t1) - d(t3, t2);
-    (offset as i64, delay as i64)
+    if delay < 0 {
+        return None;
+    }
+    Some((i64::try_from(offset).ok()?, i64::try_from(delay).ok()?))
 }
 
 #[cfg(test)]
@@ -149,9 +159,23 @@ mod tests {
         let t2 = t1 + 10 * s + 3_000_000;
         let t3 = t2 + 2_000_000;
         let t4 = t3 - 10 * s + 1_000_000;
-        let (offset, delay) = offset(t1, t2, t3, t4);
+        let (o, delay) = offset(t1, t2, t3, t4).unwrap();
         assert_eq!(delay, 4_000_000);
-        assert_eq!(offset, 10 * s as i64 + 1_000_000, "the asymmetry is half in the offset, as NTP says");
+        assert_eq!(o, 10 * s as i64 + 1_000_000, "the asymmetry is half in the offset, as NTP says");
+    }
+
+    /// Times that cannot be are not used to set a clock: a server that
+    /// sends before it receives, an answer before its question, a round
+    /// trip below zero, an offset past 64 bits (once truncated into a
+    /// garbage clock).
+    #[test]
+    fn times_that_cannot_be_give_no_offset() {
+        let s = NS;
+        assert_eq!(offset(100 * s, 50 * s, 49 * s, 101 * s), None, "sent before received");
+        assert_eq!(offset(100 * s, 50 * s, 50 * s, 99 * s), None, "answered before asked");
+        assert_eq!(offset(100 * s, 50 * s, 60 * s, 101 * s), None, "the server held it longer than the round trip");
+        assert_eq!(offset(0, u64::MAX, u64::MAX, 1), None, "an offset past 64 bits");
+        assert!(offset(0, 1 << 62, 1 << 62, 1).is_some());
     }
 
     #[test]
