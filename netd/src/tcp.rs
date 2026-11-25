@@ -564,7 +564,8 @@ impl Tcp {
         if !BLOCK_BITS.contains(&bits) || !offset.is_multiple_of(1 << bits) {
             return Err(Error::BadMemory);
         }
-        let end = offset + (1 << bits);
+        // An offset at the top of the range would wrap past it.
+        let end = offset.checked_add(1 << bits).ok_or(Error::BadMemory)?;
         let overlaps = self.conns.iter().filter(|c| c.owner == badge).filter_map(|c| c.streams.as_ref()).any(|s| {
             let (start, stop) = (s.offset, s.offset + (1 << s.bits));
             offset < stop && start < end
@@ -756,6 +757,16 @@ impl Tcp {
         c.released = true;
         c.streams = None;
         Ok(proto::CloseReply {})
+    }
+
+    /// The machine's address went (its lease ended): every connection on it
+    /// ends now, its program told at once, rather than lingering until its
+    /// retransmissions give up some ten minutes later, holding its place
+    /// and buffers, its segments dropped or sent with the wrong checksum.
+    pub fn address_gone(&mut self) {
+        for c in self.conns.iter_mut().filter(|c| !c.tcp.is_closed()) {
+            c.tcp.abort();
+        }
     }
 
     pub fn unlisten(&mut self, badge: u64, listener: u32) -> Result<proto::UnlistenReply, Error> {

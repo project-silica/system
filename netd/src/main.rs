@@ -220,6 +220,8 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         lease,
         keep,
         neighbours: [Neighbour::EMPTY; NEIGHBOURS],
+        asking: [Ipv4::UNSPECIFIED; 4],
+        defended: 0,
         held: None,
         ip_id: (silica_rt::random::u64() & 0xFFFF) as u16,
         frame: [0; BUFFER],
@@ -228,6 +230,7 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         dropped: Dropped::default(),
         tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
         resets,
+        resets_until: 0,
         time: TimeClient::new(clock, now),
         caller: 0,
         more: true,
@@ -437,6 +440,11 @@ struct Stack {
     /// The page kept across restarts (`slots::KEEP`), the lease in it.
     keep: Option<Mmio>,
     neighbours: [Neighbour; NEIGHBOURS],
+    /// Addresses asked for and not yet answered: only an answer to one of
+    /// these changes what is known of a neighbour.
+    asking: [Ipv4; 4],
+    /// When another host was last told this address is ours (a conflict).
+    defended: u64,
     held: Option<Held>,
     ip_id: u16,
     /// The frame being read (copied out of its buffer) and the one being built.
@@ -451,6 +459,9 @@ struct Stack {
     /// Resets owed to the peers of the last stack's connections, sent once
     /// their next hop's address is known.
     resets: Vec<tcp::Kept>,
+    /// When the resets not sent by then are given up (their peers' hops
+    /// never answered ARP); set when the first one waits.
+    resets_until: u64,
     time: TimeClient,
     /// Work is left (a completion there, segments with no transmit slot):
     /// look again at once rather than wait.
@@ -608,6 +619,13 @@ impl Stack {
     fn dhcp_step(&mut self, now: u64, step: dhcp_client::Step) {
         match step.event {
             Some(Event::Bound(l)) => {
+                // A new address (the old lease ended while the stack was not
+                // running, or another was given): nothing on the old one lives.
+                if self.lease.is_some_and(|old| old.address != l.address)
+                    && let Some(tcp) = self.tcp.as_mut()
+                {
+                    tcp.address_gone();
+                }
                 let dns = l.dns.iter().filter(|d| **d != Ipv4::UNSPECIFIED);
                 let mut servers = silica_rt::alloc::string::String::new();
                 for d in dns {
@@ -629,7 +647,10 @@ impl Stack {
             }
             Some(Event::Lost) => {
                 if let Some(l) = self.lease.take() {
-                    println!("netd: the lease of {} ended; asking again", l.address);
+                    println!("netd: the lease of {} ended; its connections end, and the stack asks again", l.address);
+                    if let Some(tcp) = self.tcp.as_mut() {
+                        tcp.address_gone();
+                    }
                 }
                 self.keep_lease();
             }
@@ -648,13 +669,33 @@ impl Stack {
             return;
         }
         let hop = |r: Ipv4| if l.address.same_subnet(r, l.prefix) { Some(r) } else { l.router };
+        if self.resets_until == 0 {
+            self.resets_until = now + 2 * RESOLVE_WAIT;
+        }
+        if now >= self.resets_until {
+            println!("netd: {} connections of the stack before it are not reset: their peers do not answer ARP", self.resets.len());
+            self.resets.clear();
+            return;
+        }
         let mut sent = 0;
-        while let Some(k) = self.resets.last() {
-            let Some(h) = hop(k.remote) else { break };
-            if self.neighbour(h, now).is_none() || self.free == 0 {
-                break;
+        // Every reset whose next hop is known goes; one whose hop is not is
+        // kept, its hop asked for (once while it is unanswered). Before,
+        // the first peer not known stopped all those behind it, and nothing
+        // asked for it.
+        let mut i = self.resets.len();
+        while i > 0 && self.free > 0 {
+            i -= 1;
+            let Some(h) = hop(self.resets[i].remote) else {
+                self.resets.swap_remove(i);
+                continue;
+            };
+            if self.neighbour(h, now).is_none() {
+                if !self.asking.contains(&h) {
+                    self.ask(h);
+                }
+                continue;
             }
-            let k = self.resets.pop().expect("looked at");
+            let k = self.resets.swap_remove(i);
             let header = silica_inet::tcp::Header {
                 src_port: k.local_port,
                 dst_port: k.remote_port,
@@ -930,19 +971,25 @@ impl Stack {
         self.neighbours.iter().find(|n| n.ip == ip && n.expires > now).map(|n| n.mac)
     }
 
-    /// Remember that `ip` is at `mac`: in its old place, else the oldest.
+    /// Remember that `ip` is at `mac`: in its old place, else the oldest,
+    /// never the router's (a stranger who asks for us does not push the
+    /// way out of the table).
     fn learn(&mut self, ip: Ipv4, mac: Mac, now: u64) {
         if ip == Ipv4::UNSPECIFIED || mac.is_group() {
             return;
         }
+        let router = self.lease.and_then(|l| l.router);
         let at = self.neighbours.iter().position(|n| n.ip == ip).unwrap_or_else(|| {
-            let mut oldest = 0;
+            let mut oldest = None;
             for (i, n) in self.neighbours.iter().enumerate() {
-                if n.expires < self.neighbours[oldest].expires {
-                    oldest = i;
+                if Some(n.ip) == router && n.expires > now {
+                    continue;
+                }
+                if oldest.is_none_or(|o: usize| n.expires < self.neighbours[o].expires) {
+                    oldest = Some(i);
                 }
             }
-            oldest
+            oldest.unwrap_or(0)
         });
         self.neighbours[at] = Neighbour { ip, mac, expires: now + NEIGHBOUR_LIFE };
         if let Some(h) = self.held.take() {
@@ -957,6 +1004,10 @@ impl Stack {
     /// Ask who has `ip`.
     fn ask(&mut self, ip: Ipv4) {
         let Some(l) = self.lease else { return };
+        if !self.asking.contains(&ip) {
+            self.asking.rotate_right(1);
+            self.asking[0] = ip;
+        }
         let a = arp::Arp { op: arp::REQUEST, sender_mac: self.mac, sender_ip: l.address, target_mac: Mac::ZERO, target_ip: ip };
         let mac = self.mac;
         let Some(p) = ether::header(&mut self.out, Mac::BROADCAST, mac, ether::ARP) else { return };
@@ -1000,15 +1051,36 @@ impl Stack {
 
     fn arp(&mut self, now: u64, a: &arp::Arp) {
         let Some(l) = self.lease else { return };
-        if a.target_ip != l.address {
-            // Not about us: only an answer to our own question teaches.
-            if a.op == arp::REPLY && self.held.as_ref().is_some_and(|h| h.hop == a.sender_ip) {
-                self.learn(a.sender_ip, a.sender_mac, now);
+        if a.sender_ip == l.address && a.sender_mac != self.mac {
+            // Another host says our address is its: a conflict. Said, and
+            // our claim announced, no more than every ten seconds.
+            if now >= self.defended + 10 * SECOND {
+                self.defended = now;
+                println!("netd: {} says {} is its address too", a.sender_mac, l.address);
+                self.ask(l.address);
             }
             return;
         }
-        // Someone who asks for us, or answers us, is a neighbour.
-        self.learn(a.sender_ip, a.sender_mac, now);
+        // An answer to our own question teaches, whatever was known before.
+        if a.op == arp::REPLY && a.sender_ip != Ipv4::UNSPECIFIED && self.asking.contains(&a.sender_ip) {
+            for x in self.asking.iter_mut().filter(|x| **x == a.sender_ip) {
+                *x = Ipv4::UNSPECIFIED;
+            }
+            self.learn(a.sender_ip, a.sender_mac, now);
+            return;
+        }
+        if a.target_ip != l.address {
+            return;
+        }
+        // Someone who asks for us is a neighbour: one new to us is
+        // learned; one known at another hardware address is asked again
+        // rather than believed (one unsolicited packet redirected all our
+        // traffic for a host, the router's included).
+        match self.neighbours.iter().position(|n| n.ip == a.sender_ip && n.expires > now) {
+            Some(k) if self.neighbours[k].mac != a.sender_mac => self.ask(a.sender_ip),
+            Some(k) => self.neighbours[k].expires = now + NEIGHBOUR_LIFE,
+            None => self.learn(a.sender_ip, a.sender_mac, now),
+        }
         if a.op == arp::REQUEST {
             let r =
                 arp::Arp { op: arp::REPLY, sender_mac: self.mac, sender_ip: l.address, target_mac: a.sender_mac, target_ip: a.sender_ip };
