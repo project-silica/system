@@ -45,14 +45,15 @@ struct Shell {
 const HELP: &str = "commands: services, stop <service>, start <service>, restart <service>, caps <service|device>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, date, echo <text>, help\n";
 
 impl Shell {
-    fn say(&mut self) {
-        let text = core::mem::take(&mut self.out);
-        let _ = self.term.write(&text);
+    fn say(&mut self) -> Result<(), CallError<core::convert::Infallible>> {
+        let result = self.term.write_all(&self.out);
+        self.out.clear();
+        result
     }
 
-    fn run(&mut self, line: &str) {
+    fn run(&mut self, line: &str) -> Result<(), CallError<core::convert::Infallible>> {
         let words: Vec<&str> = line.split_whitespace().collect();
-        let Some(&command) = words.first() else { return };
+        let Some(&command) = words.first() else { return Ok(()) };
         let arg = words.get(1).copied().unwrap_or("");
         match command {
             "help" => self.out.push_str(HELP),
@@ -116,7 +117,7 @@ impl Shell {
                     match part {
                         Ok((text, next)) => {
                             self.out.push_str(&text);
-                            self.say();
+                            self.say()?;
                             if next == 0 {
                                 break;
                             }
@@ -136,14 +137,12 @@ impl Shell {
                     Ok(r) => r.sources.iter().find(|s| s.name == arg).map(|s| s.written),
                     Err(e) => {
                         let _ = writeln!(self.out, "log: {arg}: {e:?}");
-                        self.say();
-                        return;
+                        return self.say();
                     }
                 };
                 let Some(end) = end else {
                     let _ = writeln!(self.out, "log: {arg}: no such log source");
-                    self.say();
-                    return;
+                    return self.say();
                 };
                 let (mut from, mut fresh) = (0, true);
                 while from < end {
@@ -160,7 +159,7 @@ impl Shell {
                                 fresh = c == '\n';
                             }
                             from = r.next;
-                            self.say();
+                            self.say()?;
                         }
                         Ok(_) => break,
                         Err(e) => {
@@ -210,7 +209,7 @@ impl Shell {
                 let _ = writeln!(self.out, "{command}: no such command (help lists them)");
             }
         }
-        self.say();
+        self.say()
     }
 }
 
@@ -273,6 +272,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             Err(CallError::Transport(TransportError::PeerGone)) => continue,
             Err(_) => return 1,
         };
-        shell.run(&line);
+        match shell.run(&line) {
+            Ok(()) | Err(CallError::Transport(TransportError::PeerGone)) => {}
+            Err(e) => {
+                silica_rt::println!("shell: console output failed: {e:?}");
+                return 1;
+            }
+        }
     }
 }

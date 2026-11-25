@@ -49,6 +49,7 @@ pub mod display {
 pub mod console {
     include!(concat!(env!("OUT_DIR"), "/silica_console_terminal.rs"));
     include!(concat!(env!("OUT_DIR"), "/silica_console_port.rs"));
+    mod output;
 }
 
 /// `silica.log.Reader`.
