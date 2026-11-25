@@ -114,6 +114,7 @@ pub mod mem;
 pub mod mmio;
 pub mod random;
 pub mod ring;
+pub mod text;
 pub mod time;
 
 pub use libsys as sys;

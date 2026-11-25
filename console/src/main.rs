@@ -168,10 +168,19 @@ impl Console {
                 self.show("\n");
                 answer_line(p, &line);
             }
+            // Typed ahead, up to [`TYPEAHEAD`] lines: past them a line is
+            // dropped and said (a stuck key, or a peer at the port, grew the
+            // queue without bound, and every line was later run).
+            None if self.lines.len() >= TYPEAHEAD => {
+                self.show("\nconsole: a line typed ahead was dropped: 16 wait already\n");
+            }
             None => self.lines.push_back(line),
         }
     }
 }
+
+/// Lines typed before anyone asks, kept for the next reader.
+const TYPEAHEAD: usize = 16;
 
 /// Answer a waiting `read_line` with `line`.
 fn answer_line(p: Parked, line: &str) {
@@ -185,7 +194,10 @@ fn answer_line(p: Parked, line: &str) {
 
 impl terminal::Server<Handle> for Console {
     fn write(&mut self, text: &str) -> WriteReply {
-        self.show(text);
+        // Printable text only: an escape sequence or a carriage return
+        // from a program would move the cursor, rewrite what another
+        // wrote, or reach a terminal beyond the console.
+        self.show(&silica_rt::text::printable(text));
         WriteReply {}
     }
 
@@ -248,7 +260,7 @@ impl Waiting for Console {
             println!("console: the keyboard's driver ended; {}", if self.keys.is_some() { "reading its successor" } else { "no keyboard" });
         }
         if bits & DISPLAY_GONE != 0 {
-            self.display = display(&mut self.devices, self.note, &self.grid);
+            self.display = display(&mut self.devices, self.note, &mut self.grid);
             self.update();
             println!(
                 "console: the display's driver ended; {}",
@@ -316,8 +328,13 @@ fn open(devices: &mut manager::Client<Channel, Handle>, class: manager::Class, n
 }
 
 /// The display, attached, showing `grid` whole.
-fn display(devices: &mut manager::Client<Channel, Handle>, note: Cap, grid: &Grid) -> Option<Display> {
-    let (mut d, _, _) = Display::new(open(devices, manager::Class::Display, note, DISPLAY_GONE)?)?;
+fn display(devices: &mut manager::Client<Channel, Handle>, note: Cap, grid: &mut Grid) -> Option<Display> {
+    let (mut d, columns, rows) = Display::new(open(devices, manager::Class::Display, note, DISPLAY_GONE)?)?;
+    // A driver started again may have set another mode: the text
+    // follows the display, rather than the display being given up.
+    if grid.size() != (columns, rows) {
+        grid.resize(columns, rows);
+    }
     d.show(grid).then_some(d)
 }
 

@@ -17,6 +17,8 @@ const FOREGROUND: u32 = 0x00D8_D8D8;
 const BACKGROUND: u32 = 0x0010_1418;
 /// A cell the display was never given: drawn whatever the grid holds.
 const UNKNOWN: char = '\u{FFFF}';
+/// The widest and tallest display mode taken, in pixels.
+const MAX_SIDE: u32 = 16384;
 
 /// The text and the cursor.
 pub struct Grid {
@@ -35,6 +37,25 @@ impl Grid {
     /// Columns and rows of characters.
     pub fn size(&self) -> (u32, u32) {
         (self.columns, self.rows)
+    }
+
+    /// Make the grid `columns` by `rows` (a display at another size took
+    /// the last one's place), keeping the newest text: the rows up to the
+    /// cursor's, each cut or padded to the new width, the cursor on the
+    /// same text.
+    pub fn resize(&mut self, columns: u32, rows: u32) {
+        let (oc, nc) = (self.columns as usize, columns as usize);
+        let kept = (self.row + 1).min(rows);
+        let first = self.row + 1 - kept;
+        let mut cells = vec![' '; nc * rows as usize];
+        for r in 0..kept as usize {
+            let from = &self.cells[(first as usize + r) * oc..][..oc.min(nc)];
+            cells[r * nc..r * nc + from.len()].copy_from_slice(from);
+        }
+        self.cells = cells;
+        (self.columns, self.rows) = (columns, rows);
+        self.row = kept - 1;
+        self.column = self.column.min(columns);
     }
 
     fn newline(&mut self) {
@@ -95,7 +116,11 @@ impl Display {
         let mut client = Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         let mode = client.mode().ok()?.mode;
         let (columns, rows) = (mode.width / WIDTH as u32, mode.height / HEIGHT as u32);
-        if columns == 0 || rows == 0 {
+        // The mode is the driver's word: one no display has (past 16384
+        // pixels a side) would size the grid and the strip past this
+        // program's memory, so it is taken for no display, and said.
+        if columns == 0 || rows == 0 || mode.width > MAX_SIDE || mode.height > MAX_SIDE {
+            silica_rt::println!("console: the display says its mode is {} by {}; not used", mode.width, mode.height);
             return None;
         }
         let bytes = mode.width as usize * HEIGHT * 4;
