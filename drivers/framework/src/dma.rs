@@ -179,6 +179,21 @@ impl Dma {
         self.space.is_some()
     }
 
+    /// From now on every access of `device` the IOMMU refuses signals
+    /// `faults` (a notification), and is counted ([`Dma::refused`]).
+    /// `Unsupported` where DMA is not confined.
+    pub fn watch_faults(&self, device: &Device, faults: Cap) -> Result<(), DeviceError> {
+        let space = self.space.ok_or(sys::Error::Unsupported)?;
+        sys::device_attach_noting(granted(grant::IDENTITY), device.id, space, faults)?;
+        Ok(())
+    }
+
+    /// How many accesses of the device the IOMMU has refused (0 where DMA is
+    /// not confined).
+    pub fn refused(&self) -> u64 {
+        self.space.and_then(|s| sys::inspect_io_space(s).ok()).map_or(0, |(_, n)| n)
+    }
+
     /// New zeroed memory of `2^bits` bytes that the driver reads and writes
     /// and the device reads, and with `device_writes` also writes.
     pub fn memory(&self, bits: u8, device_writes: bool) -> Result<DmaMemory, DeviceError> {
