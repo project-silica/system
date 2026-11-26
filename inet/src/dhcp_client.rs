@@ -276,8 +276,6 @@ fn backoff(tries: u32, random: u64) -> u64 {
     base - SECOND + (random & 0xFFFF_FFFF) % (2 * SECOND)
 }
 
-/// The lease an acknowledgement gives, or `None` when it says too little
-/// to use (no lease time: RFC 2131 requires one in an answer to a request).
 /// Whether `a` can be a host's unicast address on a network a DHCP server
 /// serves: not unspecified, loopback, link-local (RFC 3927 says no server
 /// gives those), multicast, reserved or broadcast.
@@ -286,10 +284,11 @@ fn unicast(a: Ipv4) -> bool {
     !(a == Ipv4::UNSPECIFIED || a == Ipv4::BROADCAST || x == 0 || x == 127 || (x, y) == (169, 254) || x >= 224)
 }
 
-/// The lease `r` gives, or `None` for one that cannot be used: an address
-/// that is not a host's, a prefix of 0 (every address on-link), a router
-/// that is not a host or is the address itself. Servers of names and time
-/// that are not hosts are dropped.
+/// The lease `r` gives, or `None` for one that cannot be used: no lease
+/// time (RFC 2131 requires one in an answer to a request), an address that
+/// is not a host's, a prefix of 0 (every address on-link), a router that is
+/// not a host or is the address itself. Servers of names and time that are
+/// not hosts are dropped.
 fn lease_of(now: u64, r: &Reply, server: Ipv4) -> Option<Lease> {
     let seconds = r.lease?;
     if seconds == 0 || !unicast(r.address) || r.prefix == Some(0) || r.prefix.is_some_and(|p| p > 32) {
@@ -576,5 +575,60 @@ mod tests {
         let Some(Event::Bound(l)) = e else { panic!("{e:?}") };
         assert_eq!(l.dns, [Ipv4::UNSPECIFIED, Ipv4([10, 0, 2, 3]), Ipv4::UNSPECIFIED]);
         assert_eq!(l.ntp, None);
+    }
+
+    /// A server's answer as it arrives on port 68: BOOTP's fixed part, the
+    /// magic cookie, and options 53 (kind), 54 (server), 51 (lease), 1
+    /// (netmask), 3 (router) and 6 (name server).
+    fn wire(kind: u8, xid: u32, yiaddr: Ipv4, server: Ipv4, router: Ipv4) -> [u8; 300] {
+        let mut p = [0u8; 300];
+        p[..4].copy_from_slice(&[2, 1, 6, 0]);
+        p[4..8].copy_from_slice(&xid.to_be_bytes());
+        p[16..20].copy_from_slice(&yiaddr.0);
+        p[28..34].copy_from_slice(&MAC.0);
+        let [s0, s1, s2, s3] = server.0;
+        let [r0, r1, r2, r3] = router.0;
+        #[rustfmt::skip]
+        let options = [
+            99, 130, 83, 99, 53, 1, kind, 54, 4, s0, s1, s2, s3, 51, 4, 0, 0, 2, 88,
+            1, 4, 255, 255, 255, 0, 3, 4, r0, r1, r2, r3, 6, 4, r0, r1, r2, r3, 255,
+        ];
+        p[236..236 + options.len()].copy_from_slice(&options);
+        p
+    }
+
+    /// A second DHCP server on the link (any host can be one) answers the
+    /// client's broadcasts with its own acknowledgements and refusals, in
+    /// raw packets through the parser: while requesting, while bound and
+    /// renewing, and while rebinding the lease it got from the real one.
+    /// It never takes the lease over (its router and name server would
+    /// carry all traffic) nor makes the client drop it with a NAK. Before,
+    /// any server's ACK or NAK with the right transaction was taken.
+    #[test]
+    fn a_second_server_on_the_link_neither_takes_over_nor_denies_the_lease() {
+        const ROGUE: Ipv4 = Ipv4([10, 0, 2, 66]);
+        let pkt = |kind: u8, xid: u32, yiaddr: Ipv4, server: Ipv4| {
+            crate::dhcp::parse(&wire(kind, xid, yiaddr, server, server)).expect("a well-formed answer")
+        };
+        let mut c = Client::new(MAC, 0);
+        let xid = c.step(0, None, 7 << 32).send.expect("a discover").xid;
+        // Both servers offer; the client takes the first offer (the real one's).
+        assert!(c.step(1, Some(&pkt(2, xid, ADDRESS, SERVER)), 0).send.is_some(), "a request for the real offer");
+        assert!(c.step(1, Some(&pkt(2, xid, Ipv4([10, 0, 2, 99]), ROGUE)), 0).send.is_none(), "a second offer while requesting");
+        // The rogue acknowledges the request first, then refuses it.
+        assert_eq!(c.step(2, Some(&pkt(5, xid, ADDRESS, ROGUE)), 0).event, None, "the rogue's ACK bound the client");
+        assert_eq!(c.step(2, Some(&pkt(6, xid, Ipv4::UNSPECIFIED, ROGUE)), 0).event, None, "the rogue's NAK sent it back");
+        assert!(matches!(c.step(3, Some(&pkt(5, xid, ADDRESS, SERVER)), 0).event, Some(Event::Bound(l)) if l.router == Some(SERVER)));
+        let held = *c.lease().unwrap();
+        // Renewing (unicast to its server): the rogue's NAKs and ACKs change nothing.
+        let xid = c.step(held.renew_at, None, 9 << 32).send.unwrap().xid;
+        for _ in 0..10 {
+            assert_eq!(c.step(held.renew_at + 1, Some(&pkt(6, xid, Ipv4::UNSPECIFIED, ROGUE)), 0).event, None, "NAK while renewing");
+            assert_eq!(c.step(held.renew_at + 1, Some(&pkt(5, xid, ADDRESS, ROGUE)), 0).event, None, "ACK while renewing");
+        }
+        assert_eq!(c.lease(), Some(&held));
+        assert!(
+            matches!(c.step(held.renew_at + 2, Some(&pkt(5, xid, ADDRESS, SERVER)), 0).event, Some(Event::Renewed(l)) if l.router == Some(SERVER))
+        );
     }
 }

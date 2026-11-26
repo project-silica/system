@@ -1099,6 +1099,45 @@ fn time_wait_is_restarted_only_by_the_peers_own_fin_and_not_for_ever() {
     assert!(net.now <= entered + 241 * SECOND, "TIME-WAIT lasted {} s", (net.now - entered) / SECOND);
 }
 
+/// Blind resets (and SYNs) in TIME-WAIT, from anyone who knows the ports:
+/// spread over the sequence space, a thousand in ten seconds. None ends it
+/// early or makes it last longer, and the answers they draw are the
+/// challenge rate's, not one each. Only the peer's exact reset, at the
+/// byte it is owed, ends it (as Linux's default; RFC 5961 makes a blind
+/// one a one-in-a-window guess).
+#[test]
+fn blind_resets_and_syns_in_time_wait_neither_end_it_nor_draw_answers_each() {
+    let mut net = in_time_wait();
+    let (entered, rcv_nxt) = (net.now, net.log.iter().rev().find(|l| l.0).unwrap().1.ack);
+    let mut answers = 0;
+    let mut x: u32 = 0x2545_F491;
+    for _ in 0..1000 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let seq = if x == rcv_nxt { x.wrapping_add(1) } else { x };
+        forge(&mut net, seq, x.rotate_left(7), if x & 1 == 0 { RST } else { RST | ACK }, b"");
+        answers += net.log.len();
+        forge(&mut net, seq.wrapping_add(9), 0, SYN, b"");
+        answers += net.log.len();
+        assert_eq!(net.a.state(), State::TimeWait, "a blind reset or SYN ended TIME-WAIT");
+        net.now += 10 * MS;
+        net.a.on_time(net.now);
+    }
+    assert!(answers <= 25, "{answers} answers to 2,000 blind segments in ten seconds");
+    // The wait ends when it would have.
+    while net.a.state() == State::TimeWait && net.now < entered + 120 * SECOND {
+        net.now += SECOND;
+        net.a.on_time(net.now);
+    }
+    assert!(net.a.is_closed() && net.now <= entered + 61 * SECOND, "TIME-WAIT ended {} s after it began", (net.now - entered) / SECOND);
+    // The peer's own reset, exactly where it is owed, ends it at once.
+    let mut net = in_time_wait();
+    forge(&mut net, rcv_nxt, 0, RST, b"");
+    assert!(net.a.is_closed(), "the peer's exact reset did not end TIME-WAIT");
+    assert_eq!(net.a.error(), None, "ending TIME-WAIT loses nothing");
+}
+
 /// A connection its program has let go of, closed on this side, whose
 /// peer neither closes nor sends: ended a minute after it last heard from
 /// the peer. One its program still holds is a half-close and waits on.
