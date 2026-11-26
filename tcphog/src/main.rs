@@ -12,6 +12,9 @@
 //!   larger than all of it. Each must be refused as `bad_memory`, and the
 //!   stack must still answer (one that checked the end with an addition
 //!   that overflowed aborted, taking every connection on the machine).
+//! - It listens on ports its capability does not carry (it is given
+//!   `connect` alone): the remote service's, the web server's and one
+//!   nobody holds. Each must be refused as `not_granted`.
 //!
 //! Says `tcphog: PASS` and exits 0, or says what went wrong and exits 1.
 #![no_std]
@@ -65,6 +68,16 @@ fn run() -> Result<(), silica_rt::alloc::string::String> {
     let note = Object::new(ObjectType::Notification, 0).map_err(|e| format!("no notification: {e:?}"))?;
     let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
     stack.add_memory(lend(memory.frame(), rw, 0).ok_or("no slot")?).map_err(|e| format!("add_memory: {e:?}"))?;
+    // Ports it was not given: the remote service's, the web server's and
+    // one nobody listens on. Before, any holder took any port first come,
+    // first served (the remote service's, while it started again).
+    for (port, whose) in [(22, "the remote service's"), (80, "the web server's"), (8080, "nobody's")] {
+        let ready = lend(note.cap(), Rights::WRITE, 2).ok_or("no slot")?;
+        match stack.listen(port, 1, ready) {
+            Err(CallError::Error(Error::NotGranted)) => {}
+            r => return Err(format!("listening on port {port}, {whose}, with a capability that carries no port: {r:?}, not not_granted")),
+        }
+    }
     let connect = |stack: &mut proto::Client<Channel, Handle>, offset: u64, bits: u8| {
         let wake = lend(note.cap(), Rights::WRITE, 1).ok_or(CallError::Error(Error::NoRoom))?;
         stack.connect(NOBODY, offset, bits, wake).map(|r| r.connection)

@@ -135,9 +135,26 @@ pub mod scope {
     /// `open` returns, not this).
     pub const PARTITIONS_OPEN: u64 = 1 << 1;
 
+    /// `silica.net.Tcp`: `connect`, to any address and port.
+    pub const TCP_CONNECT: u64 = 1 << 0;
+    /// `silica.net.Tcp`: `listen` on one port, the port itself in these 16
+    /// bits (`listen=<port>` in a declaration; 0: none). A port is the
+    /// owner's to give, never the first claimant's: no holder listens on a
+    /// port its capability does not carry.
+    const TCP_LISTEN_SHIFT: u32 = 1;
+
+    /// The port `badge`'s `silica.net.Tcp` capability may listen on.
+    pub const fn tcp_listen(badge: u64) -> Option<u16> {
+        match (of(badge) >> TCP_LISTEN_SHIFT) as u16 {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
     /// The scopes protocol `protocol` defines, by the names declarations
     /// use; `None` for a protocol without scopes (a capability to it
-    /// allows all of it).
+    /// allows all of it). `silica.net.Tcp` also takes `listen=<port>`
+    /// ([`parse`]).
     pub fn names(protocol: &str) -> Option<&'static [(&'static str, u64)]> {
         Some(match protocol {
             "silica.system.Manager" => &[
@@ -157,19 +174,53 @@ pub mod scope {
                 ("control", DEVICE_CONTROL),
             ],
             "silica.block.Partitions" => &[("list", PARTITIONS_LIST), ("open", PARTITIONS_OPEN)],
+            "silica.net.Tcp" => &[("connect", TCP_CONNECT)],
             _ => return None,
         })
     }
 
     /// The bits of `spec`, a `+`-separated list of scope names of
-    /// `protocol`, or the first name it does not define.
+    /// `protocol`, or the first name it does not define (for
+    /// `silica.net.Tcp`, also a `listen=<port>` that is not one port from 1
+    /// to 65535, or a second one).
     pub fn parse<'a>(protocol: &str, spec: &'a str) -> Result<u64, &'a str> {
         let known = names(protocol).unwrap_or(&[]);
         let mut bits = 0;
         for name in spec.split('+') {
+            if protocol == "silica.net.Tcp"
+                && let Some(port) = name.strip_prefix("listen=")
+            {
+                let port = port.parse::<u16>().ok().filter(|p| *p != 0).ok_or(name)?;
+                if tcp_listen(bits << SHIFT).is_some() {
+                    return Err(name);
+                }
+                bits |= (port as u64) << TCP_LISTEN_SHIFT;
+                continue;
+            }
             bits |= known.iter().find(|(n, _)| *n == name).ok_or(name)?.1;
         }
         Ok(bits)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_tcp_capability_carries_one_port_and_connect_only_when_given() {
+            let b = |spec| parse("silica.net.Tcp", spec).map(|s| s << SHIFT);
+            assert_eq!(b("listen=22").map(tcp_listen), Ok(Some(22)));
+            assert_eq!(b("listen=65535+connect").map(tcp_listen), Ok(Some(65535)));
+            assert!(has(b("connect+listen=80").unwrap(), TCP_CONNECT));
+            assert!(!has(b("listen=80").unwrap(), TCP_CONNECT));
+            assert_eq!(b("connect").map(tcp_listen), Ok(None));
+            // Not a port, or a second one: refused by name.
+            for bad in ["listen=0", "listen=65536", "listen=", "listen=x", "listen=22+listen=80", "listen"] {
+                assert!(parse("silica.net.Tcp", bad).is_err(), "{bad}");
+            }
+            // The other protocols take no port.
+            assert!(parse("silica.system.Manager", "listen=22").is_err());
+        }
     }
 }
 

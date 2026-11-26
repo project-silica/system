@@ -45,6 +45,7 @@ use silica_inet::Ipv4;
 use silica_inet::tcp::{ACK, Header, Options, RST, SYN, Segment};
 use silica_inet::tcp_conn::{Buffers, Connection, Endpoints, Error as Failure, State};
 use silica_protocols::net::tcp::{self as proto, Endpoint, Error, Reason};
+use silica_protocols::scope;
 use silica_rt::alloc::collections::BTreeMap;
 use silica_rt::alloc::vec;
 use silica_rt::alloc::vec::Vec;
@@ -797,6 +798,12 @@ impl Tcp {
         if port == 0 || backlog == 0 {
             return Err(Error::BadArgument);
         }
+        // The port is the one the caller's capability carries, never one it
+        // claims first (before: any holder could take any port, the remote
+        // service's included, while that service started again).
+        if scope::tcp_listen(badge) != Some(port) {
+            return Err(Error::NotGranted);
+        }
         if self.listeners.iter().any(|l| l.port == port) {
             return Err(Error::InUse);
         }
@@ -837,6 +844,9 @@ impl Tcp {
         bits: u8,
         wake: Handle,
     ) -> Result<proto::ConnectReply<Handle>, Error> {
+        if !scope::has(badge, scope::TCP_CONNECT) {
+            return Err(Error::NotGranted);
+        }
         let local = local.ok_or(Error::NoAddress)?;
         if peer.port == 0 || peer.address == 0 {
             return Err(Error::BadArgument);

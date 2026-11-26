@@ -9,7 +9,7 @@ publish.workspace = true
 # How the service manager runs it (init documents the fields): a check, for
 # now. A server the owner turns on is owed (M4: remote management).
 [package.metadata.silica.service]
-needs = ["silica.net.Tcp"]
+needs = ["silica.net.Tcp:listen=80"]
 memory = 24
 start = "check:http"
 
