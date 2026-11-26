@@ -45,6 +45,53 @@ pub fn parse(p: &[u8]) -> Result<Message<'_>, Malformed> {
     Ok(Message { kind: p[0], code: p[1], rest: [p[4], p[5], p[6], p[7]], data: &p[HEADER..] })
 }
 
+/// "Fragmentation needed and don't fragment set" (type 3, code 4).
+pub const FRAGMENTATION_NEEDED: u8 = 4;
+
+/// What a "fragmentation needed" message says (RFC 1191): the most the
+/// next hop carries (bytes) and the TCP segment it quotes, as its sender
+/// sent it: source and destination address, ports, sequence number. `None`
+/// for any other message, or one that quotes no TCP segment whole enough.
+/// A router that gives no size (an older one, 0) is taken to carry half the
+/// packet it quotes.
+pub fn too_big(m: &Message<'_>) -> Option<(u16, QuotedTcp)> {
+    if m.kind != UNREACHABLE || m.code != FRAGMENTATION_NEEDED {
+        return None;
+    }
+    let d = m.data;
+    if d.len() < 20 || d[0] >> 4 != 4 || d[9] != 6 {
+        return None;
+    }
+    let ihl = usize::from(d[0] & 0xF) * 4;
+    let t = d.get(ihl..ihl.checked_add(8)?).filter(|_| ihl >= 20)?;
+    let quoted_len = u16::from_be_bytes([d[2], d[3]]);
+    let mtu = match u16::from_be_bytes([m.rest[2], m.rest[3]]) {
+        0 => quoted_len / 2,
+        n => n,
+    };
+    let ip = |at: usize| crate::Ipv4([d[at], d[at + 1], d[at + 2], d[at + 3]]);
+    Some((
+        mtu,
+        QuotedTcp {
+            src: ip(12),
+            dst: ip(16),
+            src_port: u16::from_be_bytes([t[0], t[1]]),
+            dst_port: u16::from_be_bytes([t[2], t[3]]),
+            seq: u32::from_be_bytes([t[4], t[5], t[6], t[7]]),
+        },
+    ))
+}
+
+/// The TCP segment an ICMP error quotes ([`too_big`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuotedTcp {
+    pub src: crate::Ipv4,
+    pub dst: crate::Ipv4,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+}
+
 /// Write an echo request or reply (`kind`) carrying `data`; returns its
 /// length.
 pub fn echo(out: &mut [u8], kind: u8, id: u16, seq: u16, data: &[u8]) -> Option<usize> {
@@ -75,5 +122,34 @@ mod tests {
         assert_eq!(parse(&b[..n]).unwrap_err(), Malformed::BadChecksum);
         assert_eq!(parse(&b[..7]).unwrap_err(), Malformed::Truncated);
         assert!(echo(&mut b[..10], ECHO_REPLY, 0, 0, &[0; 3]).is_none());
+    }
+
+    /// A router's "fragmentation needed": its size and the quoted segment's
+    /// addresses, ports and sequence number; nothing from another message,
+    /// a quote too short, or one of another protocol.
+    #[test]
+    fn a_router_s_word_on_a_packet_too_large_is_read() {
+        let mut quote = [0u8; 28];
+        quote[0] = 0x45;
+        quote[2..4].copy_from_slice(&1500u16.to_be_bytes());
+        quote[9] = 6;
+        quote[12..16].copy_from_slice(&[10, 0, 2, 15]);
+        quote[16..20].copy_from_slice(&[10, 0, 2, 2]);
+        quote[20..22].copy_from_slice(&40000u16.to_be_bytes());
+        quote[22..24].copy_from_slice(&80u16.to_be_bytes());
+        quote[24..28].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        let m = Message { kind: UNREACHABLE, code: FRAGMENTATION_NEEDED, rest: [0, 0, 0x05, 0x78], data: &quote };
+        let (mtu, q) = too_big(&m).unwrap();
+        assert_eq!(mtu, 1400);
+        assert_eq!(
+            (q.src, q.dst, q.src_port, q.dst_port, q.seq),
+            (crate::Ipv4([10, 0, 2, 15]), crate::Ipv4([10, 0, 2, 2]), 40000, 80, 0x1234_5678)
+        );
+        assert_eq!(too_big(&Message { rest: [0; 4], ..m }).map(|(mtu, _)| mtu), Some(750), "no size given: half the quoted packet");
+        assert!(too_big(&Message { code: 1, ..m }).is_none());
+        assert!(too_big(&Message { data: &quote[..27], ..m }).is_none());
+        let mut udp = quote;
+        udp[9] = 17;
+        assert!(too_big(&Message { data: &udp, ..m }).is_none());
     }
 }

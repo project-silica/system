@@ -1151,6 +1151,15 @@ impl Stack {
                     self.probe = None;
                 }
             }
+            icmp::UNREACHABLE => {
+                // A router says a segment was too large for the path: the
+                // connection it quotes cuts smaller, if it is ours and the
+                // segment is one in flight (`Connection::path_mtu`).
+                let (Some((mtu, q)), Some(l), Some(t)) = (icmp::too_big(m), self.lease, self.tcp.as_mut()) else { return };
+                if q.src == l.address {
+                    t.path_mtu(q.src, q.src_port, q.dst, q.dst_port, mtu, q.seq);
+                }
+            }
             _ => {}
         }
     }

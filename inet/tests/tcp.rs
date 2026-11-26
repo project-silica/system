@@ -1290,3 +1290,86 @@ fn a_forged_timestamp_echo_measures_nothing() {
     forge_ts(&mut net, b_ack, end, ACK, b"", (b_val.wrapping_add(500), val.wrapping_add(500)));
     assert_eq!(net.a.srtt(), Some(before_srtt), "a forged echo changed the measured round trip");
 }
+
+/// A path that carries packets of at most `mtu` bytes: A's larger segments
+/// are dropped, and with `say` each drop's sequence number is kept for a
+/// router's "fragmentation needed" (RFC 1191), which the test hands A.
+fn narrow_path(net: &mut Net, mtu: usize, say: bool) -> std::rc::Rc<std::cell::RefCell<Vec<u32>>> {
+    let said = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let keep = said.clone();
+    // IPv4 header, TCP header and the timestamps option.
+    let most = mtu - 20 - 20 - 12;
+    net.drop = Box::new(move |_, s| {
+        let big = s.header.dst_port == 80 && s.data.len() > most;
+        if big && say {
+            keep.borrow_mut().push(s.header.seq);
+        }
+        big
+    });
+    said
+}
+
+/// Send `data` from A over a narrow path to the end: whether every byte
+/// arrived, and when.
+fn over_narrow_path(net: &mut Net, data: &[u8], said: &std::rc::Rc<std::cell::RefCell<Vec<u32>>>, limit: u64) -> Option<u64> {
+    let mut sent = 0;
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    let start = net.now;
+    while got.len() < data.len() && net.now < start + limit {
+        sent += net.a.send(&data[sent..]);
+        let n = net.b().recv(&mut buf);
+        got.extend_from_slice(&buf[..n]);
+        for seq in said.borrow_mut().drain(..) {
+            net.a.path_mtu(1400, seq);
+        }
+        if !net.step() {
+            break;
+        }
+    }
+    (got == data).then(|| net.now - start)
+}
+
+/// A path whose MTU is 1,400 bytes: a router says so for each packet too
+/// large (ICMP fragmentation needed, quoting the segment): segments are cut
+/// to fit and what was in flight goes again, at once. And on a path whose
+/// routers say nothing (their ICMP filtered: a black hole), full-size
+/// segments that go unanswered twice in a row are tried smaller (RFC 4821).
+/// Before, every segment went at the full size the peer's MSS allowed with
+/// "don't fragment" set, nothing heard a router, and a connection on such a
+/// path sent its small segments and hung on its large ones until it gave up.
+#[test]
+fn a_narrow_path_is_found_whether_its_routers_say_so_or_not() {
+    let data = pattern(64 << 10);
+    for say in [true, false] {
+        let mut net = Net::new((64 << 10, 64 << 10), (64 << 10, 64 << 10));
+        net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+        let said = narrow_path(&mut net, 1400, say);
+        let took = over_narrow_path(&mut net, &data, &said, 120 * SECOND);
+        let how = if say { "whose routers say so" } else { "whose routers say nothing" };
+        let took = took.unwrap_or_else(|| panic!("64 KiB over a 1,400-byte path {how} did not arrive"));
+        assert!(net.a.mss() <= 1400 - 52, "segments still larger than the path carries");
+        if say {
+            assert!(took < SECOND, "the router's word took {} ms to act on", took / MS);
+        }
+    }
+}
+
+/// A router's word is believed only for a segment in flight (RFC 5927): a
+/// blind sender's message quoting any other sequence number changes
+/// nothing, and no message makes segments smaller than any path carries.
+#[test]
+fn only_a_message_quoting_a_segment_in_flight_shrinks_segments() {
+    let mut net = Net::new((64 << 10, 64 << 10), (64 << 10, 64 << 10));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    let before = net.a.mss();
+    net.a.send(&pattern(8000));
+    net.flush();
+    let una = net.a.received_to(); // B's side: not a sequence of A's
+    assert!(!net.a.path_mtu(1000, una.wrapping_add(12345)), "a message quoting nothing in flight was believed");
+    assert!(!net.a.path_mtu(1000, net.a.sent_to()), "the next byte to send is not in flight");
+    assert_eq!(net.a.mss(), before);
+    let in_flight = net.log.iter().find(|l| l.0 && l.3 > 0).map(|l| l.1.seq).unwrap();
+    assert!(net.a.path_mtu(100, in_flight), "a message quoting a segment in flight");
+    assert_eq!(net.a.mss(), 576 - 52, "no path is taken to carry less than 576 bytes");
+}

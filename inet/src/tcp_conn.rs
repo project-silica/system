@@ -34,6 +34,9 @@ const RTO_INITIAL: u64 = SECOND;
 /// Its floor and ceiling.
 const RTO_MIN: u64 = 200 * MS;
 const RTO_MAX: u64 = 60 * SECOND;
+/// The smallest packet a path is taken to carry (RFC 1191: 576 bytes, what
+/// every IPv4 host takes whole); a router's word for less is not believed.
+pub const MTU_FLOOR: u32 = 576;
 /// How long PAWS keeps the newest timestamp it saw (RFC 7323 5.5: less
 /// than the 24.8 days a 1 kHz clock takes to run half its range).
 const PAWS_IDLE: u64 = 24 * 24 * 3600 * SECOND;
@@ -676,6 +679,40 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.mss
     }
 
+    /// A router says the path to the peer carries at most `mtu` bytes a
+    /// packet (ICMP fragmentation needed, RFC 1191), quoting the segment
+    /// that did not fit, which began at `seq`. Believed only if `seq` is in
+    /// flight (RFC 5927 5.1: a blind sender does not know it); then segments
+    /// are cut to fit, and what is in flight goes again in pieces that do:
+    /// a lost segment, not congestion. A size below [`MTU_FLOOR`] is not
+    /// taken. Returns whether the segment size went down.
+    pub fn path_mtu(&mut self, mtu: u16, seq: u32) -> bool {
+        if !matches!(self.state, State::Established | State::CloseWait | State::FinWait1 | State::Closing | State::LastAck)
+            || before(seq, self.snd_una)
+            || !before(seq, self.snd_max)
+        {
+            return false;
+        }
+        let mss = self.mss_for(u32::from(mtu).max(MTU_FLOOR));
+        if mss >= self.mss {
+            return false;
+        }
+        self.mss = mss;
+        self.cwnd = self.cwnd.max(self.mss);
+        for k in 0..self.segs_len {
+            if self.seg(k).flags & SACKED == 0 {
+                self.seg_mut(k).flags |= LOST;
+            }
+        }
+        true
+    }
+
+    /// The segment data a packet of `mtu` bytes carries: IPv4 and TCP
+    /// headers and the timestamps option taken off.
+    fn mss_for(&self, mtu: u32) -> u32 {
+        mtu - 40 - if self.timestamps { 12 } else { 0 }
+    }
+
     /// Take what fits of `data` to send; returns how much it took.
     pub fn send(&mut self, data: &[u8]) -> usize {
         if self.fin_queued || !self.can_send_data() {
@@ -778,6 +815,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
         self.retries += 1;
         let flight = self.snd_max.wrapping_sub(self.snd_una);
+        // Full-size segments unanswered twice in a row on a path that says
+        // nothing (its routers' ICMP filtered): try smaller ones (RFC 4821
+        // section 7.7's black hole), down to what any path carries.
+        if self.retries >= 2 && flight > self.mss && self.mss > self.mss_for(MTU_FLOOR) {
+            self.mss = (self.mss / 2).max(self.mss_for(MTU_FLOOR));
+        }
         if flight == 0 {
             // The persist timer: the peer's window is shut and nothing is
             // in flight; the next poll probes it.
@@ -1039,9 +1082,17 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     /// Send segment `k` of the scoreboard again, as it went the first time.
     fn resend(&mut self, now: u64, out: &mut [u8], k: usize) -> Option<usize> {
         let start = self.seg_start(k);
+        // Larger than segments are now (the path said so): cut, the rest
+        // left as its own record, lost too.
+        if self.seg(k).end.wrapping_sub(start) > self.mss {
+            self.split(k, start.wrapping_add(self.mss));
+        }
         let seg = *self.seg(k);
         let fin = self.fin_sent.is_some() && seg.end == self.fin_seq().wrapping_add(1);
-        let n = seg.end.wrapping_sub(start) - fin as u32;
+        // A record that could not be split (the scoreboard is full) goes a
+        // piece at a time: the peer acknowledges inside it.
+        let n = (seg.end.wrapping_sub(start) - fin as u32).min(self.mss);
+        let fin = fin && n == seg.end.wrapping_sub(start) - 1;
         let offset = start.wrapping_sub(self.send_base()) as usize;
         let mut flags = ACK;
         if fin {
@@ -1078,6 +1129,20 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     /// Where segment `k` of the scoreboard starts.
     fn seg_start(&self, k: usize) -> u32 {
         if k == 0 { self.segs_start } else { self.seg(k - 1).end }
+    }
+
+    /// Split scoreboard record `k` at `at` into two records alike (when
+    /// there is room for one more).
+    fn split(&mut self, k: usize, at: u32) {
+        if self.segs_len == SEGS {
+            return;
+        }
+        for j in (k + 1..=self.segs_len).rev() {
+            let s = *self.seg(j - 1);
+            *self.seg_mut(j) = s;
+        }
+        self.segs_len += 1;
+        self.seg_mut(k).end = at;
     }
 
     /// Put a segment just sent on the scoreboard.
