@@ -97,6 +97,11 @@ fuzz_target!(|data: &[u8]| {
     // The device manager: the first function as a hot-plug port, and the
     // second arriving in its slot.
     let Some(mut port) = Port::of(1, Config::new(port_space.mmio())) else { return };
+    // Bus numbers the bridge says are its own are taken only when they can
+    // be: behind its bus, in order, within the segment.
+    if devmgr::hotplug::buses_valid(0, port.secondary, port.subordinate, 255, &[(1, 1)]) {
+        assert!(port.secondary > 0 && port.secondary <= port.subordinate && port.secondary != 1, "bus numbers no port can own were taken");
+    }
     port.arm();
     let _ = port.changed();
     let arrived = Config::new(device_space.mmio());

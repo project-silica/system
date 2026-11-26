@@ -17,7 +17,7 @@ restart = "always"
 
 [lib]
 path = "src/lib.rs"
-test = false
+test = true
 bench = false
 
 [[bin]]

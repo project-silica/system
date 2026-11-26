@@ -148,6 +148,11 @@ struct Manager {
     parent: Parent,
     functions: Vec<Function>,
     running: Vec<Running<'static>>,
+    /// Interrupt lines given back (first, count): a device that left gives
+    /// its back, and the next device is given them before new ones (before,
+    /// every arrival took new lines and none came back, so a slot worked
+    /// for as many insertions as the machine had lines).
+    free_lines: Vec<(u32, u32)>,
     /// The next interrupt line to hand out.
     next_line: u32,
     next_id: u64,
@@ -162,7 +167,22 @@ struct Manager {
     cmdline: &'static [u8],
     /// Hot-plug capable ports, with the configuration space base (ECAM)
     /// and segment of the buses behind them.
-    ports: Vec<(hotplug::Port, u64, u16)>,
+    /// (Each with the segment's last bus.)
+    ports: Vec<(hotplug::Port, u64, u16, u8)>,
+    /// Every bridge found: its segment and the buses behind it, to judge
+    /// a hot-plug port's own (`hotplug::buses_valid`).
+    bridges: Vec<(u32, u8, u8)>,
+    /// Slots a device arrived in, waiting for their link (its deadline)
+    /// or for the 100 ms a device has after its link comes up: the port,
+    /// when to give up or go on, and whether the link is up. The device
+    /// manager serves meanwhile; before, it spun here for up to 1.1 s.
+    settling: Vec<(usize, u64, bool)>,
+    /// Devices that arrived in and departed from slots, for the log.
+    arrivals: u64,
+    departures: u64,
+    /// The longest the device manager went without listening, in
+    /// nanoseconds: what a client or a fault report may have waited.
+    longest_turn: u64,
     /// The archive's drivers, by what they drive.
     table: Vec<(Match, &'static str)>,
     /// Every configuration space mapped, by function identity.
@@ -483,29 +503,75 @@ impl Manager {
     }
 
     /// A slot's interrupt: devices that arrived get addresses and drivers,
-    /// devices taken out lose theirs.
+    /// devices taken out lose theirs, a device swapped for another between
+    /// two looks is both.
     fn slots_changed(&mut self) {
         for k in 0..self.ports.len() {
             match self.ports[k].0.changed() {
                 Some(hotplug::Change::Arrived) => self.arrived(k),
-                Some(hotplug::Change::Leaving | hotplug::Change::Left) => self.left(k),
+                Some(hotplug::Change::Leaving) => self.left(k, false),
+                Some(hotplug::Change::Left) => self.left(k, true),
+                Some(hotplug::Change::Replaced) => {
+                    println!("devmgr: {}: its device was taken out and one put in since it was last asked", PciAddress(self.ports[k].0.id));
+                    self.forget_slot(k);
+                    self.arrived(k);
+                }
                 None => {}
             }
         }
     }
 
+    /// A device arrived in slot `k`: its power on, and then a wait for its
+    /// link (at most a second) and the 100 ms PCI Express gives a device
+    /// after its link comes up before it must answer configuration requests.
+    /// The wait is the main loop's (`slots_due`): the device manager serves
+    /// its clients and hears its drivers' faults meanwhile.
     fn arrived(&mut self, k: usize) {
-        if !self.ports[k].0.power(true) {
-            println!("devmgr: {}: a device arrived, but its link never came up", PciAddress(self.ports[k].0.id));
-            return;
+        self.settling.retain(|s| s.0 != k);
+        self.ports[k].0.power(true);
+        self.arrivals += 1;
+        self.settling.push((k, silica_rt::clock().now() + 1_000_000_000, false));
+    }
+
+    /// Slots waiting for their link or their 100 ms: go on with those that
+    /// are ready; returns when to look again.
+    fn slots_due(&mut self) -> Option<u64> {
+        let now = silica_rt::clock().now();
+        let mut ready = Vec::new();
+        let mut next: Option<u64> = None;
+        let ports = &self.ports;
+        self.settling.retain_mut(|(k, until, linked)| {
+            if !*linked {
+                if ports[*k].0.link_up() {
+                    *linked = true;
+                    *until = now + 100_000_000;
+                } else if now > *until {
+                    println!("devmgr: {}: a device arrived, but its link never came up", PciAddress(ports[*k].0.id));
+                    return false;
+                } else {
+                    // The link's own interrupt may say it first; look again
+                    // soon anyway (a port need not send one).
+                    next = Some(next.map_or(now + 5_000_000, |n| n.min(now + 5_000_000)));
+                    return true;
+                }
+            }
+            if now >= *until {
+                ready.push(*k);
+                return false;
+            }
+            next = Some(next.map_or(*until, |n| n.min(*until)));
+            true
+        });
+        for k in ready {
+            self.found(k);
         }
-        // PCI Express gives a device 100 ms after its link comes up
-        // before it must answer configuration requests.
-        let clock = silica_rt::clock();
-        let until = clock.now() + 100_000_000;
-        while clock.now() < until {
-            sys::yield_now();
-        }
+        next
+    }
+
+    /// The device in slot `k` answers now: give each of its functions
+    /// addresses and a driver.
+    fn found(&mut self, k: usize) {
+        let arrival = self.arrivals;
         let (bus, ecam, segment) = (self.ports[k].0.secondary, self.ports[k].1, self.ports[k].2);
         for dev in 0..32u32 {
             let mut functions = 1;
@@ -519,6 +585,13 @@ impl Manager {
                 }
                 if function == 1 && config.multifunction() {
                     functions = 8;
+                }
+                // A function still known with a driver running (a slot
+                // whose departure was never seen): the driver ends before
+                // its record is the new device's (before, the record was
+                // overwritten under the running driver).
+                if let Some(index) = self.functions.iter().position(|g| g.id == id) {
+                    self.forget_function(index);
                 }
                 if let Err((bar, bits, memory, prefetchable)) = self.ports[k].0.place(&config) {
                     println!(
@@ -555,24 +628,83 @@ impl Manager {
                 {
                     println!("ERROR: devmgr: {} is not driven: {e}", PciAddress(id));
                 }
+                let lines = self.functions[index].lines;
+                println!(
+                    "devmgr: {}: arrival {arrival} in the slot, {}, {} lines free, longest turn {} ms",
+                    PciAddress(self.ports[k].0.id),
+                    match lines {
+                        Some((first, n)) => silica_rt::alloc::format!("interrupt lines {first} to {}", first + n - 1),
+                        None => silica_rt::alloc::string::String::from("no interrupt lines"),
+                    },
+                    self.lines_free(),
+                    self.longest_turn / 1_000_000
+                );
             }
         }
     }
 
-    fn left(&mut self, k: usize) {
-        let (first, last) = (self.ports[k].0.secondary, self.ports[k].0.subordinate);
-        let segment = self.ports[k].2;
-        while let Some(at) = self.running.iter().position(|r| PciAddress(self.functions[r.function].id).on_buses(segment, first..=last)) {
+    /// How many interrupt lines the device manager can still give.
+    fn lines_free(&self) -> u64 {
+        (sys::IRQ_LINES - self.next_line as u64) + self.free_lines.iter().map(|(_, n)| *n as u64).sum::<u64>()
+    }
+
+    /// Function `index` is gone (or about to be found again): its driver
+    /// ends, and what it was given comes back: its interrupt lines (for the
+    /// next device) and its registers' frames (a device laid out otherwise
+    /// may come next).
+    fn forget_function(&mut self, index: usize) {
+        while let Some(at) = self.running.iter().position(|r| r.function == index) {
             let r = self.running.remove(at);
-            let (driver, id) = (r.name, self.functions[r.function].id);
+            let (driver, id) = (r.name, self.functions[index].id);
             if !self.stop(r) {
                 println!("ERROR: devmgr: cannot take back the memory of {driver}");
             }
             println!("devmgr: {} was taken out; {driver} ended", PciAddress(id));
         }
+        let f = &mut self.functions[index];
         // Nothing is started again for a device that is gone.
-        for f in self.functions.iter_mut().filter(|f| PciAddress(f.id).on_buses(segment, first..=last)) {
-            f.waiting = None;
+        f.waiting = None;
+        if let Some(lines) = f.lines.take() {
+            self.free_lines.push(lines);
+        }
+        let bars = f.bars;
+        for bar in bars.iter().flatten() {
+            // SAFETY: its driver has ended (above), and the device manager
+            // maps no device's registers but the ports' own.
+            #[allow(unsafe_code)]
+            unsafe {
+                self.memory.release(bar.base, bar.bits)
+            };
+        }
+        self.functions[index].bars = [None; 6];
+    }
+
+    /// Every function behind slot `k` is gone.
+    fn forget_slot(&mut self, k: usize) {
+        self.settling.retain(|s| s.0 != k);
+        let (first, last) = (self.ports[k].0.secondary, self.ports[k].0.subordinate);
+        let segment = self.ports[k].2;
+        for index in 0..self.functions.len() {
+            if PciAddress(self.functions[index].id).on_buses(segment, first..=last) {
+                self.forget_function(index);
+            }
+        }
+        self.ports[k].0.empty();
+    }
+
+    /// The device in slot `k` is leaving (someone pressed its button: it is
+    /// still there, and is let go of and its power switched off) or `gone`.
+    fn left(&mut self, k: usize, gone: bool) {
+        self.forget_slot(k);
+        if gone {
+            self.departures += 1;
+            println!(
+                "devmgr: {}: departure {} from the slot, {} lines free, longest turn {} ms",
+                PciAddress(self.ports[k].0.id),
+                self.departures,
+                self.lines_free(),
+                self.longest_turn / 1_000_000
+            );
         }
         self.ports[k].0.power(false);
     }
@@ -625,11 +757,13 @@ impl Manager {
                 if config.header() == 1 {
                     // A bridge: the firmware numbered the bus behind it.
                     let behind = config.secondary_bus();
+                    let r = config.registers();
+                    self.bridges.push((id, r.read8(0x19), r.read8(0x1A)));
                     if behind > bus && behind <= last_bus && depth < 16 {
                         self.scan(ecam, segment, behind, last_bus, depth + 1);
                     }
                     if let Some(port) = hotplug::Port::of(id, config) {
-                        self.ports.push((port, ecam, segment));
+                        self.ports.push((port, ecam, segment, last_bus));
                     }
                 }
                 self.functions.push(function_of(id, config, config_frame));
@@ -653,6 +787,26 @@ impl Manager {
             // The table gives the address of bus 0 even when the segment starts later.
             self.scan(base, segment, first, last, 0);
         }
+        // A port is trusted with the buses behind it only when they are its
+        // own (`hotplug::buses_valid`): a device found on another's would
+        // be given addresses out of this port's windows.
+        let bridges = core::mem::take(&mut self.bridges);
+        self.ports.retain(|(p, _, segment, last)| {
+            let bus = (p.id >> 8) as u8;
+            let others: Vec<(u8, u8)> =
+                bridges.iter().filter(|(b, _, _)| *b >> 16 == *segment as u32 && *b != p.id).map(|(_, sec, sub)| (*sec, *sub)).collect();
+            let ok = hotplug::buses_valid(bus, p.secondary, p.subordinate, *last, &others);
+            if !ok {
+                println!(
+                    "devmgr: {} says the buses behind it are {} to {}, which are not its own; it takes no devices",
+                    PciAddress(p.id),
+                    p.secondary,
+                    p.subordinate
+                );
+            }
+            ok
+        });
+        self.bridges = bridges;
         Ok(())
     }
 
@@ -663,14 +817,18 @@ impl Manager {
         let (id, config) = (f.id, f.config);
         // Its interrupt lines: as many as it can raise, up to a limit; the
         // same ones every time a driver is started for it.
-        let (first_line, lines) = match f.lines {
-            Some(l) => l,
+        let (first_line, lines, reused) = match f.lines {
+            Some((first, n)) => (first, n, None),
             None => {
                 let lines = (f.vectors as u32).min(LINES_PER_DEVICE);
-                if self.next_line as u64 + lines as u64 > sys::IRQ_LINES {
-                    return Err("the machine has no interrupt lines left for it");
+                // Lines a device that left gave back come first.
+                match self.free_lines.iter().position(|&(_, n)| n >= lines) {
+                    Some(k) => (self.free_lines[k].0, lines, Some(k)),
+                    None if self.next_line as u64 + lines as u64 > sys::IRQ_LINES => {
+                        return Err("the machine has no interrupt lines left for it");
+                    }
+                    None => (self.next_line, lines, None),
                 }
-                (self.next_line, lines)
             }
         };
         // Its registers: one frame per memory BAR.
@@ -750,11 +908,22 @@ impl Manager {
             );
             "its driver could not be started"
         })?;
-        let f = &mut self.functions[index];
-        if f.lines.is_none() {
-            f.lines = Some((first_line, lines));
-            self.next_line += lines;
+        if self.functions[index].lines.is_none() {
+            match reused {
+                // What is left of a range given back stays free.
+                Some(k) => {
+                    let (first, n) = self.free_lines[k];
+                    if n == lines {
+                        self.free_lines.swap_remove(k);
+                    } else {
+                        self.free_lines[k] = (first + lines, n - lines);
+                    }
+                }
+                None => self.next_line += lines,
+            }
+            self.functions[index].lines = Some((first_line, lines));
         }
+        let f = &mut self.functions[index];
         f.starts += 1;
         f.restarts.started(silica_rt::clock().now());
         f.waiting = None;
@@ -891,12 +1060,18 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         functions: Vec::new(),
         running: Vec::new(),
         next_line: info.msi_first as u32,
+        free_lines: Vec::new(),
         next_id: 0,
         listing: Vec::new(),
         described: silica_rt::alloc::string::String::new(),
         next_client: CLIENTS,
         cmdline: &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())],
         ports: Vec::new(),
+        bridges: Vec::new(),
+        settling: Vec::new(),
+        arrivals: 0,
+        departures: 0,
+        longest_turn: 0,
         table: drivers(archive),
         configs: BTreeMap::new(),
         watchers: Vec::new(),
@@ -963,10 +1138,21 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     m.slots_changed();
     // From here on: clients' calls, drivers that end, the button and the slots.
     let mut listener = Listener::new(events);
+    // When the device manager last took something to do: how long it then
+    // went without listening is its turn (`longest_turn`).
+    let mut took = silica_rt::clock().now();
     loop {
         // Drivers whose restart is due, and when the next one is.
-        let next = m.restart_due();
+        let restart = m.restart_due();
+        let slots = m.slots_due();
+        let now = silica_rt::clock().now();
+        m.longest_turn = m.longest_turn.max(now - took);
+        let next = match (restart, slots) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let got = listener.recv_listening(happened.cap(), next.map_or(Wait::Forever, Wait::Until));
+        took = silica_rt::clock().now();
         if matches!(got, Err(sys::Error::Timeout)) {
             continue;
         }
