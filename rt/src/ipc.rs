@@ -202,6 +202,11 @@ fn dispatch(
     reply_caps: &mut CapList<Handle>,
     handle: impl FnOnce(&[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize,
 ) -> usize {
+    // The service manager asking whether this provider still takes calls:
+    // an empty answer, whatever the protocol (`crate::PROBE_LABEL`).
+    if m.info.label() == crate::PROBE_LABEL && m.info.caps() == 0 {
+        return 0;
+    }
     let mut caps = CapList::new();
     collect(buf, m.info.caps(), &mut caps);
     match unpack(buf, m, request) {
@@ -226,13 +231,16 @@ pub struct Channel {
     endpoint: Cap,
     /// The longest a call may take, in nanoseconds (0: no limit).
     limit: u64,
+    /// The need it reaches, by its index in the program's declaration: a
+    /// call past its limit is reported to the service manager.
+    need: Option<u64>,
 }
 
 impl Channel {
     /// A channel through the endpoint capability `endpoint`, which must
     /// allow sending (and passing capabilities, if the protocol does).
     pub fn new(endpoint: Cap) -> Channel {
-        Channel { endpoint, limit: 0 }
+        Channel { endpoint, limit: 0, need: None }
     }
 
     /// As [`Channel::new`], each call ending with `cancelled` if its answer
@@ -242,7 +250,17 @@ impl Channel {
     /// (a service calling a driver) this way, so a provider that hangs
     /// without ending holds it, and its own clients, for no longer.
     pub fn within(endpoint: Cap, limit_ns: u64) -> Channel {
-        Channel { endpoint, limit: limit_ns }
+        Channel { endpoint, limit: limit_ns, need: None }
+    }
+
+    /// As [`Channel::within`], to need `need` of this service's declaration
+    /// (its `index` among the `needs`): a call that passes its limit is also
+    /// reported to the service manager (`crate::UNANSWERED_LABEL`), which
+    /// asks the provider itself and starts it again if it does not answer
+    /// either. How a service calls another it depends on without a hung
+    /// provider holding it, and without the hang lasting.
+    pub fn to_need(endpoint: Cap, need: u64, limit_ns: u64) -> Channel {
+        Channel { endpoint, limit: limit_ns, need: Some(need) }
     }
 }
 
@@ -268,7 +286,14 @@ impl Transport<Handle> for Channel {
             // The endpoint, or the provider holding the call, went away.
             Error::Gone => TransportError::PeerGone,
             // Its time limit passed: the call is given up.
-            Error::Timeout => TransportError::Cancelled,
+            Error::Timeout => {
+                // Told without waiting: the service manager may be asking
+                // this very program whether it answers.
+                if let Some(need) = self.need {
+                    let _ = sys::try_send(crate::slots::PARENT, MsgInfo::new(crate::UNANSWERED_LABEL, 1), [need, 0, 0, 0]);
+                }
+                TransportError::Cancelled
+            }
             // BadCap, NoRights, WrongType: this capability does not reach a provider.
             _ => TransportError::Revoked,
         })?;

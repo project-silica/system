@@ -87,6 +87,16 @@ impl Service {
 
 impl source::Server<Handle> for Service {
     fn fill<'a>(&'a mut self, count: u32) -> Result<FillReply<'a>, Error> {
+        // For the check that a provider which hangs is started again
+        // (`entropy.hang_on=<count>` on the boot's command line, which only
+        // the owner writes): asked for exactly that many bytes, the service
+        // stops taking calls without ending, as a deadlocked one would.
+        if silica_rt::option("hang_on").and_then(|v| v.parse::<u32>().ok()) == Some(count) {
+            println!("entropy: asked for {count} bytes, which this boot's options make it stop answering at");
+            loop {
+                let _ = silica_rt::sys::thread_suspend(slots::THREAD);
+            }
+        }
         if self.mixed_at == 0 || silica_rt::clock().now() - self.mixed_at > REMIX_NS || !self.seeded() {
             self.mix_devices();
         }

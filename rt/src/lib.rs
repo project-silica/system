@@ -180,6 +180,20 @@ pub const PROCESS_MAGIC: u64 = 0x4F46_4E49_434F_5250; // "PROCINFO"
 /// is its exit status.
 pub const EXIT_LABEL: u64 = 1;
 
+/// Label of the message a program sends its parent when a time-limited call
+/// to a provider it needs went unanswered (`ipc::Channel::to_need`); word 0
+/// is the need's index in its declaration. The service manager then asks
+/// that provider itself ([`PROBE_LABEL`]) and starts it again if it does
+/// not answer either: a provider that hangs without ending is noticed only
+/// because a client waited for it, and nothing runs while nobody does.
+pub const UNANSWERED_LABEL: u64 = 2;
+
+/// Label of a call every provider's runtime answers at once, with an empty
+/// reply, from its request loop (`ipc::dispatch`), before any protocol sees
+/// it: whether the provider still takes calls. No protocol message has
+/// this label (theirs is their length, at most 4000 bytes).
+pub const PROBE_LABEL: u64 = 0xFFFF_FFFF;
+
 /// The exit status that asks the program's supervisor to start it again at
 /// once, as a fresh start and not a failure: a driver whose device can be
 /// put back to its first state only by a reset ends with it when its client

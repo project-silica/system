@@ -49,7 +49,7 @@ use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Handle, Listener};
 use silica_rt::log::directory;
 use silica_rt::mem::Object;
-use silica_rt::{EXIT_LABEL, println};
+use silica_rt::{EXIT_LABEL, PROBE_LABEL, UNANSWERED_LABEL, println};
 
 macro_rules! fail {
     ($($a:tt)*) => {{
@@ -107,6 +107,16 @@ const SECOND: u64 = 1_000_000_000;
 const CONSUMERS: u64 = 1 << 32;
 /// Service `i` runs with the program identifier `SERVICE_IDS + i`.
 const SERVICE_IDS: u64 = 1000;
+/// How long a provider has to answer the service manager's probe after a
+/// client reported it unanswered (`Manager::unanswered`): its runtime
+/// answers from its request loop, so only a provider that takes no calls
+/// at all, for longer than a driver is given (`DRIVER_CALL_LIMIT`), misses it.
+const PROBE_LIMIT: u64 = 2 * SECOND;
+/// How long after it answered a probe a provider is not asked again.
+const PROBE_QUIET: u64 = 5 * SECOND;
+/// The status `after` is given for a provider ended because it stopped
+/// answering (no program exits with it).
+const HUNG: i64 = i64::MIN + 1;
 /// How long an updated service's new program is on trial: failing within
 /// it puts the program before it back (`update`).
 const TRIAL: u64 = 10 * SECOND;
@@ -126,6 +136,8 @@ struct Running {
     starts: u64,
     /// When it failed and when it is started again (`restart=always`).
     restarts: Restarts,
+    /// When it last answered the service manager's probe (`unanswered`).
+    answered_at: u64,
     /// Stopped by the owner: not started again until asked.
     stopped: bool,
     /// The program it runs, when an `update` gave it one; `None`: the boot
@@ -410,6 +422,7 @@ impl Manager {
         let name = self.services[i].name;
         match status {
             Some(0) => println!("init: {name} ended"),
+            Some(HUNG) => println!("init: {name} was ended: it stopped answering"),
             Some(s) => println!("init: {name} ended with status {s}"),
             None => println!("init: {name} faulted"),
         }
@@ -477,6 +490,14 @@ impl Manager {
             listener.answer(&m, |request, caps, reply, reply_caps| manager::dispatch(self, request, caps, reply, reply_caps));
             return Ok(None);
         }
+        // A service whose time-limited call to a provider it needs went
+        // unanswered: ask the provider ourselves.
+        if m.badge & FAULT_BADGE == 0 && m.info.label() == UNANSWERED_LABEL
+            && let Some(i) = m.badge.checked_sub(SERVICE_IDS).map(|i| i as usize).filter(|i| *i < self.services.len())
+        {
+            self.unanswered(i, m.words[0]);
+            return Ok(None);
+        }
         match self.ended(&m) {
             Some((j, status)) if Some(j) == watch => Ok(Some((j, status))),
             Some((j, status)) => {
@@ -484,6 +505,35 @@ impl Manager {
                 Ok(None)
             }
             None => Ok(None),
+        }
+    }
+
+    /// Service `i` waited past its limit for need `need`'s provider: ask the
+    /// provider itself, once, within [`PROBE_LIMIT`] (its runtime answers
+    /// from its request loop, whatever its protocol); one that does not
+    /// answer either has hung without ending, and is ended and started
+    /// again as a failure (the restart backoff applies). A provider that
+    /// answered is not asked again for [`PROBE_QUIET`], so reports cannot
+    /// keep the service manager busy. Nothing happens without a report.
+    fn unanswered(&mut self, i: usize, need: u64) {
+        let Some(protocol) = usize::try_from(need).ok().and_then(|n| self.services[i].needs.get(n)).copied() else { return };
+        let Some(p) = self.services.iter().position(|s| s.provides == Some(protocol)) else { return };
+        let Some(endpoint) = self.endpoints[p].as_ref().map(Object::cap) else { return };
+        let now = silica_rt::clock().now();
+        if self.running[p].child.is_none() || now < self.running[p].answered_at.saturating_add(PROBE_QUIET) {
+            return;
+        }
+        match sys::call_within(endpoint, sys::MsgInfo::new(PROBE_LABEL, 0), [0; 4], PROBE_LIMIT) {
+            Ok(_) => self.running[p].answered_at = silica_rt::clock().now(),
+            Err(sys::Error::Timeout) => {
+                let (name, by) = (self.services[p].name, self.services[i].name);
+                println!("init: {name} did not answer within {} ms after {by} waited for it", PROBE_LIMIT / 1_000_000);
+                if let Some(child) = self.running[p].child.take() {
+                    self.end(p, child);
+                    self.after(p, Some(HUNG));
+                }
+            }
+            Err(_) => {}
         }
     }
 
@@ -934,6 +984,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             given: Vec::new(),
             starts: 0,
             restarts: Restarts::default(),
+            answered_at: 0,
             stopped: false,
             program: None,
             trial: None,
