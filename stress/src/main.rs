@@ -357,7 +357,8 @@ fn cache(requests: u64, watching: bool) -> i64 {
     for r in 0..requests {
         // Before each request, as a server looks at its events: was it told?
         if sys::recv(note.cap(), Wait::Poll).is_ok() {
-            cache = Vec::new();
+            cache.clear();
+            cache.shrink_to_fit();
             let _ = trim();
             let_go += 1;
         }
