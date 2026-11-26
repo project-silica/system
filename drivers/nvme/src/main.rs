@@ -32,8 +32,12 @@
 //! of its own: the device manager's identities and endpoints are one per
 //! PCI function today), namespaces with metadata or protection information,
 //! more than one I/O queue, namespaces attached or detached while the driver
-//! runs (they are seen when it is next started), the shutdown notification
-//! (`CC.SHN`) before the driver ends.
+//! runs (they are seen when it is next started).
+//!
+//! Asked to end as the machine turns off, the block service flushes the
+//! controller's cache and the driver shuts it down in order (`CC.SHN`,
+//! waiting for `CSTS.SHST` as long as the controller's RTD3E says), so it
+//! records no unsafe shutdown.
 
 #![no_std]
 #![no_main]
@@ -44,8 +48,10 @@ use silica_block::device::{Error, Info};
 use silica_block::service::{CLIENT, Completions, Device as BlockDevice, Refusal, Service, Ticket};
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
+#[cfg(feature = "harness")]
 use silica_driver::inject::{self, Fault};
 use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::oldest::Oldest;
 use silica_driver::{Device, DeviceError};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::mmio::Mmio;
@@ -72,6 +78,8 @@ const CC_EN: u32 = 1;
 const CC_ENTRY_SIZES: u32 = (6 << 16) | (4 << 20);
 const CSTS_RDY: u32 = 1;
 const CSTS_CFS: u32 = 2;
+/// How long a controller that gives no RTD3E may take to shut down.
+const SHUTDOWN_NS: u64 = 5_000_000_000;
 
 const ADMIN_CREATE_SQ: u32 = 0x01;
 const ADMIN_CREATE_CQ: u32 = 0x05;
@@ -93,6 +101,9 @@ const PRP_LIST_BYTES: usize = (MAX_TRANSFER / PAGE) as usize * 8;
 const ADMIN_TIMEOUT_NS: u64 = 5_000_000_000;
 /// How often a register is read while waiting for the controller.
 const POLL_NS: u64 = 50_000;
+/// The longest between two looks at the admin queue while a command is in
+/// progress (the interval doubles from `POLL_NS` up to this).
+const ADMIN_POLL_MAX_NS: u64 = 10_000_000;
 
 // The bits of the driver's notification: interrupt n signals 2 << n.
 const ADMIN_BIT: u64 = 2;
@@ -165,41 +176,49 @@ impl Controller {
         }
     }
 
-    /// Wait until the notification is signalled or `until` (a sleep when
-    /// nothing will signal it).
-    fn sleep(&self, until: u64) {
-        // A timeout is the expected end; anything else (an interrupt) is a wake-up.
-        let _ = sys::recv(self.listen, Wait::Until(until));
-    }
-
     /// Wait for CSTS.RDY to read `ready`, as long as CAP.TO allows.
     fn wait_ready(&self, ready: bool) -> Result<(), DeviceError> {
-        let deadline = now() + self.ready_ns;
-        loop {
+        silica_driver::settle(self.ready_ns, if ready { "CSTS.RDY to set" } else { "CSTS.RDY to clear" }, || {
             let status = self.status()?;
             if ready && status & CSTS_CFS != 0 {
                 return Err(DeviceError::Protocol("the controller reports fatal status"));
             }
-            if (status & CSTS_RDY != 0) == ready {
-                return Ok(());
-            }
-            let t = now();
-            if t >= deadline {
-                return Err(DeviceError::Timeout(if ready { "CSTS.RDY to set" } else { "CSTS.RDY to clear" }));
-            }
-            self.sleep((t + POLL_NS).min(deadline));
-        }
+            Ok((status & CSTS_RDY != 0) == ready)
+        })
     }
 
     /// Run one admin command to completion: its completion's first word.
     fn admin(&mut self, mut command: [u32; 16], what: &'static str) -> Result<u32, DeviceError> {
         self.cid = (self.cid + 1) & 0x7FFF;
         command[0] |= (self.cid as u32) << 16;
+        // An injected fault (`inject`): this command's interrupt is lost.
+        #[cfg(feature = "harness")]
+        let lose_interrupt = inject::planned() == Some(Fault::AdminMissed) && inject::due() == Some(Fault::AdminMissed);
         self.admin.push(&command);
         self.admin.ring();
-        let deadline = now() + ADMIN_TIMEOUT_NS;
+        let start = now();
+        let deadline = start + ADMIN_TIMEOUT_NS;
+        // The interrupt normally ends the wait; the queue is looked at
+        // again after a poll interval that doubles from POLL_NS, so a lost
+        // interrupt costs milliseconds, not the whole timeout, and a
+        // controller that has died is seen as soon (CSTS).
+        let mut poll = POLL_NS;
+        // A lost interrupt is lost from the moment the command is rung,
+        // whether the completion comes before the first look or after: the
+        // fault is committed here, not when (or if) the interrupt arrives.
+        #[cfg(feature = "harness")]
+        let lost = lose_interrupt && inject::pending(Fault::AdminMissed);
+        #[cfg(not(feature = "harness"))]
+        let lost = false;
+        let mut woken = !lost;
         loop {
             if let Some(c) = self.admin.pop()? {
+                if !woken {
+                    println!(
+                        "nvme: {what}: its completion came without its interrupt; found by polling after {} us",
+                        (now() - start) / 1000
+                    );
+                }
                 self.admin.release();
                 if c.cid != self.cid {
                     return Err(DeviceError::Protocol("an admin completion names a command not in progress"));
@@ -213,10 +232,14 @@ impl Controller {
             if self.status()? & CSTS_CFS != 0 {
                 return Err(DeviceError::Protocol("the controller reports fatal status"));
             }
-            if now() >= deadline {
+            let t = now();
+            if t >= deadline {
                 return Err(DeviceError::Timeout(what));
             }
-            self.sleep(deadline);
+            let until = (t + poll).min(deadline);
+            // Lost: the driver does not know it came, and waits on.
+            woken = sys::recv(self.listen, Wait::Until(until)).is_ok() && !lost;
+            poll = (poll * 2).min(ADMIN_POLL_MAX_NS);
         }
     }
 
@@ -275,12 +298,19 @@ struct Disk {
     /// The request each command identifier carries, while the device has
     /// it, and when it was started.
     tickets: Vec<Option<(Ticket, u64)>>,
+    /// The oldest of them, found without a walk.
+    oldest: Oldest,
     free: Vec<u16>,
     /// Commands pushed since the doorbell was last rung.
     unrung: bool,
     /// The bit the I/O queue's interrupt signals: `IO_BIT`, or `ADMIN_BIT`
-    /// when both queues share a vector.
+    /// when both queues share a vector (which interrupt an injected
+    /// `missed` loses).
+    #[cfg(feature = "harness")]
     io_bit: u64,
+    /// How long the controller may take to shut down (Identify Controller's
+    /// RTD3E, nanoseconds), or a few seconds when it gives none.
+    shutdown_ns: u64,
     // Kept alive for as long as the controller may use them.
     _admin: Queue,
     _interrupts: (Interrupt, Option<Interrupt>),
@@ -364,9 +394,13 @@ impl BlockDevice for Disk {
             c[11] = (request.block >> 32) as u32;
             c[12] = request.blocks - 1;
         }
-        self.tickets[cid as usize] = Some((ticket, now()));
+        let at = now();
+        self.tickets[cid as usize] = Some((ticket, at));
+        let tickets = &self.tickets;
+        self.oldest.started(cid as u32, at, tickets.len(), |s, t| tickets[s as usize].is_some_and(|(_, x)| x == t));
         // An injected fault (`silica_driver::inject`): the controller never
         // sees this command.
+        #[cfg(feature = "harness")]
         if inject::due() == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
             return Ok(());
         }
@@ -377,6 +411,7 @@ impl BlockDevice for Disk {
 
     fn kick(&mut self) {
         // An injected fault: the controller resets itself instead.
+        #[cfg(feature = "harness")]
         if inject::pending(Fault::Reset) {
             self.regs.write32(CC, self.regs.read32(CC) & !CC_EN);
             self.unrung = false;
@@ -391,6 +426,7 @@ impl BlockDevice for Disk {
     fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
         // An injected fault: this interrupt never came (what it brought
         // waits for the next look).
+        #[cfg(feature = "harness")]
         if bits & self.io_bit != 0 && inject::pending(Fault::Missed) {
             return;
         }
@@ -402,8 +438,10 @@ impl BlockDevice for Disk {
                 Err(e) => give_up(e),
             };
             taken += 1;
+            let cid = c.cid;
             // An injected fault: the controller wrote nonsense in it.
-            let cid = if inject::pending(Fault::Garbage) { u16::MAX } else { c.cid };
+            #[cfg(feature = "harness")]
+            let cid = if inject::pending(Fault::Garbage) { u16::MAX } else { cid };
             let Some((ticket, _)) = self.tickets.get_mut(cid as usize).and_then(Option::take) else {
                 give_up(DeviceError::Protocol("a completion names a command not in progress"));
             };
@@ -423,8 +461,9 @@ impl BlockDevice for Disk {
     }
 
     fn deadline(&self) -> Option<u64> {
-        let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { IO_TIMEOUT_NS };
-        self.tickets.iter().flatten().map(|(_, t)| t + limit).min()
+        let limit = silica_driver::io_limit(IO_TIMEOUT_NS);
+        let tickets = &self.tickets;
+        self.oldest.oldest(|s, t| tickets[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + limit)
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -432,6 +471,20 @@ impl BlockDevice for Disk {
         self.signals(0, done);
         if self.deadline().is_some_and(|d| d <= now()) {
             give_up(DeviceError::Timeout("an I/O command the controller never completed"));
+        }
+    }
+
+    fn shutdown(&mut self) {
+        // A normal shutdown (NVMe base specification 2.0, 3.6.2): CC.SHN
+        // 01b, then CSTS.SHST reads 10b once the controller has made what
+        // it holds durable. A controller turned off without it records an
+        // unsafe shutdown and may lose what its cache held.
+        let cc = self.regs.read32(CC);
+        self.regs.write32(CC, cc & !(3 << 14) | 1 << 14);
+        let regs = &self.regs;
+        match silica_driver::settle(self.shutdown_ns, "CSTS.SHST to say the shutdown is complete", || Ok(regs.read32(CSTS) >> 2 & 3 == 2)) {
+            Ok(()) => println!("nvme: the controller shut down in order"),
+            Err(_) => println!("nvme: the controller did not finish its shutdown within {} ms", self.shutdown_ns / 1_000_000),
         }
     }
 }
@@ -453,8 +506,10 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     // The I/O queue gets an interrupt of its own where there are two;
     // otherwise it shares the admin queue's.
     let io_irq = if vectors >= 2 && lines >= 2 { Some(Interrupt::bind_to(&device, 1, signals.sender(IO_BIT)?)?) } else { None };
-    let io_bit = if io_irq.is_some() { IO_BIT } else { ADMIN_BIT };
     // Injected interrupts arrive as the I/O queue's would.
+    #[cfg(feature = "harness")]
+    let io_bit = if io_irq.is_some() { IO_BIT } else { ADMIN_BIT };
+    #[cfg(feature = "harness")]
     inject::interrupts(signals.sender(io_bit)?);
 
     let cap = read64(&regs, CAP);
@@ -505,6 +560,10 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     }
     let namespaces = m.read32(516);
     let write_cache = m.read8(525) & 1 != 0;
+    let shutdown_ns = match m.read32(88) as u64 {
+        0 => SHUTDOWN_NS,
+        us => (us * 1000).clamp(1_000_000, 60_000_000_000),
+    };
     let mut model = [0u8; 40];
     for (i, b) in model.iter_mut().enumerate() {
         *b = match m.read8(24 + i) {
@@ -557,7 +616,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     }
     let info_out = Info { block_size: 1 << ns.block_bits, blocks: ns.blocks, read_only: ns.read_only, write_cache, max_blocks };
     println!(
-        "nvme: {}: namespace {}, {} blocks of {} bytes, {} I/O entries, MSI-X {}, write cache {}",
+        "nvme: {}: namespace {}, {} blocks of {} bytes, {} I/O entries, MSI-X {}, write cache {}, max {} blocks per request",
         core::str::from_utf8(&model).unwrap_or("?").trim_end(),
         ns.id,
         info_out.blocks,
@@ -565,6 +624,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         io_entries,
         if io_irq.is_some() { "0 and 1" } else { "0 only" },
         if write_cache { "on" } else { "off" },
+        info_out.max_blocks,
     );
 
     let prp = dma.memory(bits_for(io_entries as usize * PRP_LIST_BYTES), false)?;
@@ -577,9 +637,12 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         prp_mem: prp.shared(),
         prp,
         tickets: (0..io_entries).map(|_| None).collect(),
+        oldest: Oldest::for_slots(io_entries as usize)?,
         free: (0..io_entries).rev().collect(),
         unrung: false,
+        #[cfg(feature = "harness")]
         io_bit,
+        shutdown_ns,
         io,
         _admin: ctl.admin,
         _interrupts: (admin_irq, io_irq),

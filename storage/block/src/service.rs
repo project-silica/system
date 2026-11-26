@@ -97,11 +97,15 @@
 //! fatal error) ends with a nonzero status from `main`, or with
 //! `silica_rt::exit` from anywhere, `signals` included: the device manager
 //! silences the device and starts the driver again, which resets it, and
-//! each client sends again what was in flight. After three such failures
-//! the device is left alone and its owner told. A driver for a device it
-//! will never support (a namespace format it does not know) should end
-//! with status 0 after saying why: ending well is not a failure, and the
-//! device is left alone at once.
+//! each client sends again what was in flight. A driver that keeps failing
+//! is started again later each time (up to a minute apart), never left for
+//! good. A driver for a device it will never support (a namespace format it
+//! does not know) should end with status 0 after saying why: ending well is
+//! not a failure, and the device is left alone at once.
+//!
+//! A driver asked to end by its parent ([`silica_rt::END`], as the machine
+//! turns off) is ended here: the service flushes the device's write cache
+//! with a request of its own, then calls [`Device::shutdown`] and exits 0.
 
 use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, NarrowReply, RemoveMemoryReply, TraceReply};
 use crate::{Op, Request, Status};
@@ -176,6 +180,12 @@ pub trait Device {
     /// The deadline passed: report what the device has finished, and deal
     /// with what it has not (see the module's "Timeouts").
     fn timeout(&mut self, _done: &mut Completions<'_>) {}
+
+    /// The driver is ending in order ([`silica_rt::END`]), after its cache was
+    /// flushed: leave the device as its specification asks of a host that
+    /// turns it off (an NVMe controller's normal shutdown), so it never
+    /// records an unsafe shutdown. The default: nothing.
+    fn shutdown(&mut self) {}
 }
 
 /// Where a driver reports a finished request: the ticket it was started
@@ -217,15 +227,27 @@ fn status(s: Result<(), Status>) -> u32 {
     s.map_or_else(|s| s as u32, |()| 0)
 }
 
-/// Badges of the capabilities `narrow` makes start here, above any the
-/// device manager gives clients.
+/// Badges of the capabilities `narrow` makes: this plus the window's index
+/// in [`Windows`], so a request finds what its capability reaches in one
+/// step. Above any badge the device manager gives clients.
 const NARROWED: u64 = 1 << 48;
-/// Most narrowed capabilities one run of a driver makes.
-const WINDOWS: usize = 256;
+/// Windows narrowed from a capability to the whole device (a partition
+/// each, as the partitions service opens them), and windows narrowed from
+/// those, kept apart so that neither kind can use up the other's.
+const FIRST_WINDOWS: usize = 128;
+const INNER_WINDOWS: usize = 128;
+/// Most windows narrowed (at any depth) under one first window.
+const INNER_PER_FIRST: u32 = 4;
 
 /// A request's tag with this bit set asks for its way through the provider
 /// to be kept (`trace`).
 pub const TRACED: u64 = 1 << 62;
+
+/// The tag of the flush a driver makes as it ends (`Service::end`): no
+/// client's ([`provider::Ticket::own`]).
+const END_FLUSH_TAG: u64 = u64::MAX;
+/// How long a driver that is ending waits for its flush.
+const END_FLUSH_NS: u64 = 5_000_000_000;
 /// Traced requests kept.
 const TRACES: usize = 16;
 
@@ -240,12 +262,75 @@ struct Trace {
     done: u64,
 }
 
-/// The blocks a capability reaches.
-#[derive(Clone, Copy, Debug)]
+/// The blocks a narrowed capability reaches, and how it came to be.
+#[derive(Debug)]
 struct Window {
-    badge: u64,
+    /// The badge of the capability it was narrowed from.
+    owner: u64,
     first: u64,
     blocks: u64,
+    /// The first window it lies under (`None`: it is one).
+    under: Option<usize>,
+    /// A first window: how many windows lie under it now.
+    inner: u32,
+    /// When it was made, among this run's windows (the oldest goes first).
+    made: u64,
+    /// This service's capability with the window's badge: what each holder
+    /// is given is derived from it, so deleting it takes every one back.
+    keep: Handle,
+}
+
+/// Every window, by index ([`NARROWED`]): the first `FIRST_WINDOWS` are
+/// first windows, the rest inner ones. An index is used again only after
+/// its window's capabilities are all gone and its client disconnected.
+struct Windows {
+    all: Vec<Option<Window>>,
+    made: u64,
+}
+
+impl Windows {
+    fn new() -> Windows {
+        let mut all = Vec::new();
+        all.resize_with(FIRST_WINDOWS + INNER_WINDOWS, || None);
+        Windows { all, made: 0 }
+    }
+
+    /// What the capability with `badge` reaches: its first block and how
+    /// many. A capability the device manager gave reaches the whole
+    /// device; a narrowed one whose window is gone, nothing.
+    fn reach(&self, badge: u64, info: &Info) -> (u64, u64) {
+        if badge < NARROWED {
+            return (0, info.blocks);
+        }
+        let at = usize::try_from(badge - NARROWED).ok();
+        at.and_then(|k| self.all.get(k)).and_then(Option::as_ref).map_or((0, 0), |w| (w.first, w.blocks))
+    }
+}
+
+/// The state of the device's write cache, as flushes see it.
+///
+/// A flush makes durable every write that completed before it was asked
+/// for; the device's flush covers what completed before it was issued.
+/// So a device flush is needed only if a write completed since the last
+/// one was issued: a flush asked for while one is on the device that no
+/// write has completed since rides on it, and one asked for with nothing
+/// written since the last successful flush is done at once. One device
+/// flush is in flight at a time; those that need the next wait for it.
+/// A client with nothing to flush cannot make the device flush, and no
+/// client can make it flush more often than writes complete (a
+/// partition's client could make the whole device flush at any rate).
+struct Flushes {
+    /// A write completed since the last device flush was issued. True at
+    /// start: the driver before may have left writes in the cache.
+    dirty: bool,
+    /// The last device flush succeeded.
+    ok: bool,
+    /// The device flush in flight (its ticket: the request that issued it).
+    on_device: Option<Ticket>,
+    /// Requests that its completion answers.
+    riding: Vec<Ticket>,
+    /// Requests that need the next device flush.
+    next: Vec<Ticket>,
 }
 
 /// A block device's service: the provider of `silica.block.Device`.
@@ -256,7 +341,8 @@ pub struct Service<D: Device> {
     /// The endpoint clients call on, from which `narrow` makes capabilities.
     endpoint: Cap,
     /// What narrowed capabilities reach; any other reaches the whole device.
-    windows: Vec<Window>,
+    windows: Windows,
+    flushes: Flushes,
     /// The most recent traced requests, the next to be replaced at `next_trace`.
     traces: [Trace; TRACES],
     next_trace: usize,
@@ -264,6 +350,24 @@ pub struct Service<D: Device> {
     caller: u64,
     /// A client to wake as the driver next waits (`Session::flush`).
     wake: Option<Cap>,
+    /// The driver is ending in order (`Service::begin_end`).
+    ending: Option<Ending>,
+}
+
+/// A driver ending in order: its last flush, heard of through the same wait
+/// as everything else the device says.
+struct Ending {
+    /// The flush reached the device (it may have been full when asked).
+    started: bool,
+    /// How the flush ended, once the device said.
+    result: Option<Result<(), Status>>,
+    /// When the device is given up on (monotonic ns).
+    deadline: u64,
+}
+
+/// A flush request, as the device is given one.
+fn flush_request(ticket: Ticket) -> Request {
+    Request { op: Op::Flush, memory: 0, block: 0, offset: 0, blocks: 0, tag: ticket.tag() }
 }
 
 impl<D: Device> Service<D> {
@@ -276,17 +380,14 @@ impl<D: Device> Service<D> {
             device,
             session: Session::new(wake),
             endpoint,
-            windows: Vec::new(),
+            windows: Windows::new(),
+            flushes: Flushes { dirty: true, ok: true, on_device: None, riding: Vec::new(), next: Vec::new() },
             traces: [Trace::default(); TRACES],
             next_trace: 0,
             caller: 0,
             wake: None,
+            ending: None,
         }
-    }
-
-    /// What the capability with `badge` reaches: its first block and how many.
-    fn window(windows: &[Window], badge: u64, info: &Info) -> (u64, u64) {
-        windows.iter().find(|w| w.badge == badge).map_or((0, info.blocks), |w| (w.first, w.blocks))
     }
 
     /// Take requests from the rings, check each against the device, the
@@ -294,7 +395,8 @@ impl<D: Device> Service<D> {
     /// rings are empty (and their clients told this side sleeps) or the
     /// device is full; then tell the device.
     fn pump(&mut self) {
-        let (session, device, windows) = (&mut self.session, &mut self.device, &self.windows);
+        self.next_flush();
+        let (session, device, windows, flushes) = (&mut self.session, &mut self.device, &self.windows, &mut self.flushes);
         let (traces, next_trace) = (&mut self.traces, &mut self.next_trace);
         let info = device.info();
         let clock = silica_rt::clock();
@@ -303,7 +405,7 @@ impl<D: Device> Service<D> {
             if traced {
                 traces[*next_trace] = Trace { client, tag: ticket.tag(), taken: clock.now(), started: 0, done: 0 };
             }
-            let r = Service::<D>::check_and_start(device, windows, &info, raw, ticket, region, client);
+            let r = Service::<D>::check_and_start(device, windows, flushes, &info, raw, ticket, region, client);
             if traced {
                 if r.is_ok() {
                     traces[*next_trace].started = clock.now();
@@ -321,53 +423,117 @@ impl<D: Device> Service<D> {
 
     /// Check one request against the device, the memory and what its
     /// client may reach, and start it.
+    #[allow(clippy::too_many_arguments)]
     fn check_and_start(
         device: &mut D,
-        windows: &[Window],
+        windows: &Windows,
+        flushes: &mut Flushes,
         info: &Info,
         raw: &silica_queue::Raw,
         ticket: Ticket,
         region: Option<provider::Region>,
         client: u64,
     ) -> Result<Ticket, provider::Refusal> {
-        {
-            let invalid = provider::Refusal::Fail(Status::Invalid as u32);
-            let r = Request::decode(raw).ok_or(invalid)?;
-            if r.op == Op::Flush {
-                // A flush uses no memory, and reaches the whole device's cache.
-                let ticket = ticket.without_memory();
-                device.start(&r, 0, ticket)?;
-                return Ok(ticket);
-            }
-            let m = region.ok_or(invalid)?;
-            let (first, blocks) = Service::<D>::window(windows, client, info);
-            let bytes = r.blocks as u64 * info.block_size as u64;
-            let within = r.blocks != 0 && r.blocks <= info.max_blocks && r.block.checked_add(r.blocks as u64).is_some_and(|e| e <= blocks);
-            let in_memory = r.offset.is_multiple_of(512) && r.offset as u64 + bytes <= m.bytes;
-            let allowed = match r.op {
-                Op::Read => m.writable,
-                _ => !info.read_only,
-            };
-            if !(within && in_memory && allowed) {
+        let invalid = provider::Refusal::Fail(Status::Invalid as u32);
+        let r = Request::decode(raw).ok_or(invalid)?;
+        let (first, blocks) = windows.reach(client, info);
+        if r.op == Op::Flush {
+            // A flush uses no memory, and reaches the whole device's cache:
+            // the device is asked only when a write needs it (`Flushes`).
+            // Through a capability that reaches nothing, nothing.
+            if blocks == 0 {
                 return Err(invalid);
             }
-            // The device's own numbering.
-            let on_device = Request { block: first + r.block, ..r };
-            device.start(&on_device, m.address + r.offset as u64, ticket)?;
-            Ok(ticket)
+            let ticket = ticket.without_memory();
+            if !info.write_cache || (flushes.on_device.is_none() && !flushes.dirty && flushes.ok) {
+                return Err(provider::Refusal::Fail(0));
+            }
+            if flushes.on_device.is_some() {
+                if flushes.dirty {
+                    flushes.next.push(ticket)
+                } else {
+                    flushes.riding.push(ticket)
+                }
+                return Ok(ticket);
+            }
+            device.start(&r, 0, ticket)?;
+            flushes.on_device = Some(ticket);
+            flushes.dirty = false;
+            return Ok(ticket);
+        }
+        let m = region.ok_or(invalid)?;
+        let bytes = r.blocks as u64 * info.block_size as u64;
+        let within = r.blocks != 0 && r.blocks <= info.max_blocks && r.block.checked_add(r.blocks as u64).is_some_and(|e| e <= blocks);
+        let in_memory = r.offset.is_multiple_of(512) && r.offset as u64 + bytes <= m.bytes;
+        let allowed = match r.op {
+            Op::Read => m.writable,
+            _ => !info.read_only,
+        };
+        if !(within && in_memory && allowed) {
+            return Err(invalid);
+        }
+        // Writes are marked: their completion is what makes a flush needed.
+        let ticket = if r.op == Op::Write { ticket.marked() } else { ticket };
+        // The device's own numbering.
+        let on_device = Request { block: first + r.block, ..r };
+        device.start(&on_device, m.address + r.offset as u64, ticket)?;
+        Ok(ticket)
+    }
+
+    /// Issue the device flush that requests waiting for the next one need,
+    /// if none is on the device. The device may be full: then after its
+    /// next completion.
+    fn next_flush(&mut self) {
+        let f = &mut self.flushes;
+        if f.on_device.is_some() || f.next.is_empty() {
+            return;
+        }
+        let first = f.next[0];
+        match self.device.start(&flush_request(first), 0, first) {
+            Ok(()) => {
+                f.on_device = Some(first);
+                f.dirty = false;
+                f.riding = f.next.split_off(1);
+                f.next.clear();
+            }
+            Err(Refusal::Busy) => {}
+            Err(Refusal::Fail(s)) => {
+                for t in core::mem::take(&mut f.next) {
+                    self.session.complete(t, s as u32, 0);
+                }
+            }
         }
     }
 
     /// The device's signals (`Some`), or its deadline passing (`None`):
     /// what it reports finished goes to the client.
     fn device_event(&mut self, bits: Option<u64>) {
-        let (session, traces) = (&mut self.session, &mut self.traces);
+        let (session, traces, flushes, ending) = (&mut self.session, &mut self.traces, &mut self.flushes, &mut self.ending);
         let clock = silica_rt::clock();
         let mut done = |ticket: Ticket, s: Result<(), Status>| {
+            if ticket == provider::Ticket::own(END_FLUSH_TAG) {
+                // The flush the driver made as it ends: no client's.
+                if let Some(e) = ending.as_mut() {
+                    e.result = Some(s);
+                }
+                return;
+            }
             if ticket.tag() & TRACED != 0
                 && let Some(t) = traces.iter_mut().find(|t| t.tag == ticket.tag() && t.done == 0 && t.taken != 0)
             {
                 t.done = clock.now();
+            }
+            if ticket.is_marked() && s.is_ok() {
+                flushes.dirty = true;
+            }
+            if flushes.on_device == Some(ticket) {
+                // The flush answers every request that rode on it.
+                flushes.on_device = None;
+                flushes.ok = s.is_ok();
+                flushes.dirty |= s.is_err();
+                for t in core::mem::take(&mut flushes.riding) {
+                    session.complete(t, status(s), 0);
+                }
             }
             session.complete(ticket, status(s), 0)
         };
@@ -375,13 +541,108 @@ impl<D: Device> Service<D> {
             Some(bits) => self.device.signals(bits, &mut done),
             None => self.device.timeout(&mut done),
         }
+        self.next_flush();
+        // Memory of ended connections whose last request has completed.
+        self.session.unmap_finished(&mut Map(&mut self.device));
+    }
+
+    /// End window `k`: every capability to it goes, its client is
+    /// disconnected, and so is every window under it.
+    fn end_window(&mut self, k: usize) {
+        let Some(w) = self.windows.all[k].take() else { return };
+        self.session.disconnect(NARROWED + k as u64, &mut Map(&mut self.device));
+        // Its capability goes, and with it every one derived from it (the
+        // holders'), which is the point (`Handle` deletes it when dropped).
+        let under = w.under;
+        drop(w);
+        match under {
+            Some(f) => {
+                if let Some(first) = self.windows.all[f].as_mut() {
+                    first.inner = first.inner.saturating_sub(1);
+                }
+            }
+            None => {
+                for i in FIRST_WINDOWS..FIRST_WINDOWS + INNER_WINDOWS {
+                    if self.windows.all[i].as_ref().is_some_and(|w| w.under == Some(k)) {
+                        self.end_window(i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Its parent asked it to end ([`silica_rt::END`]): what was written is
+    /// made durable (one flush, when the device has a write cache), the
+    /// device is left as its specification asks ([`Device::shutdown`]), and
+    /// the driver exits. Before, it was destroyed where it stood, a power
+    /// cut for the device's cache. What clients still have on the device is
+    /// theirs to lose: the service manager ends clients before the device
+    /// manager, and the flush covers every write the device had finished.
+    ///
+    /// The flush is one more request on the device: its completion arrives
+    /// as every completion does, on the driver's one wait (the device's
+    /// interrupt, [`Events::signals`]), and the device's bound on it is that
+    /// wait's deadline ([`Events::deadline`]). Nothing is looked at between
+    /// the two (before, the driver woke every 100 us for up to 5 s to ask).
+    fn begin_end(&mut self) {
+        if self.ending.is_some() {
+            return;
+        }
+        if !self.device.info().write_cache {
+            self.finish_end("no write cache");
+        }
+        self.ending = Some(Ending { started: false, result: None, deadline: silica_rt::clock().now() + END_FLUSH_NS });
+        self.end_step();
+    }
+
+    /// The ending driver's next step, after anything the device said: the
+    /// flush offered (again, if the device was full), or the end itself
+    /// once the flush is answered or the device's time for it is up.
+    fn end_step(&mut self) {
+        let (device, Some(e)) = (&mut self.device, self.ending.as_mut()) else { return };
+        if !e.started && e.result.is_none() {
+            let ticket = provider::Ticket::own(END_FLUSH_TAG);
+            match device.start(&flush_request(ticket), 0, ticket) {
+                Ok(()) => {
+                    e.started = true;
+                    device.kick();
+                }
+                // Offered again after the device's next completion.
+                Err(Refusal::Busy) => {}
+                Err(Refusal::Fail(_)) => e.result = Some(Err(Status::Io)),
+            }
+        }
+        let (result, late) = (e.result, silica_rt::clock().now() >= e.deadline);
+        match result {
+            Some(Ok(())) => self.finish_end("its write cache flushed"),
+            Some(Err(_)) => self.finish_end("its write cache's flush failed"),
+            None if late => self.finish_end("its write cache's flush did not finish in time"),
+            None => {}
+        }
+    }
+
+    fn finish_end(&mut self, said: &str) -> ! {
+        self.device.shutdown();
+        silica_rt::println!("block: the driver ended in order, {said}");
+        silica_rt::exit(0)
+    }
+
+    /// A capability derived from window `k`'s, for its next holder.
+    fn give_window(&self, k: usize) -> Result<NarrowReply<Handle>, Error> {
+        let keep = self.windows.all[k].as_ref().ok_or(Error::NoRoom)?.keep.cap();
+        let slot = free_slot().ok_or(Error::NoRoom)?;
+        if sys::cap_derive(slots::SPACE, slot, keep, Rights(Rights::WRITE.0 | Rights::GRANT.0), 0).is_err() {
+            release_slot(slot);
+            return Err(Error::NoRoom);
+        }
+        Ok(NarrowReply { device: Handle::new(Cap(slot)) })
     }
 }
 
 impl<D: Device> device::Server<Handle> for Service<D> {
     fn info(&mut self) -> InfoReply {
         let mut info = self.device.info();
-        info.blocks = Service::<D>::window(&self.windows, self.caller, &info).1;
+        info.blocks = self.windows.reach(self.caller, &info).1;
         InfoReply { info }
     }
 
@@ -390,23 +651,68 @@ impl<D: Device> device::Server<Handle> for Service<D> {
         Ok(TraceReply { taken: t.taken, started: t.started, done: t.done })
     }
 
+    /// Windows are kept for as long as the driver runs, so they are
+    /// bounded. A first window (narrowed from the whole device) is named by
+    /// its range alone: every holder of the whole device may reach it, so
+    /// whoever narrows the same range again (a partition opened again, by
+    /// the same or another opener) is given the same window; there are
+    /// `FIRST_WINDOWS`, and past them the oldest ends (its capabilities
+    /// are taken back, its client disconnected). An inner window (narrowed
+    /// from a narrowed capability) is named by its range and the window it
+    /// was narrowed from; under one first window there are at most
+    /// `INNER_PER_FIRST`, past them `no_room`.
     fn narrow(&mut self, first: u64, blocks: u64) -> Result<NarrowReply<Handle>, Error> {
         let info = self.device.info();
-        let (base, reach) = Service::<D>::window(&self.windows, self.caller, &info);
+        let caller = self.caller;
+        let (base, reach) = self.windows.reach(caller, &info);
         if blocks == 0 || first.checked_add(blocks).is_none_or(|end| end > reach) {
             return Err(Error::Outside);
         }
-        if self.windows.len() >= WINDOWS {
+        let first = base + first;
+        let narrowed = caller >= NARROWED;
+        let same = |w: &Window| (w.first, w.blocks) == (first, blocks) && if narrowed { w.owner == caller } else { w.under.is_none() };
+        if let Some(k) = self.windows.all.iter().position(|w| w.as_ref().is_some_and(same)) {
+            return self.give_window(k);
+        }
+        // Under which first window it lies, if the caller's is narrowed.
+        let under = (caller >= NARROWED).then(|| {
+            let k = (caller - NARROWED) as usize;
+            self.windows.all[k].as_ref().and_then(|w| w.under).unwrap_or(k)
+        });
+        let k = match under {
+            Some(f) => {
+                if self.windows.all[f].as_ref().is_none_or(|w| w.inner >= INNER_PER_FIRST) {
+                    return Err(Error::NoRoom);
+                }
+                (FIRST_WINDOWS..FIRST_WINDOWS + INNER_WINDOWS).find(|i| self.windows.all[*i].is_none()).ok_or(Error::NoRoom)?
+            }
+            None => match (0..FIRST_WINDOWS).find(|i| self.windows.all[*i].is_none()) {
+                Some(k) => k,
+                None => {
+                    // The oldest goes.
+                    let oldest = (0..FIRST_WINDOWS)
+                        .min_by_key(|i| self.windows.all[*i].as_ref().map_or(u64::MAX, |w| w.made))
+                        .ok_or(Error::NoRoom)?;
+                    self.end_window(oldest);
+                    oldest
+                }
+            },
+        };
+        let badge = NARROWED + k as u64;
+        let keep = free_slot().ok_or(Error::NoRoom)?;
+        if sys::cap_derive(slots::SPACE, keep, self.endpoint, Rights(Rights::WRITE.0 | Rights::GRANT.0), badge).is_err() {
+            release_slot(keep);
             return Err(Error::NoRoom);
         }
-        let badge = NARROWED + self.windows.len() as u64;
-        let slot = free_slot().ok_or(Error::NoRoom)?;
-        if sys::cap_derive(slots::SPACE, slot, self.endpoint, Rights(Rights::WRITE.0 | Rights::GRANT.0), badge).is_err() {
-            release_slot(slot);
-            return Err(Error::NoRoom);
+        self.windows.made += 1;
+        self.windows.all[k] =
+            Some(Window { owner: caller, first, blocks, under, inner: 0, made: self.windows.made, keep: Handle::new(Cap(keep)) });
+        if let Some(f) = under
+            && let Some(w) = self.windows.all[f].as_mut()
+        {
+            w.inner += 1;
         }
-        self.windows.push(Window { badge, first: base + first, blocks });
-        Ok(NarrowReply { device: Handle::new(Cap(slot)) })
+        self.give_window(k)
     }
 
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<ConnectReply<Handle>, Error> {
@@ -432,15 +738,24 @@ impl<D: Device> Events for Service<D> {
     }
 
     fn signals(&mut self, bits: u64) {
-        if bits & !CLIENT != 0 {
-            self.device_event(Some(bits & !CLIENT));
+        // The device's bits: not the clients', not the parent's.
+        let device = bits & !(CLIENT | silica_rt::END);
+        if device != 0 {
+            self.device_event(Some(device));
         }
-        self.pump();
-        self.wake = self.session.flush();
+        if bits & silica_rt::END != 0 {
+            self.begin_end();
+        }
+        self.after_event();
     }
 
     fn deadline(&self) -> Option<u64> {
-        self.device.deadline()
+        // The device's deadline for its requests; and, ending, its time for
+        // the last flush.
+        match (self.device.deadline(), self.ending.as_ref().map(|e| e.deadline)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn take_wake(&mut self) -> Option<Cap> {
@@ -449,7 +764,20 @@ impl<D: Device> Events for Service<D> {
 
     fn timer(&mut self) {
         self.device_event(None);
-        self.pump();
+        self.after_event();
+    }
+}
+
+impl<D: Device> Service<D> {
+    /// After the device spoke or a deadline passed: an ending driver takes
+    /// its next step and no new request; any other takes what its clients
+    /// have ready.
+    fn after_event(&mut self) {
+        if self.ending.is_some() {
+            self.end_step();
+        } else {
+            self.pump();
+        }
         self.wake = self.session.flush();
     }
 }

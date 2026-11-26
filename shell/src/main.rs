@@ -45,14 +45,15 @@ struct Shell {
 const HELP: &str = "commands: services, stop <service>, start <service>, restart <service>, caps <service|device>, log <service>, trace, devices, restart-driver <device>, shutdown, reboot, date, echo <text>, help\n";
 
 impl Shell {
-    fn say(&mut self) {
-        let text = core::mem::take(&mut self.out);
-        let _ = self.term.write(&text);
+    fn say(&mut self) -> Result<(), CallError<core::convert::Infallible>> {
+        let result = self.term.write_all(&self.out);
+        self.out.clear();
+        result
     }
 
-    fn run(&mut self, line: &str) {
+    fn run(&mut self, line: &str) -> Result<(), CallError<core::convert::Infallible>> {
         let words: Vec<&str> = line.split_whitespace().collect();
-        let Some(&command) = words.first() else { return };
+        let Some(&command) = words.first() else { return Ok(()) };
         let arg = words.get(1).copied().unwrap_or("");
         match command {
             "help" => self.out.push_str(HELP),
@@ -69,22 +70,33 @@ impl Shell {
             "echo" => {
                 let _ = writeln!(self.out, "{}", line.trim_start().strip_prefix("echo").unwrap_or("").trim());
             }
-            "services" => match self.system.list() {
-                Ok(r) => {
-                    for s in r.services.iter() {
-                        let state = match s.state {
-                            system::State::Running => "running",
-                            system::State::Stopped => "stopped",
-                            system::State::Failed => "failed",
-                            system::State::Unknown(_) => "?",
-                        };
-                        let _ = writeln!(self.out, "  {:<12} {:<8} failures {:<2} {}", s.name, state, s.failures, s.provides);
+            "services" => {
+                // Part after part, as the service manager gives them.
+                let mut from = 0;
+                loop {
+                    match self.system.list(from) {
+                        Ok(r) => {
+                            for s in r.services.iter() {
+                                let state = match s.state {
+                                    system::State::Running => "running",
+                                    system::State::Stopped => "stopped",
+                                    system::State::Failed => "failed",
+                                    system::State::Unknown(_) => "?",
+                                };
+                                let _ = writeln!(self.out, "  {:<12} {:<8} failures {:<2} {}", s.name, state, s.failures, s.provides);
+                            }
+                            if r.next <= from {
+                                break;
+                            }
+                            from = r.next;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(self.out, "services: {e:?}");
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    let _ = writeln!(self.out, "services: {e:?}");
-                }
-            },
+            }
             "stop" | "start" | "restart" if !arg.is_empty() => {
                 let r = match command {
                     "stop" => self.system.stop(arg).map(|_| ()),
@@ -116,7 +128,7 @@ impl Shell {
                     match part {
                         Ok((text, next)) => {
                             self.out.push_str(&text);
-                            self.say();
+                            self.say()?;
                             if next == 0 {
                                 break;
                             }
@@ -132,18 +144,25 @@ impl Shell {
             "log" if !arg.is_empty() => {
                 // Stop at the writer's current position. In particular,
                 // displaying the console's own log writes more of that log.
-                let end = match self.log.sources() {
-                    Ok(r) => r.sources.iter().find(|s| s.name == arg).map(|s| s.written),
-                    Err(e) => {
-                        let _ = writeln!(self.out, "log: {arg}: {e:?}");
-                        self.say();
-                        return;
+                let mut part = 0;
+                let end = loop {
+                    match self.log.sources(part) {
+                        Ok(r) => {
+                            let found = r.sources.iter().find(|s| s.name == arg).map(|s| s.written);
+                            if found.is_some() || r.next <= part {
+                                break found;
+                            }
+                            part = r.next;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(self.out, "log: {arg}: {e:?}");
+                            return self.say();
+                        }
                     }
                 };
                 let Some(end) = end else {
                     let _ = writeln!(self.out, "log: {arg}: no such log source");
-                    self.say();
-                    return;
+                    return self.say();
                 };
                 let (mut from, mut fresh) = (0, true);
                 while from < end {
@@ -160,7 +179,7 @@ impl Shell {
                                 fresh = c == '\n';
                             }
                             from = r.next;
-                            self.say();
+                            self.say()?;
                         }
                         Ok(_) => break,
                         Err(e) => {
@@ -184,10 +203,15 @@ impl Shell {
                     (devices::Class::Entropy, "entropy"),
                     (devices::Class::Port, "port"),
                 ] {
-                    if let Ok(r) = self.devices.list(class) {
+                    let mut from = 0;
+                    while let Ok(r) = self.devices.list(class, from) {
                         for d in r.devices.iter() {
                             let _ = writeln!(self.out, "  {} {name:<8} {}", PciAddress(d.id), d.driver);
                         }
+                        if r.next <= from {
+                            break;
+                        }
+                        from = r.next;
                     }
                 }
             }
@@ -210,7 +234,7 @@ impl Shell {
                 let _ = writeln!(self.out, "{command}: no such command (help lists them)");
             }
         }
-        self.say();
+        self.say()
     }
 }
 
@@ -221,7 +245,7 @@ impl Shell {
     fn trace(&mut self) -> Result<(), &'static str> {
         let server = Cap(slots::FIRST_GRANT + 4);
         let mut parts = silica_block::partitions::Client::<Channel, Handle>::from(Channel::new(server));
-        let listed = parts.list().map_err(|_| "the block server does not answer")?;
+        let listed = parts.list(0).map_err(|_| "the block server does not answer")?;
         let p = listed.partitions.iter().next().ok_or("the block server lists no partition")?;
         let (id, name) = (p.id, String::from(p.name));
         let clock = silica_rt::clock();
@@ -260,7 +284,9 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         out: String::new(),
     };
     let _ = shell.term.write("Silica. Type help for the commands.\n");
-    loop {
+    // No request loop of the runtime's: it serves from here.
+    silica_rt::serving();
+    'prompt: loop {
         // The console restarted under a call (`peer_gone`): its endpoint is
         // the service manager's, so calling again reaches the new one, and
         // the prompt is shown again on its fresh screen.
@@ -269,10 +295,23 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             Err(_) => return 1,
         }
         let line = match shell.term.read_line() {
-            Ok(r) => String::from(r.line),
-            Err(CallError::Transport(TransportError::PeerGone)) => continue,
+            Ok(r) if !r.busy => String::from(r.line),
+            // The console keeps one waiting read a holder and answers
+            // them in turn, so busy means it had no place to keep this
+            // one: said, and the shell ends to be started again.
+            Ok(_) => {
+                silica_rt::println!("shell: the console could not keep a read waiting");
+                return 1;
+            }
+            Err(CallError::Transport(TransportError::PeerGone)) => continue 'prompt,
             Err(_) => return 1,
         };
-        shell.run(&line);
+        match shell.run(&line) {
+            Ok(()) | Err(CallError::Transport(TransportError::PeerGone)) => {}
+            Err(e) => {
+                silica_rt::println!("shell: console output failed: {e:?}");
+                return 1;
+            }
+        }
     }
 }

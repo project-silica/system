@@ -19,10 +19,15 @@
 use silica_driver::pci::{CAP_EXPRESS, COMMAND_MASTER, COMMAND_MEMORY, Config};
 
 /// The bit of the device manager's notification a slot's change sets.
-pub const HOTPLUG: u64 = 2;
+pub const HOTPLUG: u64 = 1 << 33;
 
 // The PCI Express capability's registers, from its start.
 const CAPS: usize = 0x02;
+const LINK_CAPS: usize = 0x0C;
+/// Link Capabilities: the port reports whether its link is active, and
+/// interrupts when that changes (Data Link Layer Link Active Reporting
+/// Capable).
+const LINK_REPORTING: u32 = 1 << 20;
 const LINK_STATUS: usize = 0x12;
 const SLOT_CAPS: usize = 0x14;
 const SLOT_CONTROL: usize = 0x18;
@@ -64,6 +69,62 @@ pub enum Change {
     Leaving,
     /// The device is gone.
     Left,
+    /// A device is there, but the slot's presence changed since it was
+    /// last asked: the one seen before was taken out and another (or the
+    /// same) put in before the change was read. Its drivers end and the
+    /// slot is found again, as for a departure and an arrival.
+    Replaced,
+}
+
+/// What happened to a slot whose device was there (`was`), given the
+/// Slot Status register read now: the change, and whether a device is
+/// there now. Presence Detect Changed is a sticky bit: a removal and a
+/// re-insertion between two reads set it once and leave Presence Detect
+/// State as it was, so a change with a device there both times is a
+/// replacement, never nothing (the 2026-11-24 audit: such a swap was
+/// invisible, its stale driver left on the new device).
+pub fn classify(was: bool, status: u16) -> (Option<Change>, bool) {
+    let now = status & PRESENT != 0;
+    let change = match (was, now) {
+        (false, true) => Some(Change::Arrived),
+        (true, false) => Some(Change::Left),
+        // Someone asks to take the device out: its drivers end and the
+        // slot's power goes off, after which it can be pulled.
+        (true, true) if status & BUTTON_PRESSED != 0 => Some(Change::Leaving),
+        (true, true) if status & PRESENCE_CHANGED != 0 => Some(Change::Replaced),
+        _ => None,
+    };
+    (change, now)
+}
+
+/// The Slot Status bits to write back after reading `status`: exactly the
+/// change bits that were set when it was read. They are write-1-to-clear,
+/// so a change that happens after the read keeps its bit (it is written as
+/// 0) and raises the next interrupt; writing back more would lose it.
+pub fn to_clear(status: u16) -> u16 {
+    status & (BUTTON_PRESSED | PRESENCE_CHANGED | COMMAND_COMPLETED | LINK_CHANGED)
+}
+
+/// Whether a hot-plug port on bus `bus`, whose bridge says the buses
+/// behind it are `secondary` to `subordinate`, may be trusted with them:
+/// behind it (above its own bus), in order, within the segment's last bus
+/// (`last`), and overlapping no other bridge's buses except by nesting
+/// (`others`: each other bridge's secondary and subordinate). A device
+/// found on buses a port does not own would be given addresses out of the
+/// port's windows, re-placing a live device's registers (the audit: the
+/// numbers were used as the bridge gave them).
+pub fn buses_valid(bus: u8, secondary: u8, subordinate: u8, last: u8, others: &[(u8, u8)]) -> bool {
+    // `a` behind `b`: its first bus after `b`'s own (a bridge behind another
+    // sits on one of its buses and numbers buses after it).
+    let behind = |a: (u8, u8), b: (u8, u8)| b.0 < a.0 && a.1 <= b.1;
+    secondary > bus
+        && secondary <= subordinate
+        && subordinate <= last
+        && others.iter().all(|&o| {
+            let disjoint = o.1 < secondary || subordinate < o.0;
+            let own = (secondary, subordinate);
+            disjoint || behind(own, o) || behind(o, own)
+        })
 }
 
 /// A BAR that did not fit: its index, its size in bits, and the port's
@@ -111,6 +172,13 @@ pub struct Port {
     pub occupied: bool,
     /// Whether the slot's power is the system's to switch.
     powered: bool,
+    /// Whether the port interrupts when its link comes up or goes: it was
+    /// armed ([`Port::arm`]) and reports its link's state (Link
+    /// Capabilities, Data Link Layer Link Active Reporting Capable, which
+    /// the specification requires of a hot-plug capable port). The wait
+    /// for an arrived device's link is then the interrupt's, with the
+    /// hardware's bound as its only other end.
+    pub link_interrupt: bool,
 }
 
 impl Port {
@@ -144,13 +212,15 @@ impl Port {
             windows,
             occupied,
             powered,
+            link_interrupt: false,
         })
     }
 
     /// Let the slot interrupt, through the port's MSI-X entry 0 (already
     /// written by the caller): the port may send it, and its MSI-X is on.
-    pub fn arm(&self) {
+    pub fn arm(&mut self) {
         let r = self.config.registers();
+        self.link_interrupt = r.read32(self.express + LINK_CAPS) & LINK_REPORTING != 0;
         r.write16(4, r.read16(4) | COMMAND_MEMORY | COMMAND_MASTER);
         if let Some(m) = self.config.msix() {
             // Enabled, the function's mask off.
@@ -166,53 +236,46 @@ impl Port {
 
     /// Switch the slot's power on or off (a slot with a power controller
     /// keeps a device it holds unpowered, and invisible, until the system
-    /// switches it on), with its indicator. When switching on, wait until
-    /// the link to the device is up (at most a second): false if it never is.
-    pub fn power(&self, on: bool) -> bool {
+    /// switches it on), with its indicator. It returns at once: whether the
+    /// link has come up is [`Port::link_up`]'s, asked while the device
+    /// manager goes on serving (before, it waited here for up to a second,
+    /// and every client and fault report with it).
+    pub fn power(&self, on: bool) {
         let r = self.config.registers();
         if self.powered {
             let control = r.read16(self.express + SLOT_CONTROL) & !(POWER_OFF | POWER_INDICATOR);
             r.write16(self.express + SLOT_CONTROL, control | if on { INDICATOR_ON } else { POWER_OFF | POWER_INDICATOR });
         }
-        if !on {
-            return true;
-        }
-        let clock = silica_rt::clock();
-        let until = clock.now() + 1_000_000_000;
-        while r.read16(self.express + LINK_STATUS) & LINK_ACTIVE == 0 {
-            if clock.now() > until {
-                return false;
-            }
-            libsys::yield_now();
-        }
-        true
+    }
+
+    /// Whether the link to the slot's device is up.
+    pub fn link_up(&self) -> bool {
+        self.config.registers().read16(self.express + LINK_STATUS) & LINK_ACTIVE != 0
     }
 
     /// After the interrupt (or once after arming): what happened to the
-    /// slot since it was last asked.
+    /// slot since it was last asked ([`classify`]).
     pub fn changed(&mut self) -> Option<Change> {
         let r = self.config.registers();
         let status = r.read16(self.express + SLOT_STATUS);
-        let news = status & (BUTTON_PRESSED | PRESENCE_CHANGED | COMMAND_COMPLETED | LINK_CHANGED);
+        let news = to_clear(status);
         if news != 0 {
             r.write16(self.express + SLOT_STATUS, news);
         }
         // Present is what counts: an unpowered slot's link is down until
         // the system powers it (`power`).
-        let now = status & PRESENT != 0;
-        let was = core::mem::replace(&mut self.occupied, now);
-        if !now {
-            (self.memory, self.prefetchable) = self.windows;
+        let (change, now) = classify(self.occupied, status);
+        self.occupied = now;
+        if !now || change == Some(Change::Replaced) {
+            self.empty();
         }
-        match (was, now) {
-            (false, true) => Some(Change::Arrived),
-            (true, false) => Some(Change::Left),
-            // The device is still there, and someone asks to take it out:
-            // its drivers end and the slot's power goes off, after which it
-            // can be pulled (and its absence reported).
-            (true, true) if status & BUTTON_PRESSED != 0 => Some(Change::Leaving),
-            _ => None,
-        }
+        change
+    }
+
+    /// The slot is empty (or about to be found again): its windows are
+    /// all the next device's.
+    pub fn empty(&mut self) {
+        (self.memory, self.prefetchable) = self.windows;
     }
 
     /// Give every memory BAR of the arrived function `f` an address out of
@@ -246,5 +309,53 @@ impl Port {
             i += if wide { 2 } else { 1 };
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A removal and re-insertion between two reads of the slot leaves one
+    /// Presence Detect Changed and a device present both times: before,
+    /// that read as nothing (`None`), the new device kept the driver of
+    /// the one taken out and was never given addresses or its own.
+    #[test]
+    fn a_swap_between_two_reads_is_a_replacement() {
+        assert_eq!(classify(true, PRESENT | PRESENCE_CHANGED), (Some(Change::Replaced), true));
+        assert_eq!(classify(true, PRESENT | PRESENCE_CHANGED | LINK_CHANGED), (Some(Change::Replaced), true));
+        // A link change alone (the slot was just powered) is no change.
+        assert_eq!(classify(true, PRESENT | LINK_CHANGED), (None, true));
+        assert_eq!(classify(false, PRESENT | PRESENCE_CHANGED), (Some(Change::Arrived), true));
+        assert_eq!(classify(true, PRESENCE_CHANGED), (Some(Change::Left), false));
+        assert_eq!(classify(true, PRESENT | BUTTON_PRESSED | PRESENCE_CHANGED), (Some(Change::Leaving), true));
+        assert_eq!(classify(false, 0), (None, false));
+    }
+
+    /// Only the change bits that were read are written back: a change after
+    /// the read keeps its bit and raises the next interrupt.
+    #[test]
+    fn only_the_bits_read_are_cleared() {
+        assert_eq!(to_clear(PRESENT | PRESENCE_CHANGED), PRESENCE_CHANGED);
+        assert_eq!(to_clear(PRESENT | LINK_ACTIVE_IN_STATUS_NEVER), 0);
+        assert_eq!(to_clear(0xFFFF), BUTTON_PRESSED | PRESENCE_CHANGED | COMMAND_COMPLETED | LINK_CHANGED);
+    }
+    const LINK_ACTIVE_IN_STATUS_NEVER: u16 = 1 << 13;
+
+    /// A port's bus numbers are taken only when they are its own: behind
+    /// it, in order, within the segment, overlapping no other bridge but by
+    /// nesting.
+    #[test]
+    fn bus_numbers_a_bridge_cannot_own_are_refused() {
+        let others = [(1, 1), (2, 4), (3, 3)];
+        assert!(buses_valid(0, 5, 5, 255, &others));
+        assert!(buses_valid(2, 3, 3, 255, &[(1, 1), (2, 4)]), "nested in its parent's range");
+        assert!(!buses_valid(0, 0, 0, 255, &others), "its own bus (bus 0 is the machine's)");
+        assert!(!buses_valid(4, 2, 2, 255, &[]), "below its own bus");
+        assert!(!buses_valid(0, 6, 5, 255, &others), "out of order");
+        assert!(!buses_valid(0, 5, 9, 8, &others), "past the segment's last bus");
+        assert!(!buses_valid(0, 1, 1, 255, &others), "another bridge's bus");
+        assert!(!buses_valid(0, 3, 6, 255, &others), "overlapping another bridge's range");
+        assert!(!buses_valid(0, 1, 5, 255, &[(1, 1)]), "another bridge starting at its own first bus");
     }
 }

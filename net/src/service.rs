@@ -195,6 +195,8 @@ impl<D: Device> Service<D> {
                 None => self.device.timeout(&mut done),
             }
         }
+        // Memory of ended connections whose last request has completed.
+        self.session.unmap_finished(&mut Map(&mut self.device));
         if let Some(up) = changed {
             self.link(up);
         }

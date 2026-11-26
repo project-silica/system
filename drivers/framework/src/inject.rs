@@ -15,8 +15,17 @@
 //! | `spurious` | interrupts with nothing completed |
 //! | `missed` | completes the request without an interrupt |
 //! | `reset` | resets itself: everything in flight is lost |
+//! | `broken` | gives up and asks to be reset (virtio's DEVICE_NEEDS_RESET), as it must when the driver breaks the protocol |
+//! | `admin_missed` | NVMe: completes the first admin command without an interrupt (the driver ignores the one it gets) |
+//! | `tiny` | virtio: offers a queue of two descriptors, fewer than one request takes |
+//! | `generation` | virtio: its configuration's generation changes on every read, from bring-up on |
+//! | `short` | virtio-blk: completes a read saying it wrote only the status byte, not the data |
+//! | `unplugged` | e1000e: holds every transmit while its link is down, as an 82574 does |
 //!
-//! The virtio queue ([`crate::virtio`]) commits all five; a driver of
+//! The virtio queue ([`crate::virtio`]) commits all six (`broken` by
+//! offering the device a descriptor chain it must refuse, which a virtio
+//! device answers by asking to be reset: the device does it, not the
+//! driver); a driver of
 //! another transport calls [`due`] and [`pending`] where its own device
 //! would. While a fault is armed a driver's request timeout is
 //! [`ARMED_TIMEOUT_NS`], so the test takes seconds rather than minutes.
@@ -33,6 +42,12 @@ pub enum Fault {
     Spurious = 3,
     Missed = 4,
     Reset = 5,
+    Broken = 6,
+    AdminMissed = 7,
+    Tiny = 8,
+    Generation = 9,
+    Short = 10,
+    Unplugged = 11,
 }
 
 impl Fault {
@@ -44,6 +59,12 @@ impl Fault {
             b"spurious" => Fault::Spurious,
             b"missed" => Fault::Missed,
             b"reset" => Fault::Reset,
+            b"broken" => Fault::Broken,
+            b"admin_missed" => Fault::AdminMissed,
+            b"tiny" => Fault::Tiny,
+            b"generation" => Fault::Generation,
+            b"short" => Fault::Short,
+            b"unplugged" => Fault::Unplugged,
             _ => return None,
         })
     }
@@ -55,6 +76,12 @@ impl Fault {
             3 => Fault::Spurious,
             4 => Fault::Missed,
             5 => Fault::Reset,
+            6 => Fault::Broken,
+            7 => Fault::AdminMissed,
+            8 => Fault::Tiny,
+            9 => Fault::Generation,
+            10 => Fault::Short,
+            11 => Fault::Unplugged,
             _ => return None,
         })
     }
@@ -85,6 +112,12 @@ pub fn arm(plan: u32) {
         ARMED.store(1, Ordering::Relaxed);
         silica_rt::println!("inject: {:?} at request {}", f, (plan & 0xFF_FFFF).max(1));
     }
+}
+
+/// The fault armed and not yet due, if any: for a driver whose fault is
+/// on a path other than its requests' (an NVMe admin command).
+pub fn planned() -> Option<Fault> {
+    Fault::of(PLAN.load(Ordering::Relaxed) >> 56)
 }
 
 /// Whether a fault was armed for this run, committed or not: a driver

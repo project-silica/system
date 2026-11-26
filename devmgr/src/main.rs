@@ -23,13 +23,19 @@
 //! A driver that faults or ends with a failure is taken down, its device
 //! is silenced (no bus mastering; the kernel has already cut it off from
 //! memory, which happens when the driver's device address space goes), and
-//! the driver is started again, at most [`MAX_RESTARTS`] times; the driver
-//! is told how many times it has been started. A driver may be replaced:
-//! `driver=<vendor>:<device>=<program>` on the kernel command line (four
-//! hexadecimal digits each) starts `<program>` from the boot archive for
-//! that kind of device instead of the driver the device manager would pick.
-//! `inject=<driver>:<fault>@<n>` has the first run of `<driver>` commit a
-//! device's fault at its `n`th request (`silica_driver::inject`).
+//! the driver is started again (at once the first time, then backing off,
+//! never for good: `silica_proc::Restarts`); the driver is told how many
+//! times it has been started. Which program drives a device is said by the
+//! boot archive's `drivers` list and by nothing else: the list is part of
+//! the archive the kernel checked, and no word of the boot command line
+//! reaches this program's choice (before, `driver=<ids>=<program>` there
+//! gave any program in the archive a device's authority).
+//!
+//! In a test image only (the `harness` feature, which a machine's image is
+//! never built with), the device manager's own option
+//! `inject=<driver>:<fault>@<n>` (`devmgr.inject=...` to the service
+//! manager) has the first run of `<driver>` commit a device's fault at its
+//! `n`th request (`silica_driver::inject`).
 //!
 //! It provides `silica.device.Manager`: a program that uses devices (the
 //! block server, a filesystem, the network stack) lists the devices of a
@@ -50,8 +56,10 @@
 //! as grants: 0 its endpoint (to receive on, and to give drivers their way
 //! to report), 1 the service manager's (`silica.system.Manager`), 2 the
 //! frame of the kernel's `RootInfo` (read-only), 3 the device identities,
-//! 4 the interrupt lines, 5 the I/O ports (or nothing), then `args[0]`
-//! frames of the ramdisk (in
+//! 4 the interrupt lines, 5 the I/O ports (or nothing), 6 a capability that
+//! signals the service manager's watchdog notification (how it is told
+//! that the watchdog's driver changed: `Manager::tell_watchdog`), then
+//! `args[0]` frames of the ramdisk (in
 //! `RootInfo` order, read-only), then `args[1]` Untyped capabilities, given
 //! outright: the machine's device memory and the firmware's memory (where
 //! its ACPI tables are), in `RootInfo` order.
@@ -67,15 +75,16 @@ use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use phys::DeviceMemory;
 use silica_driver::pci::{self, Config};
 use silica_formats::{acpi, ramdisk};
-use silica_proc::{Child, FAULT_BADGE, Grant, Parent, Program, spawn};
+use silica_proc::{Child, FAULT_BADGE, Grant, Parent, Program, Restarts, spawn};
 use silica_rt::alloc::collections::BTreeMap;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, Listener, free_slot, release_slot};
-use silica_rt::mem::{self, Object};
+use silica_rt::mem::{self, Object, OwnedObject};
 use silica_rt::mmio::Mmio;
 use silica_rt::{EXIT_LABEL, ProcessInfo, println, slots};
 
 use silica_protocols::device::{PciAddress, manager};
+use silica_protocols::{paging, scope};
 
 silica_rt::main!(main);
 
@@ -86,15 +95,13 @@ const GRANT_INFO: u64 = 2;
 const GRANT_DEVICES: u64 = 3;
 const GRANT_IRQS: u64 = 4;
 const GRANT_PORTS: u64 = 5;
-const GRANT_FIRST_RAMDISK: u64 = 6;
+const GRANT_WATCHDOG: u64 = 6;
+const GRANT_FIRST_RAMDISK: u64 = 7;
 /// Badges of the capabilities clients call through start here (and stay
 /// below `silica_proc::FAULT_BADGE`); below are the drivers'.
 pub const CLIENTS: u64 = 1 << 32;
 /// Interrupt lines one device gets at most.
 const LINES_PER_DEVICE: u32 = 8;
-/// How often a driver that failed is started again before its device is
-/// left alone.
-const MAX_RESTARTS: u32 = 3;
 
 fn granted(n: u64) -> Cap {
     Cap(slots::FIRST_GRANT + n)
@@ -116,9 +123,11 @@ struct Function {
     lines: Option<(u32, u32)>,
     /// How many times a driver has been started for it.
     starts: u32,
-    /// How many times its driver failed (faulted, or ended with a failure);
-    /// an owner's restart is not a failure.
-    failures: u32,
+    /// Its driver's failures (faulted, or ended with a failure; an owner's
+    /// restart is not one) and when it is started again
+    /// (`silica_proc::Restarts`), and the driver waiting to be.
+    restarts: Restarts,
+    waiting: Option<&'static str>,
     /// Its drivers' log (`silica.system.Manager`'s `add_log`): the ring and
     /// what its writer signals, made when its first driver starts and
     /// handed to every one after it.
@@ -134,8 +143,15 @@ struct Running<'a> {
     child: Child,
     /// The endpoint its clients call it on.
     service: Object,
+    /// The driver's events notification (`slots::EVENTS` in it): what
+    /// the device manager asks it to end on ([`silica_rt::END`]).
+    events: OwnedObject,
     /// What clients asked to have signalled when this driver ends.
-    gone: Vec<Handle>,
+    gone: Vec<(u64, Handle)>,
+    /// A client was given it (`open`) since it started: one that then ends
+    /// asking to be started again (`silica_rt::AGAIN_LABEL`) is, at once; one
+    /// nobody opened is not (it could keep the device manager starting it).
+    opened: bool,
 }
 
 struct Manager {
@@ -147,6 +163,11 @@ struct Manager {
     parent: Parent,
     functions: Vec<Function>,
     running: Vec<Running<'static>>,
+    /// Interrupt lines given back (first, count): a device that left gives
+    /// its back, and the next device is given them before new ones (before,
+    /// every arrival took new lines and none came back, so a slot worked
+    /// for as many insertions as the machine had lines).
+    free_lines: Vec<(u32, u32)>,
     /// The next interrupt line to hand out.
     next_line: u32,
     next_id: u64,
@@ -156,19 +177,59 @@ struct Manager {
     described: silica_rt::alloc::string::String,
     /// Badges of driver capabilities handed out, so each client is told apart.
     next_client: u64,
-    /// The kernel command line: `inject=<driver>:<fault>@<n>`
-    /// (`silica_driver::inject`) is read at each driver's first start.
-    cmdline: &'static [u8],
     /// Hot-plug capable ports, with the configuration space base (ECAM)
     /// and segment of the buses behind them.
-    ports: Vec<(hotplug::Port, u64, u16)>,
+    /// (Each with the segment's last bus.)
+    ports: Vec<(hotplug::Port, u64, u16, u8)>,
+    /// Every bridge found: its segment and the buses behind it, to judge
+    /// a hot-plug port's own (`hotplug::buses_valid`).
+    bridges: Vec<(u32, u8, u8)>,
+    /// Slots a device arrived in, waiting for their link (its deadline)
+    /// or for the 100 ms a device has after its link comes up: the port,
+    /// when to give up or go on, and whether the link is up. The device
+    /// manager serves meanwhile; before, it spun here for up to 1.1 s.
+    settling: Vec<(usize, u64, bool)>,
+    /// Devices that arrived in and departed from slots, for the log.
+    arrivals: u64,
+    departures: u64,
+    /// The longest the device manager went without listening, in
+    /// nanoseconds: what a client or a fault report may have waited.
+    longest_turn: u64,
     /// The archive's drivers, by what they drive.
     table: Vec<(Match, &'static str)>,
+    /// The configuration writes each driver's declaration asks for, made
+    /// before it starts (`drivers`).
+    writes: Vec<(&'static str, Vec<ConfigWrite>)>,
     /// Every configuration space mapped, by function identity.
     configs: BTreeMap<u32, (Config, Cap)>,
     /// What clients asked to have signalled when a device of a class gains
     /// or loses its driver (`watch`).
-    watchers: Vec<(manager::Class, Handle)>,
+    watchers: Vec<(u64, manager::Class, Handle)>,
+    /// The service manager has not been seen to act on the watchdog as it
+    /// now is (`tell_watchdog`): true from the start, so a machine without
+    /// a watchdog is said to have none, and again whenever a watchdog's
+    /// driver starts or ends.
+    watchdog_news: bool,
+    /// It was told of that news, and this program has done nothing since
+    /// but answer it: not told again until it has.
+    watchdog_told: bool,
+    /// The badge of the call being answered: whose capability, and its
+    /// scopes (`silica_protocols::scope`).
+    caller: u64,
+}
+
+/// The scope a caller needs for devices of `class`.
+fn scope_of(class: manager::Class) -> u64 {
+    match class {
+        manager::Class::Block => scope::DEVICE_BLOCK,
+        manager::Class::Network => scope::DEVICE_NETWORK,
+        manager::Class::Display => scope::DEVICE_DISPLAY,
+        manager::Class::Port => scope::DEVICE_PORT,
+        manager::Class::Input => scope::DEVICE_INPUT,
+        manager::Class::Entropy => scope::DEVICE_ENTROPY,
+        manager::Class::Watchdog => scope::DEVICE_WATCHDOG,
+        _ => 0,
+    }
 }
 
 /// A function as found, its BARs probed.
@@ -191,7 +252,8 @@ fn function_of(id: u32, config: Config, config_frame: Cap) -> Function {
         vectors: config.msix().map_or(0, |m| m.vectors),
         lines: None,
         starts: 0,
-        failures: 0,
+        restarts: Restarts::default(),
+        waiting: None,
         log: None,
     }
 }
@@ -207,40 +269,68 @@ fn class_of(f: &Function) -> Option<manager::Class> {
         (0x07, ..) => Some(manager::Class::Port),
         (0x09, ..) => Some(manager::Class::Input),
         (_, 0x1AF4, 0x1044) => Some(manager::Class::Entropy),
+        // Intel's 6300ESB watchdog (class "other system peripheral").
+        (_, 0x8086, 0x25AB) => Some(manager::Class::Watchdog),
         _ => None,
     }
 }
 
 impl manager::Server<Handle> for Manager {
-    fn list<'a>(&'a mut self, class: manager::Class) -> manager::ListReply<'a, Handle> {
+    fn list<'a>(&'a mut self, class: manager::Class, from: u32) -> manager::ListReply<'a, Handle> {
         self.listing.clear();
-        for r in &self.running {
-            let f = &self.functions[r.function];
-            if class_of(f) == Some(class) {
-                self.listing.push(manager::Device { id: f.id, class, driver: r.name });
-            }
+        if scope_of(class) == 0 || !scope::has(self.caller, scope_of(class)) {
+            return manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing), next: 0 };
         }
-        manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing) }
+        let functions = &self.functions;
+        let of_class = self.running.iter().map(|r| (&functions[r.function], r.name)).filter(|(f, _)| class_of(f) == Some(class));
+        // The service manager asked what watchdog there is, and there is
+        // none: it knows (`tell_watchdog`).
+        if class == manager::Class::Watchdog && of_class.clone().next().is_none() {
+            self.watchdog_news = false;
+        }
+        let listing = &mut self.listing;
+        let next = paging::part(
+            of_class,
+            from,
+            |(_, driver)| paging::record(4 + 4 + paging::text(driver.len())),
+            |(f, driver)| listing.push(manager::Device { id: f.id, class, driver }),
+        );
+        manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing), next }
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<manager::OpenReply<Handle>, manager::Error> {
-        let functions = &self.functions;
+        let (functions, caller) = (&self.functions, self.caller);
         let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
-        if let Some(g) = gone {
-            // Kept until the driver ends; a notice nobody can signal is dropped then.
-            r.gone.push(g);
+        let class = class_of(&functions[r.function]);
+        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+            return Err(manager::Error::Refused);
         }
-        let slot = free_slot().ok_or(manager::Error::NoSuchDevice)?;
+        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
         self.next_client += 1;
         let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
         if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, self.next_client).is_err() {
             release_slot(slot);
-            return Err(manager::Error::NoSuchDevice);
+            return Err(manager::Error::NoRoom);
+        }
+        if let Some(g) = gone {
+            // Kept until the driver ends, one for each caller: a caller's
+            // later notice (its reconnecting) replaces its earlier one.
+            r.gone.retain(|(c, _)| *c != caller);
+            r.gone.push((caller, g));
+        }
+        r.opened = true;
+        if class == Some(manager::Class::Watchdog) {
+            // The service manager takes the watchdog's driver: it knows
+            // (`tell_watchdog`).
+            self.watchdog_news = false;
         }
         Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
     }
 
     fn restart(&mut self, id: u32) -> Result<manager::RestartReply, manager::Error> {
+        if !scope::has(self.caller, scope::DEVICE_CONTROL) {
+            return Err(manager::Error::Refused);
+        }
         let at = self.running.iter().position(|r| self.functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
         let r = self.running.remove(at);
         let (driver, function) = (r.name, r.function);
@@ -256,11 +346,18 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn watch(&mut self, class: manager::Class, changed: Handle) -> manager::WatchReply {
-        self.watchers.push((class, changed));
+        if scope_of(class) != 0 && scope::has(self.caller, scope_of(class)) {
+            let caller = self.caller;
+            self.watchers.retain(|(c, k, _)| (*c, *k) != (caller, class));
+            self.watchers.push((caller, class, changed));
+        }
         manager::WatchReply {}
     }
 
     fn describe<'a>(&'a mut self, id: u32, from: u32) -> Result<manager::DescribeReply<'a>, manager::Error> {
+        if !scope::has(self.caller, scope::DEVICE_CONTROL) {
+            return Err(manager::Error::Refused);
+        }
         let functions = &self.functions;
         let r = self.running.iter().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
         let name = silica_rt::alloc::format!("{}@{}", r.name, PciAddress(id));
@@ -281,30 +378,26 @@ impl manager::Server<Handle> for Manager {
     }
 }
 
-/// The value of `key` on a command line of space-separated `key=value` words.
-/// The fault `inject=<driver>:<fault>@<n>` asks `driver` to commit, as
-/// `silica_driver::inject::Fault::plan` makes it (0: none).
-fn inject_plan(cmdline: &[u8], driver: &str) -> u32 {
-    for choice in option(cmdline, "inject") {
-        let Some(colon) = choice.iter().position(|&b| b == b':') else { continue };
-        if &choice[..colon] != driver.as_bytes() {
+/// The fault this program's `inject=<driver>:<fault>@<n>` options ask
+/// `driver` to commit, as `silica_driver::inject::Fault::plan` makes it (0:
+/// none). Test images only: a machine's device manager has no such option.
+#[cfg(feature = "harness")]
+fn inject_plan(driver: &str) -> u32 {
+    for choice in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("inject=")) {
+        let Some((name, rest)) = choice.split_once(':') else { continue };
+        if name != driver {
             continue;
         }
-        let rest = &choice[colon + 1..];
-        let (fault, n) = match rest.iter().position(|&b| b == b'@') {
-            Some(at) => (&rest[..at], core::str::from_utf8(&rest[at + 1..]).ok().and_then(|n| n.parse().ok()).unwrap_or(1)),
+        let (fault, n) = match rest.split_once('@') {
+            Some((fault, n)) => (fault, n.parse().unwrap_or(1)),
             None => (rest, 1),
         };
-        match silica_driver::inject::Fault::named(fault) {
+        match silica_driver::inject::Fault::named(fault.as_bytes()) {
             Some(f) => return f.plan(n),
-            None => println!("devmgr: inject: no fault named {}", core::str::from_utf8(fault).unwrap_or("?")),
+            None => println!("devmgr: inject: no fault named {fault}"),
         }
     }
     0
-}
-
-fn option<'a>(cmdline: &'a [u8], key: &str) -> impl Iterator<Item = &'a [u8]> {
-    cmdline.split(|b| b.is_ascii_whitespace()).filter_map(move |w| w.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
 }
 
 /// What a driver says it drives: a line of the boot archive's `drivers`
@@ -337,27 +430,77 @@ fn drivers(archive: &'static [u8]) -> Vec<(Match, &'static str)> {
             }
             _ => None,
         };
-        match (m, w.next(), w.next()) {
-            (Some(m), Some(program), None) => table.push((m, program)),
+        match (m, w.next(), w.next(), w.next()) {
+            (Some(m), Some(program), None, None) => table.push((m, program)),
+            (Some(m), Some(program), Some(c), None) if c.starts_with("config=") => table.push((m, program)),
             _ => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
         }
     }
     table
 }
 
-/// The driver for a function: the owner's choice on the command line
-/// (`driver=<vendor>:<device>=<program>`), else the first in the archive's
-/// list that names its identifiers, else the first that names its class.
-fn driver_for(f: &Function, cmdline: &'static [u8], table: &[(Match, &'static str)]) -> Option<&'static str> {
-    let hex = |b: &[u8]| core::str::from_utf8(b).ok().and_then(|s| u16::from_str_radix(s, 16).ok());
-    for choice in option(cmdline, "driver") {
-        let mut parts = choice.splitn(2, |b| *b == b'=');
-        let (Some(ids), Some(program)) = (parts.next(), parts.next()) else { continue };
-        let mut ids = ids.splitn(2, |b| *b == b':');
-        if (ids.next().and_then(hex), ids.next().and_then(hex)) == (Some(f.vendor), Some(f.device)) {
-            return core::str::from_utf8(program).ok();
+/// A write to a device's configuration space that its driver's declaration
+/// asks for (`config = ["<offset>:<bytes>:<value>", ...]`, hexadecimal):
+/// a device that is set up through registers of its own configuration
+/// space, which drivers may only read (the watchdog's enable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConfigWrite {
+    offset: u16,
+    bytes: u8,
+    value: u32,
+}
+
+/// The writes the archive's driver list declares, by driver program (the
+/// list's `config=<offset>:<bytes>:<value>,...` word).
+fn config_writes(archive: &'static [u8]) -> Vec<(&'static str, Vec<ConfigWrite>)> {
+    let mut all = Vec::new();
+    let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return all };
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let mut w = line.split_ascii_whitespace().skip(2);
+        let (Some(program), Some(spec)) = (w.next(), w.next().and_then(|c| c.strip_prefix("config="))) else { continue };
+        let writes: Option<Vec<ConfigWrite>> = spec
+            .split(',')
+            .map(|one| {
+                let mut p = one.split(':');
+                let offset = u16::from_str_radix(p.next()?, 16).ok()?;
+                let bytes = u8::from_str_radix(p.next()?, 16).ok()?;
+                let value = u32::from_str_radix(p.next()?, 16).ok()?;
+                p.next().is_none().then_some(ConfigWrite { offset, bytes, value })
+            })
+            .collect();
+        match writes {
+            Some(writes) => all.push((program, writes)),
+            None => println!("devmgr: the archive's driver list declares writes it cannot read: {line}"),
         }
     }
+    all
+}
+
+/// Whether `w` may be made to a device whose capabilities are `caps`
+/// (offset and identifier): only the device's own registers, after the
+/// standard header and outside every capability structure, at a width the
+/// bus has and aligned to it. A declaration can never move a BAR, turn on
+/// bus mastering or change a message interrupt: those stay the device
+/// manager's.
+fn write_allowed(w: ConfigWrite, caps: &[(u8, usize)]) -> bool {
+    let (at, n) = (w.offset as usize, w.bytes as usize);
+    let length = |id: u8| match id {
+        0x01 => 8,  // power management
+        0x05 => 24, // MSI
+        0x10 => 60, // PCI Express
+        0x11 => 12, // MSI-X
+        _ => 16,
+    };
+    matches!(n, 1 | 2 | 4)
+        && at.is_multiple_of(n)
+        && at >= 0x40
+        && at + n <= 0x100
+        && caps.iter().all(|&(id, cap)| at + n <= cap || at >= cap + length(id))
+}
+
+/// The driver for a function: the first in the archive's list that names
+/// its identifiers, else the first that names its class.
+fn driver_for(f: &Function, table: &[(Match, &'static str)]) -> Option<&'static str> {
     let by_id = table.iter().find(|(m, _)| matches!(m, Match::Id(v, d) if (*v, *d) == (f.vendor, f.device)));
     let by_class = || table.iter().find(|(m, _)| matches!(m, Match::Class(c, s, p) if (*c, *s, *p) == f.class));
     by_id.or_else(by_class).map(|(_, program)| *program)
@@ -443,29 +586,80 @@ impl Manager {
     }
 
     /// A slot's interrupt: devices that arrived get addresses and drivers,
-    /// devices taken out lose theirs.
+    /// devices taken out lose theirs, a device swapped for another between
+    /// two looks is both.
     fn slots_changed(&mut self) {
         for k in 0..self.ports.len() {
             match self.ports[k].0.changed() {
                 Some(hotplug::Change::Arrived) => self.arrived(k),
-                Some(hotplug::Change::Leaving | hotplug::Change::Left) => self.left(k),
+                Some(hotplug::Change::Leaving) => self.left(k, false),
+                Some(hotplug::Change::Left) => self.left(k, true),
+                Some(hotplug::Change::Replaced) => {
+                    println!("devmgr: {}: its device was taken out and one put in since it was last asked", PciAddress(self.ports[k].0.id));
+                    self.forget_slot(k);
+                    self.arrived(k);
+                }
                 None => {}
             }
         }
     }
 
+    /// A device arrived in slot `k`: its power on, and then a wait for its
+    /// link (at most a second) and the 100 ms PCI Express gives a device
+    /// after its link comes up before it must answer configuration requests.
+    /// The wait is the main loop's (`slots_due`): the device manager serves
+    /// its clients and hears its drivers' faults meanwhile.
     fn arrived(&mut self, k: usize) {
-        if !self.ports[k].0.power(true) {
-            println!("devmgr: {}: a device arrived, but its link never came up", PciAddress(self.ports[k].0.id));
-            return;
+        self.settling.retain(|s| s.0 != k);
+        self.ports[k].0.power(true);
+        self.arrivals += 1;
+        self.settling.push((k, silica_rt::clock().now() + 1_000_000_000, false));
+    }
+
+    /// Slots waiting for their link or their 100 ms: go on with those that
+    /// are ready; returns when to look again.
+    fn slots_due(&mut self) -> Option<u64> {
+        let now = silica_rt::clock().now();
+        let mut ready = Vec::new();
+        let mut next: Option<u64> = None;
+        let ports = &self.ports;
+        self.settling.retain_mut(|(k, until, linked)| {
+            if !*linked {
+                if ports[*k].0.link_up() {
+                    *linked = true;
+                    *until = now + 100_000_000;
+                } else if now > *until {
+                    println!("devmgr: {}: a device arrived, but its link never came up", PciAddress(ports[*k].0.id));
+                    return false;
+                } else {
+                    // The port's interrupt says when the link comes up (it
+                    // turns this loop, which asks here again): nothing looks
+                    // meanwhile, and the second PCI Express gives a link is
+                    // the wait's only other end. A port that could not be
+                    // armed, or reports no link changes, sends none: its
+                    // link is looked at every 5 ms within that second.
+                    let look = if ports[*k].0.link_interrupt { *until + 1 } else { (now + 5_000_000).min(*until + 1) };
+                    next = Some(next.map_or(look, |n| n.min(look)));
+                    return true;
+                }
+            }
+            if now >= *until {
+                ready.push(*k);
+                return false;
+            }
+            next = Some(next.map_or(*until, |n| n.min(*until)));
+            true
+        });
+        for k in ready {
+            self.found(k);
         }
-        // PCI Express gives a device 100 ms after its link comes up
-        // before it must answer configuration requests.
-        let clock = silica_rt::clock();
-        let until = clock.now() + 100_000_000;
-        while clock.now() < until {
-            sys::yield_now();
-        }
+        next
+    }
+
+    /// The device in slot `k` answers now: give each of its functions
+    /// addresses and a driver.
+    fn found(&mut self, k: usize) {
+        let arrival = self.arrivals;
         let (bus, ecam, segment) = (self.ports[k].0.secondary, self.ports[k].1, self.ports[k].2);
         for dev in 0..32u32 {
             let mut functions = 1;
@@ -479,6 +673,13 @@ impl Manager {
                 }
                 if function == 1 && config.multifunction() {
                     functions = 8;
+                }
+                // A function still known with a driver running (a slot
+                // whose departure was never seen): the driver ends before
+                // its record is the new device's (before, the record was
+                // overwritten under the running driver).
+                if let Some(index) = self.functions.iter().position(|g| g.id == id) {
+                    self.forget_function(index);
                 }
                 if let Err((bar, bits, memory, prefetchable)) = self.ports[k].0.place(&config) {
                     println!(
@@ -499,7 +700,7 @@ impl Manager {
                     }
                 };
                 let f = &self.functions[index];
-                let driver = driver_for(f, self.cmdline, &self.table);
+                let driver = driver_for(f, &self.table);
                 println!(
                     "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x} arrived: {}",
                     PciAddress(id),
@@ -515,22 +716,115 @@ impl Manager {
                 {
                     println!("ERROR: devmgr: {} is not driven: {e}", PciAddress(id));
                 }
+                let lines = self.functions[index].lines;
+                println!(
+                    "devmgr: {}: arrival {arrival} in the slot, {}, {} lines free, longest turn {} ms",
+                    PciAddress(self.ports[k].0.id),
+                    match lines {
+                        Some((first, n)) => silica_rt::alloc::format!("interrupt lines {first} to {}", first + n - 1),
+                        None => silica_rt::alloc::string::String::from("no interrupt lines"),
+                    },
+                    self.lines_free(),
+                    self.longest_turn / 1_000_000
+                );
             }
         }
     }
 
-    fn left(&mut self, k: usize) {
-        let (first, last) = (self.ports[k].0.secondary, self.ports[k].0.subordinate);
-        let segment = self.ports[k].2;
-        while let Some(at) = self.running.iter().position(|r| PciAddress(self.functions[r.function].id).on_buses(segment, first..=last)) {
+    /// How many interrupt lines the device manager can still give.
+    fn lines_free(&self) -> u64 {
+        (sys::IRQ_LINES - self.next_line as u64) + self.free_lines.iter().map(|(_, n)| *n as u64).sum::<u64>()
+    }
+
+    /// Function `index` is gone (or about to be found again): its driver
+    /// ends, and what it was given comes back: its interrupt lines (for the
+    /// next device) and its registers' frames (a device laid out otherwise
+    /// may come next).
+    fn forget_function(&mut self, index: usize) {
+        while let Some(at) = self.running.iter().position(|r| r.function == index) {
             let r = self.running.remove(at);
-            let (driver, id) = (r.name, self.functions[r.function].id);
+            let (driver, id) = (r.name, self.functions[index].id);
             if !self.stop(r) {
                 println!("ERROR: devmgr: cannot take back the memory of {driver}");
             }
             println!("devmgr: {} was taken out; {driver} ended", PciAddress(id));
         }
+        let f = &mut self.functions[index];
+        // Nothing is started again for a device that is gone.
+        f.waiting = None;
+        if let Some(lines) = f.lines.take() {
+            self.free_lines.push(lines);
+        }
+        let bars = f.bars;
+        for bar in bars.iter().flatten() {
+            // SAFETY: its driver has ended (above), and the device manager
+            // maps no device's registers but the ports' own.
+            #[allow(unsafe_code)]
+            unsafe {
+                self.memory.release(bar.base, bar.bits)
+            };
+        }
+        self.functions[index].bars = [None; 6];
+    }
+
+    /// Every function behind slot `k` is gone.
+    fn forget_slot(&mut self, k: usize) {
+        self.settling.retain(|s| s.0 != k);
+        let (first, last) = (self.ports[k].0.secondary, self.ports[k].0.subordinate);
+        let segment = self.ports[k].2;
+        for index in 0..self.functions.len() {
+            if PciAddress(self.functions[index].id).on_buses(segment, first..=last) {
+                self.forget_function(index);
+            }
+        }
+        self.ports[k].0.empty();
+    }
+
+    /// The device in slot `k` is leaving (someone pressed its button: it is
+    /// still there, and is let go of and its power switched off) or `gone`.
+    fn left(&mut self, k: usize, gone: bool) {
+        self.forget_slot(k);
+        if gone {
+            self.departures += 1;
+            println!(
+                "devmgr: {}: departure {} from the slot, {} lines free, longest turn {} ms",
+                PciAddress(self.ports[k].0.id),
+                self.departures,
+                self.lines_free(),
+                self.longest_turn / 1_000_000
+            );
+        }
         self.ports[k].0.power(false);
+    }
+
+    /// Start a driver for function `index` again after a failure; one that
+    /// cannot be started is tried again later, as if it had failed again.
+    fn start_again(&mut self, index: usize, driver: &'static str) {
+        let device = PciAddress(self.functions[index].id);
+        match self.start(index, driver) {
+            Ok(()) => println!("devmgr: {driver} for {device} started again"),
+            Err(e) => {
+                let now = silica_rt::clock().now();
+                let due = self.functions[index].restarts.failed(now);
+                self.functions[index].waiting = Some(driver);
+                println!("ERROR: devmgr: {device} is not driven: {e}; tried again in {} ms", (due - now) / 1_000_000);
+            }
+        }
+    }
+
+    /// Start the drivers whose restart is due; returns when the next one is.
+    fn restart_due(&mut self) -> Option<u64> {
+        let now = silica_rt::clock().now();
+        for index in 0..self.functions.len() {
+            let f = &self.functions[index];
+            if let Some(driver) = f.waiting
+                && f.restarts.due <= now
+            {
+                self.functions[index].waiting = None;
+                self.start_again(index, driver);
+            }
+        }
+        self.functions.iter().filter(|f| f.waiting.is_some()).map(|f| f.restarts.due).min()
     }
 
     /// Find every function on `bus` and behind its bridges.
@@ -551,11 +845,13 @@ impl Manager {
                 if config.header() == 1 {
                     // A bridge: the firmware numbered the bus behind it.
                     let behind = config.secondary_bus();
+                    let r = config.registers();
+                    self.bridges.push((id, r.read8(0x19), r.read8(0x1A)));
                     if behind > bus && behind <= last_bus && depth < 16 {
                         self.scan(ecam, segment, behind, last_bus, depth + 1);
                     }
                     if let Some(port) = hotplug::Port::of(id, config) {
-                        self.ports.push((port, ecam, segment));
+                        self.ports.push((port, ecam, segment, last_bus));
                     }
                 }
                 self.functions.push(function_of(id, config, config_frame));
@@ -579,6 +875,26 @@ impl Manager {
             // The table gives the address of bus 0 even when the segment starts later.
             self.scan(base, segment, first, last, 0);
         }
+        // A port is trusted with the buses behind it only when they are its
+        // own (`hotplug::buses_valid`): a device found on another's would
+        // be given addresses out of this port's windows.
+        let bridges = core::mem::take(&mut self.bridges);
+        self.ports.retain(|(p, _, segment, last)| {
+            let bus = (p.id >> 8) as u8;
+            let others: Vec<(u8, u8)> =
+                bridges.iter().filter(|(b, _, _)| *b >> 16 == *segment as u32 && *b != p.id).map(|(_, sec, sub)| (*sec, *sub)).collect();
+            let ok = hotplug::buses_valid(bus, p.secondary, p.subordinate, *last, &others);
+            if !ok {
+                println!(
+                    "devmgr: {} says the buses behind it are {} to {}, which are not its own; it takes no devices",
+                    PciAddress(p.id),
+                    p.secondary,
+                    p.subordinate
+                );
+            }
+            ok
+        });
+        self.bridges = bridges;
         Ok(())
     }
 
@@ -589,27 +905,46 @@ impl Manager {
         let (id, config) = (f.id, f.config);
         // Its interrupt lines: as many as it can raise, up to a limit; the
         // same ones every time a driver is started for it.
-        let (first_line, lines) = match f.lines {
-            Some(l) => l,
+        let (first_line, lines, reused) = match f.lines {
+            Some((first, n)) => (first, n, None),
             None => {
                 let lines = (f.vectors as u32).min(LINES_PER_DEVICE);
-                if self.next_line as u64 + lines as u64 > sys::IRQ_LINES {
-                    return Err("the machine has no interrupt lines left for it");
+                // Lines a device that left gave back come first.
+                match self.free_lines.iter().position(|&(_, n)| n >= lines) {
+                    Some(k) => (self.free_lines[k].0, lines, Some(k)),
+                    None if self.next_line as u64 + lines as u64 > sys::IRQ_LINES => {
+                        return Err("the machine has no interrupt lines left for it");
+                    }
+                    None => (self.next_line, lines, None),
                 }
-                (self.next_line, lines)
             }
         };
         // Its registers: one frame per memory BAR.
         let mut grants = [Grant::none(); silica_driver::grant::COUNT];
+        let mut frames = [None; 6];
         for (i, bar) in f.bars.iter().enumerate() {
             let Some(bar) = bar else { continue };
-            if bar.bits < 12 {
-                // Registers smaller than a page share their page with
-                // whatever else the firmware put there.
-                return Err("it has registers smaller than a page, which cannot be handed out on their own yet");
-            }
-            let frame = self.memory.frame(bar.base, bar.bits).map_err(|_| "its registers are not in the machine's device memory")?;
+            // Registers smaller than a page are handed out as their page
+            // when nothing else in the machine is there (another device's
+            // registers would be reachable through it): the driver finds
+            // where in the page they start from the BAR's address.
+            let (base, bits) = if bar.bits < 12 {
+                let page = bar.base & !0xFFF;
+                let shares = self.functions.iter().flat_map(|g| g.bars.iter().flatten()).any(|b| {
+                    (b.base, b.bits) != (bar.base, bar.bits) && b.base < page + 0x1000 && b.base.saturating_add(1 << b.bits) > page
+                });
+                if shares {
+                    return Err("its registers share a page with another device's, which cannot be handed out on their own");
+                }
+                (page, 12)
+            } else {
+                (bar.base, bar.bits)
+            };
+            let frame = self.memory.frame(base, bits).map_err(|_| "its registers are not in the machine's device memory")?;
             grants[silica_driver::grant::BAR0 as usize + i] = Grant::lend(frame, RW);
+            if let Some(slot) = frames.get_mut(i) {
+                *slot = Some((frame, bar.bits));
+            }
         }
         let f = &self.functions[index];
         let service = Object::new(ObjectType::Endpoint, 0).map_err(|_| "no memory for its service endpoint")?;
@@ -625,15 +960,6 @@ impl Manager {
                 Grant::badged(granted(GRANT_IRQS), Rights::ALL, first_line as u64 | (first_line as u64 + lines as u64) << 32);
         }
         grants[silica_driver::grant::CONFIG as usize] = Grant::lend(f.config_frame, Rights::READ);
-        // What the driver may not change itself: the device answers memory
-        // accesses, may do DMA and send message interrupts, and raises
-        // those through MSI-X, never the legacy wire.
-        let registers = config.registers();
-        registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
-        if let Some(msix) = config.msix() {
-            registers.write16(msix.cap + 2, (registers.read16(msix.cap + 2) | 1 << 15) & !(1 << 14));
-        }
-        self.next_id += 1;
         // A display: the framebuffer the firmware set up, if it is this
         // device's (its mode, and the BAR it starts at the first byte of).
         let mut display = [0u64; 3];
@@ -645,10 +971,53 @@ impl Manager {
                 None => return Err("the firmware's framebuffer does not start a BAR of this display"),
             }
         }
-        // A fault to commit on purpose, in the driver's first run only.
-        let inject = if f.starts == 0 { inject_plan(self.cmdline, driver) } else { 0 };
+        // What the driver may not change itself: the device answers memory
+        // accesses, may do DMA and send message interrupts, and raises
+        // those through MSI-X, never the legacy wire.
+        let registers = config.registers();
+        // What the driver's declaration asks to have set in the device's
+        // own configuration registers, which the driver may only read.
+        if let Some((_, writes)) = self.writes.iter().find(|(p, _)| *p == driver) {
+            let caps: Vec<(u8, usize)> = config.capabilities().collect();
+            if !writes.iter().all(|w| write_allowed(*w, &caps)) {
+                return Err("its declaration asks to write configuration registers that are not its device's own");
+            }
+            for w in writes {
+                match w.bytes {
+                    1 => registers.write8(w.offset as usize, w.value as u8),
+                    2 => registers.write16(w.offset as usize, w.value as u16),
+                    _ => registers.write32(w.offset as usize, w.value),
+                }
+            }
+        }
+        registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
+        if let Some(msix) = config.msix() {
+            // Every entry masked and emptied before any can fire: the table
+            // still holds the last driver's messages, whose lines may since
+            // belong to another device. Enabled under the function mask,
+            // emptied, then the mask lifted; the new driver unmasks each
+            // entry only after writing it (`Interrupt::bind_to`).
+            let control = registers.read16(msix.cap + 2);
+            registers.write16(msix.cap + 2, control | 1 << 15 | 1 << 14);
+            match frames.get(msix.bar as usize).copied().flatten() {
+                Some((frame, bits)) => mask_msix_table(frame, bits, msix.offset as usize, msix.vectors as usize)?,
+                None => return Err("its MSI-X table is in no memory BAR"),
+            }
+            registers.write16(msix.cap + 2, (registers.read16(msix.cap + 2) | 1 << 15) & !(1 << 14));
+        }
+        self.next_id += 1;
+        // A test image's fault to commit on purpose, in the driver's first
+        // run only; a machine's image has no such thing to pass.
+        #[cfg(feature = "harness")]
+        let inject = if f.starts == 0 { inject_plan(driver) } else { 0 };
+        #[cfg(not(feature = "harness"))]
+        let inject = 0u32;
         let starts = f.starts;
         let log = self.log_of(index, driver);
+        let events = OwnedObject::new(ObjectType::Notification, 0).map_err(|_| {
+            silence(&config);
+            "no memory for its driver's notification"
+        })?;
         let program = Program {
             grants: &grants,
             args: [
@@ -662,20 +1031,50 @@ impl Manager {
                 display[2],
             ],
             aspace_bits: 18,
+            events: Some(events.cap()),
             log,
             ..Program::new(image, self.next_id)
         };
         let child = spawn(&self.parent, &program).map_err(|e| {
-            println!("devmgr: cannot start {driver}: {e:?}");
+            // Nothing drives it: it does no DMA and raises nothing.
+            silence(&config);
+            let command = config.registers().read16(4);
+            println!(
+                "devmgr: cannot start {driver}: {e:?}; {} left with bus mastering {} (command {command:#06x})",
+                PciAddress(id),
+                if command & pci::COMMAND_MASTER != 0 { "on" } else { "off" }
+            );
             "its driver could not be started"
         })?;
-        let f = &mut self.functions[index];
-        if f.lines.is_none() {
-            f.lines = Some((first_line, lines));
-            self.next_line += lines;
+        if self.functions[index].lines.is_none() {
+            match reused {
+                // What is left of a range given back stays free.
+                Some(k) => {
+                    let (first, n) = self.free_lines[k];
+                    if n == lines {
+                        self.free_lines.swap_remove(k);
+                    } else {
+                        self.free_lines[k] = (first + lines, n - lines);
+                    }
+                }
+                None => self.next_line += lines,
+            }
+            self.functions[index].lines = Some((first_line, lines));
         }
+        let f = &mut self.functions[index];
         f.starts += 1;
-        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, gone: Vec::new() });
+        f.restarts.started(silica_rt::clock().now());
+        f.waiting = None;
+        self.running.push(Running {
+            name: driver,
+            id: self.next_id,
+            function: index,
+            child,
+            service,
+            events,
+            gone: Vec::new(),
+            opened: false,
+        });
         self.changed(index);
         Ok(())
     }
@@ -687,7 +1086,29 @@ impl Manager {
     /// (its holder ended) is forgotten.
     fn changed(&mut self, index: usize) {
         let Some(class) = class_of(&self.functions[index]) else { return };
-        self.watchers.retain(|(c, n)| *c != class || sys::signal(n.cap()).is_ok());
+        self.watchers.retain(|(_, c, n)| *c != class || sys::signal(n.cap()).is_ok());
+        self.watchdog_news |= class == manager::Class::Watchdog;
+    }
+
+    /// Tell the service manager that the watchdog's driver changed, by the
+    /// capability it gave this program at its start (`GRANT_WATCHDOG`): the
+    /// service manager alone pets a watchdog, and takes its driver when it
+    /// hears. Called as the loop turns to listen, so the calls that follow
+    /// (`list`, `open`) are answered at once; and again after every turn
+    /// this program spent on something else, until the service manager has
+    /// been seen to act (it opened the watchdog's driver, or asked and
+    /// there is none), so one that gave up on a call while this program was
+    /// busy hears again when it no longer is. The kernel keeps the signal
+    /// until the service manager listens: nothing is asked for beforehand.
+    fn tell_watchdog(&mut self) {
+        if !self.watchdog_news || self.watchdog_told {
+            return;
+        }
+        self.watchdog_told = true;
+        if sys::signal(granted(GRANT_WATCHDOG)).is_err() {
+            // Started by something that pets no watchdog: nobody to tell.
+            self.watchdog_news = false;
+        }
     }
 
     /// The log of the drivers of function `index` (`driver` names it with
@@ -715,14 +1136,10 @@ impl Manager {
     /// off from memory as the driver's device address space goes.
     fn stop(&mut self, r: Running<'static>) -> bool {
         let config = self.functions[r.function].config;
-        let registers = config.registers();
-        registers.write16(4, registers.read16(4) & !pci::COMMAND_MASTER);
-        if let Some(msix) = config.msix() {
-            registers.write16(msix.cap + 2, registers.read16(msix.cap + 2) & !(1 << 15));
-        }
+        silence(&config);
         let ok = r.child.destroy().is_ok();
         // Its clients hear of it now, not on their next call.
-        for g in r.gone {
+        for (_, g) in r.gone {
             let _ = sys::signal(g.cap());
         }
         self.changed(r.function);
@@ -733,6 +1150,65 @@ impl Manager {
         };
         ok
     }
+
+    /// End every driver, block devices' in order: each is asked
+    /// ([`silica_rt::END`] on its events notification) and has until
+    /// [`END_NS`] to make its device's cache durable, shut the device down
+    /// and exit; one that has not is ended where it stands, as is every
+    /// other driver (nothing they hold outlives them). Before, every driver
+    /// was destroyed where it stood: a power cut for the disks' caches.
+    /// Exits arrive on the endpoint clients call: a call taken meanwhile is
+    /// not answered (the machine is going down).
+    fn end_drivers(&mut self, listener: &mut Listener) {
+        let mut asked = Vec::new();
+        for r in &self.running {
+            if class_of(&self.functions[r.function]) != Some(manager::Class::Block) {
+                continue;
+            }
+            match signal_bits(r.events.cap(), silica_rt::END) {
+                Ok(()) => asked.push(r.id),
+                Err(e) => println!("devmgr: cannot ask {} to end: {e:?}", r.name),
+            }
+        }
+        println!("devmgr: {} disk drivers asked to end, {} drivers in all", asked.len(), self.running.len());
+        let deadline = silica_rt::clock().now() + END_NS;
+        while !asked.is_empty() {
+            let Ok(msg) = listener.recv(Wait::Until(deadline)) else { break };
+            let Some(k) = asked.iter().position(|id| *id == msg.badge & !FAULT_BADGE) else { continue };
+            asked.swap_remove(k);
+            let Some(at) = self.running.iter().position(|r| r.id == msg.badge & !FAULT_BADGE) else { continue };
+            let r = self.running.remove(at);
+            let device = PciAddress(self.functions[r.function].id);
+            if msg.badge & FAULT_BADGE == 0 && msg.info.label() == EXIT_LABEL && msg.words[0] == 0 {
+                println!("devmgr: {} for {device} ended in order", r.name);
+            } else {
+                println!("devmgr: {} for {device} did not end in order (status {})", r.name, msg.words[0] as i64);
+            }
+            self.stop(r);
+        }
+        while let Some(r) = self.running.pop() {
+            if asked.contains(&r.id) {
+                println!("devmgr: {} did not end within {} ms; ended where it stood", r.name, END_NS / 1_000_000);
+            }
+            self.stop(r);
+        }
+    }
+}
+
+/// How long a driver asked to end has to do so (`Manager::end_drivers`):
+/// a flush and an NVMe controller's shutdown, each bounded by the driver.
+const END_NS: u64 = 8_000_000_000;
+
+/// Signal `bits` on the notification `cap` (an unbadged capability signals
+/// bit 0 alone).
+fn signal_bits(cap: Cap, bits: u64) -> Result<(), sys::Error> {
+    let slot = free_slot().ok_or(sys::Error::NoMemory)?;
+    let made = sys::cap_derive(slots::SPACE, slot, cap, Rights::WRITE, bits).and_then(|()| sys::signal(Cap(slot)));
+    // SAFETY: the capability was made here, for this signal alone.
+    #[allow(unsafe_code)]
+    let _ = unsafe { sys::cap_delete(Cap(slot)) };
+    release_slot(slot);
+    made
 }
 
 /// Map the boot archive: the ramdisk frames, laid out as they are in memory.
@@ -812,18 +1288,26 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         functions: Vec::new(),
         running: Vec::new(),
         next_line: info.msi_first as u32,
+        free_lines: Vec::new(),
         next_id: 0,
         listing: Vec::new(),
         described: silica_rt::alloc::string::String::new(),
         next_client: CLIENTS,
-        cmdline: &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())],
         ports: Vec::new(),
+        bridges: Vec::new(),
+        settling: Vec::new(),
+        arrivals: 0,
+        departures: 0,
+        longest_turn: 0,
         table: drivers(archive),
+        writes: config_writes(archive),
         configs: BTreeMap::new(),
         watchers: Vec::new(),
+        watchdog_news: true,
+        watchdog_told: false,
+        caller: 0,
     };
     m.enumerate()?;
-    let cmdline = m.cmdline;
     let table = m.table.clone();
     if table.is_empty() {
         println!("devmgr: the boot archive lists no drivers");
@@ -835,7 +1319,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     let mut failed = false;
     let mut wanted = Vec::new();
     for (i, f) in m.functions.iter().enumerate() {
-        let driver = driver_for(f, cmdline, &table);
+        let driver = driver_for(f, &table);
         println!(
             "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x}, {} interrupts: {}",
             PciAddress(f.id),
@@ -859,11 +1343,12 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         println!("ERROR: devmgr: not every device has its driver");
     }
     // What happens to the machine: the power button and the hot-plug slots,
-    // each a bit of one notification.
-    let happened = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for its notification")?;
+    // each a bit (from 32 up) of its events notification, where the service
+    // manager asks it to end (`silica_rt::END`).
+    let happened = slots::EVENTS;
     let sender = |bits: u64| -> Result<Cap, &'static str> {
         let slot = free_slot().ok_or("no capability slots left")?;
-        sys::cap_derive(slots::SPACE, slot, happened.cap(), Rights::WRITE, bits).map_err(|_| "cannot make a notification sender")?;
+        sys::cap_derive(slots::SPACE, slot, happened, Rights::WRITE, bits).map_err(|_| "cannot make a notification sender")?;
         Ok(Cap(slot))
     };
     let button = match power::Button::new(&mut m, granted(GRANT_PORTS), granted(GRANT_IRQS), sender(power::BUTTON)?) {
@@ -883,10 +1368,40 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     m.slots_changed();
     // From here on: clients' calls, drivers that end, the button and the slots.
     let mut listener = Listener::new(events);
+    // When the device manager last took something to do: how long it then
+    // went without listening is its turn (`longest_turn`).
+    let mut took = silica_rt::clock().now();
     loop {
-        let got = listener.recv_listening(happened.cap(), Wait::Forever);
+        // Drivers whose restart is due, and when the next one is.
+        let restart = m.restart_due();
+        let slots = m.slots_due();
+        let now = silica_rt::clock().now();
+        m.longest_turn = m.longest_turn.max(now - took);
+        let next = match (restart, slots) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // About to listen: the service manager hears of a watchdog now.
+        m.tell_watchdog();
+        let got = listener.recv_listening(happened, next.map_or(Wait::Forever, Wait::Until));
+        took = silica_rt::clock().now();
+        // Anything but the service manager's answer to that news is this
+        // program busy with something else: the news is told again after.
+        let answering = matches!(&got, Ok(msg) if msg.signals().is_none()
+            && msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 && scope::has(msg.badge, scope::DEVICE_WATCHDOG));
+        m.watchdog_told &= answering;
+        if matches!(got, Err(sys::Error::Timeout)) {
+            continue;
+        }
         let Ok(msg) = got else { return Err("its endpoint was taken away") };
         if let Some(bits) = msg.signals() {
+            if bits & silica_rt::END != 0 {
+                // The service manager is turning the machine off: the disks'
+                // caches are made durable before anything is let go of.
+                println!("devmgr: asked to end: its drivers end in order");
+                m.end_drivers(&mut listener);
+                silica_rt::exit(0);
+            }
             if bits & hotplug::HOTPLUG != 0 {
                 m.slots_changed();
             }
@@ -895,6 +1410,9 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
                 && b.pressed()
             {
                 println!("devmgr: the power button was pressed: shutting down");
+                // The service manager cannot ask this program to end while it
+                // waits in the call below: its drivers end in order first.
+                m.end_drivers(&mut listener);
                 let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
                 if let Err(e) = system.shutdown(false) {
                     println!("ERROR: devmgr: the service manager would not shut down: {e:?}");
@@ -905,6 +1423,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         // Clients' badges are from CLIENTS up; a fault report's has
         // FAULT_BADGE, above them, which no client is given.
         if msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 {
+            m.caller = msg.badge;
             listener.answer(&msg, |request, caps, reply, reply_caps| manager::dispatch(&mut m, request, caps, reply, reply_caps));
             continue;
         }
@@ -919,10 +1438,17 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         let r = m.running.remove(at);
         let (driver, function) = (r.name, r.function);
         let device = PciAddress(m.functions[function].id);
+        let mut again = false;
         let ended_well = if label == EXIT_LABEL && !fault {
             let status = msg.words[0] as i64;
             println!("devmgr: {driver} for {device} ended with status {status}");
             status == 0
+        } else if label == silica_rt::AGAIN_LABEL && !fault {
+            // To reset its device for its next client: a start, not a
+            // failure, of a driver a client was given since it started.
+            println!("devmgr: {driver} for {device} ended to be started again");
+            again = r.opened;
+            again
         } else if fault {
             // The kernel's fault message: instruction, address, detail.
             let kind = match label - sys::FAULT_LABEL {
@@ -939,16 +1465,68 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         if !m.stop(r) {
             println!("ERROR: devmgr: cannot take back the memory of {driver}");
         }
+        if again {
+            // It asked to be started again (to reset its device): a start,
+            // not a failure.
+            m.start_again(function, driver);
+            continue;
+        }
         if ended_well {
             continue;
         }
-        m.functions[function].failures += 1;
-        if m.functions[function].failures > MAX_RESTARTS {
-            println!("ERROR: devmgr: {driver} for {device} failed {} times; the device is left alone", m.functions[function].failures);
-        } else if let Err(e) = m.start(function, driver) {
-            println!("ERROR: devmgr: {device} is not driven: {e}");
-        } else {
-            println!("devmgr: {driver} for {device} started again");
+        let now = silica_rt::clock().now();
+        let due = m.functions[function].restarts.failed(now);
+        if due > now {
+            println!(
+                "devmgr: {driver} for {device} has failed {} times in a row; started again in {} ms",
+                m.functions[function].restarts.streak,
+                (due - now) / 1_000_000
+            );
+            m.functions[function].waiting = Some(driver);
+            continue;
         }
+        m.start_again(function, driver);
+    }
+}
+
+/// Mask and empty each of the `vectors` entries of the MSI-X table at
+/// `offset` in the BAR whose frame is `frame` (`2^bits` bytes), before a
+/// driver is started: an entry left by the last driver names a line that
+/// may since be another device's (QEMU's VT-d model aborted re-routing one,
+/// and real units fault every message through it).
+fn mask_msix_table(frame: Cap, bits: u8, offset: usize, vectors: usize) -> Result<(), &'static str> {
+    let at = mem::map(frame, bits, RW).map_err(|_| "its MSI-X table cannot be mapped")?;
+    // SAFETY: the device's own BAR, mapped here and unmapped below before
+    // its driver (which gets a copy of the frame) is started.
+    #[allow(unsafe_code)]
+    let table = unsafe { Mmio::new(at, 1 << bits) };
+    let result = (|| {
+        for v in 0..vectors {
+            let entry = table.part(offset + v * 16, 16).ok_or("its MSI-X table lies outside its BAR")?;
+            entry.write32(12, 1);
+            entry.write32(0, 0);
+            entry.write32(4, 0);
+            entry.write32(8, 0);
+        }
+        Ok(())
+    })();
+    // SAFETY: nothing refers to the mapping after this.
+    #[allow(unsafe_code)]
+    let _ = unsafe { sys::unmap(frame) };
+    result
+}
+
+/// The device of `config` may no longer do DMA or send message interrupts:
+/// a device without a running driver (stopped, or never started because
+/// starting it failed) is silenced, so that without an IOMMU it cannot
+/// reach memory at all. Says so if the device does not take it.
+fn silence(config: &Config) {
+    let registers = config.registers();
+    registers.write16(4, registers.read16(4) & !pci::COMMAND_MASTER);
+    if let Some(msix) = config.msix() {
+        registers.write16(msix.cap + 2, registers.read16(msix.cap + 2) & !(1 << 15));
+    }
+    if registers.read16(4) & pci::COMMAND_MASTER != 0 {
+        println!("ERROR: devmgr: a device kept bus mastering after it was switched off");
     }
 }

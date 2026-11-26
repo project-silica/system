@@ -104,6 +104,12 @@ impl<T: Copy> Ring<T> {
         (self.tail + RING - self.next) % RING
     }
 
+    /// When the oldest request the device holds was given: the one at
+    /// `next` (the device takes them in order), without a walk.
+    pub fn oldest(&self) -> Option<u64> {
+        (self.holding() != 0).then(|| self.slots[self.next].map(|(_, at)| at)).flatten()
+    }
+
     /// When each request the device holds was given.
     pub fn given(&self) -> impl Iterator<Item = u64> + '_ {
         self.slots.iter().flatten().map(|(_, at)| *at)
@@ -147,5 +153,22 @@ impl<T: Copy> Ring<T> {
         let (ticket, _) = self.slots[self.next].take()?;
         self.next = (self.next + 1) % RING;
         Some(Done { ticket, length, status, errors })
+    }
+
+    /// Take back every request the device holds, oldest first, whether or
+    /// not it wrote them back, and start the ring again from its first
+    /// descriptor: for a ring whose queue the driver has stopped, after
+    /// which the device's head and tail are set to 0 as well.
+    pub fn drain(&mut self, mut each: impl FnMut(T)) {
+        while self.next != self.tail {
+            if let Some((ticket, _)) = self.slots[self.next].take() {
+                each(ticket);
+            }
+            self.words.write32(self.next * DESC + 12, 0);
+            self.next = (self.next + 1) % RING;
+        }
+        self.next = 0;
+        self.tail = 0;
+        self.added = false;
     }
 }

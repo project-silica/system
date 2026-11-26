@@ -13,7 +13,9 @@
 
 use silica_block::client::{Disk, Error};
 use silica_block::partitions;
-use silica_block::{Op, Request, Status};
+use silica_block::service::TRACED;
+use silica_block::{Op, Request, Status, device};
+use silica_protocols::device::manager;
 use silica_rt::ipc::{Channel, Handle};
 use silica_rt::mem::Memory;
 use silica_rt::sys::Cap;
@@ -33,12 +35,82 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     }
 }
 
+/// Wait until the block server lists partitions (as many as
+/// `partcheck.partitions=<n>` says, when it says), woken by the device
+/// manager each time a disk gains or loses its driver (`watch` first, then
+/// `list`, so no change between them is missed). The block server serves
+/// from its start with the disks it has; a disk still on its way is the
+/// client's to wait for, on the device manager's word. The bound is a
+/// backstop: past it no disk came, which is this test's failure.
+fn wait_for_partitions(devices: Cap, list: &mut partitions::Client<Channel, Handle>) -> Result<(), &'static str> {
+    use silica_rt::sys::{self, ObjectType, Rights, Wait};
+    let changed = silica_rt::mem::Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
+    let slot = silica_rt::ipc::free_slot().ok_or("no free slot")?;
+    sys::cap_derive(slots::SPACE, slot, changed.cap(), Rights::WRITE, 0).map_err(|_| "the notification cannot be lent")?;
+    let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(devices));
+    devices.watch(manager::Class::Block, Handle::new(Cap(slot))).map_err(|_| "the device manager does not answer a watch")?;
+    let want = silica_rt::option("partitions").and_then(|n| n.parse::<u32>().ok());
+    let deadline = silica_rt::clock().now() + 30 * SECOND;
+    loop {
+        let (mut n, mut from) = (0u32, 0);
+        loop {
+            let part = list.list(from).map_err(|_| "the block server does not answer")?;
+            n += part.partitions.iter().count() as u32;
+            if part.next == 0 || part.next <= from {
+                break;
+            }
+            from = part.next;
+        }
+        if n > 0 && want.is_none_or(|w| n >= w) {
+            return Ok(());
+        }
+        if sys::recv(changed.cap(), Wait::Until(deadline)).is_err() {
+            println!("partcheck: {n} partitions listed after 30 s of the device manager's news");
+            return Err("no disk with the partitions expected arrived");
+        }
+    }
+}
+
 fn run() -> Result<(), &'static str> {
     let pass = |name: &str| println!("TEST partitions.{name} PASS");
     let devices = Cap(slots::FIRST_GRANT);
     let server = Cap(slots::FIRST_GRANT + 1);
     let mut list = partitions::Client::<Channel, Handle>::from(Channel::new(server));
-    let listed = list.list().map_err(|_| "the block server does not answer")?;
+    wait_for_partitions(devices, &mut list)?;
+    // Every partition of every disk, part after part: as many as the
+    // machine's disks have (`partcheck.partitions=<n>` says how many to
+    // expect: a disk with a full table of 128 is one before which the list
+    // was refused to every caller, too long for one message).
+    let (mut all, mut ids, mut from, mut parts) = (0u32, silica_rt::alloc::vec::Vec::new(), 0, 0);
+    loop {
+        let part = list.list(from).map_err(|_| "the block server does not answer")?;
+        parts += 1;
+        for p in part.partitions.iter() {
+            all += 1;
+            ids.push(p.id);
+        }
+        if part.next == 0 {
+            break;
+        }
+        if part.next <= from {
+            return Err("the block server's next part does not move on");
+        }
+        from = part.next;
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() as u32 != all {
+        return Err("the block server listed a partition twice");
+    }
+    if let Some(n) = silica_rt::option("partitions").and_then(|n| n.parse::<u32>().ok())
+        && n != all
+    {
+        println!("partcheck: {all} partitions listed, {n} expected");
+        return Err("the block server did not list every partition");
+    }
+    println!("partcheck: {all} partitions listed, in {parts} parts");
+    pass("listed_whole");
+    let listed = list.list(0).map_err(|_| "the block server does not answer")?;
     let Some(p) = listed.partitions.iter().next() else { return Err("the block server lists no partition") };
     let (id, disk_id, first, blocks) = (p.id, p.disk, p.first, p.blocks);
     println!("partcheck: partition {id:#x} of disk {disk_id:#x}: blocks {first} to {}, {} {}", first + blocks - 1, p.kind, p.name);
@@ -91,5 +163,84 @@ fn run() -> Result<(), &'static str> {
         return Err("a write to the partition did not land where it belongs on the disk");
     }
     pass("write");
+
+    // What a capability's scopes allow (`silica_protocols::scope`): the
+    // third grant may list partitions and not open them.
+    let mut listing = partitions::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT + 2)));
+    match listing.open(id, None) {
+        Err(silica_idl_rt::CallError::Error(partitions::Error::Refused)) => {}
+        Ok(_) => return Err("a capability given only `list` opened a partition"),
+        Err(e) => {
+            println!("partcheck: open through the list-only capability: {e:?}");
+            return Err("open through the list-only capability failed otherwise than refused");
+        }
+    }
+    if listing.list(0).map_or(true, |r| r.partitions.iter().next().is_none()) {
+        return Err("the list-only capability lists nothing");
+    }
+    pass("scopes");
+
+    // Opening a partition again and again (each open asks the driver to
+    // narrow the disk's capability): the same range is the same window,
+    // so the driver's windows are not used up (they were, at 256 opens).
+    for n in 0..300 {
+        if let Err(e) = list.open(id, None) {
+            println!("partcheck: open {n} of the same partition: {e:?}");
+            return Err("opening one partition again and again used up the driver's windows");
+        }
+    }
+    pass("opens_bounded");
+
+    // A partition's client narrowing its capability as often as it likes:
+    // it gets a few windows under its own, and the disk's holders can
+    // still narrow theirs (a client once used up every window there was,
+    // and no partition could be opened after it).
+    // The capability is kept while it is used: dropping it deletes it.
+    let opened = list.open(id, None).map_err(|_| "the partition cannot be opened")?.device;
+    let mut inside = device::Client::<Channel, Handle>::from(Channel::new(opened.cap()));
+    let mut granted = 0;
+    for i in 0..300u64 {
+        if inside.narrow(i % blocks, 1).is_ok() {
+            granted += 1;
+        }
+    }
+    println!("partcheck: a partition's client asked for 300 windows under its own and was given {granted}");
+    let mut devices_client = manager::Client::<Channel, Handle>::from(Channel::new(devices));
+    let driver = devices_client.open(disk_id, None).map_err(|_| "the disk's driver cannot be opened")?.driver;
+    let mut disk_control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+    if let Err(e) = disk_control.narrow(first + blocks / 2, 7) {
+        println!("partcheck: after a partition's client narrowed 300 times ({granted} granted), a new window of the disk: {e:?}");
+        return Err("a partition's client narrowing used up the windows of the disk's other holders");
+    }
+    if granted > 4 {
+        println!("partcheck: a partition's client was granted {granted} windows under its own");
+        return Err("a partition's client is not bounded in the windows it makes");
+    }
+    pass("narrowing_bounded");
+
+    // A flush through a partition reaches the device only when a write
+    // needs it: one with nothing written since the last makes the device
+    // do nothing (any partition's client could make the whole disk flush
+    // at any rate). Traced (bit 62 of the tag), so the driver says whether
+    // the device was given it.
+    let flush = |tag| Request { op: Op::Flush, memory: 0, block: 0, offset: 0, blocks: 0, tag: TRACED | tag };
+    if part.info().write_cache {
+        part.run(&flush(20), deadline()).map_err(|_| "a flush failed")?;
+        for tag in 21..31 {
+            part.run(&flush(tag), deadline()).map_err(|_| "a flush failed")?;
+            let (_, started, _) = part.trace(TRACED | tag).map_err(|_| "the driver lost a traced flush")?;
+            if started != 0 {
+                return Err("a flush with nothing written since the last made the device flush the whole disk");
+            }
+        }
+        // And one after a write does reach it.
+        part.run(&req(Op::Write, last, 0, 1, 31), deadline()).map_err(|_| "a write failed")?;
+        part.run(&flush(32), deadline()).map_err(|_| "a flush after a write failed")?;
+        let (_, started, _) = part.trace(TRACED | 32).map_err(|_| "the driver lost a traced flush")?;
+        if started == 0 {
+            return Err("a flush after a write did not reach the device");
+        }
+    }
+    pass("flush_bounded");
     Ok(())
 }

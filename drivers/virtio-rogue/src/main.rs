@@ -68,8 +68,8 @@ fn bring_up(device: &Device, dma: &Dma) -> Result<Box<dyn Weapon>, DeviceError> 
     if device.config().device() == NET_DEVICE {
         transport.negotiate(dma, F_MAC, 0)?;
         let interrupt = Interrupt::bind(device, 0)?;
-        let rx = transport.queue(dma, 0, 64, Some(0))?;
-        let tx = transport.queue(dma, 1, 64, Some(0))?;
+        let rx = transport.queue(dma, 0, 64, 3, Some(0))?;
+        let tx = transport.queue(dma, 1, 64, 2, Some(0))?;
         let config = transport.device_config().ok_or(DeviceError::Missing("a network configuration"))?;
         let mac = core::array::from_fn(|i| config.read8(i));
         transport.start();
@@ -77,7 +77,7 @@ fn bring_up(device: &Device, dma: &Dma) -> Result<Box<dyn Weapon>, DeviceError> 
     }
     transport.negotiate(dma, 0, 0)?;
     let interrupt = Interrupt::bind(device, 0)?;
-    let queue = transport.queue(dma, 0, 64, Some(0))?;
+    let queue = transport.queue(dma, 0, 64, 3, Some(0))?;
     transport.start();
     Ok(Box::new(Disk { transport, queue, interrupt, request: dma.memory(13, true)? }))
 }
@@ -306,10 +306,11 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     }
     let outcome = disk.aim(T_IN, 0x10_0000)?;
     println!("virtio-rogue: told the device to write at 0x100000: {outcome:?}");
-    // Time for the kernel to report the refusal before the next one: an
-    // IOMMU keeps few fault records (QEMU's, one), and drops faults while
-    // they are full.
+    // Time for the kernel to report the refusal, and the report taken
+    // (the count read) before the next one: a device is reported once and
+    // then held quiet until whoever attached it has looked.
     pause(50_000_000);
+    let first = dma.refused();
     // To read from it: a disk write whose data is someone else's memory.
     // (Sector 2: nothing in this test reads it afterwards, and the disk is
     // a snapshot.)
@@ -317,12 +318,24 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     let outcome = disk.aim(T_OUT, 0x20_0000)?;
     println!("virtio-rogue: told the device to read at 0x200000: {outcome:?}");
     pause(50_000_000);
+    let second = dma.refused();
+    if first == 0 || second <= first {
+        return Err(fail(
+            "rogue_faults_reported",
+            format_args!("refused accesses counted: {first} after the first, {second} after the second"),
+        ));
+    }
     // To write to memory it may only read. This one the driver sees for
     // itself: the memory is its own.
     let mut disk = bring_up(&device, &dma)?;
     let read_only = dma.memory(12, false)?;
     read_only.shared().write64(0, 0x5EA1_ED00_5EA1_ED00);
+    // Unchanged bytes alone would prove nothing (a request that failed for
+    // any other reason leaves them so): the address is said, and the
+    // harness requires the kernel's line refusing the device that write.
     let outcome = disk.aim(T_IN, read_only.device_address())?;
+    println!("virtio-rogue: told the device to write its read-only page at {:#x}: {outcome:?}", read_only.device_address());
+    pause(50_000_000);
     if read_only.shared().read64(0) != 0x5EA1_ED00_5EA1_ED00 {
         return Err(fail("rogue_write_read_only", format_args!("the device wrote memory mapped for reading only ({outcome:?})")));
     }
@@ -334,6 +347,48 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
         return Err(fail("rogue_recovers", format_args!("the device does not work after a reset")));
     }
     pass("rogue_recovers");
+
+    // A flood of refused accesses: forty with nobody looking, then, the
+    // report taken, one more. The kernel once stopped reporting for good
+    // after 32 refusals since boot, then held every device's reports off
+    // for a second once ten lines were written in one. Now a refusal is
+    // reported once (the kernel's line, a notification given with the
+    // attach, the space's count) and its device held quiet until its
+    // attacher has read the count: the flood is one report, and the
+    // refusal after it is reported at once. The harness requires the
+    // kernel's line for that last one, at 0x3f0000.
+    let faults = mem::Object::new(sys::ObjectType::Notification, 0)?;
+    dma.watch_faults(&device, faults.cap())?;
+    let before = dma.refused();
+    // One bring-up for the flood, again only when the device gives up
+    // (each leaves its rings behind, and a network device's are large).
+    let mut disk = bring_up(&device, &dma)?;
+    for i in 0..40u64 {
+        if disk.aim(T_IN, 0x40_0000 + i * 0x1000)? == Outcome::Refused {
+            disk = bring_up(&device, &dma)?;
+        }
+        pause(5_000_000);
+    }
+    let told = sys::recv(faults.cap(), sys::Wait::Poll).is_ok();
+    let flood = dma.refused().saturating_sub(before);
+    let mut disk = bring_up(&device, &dma)?;
+    let outcome = disk.aim(T_IN, 0x3F_0000)?;
+    println!("virtio-rogue: after the flood, told the device to write at 0x3f0000: {outcome:?}");
+    pause(50_000_000);
+    let told_after = sys::recv(faults.cap(), sys::Wait::Poll).is_ok();
+    let after = dma.refused().saturating_sub(before + flood);
+    println!(
+        "virtio-rogue: the flood: its attacher told {told}, {flood} reported; the refusal after it: told {told_after}, {after} reported"
+    );
+    // (A request's refusals already on their way when the first is
+    // reported may still be counted: a few, never the forty.)
+    if !told || !(1..=4).contains(&flood) || !told_after || after == 0 {
+        return Err(fail(
+            "rogue_faults_reported",
+            format_args!("the flood: told {told}, {flood} reported; the refusal after it: told {told_after}, {after} reported"),
+        ));
+    }
+    pass("rogue_faults_reported");
 
     // Interrupts: the driver holds the BAR with its device's MSI-X table, so
     // it can make the device send any message at all. First one in the old

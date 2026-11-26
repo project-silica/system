@@ -126,12 +126,11 @@ pub fn write(text: &[u8]) -> bool {
 /// The directory of log rings: how the service manager tells the log
 /// service which rings it has, without either of them calling the other.
 ///
-/// The service manager waits for the log service (a flush, before a
-/// verdict or turning the machine off), so the log service must never wait
-/// for the service manager: a call from it, answered only once the manager
-/// stops waiting, held both until the wait gave up and lost what the rings
-/// still held (2026-11-23, half of 48 loaded boots of the entropy check).
-/// So the manager puts each ring's capability in a slot of the log
+/// The service manager waits for the log service's exit as the machine
+/// turns off (it is asked to end, and puts what the rings hold on the
+/// console first), so the log service must never wait for the service
+/// manager: a call from it, answered only once the manager stops waiting,
+/// would hold both. So the manager puts each ring's capability in a slot of the log
 /// service's own CapSpace (entry `k`'s ring is in the `k`th of the slots it
 /// reserved for them), then writes the source's name in entry `k` of this
 /// frame, which the log service maps read-only, and then the entry's

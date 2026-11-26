@@ -14,6 +14,9 @@ memory = 22
 start = "boot"
 restart = "always"
 keeps = true
+# Asked to end as the machine turns off, it puts what the rings still hold on
+# the console and exits.
+ends = true
 
 [[bin]]
 name = "logd"

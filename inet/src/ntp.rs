@@ -37,8 +37,10 @@ pub fn to_unix_ns(t: u64) -> Option<u64> {
     Some(secs.checked_sub(UNIX_EPOCH)? * NS + frac)
 }
 
-/// A client's question, sent at `transmit` (an NTP timestamp the answer
-/// must echo, the client's guard against answers it did not ask for).
+/// A client's question carrying `transmit`, which the answer must echo:
+/// the client's guard against answers it did not ask for, so not its clock
+/// (which anyone can guess) but a random number it keeps (RFC 5905
+/// section 9.1 allows any value; the client keeps its own send time).
 pub fn request(out: &mut [u8; LEN], transmit: u64) {
     out.fill(0);
     out[0] = 4 << 3 | 3; // no leap warning, version 4, client
@@ -84,12 +86,103 @@ pub fn parse(p: &[u8]) -> Result<Reply, Malformed> {
 /// nanoseconds, from the four times (all nanoseconds since 1970): `t1` the
 /// question sent and `t4` the answer received by the client's clock, `t2`
 /// and `t3` the server's (RFC 5905 section 8). The offset is what to add
-/// to the client's clock.
-pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> (i64, i64) {
+/// to the client's clock. `None` for times that cannot be: the server
+/// sending before it received, the answer before the question, a delay
+/// below zero, or an offset past what 64 bits of nanoseconds hold.
+pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> Option<(i64, i64)> {
+    if t3 < t2 || t4 < t1 {
+        return None;
+    }
     let d = |a: u64, b: u64| a as i128 - b as i128;
     let offset = (d(t2, t1) + d(t3, t4)) / 2;
     let delay = d(t4, t1) - d(t3, t2);
-    (offset as i64, delay as i64)
+    if delay < 0 {
+        return None;
+    }
+    Some((i64::try_from(offset).ok()?, i64::try_from(delay).ok()?))
+}
+
+/// The longest round trip an answer may take to be believed: a longer one
+/// leaves too much room for its times to be wrong (half of it is the
+/// offset's uncertainty).
+pub const DELAY_MOST: i64 = 1_000_000_000;
+/// The most a clock the network already set is moved by one answer: past
+/// it, the answer is not believed (ntpd's panic threshold). A clock not set
+/// from the network yet (the firmware's may be years out) is moved any
+/// amount.
+pub const STEP_MOST: u64 = 1000 * NS;
+
+/// Why an answer is not believed ([`judge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// Its times cannot be ([`offset`]).
+    Impossible,
+    /// The round trip took this many nanoseconds, past [`DELAY_MOST`].
+    Slow(i64),
+    /// It would move a set clock by this many nanoseconds, past [`STEP_MOST`].
+    Step(i64),
+    /// As `Step`, and no earlier answer agrees yet ([`Steps`]).
+    Unconfirmed(i64),
+}
+
+/// Whether to believe an answer with the four times of [`offset`], to a
+/// client whose clock the network has (`set`) or has not set yet: the
+/// offset to add to its clock and the round trip, or why not.
+pub fn judge(t1: u64, t2: u64, t3: u64, t4: u64, set: bool) -> Result<(i64, i64), Refused> {
+    let (shift, delay) = offset(t1, t2, t3, t4).ok_or(Refused::Impossible)?;
+    if delay > DELAY_MOST {
+        return Err(Refused::Slow(delay));
+    }
+    if set && shift.unsigned_abs() > STEP_MOST {
+        return Err(Refused::Step(shift));
+    }
+    Ok((shift, delay))
+}
+
+/// How far apart two answers must come to confirm a step past [`STEP_MOST`]
+/// ([`Steps`]): separate questions, each with its own random number and port.
+pub const CONFIRM_APART: u64 = NS;
+
+/// A clock's steps past [`STEP_MOST`]: one answer never makes one, two
+/// answers to separate questions at least [`CONFIRM_APART`] apart that agree
+/// within their round trips do. So a lie, or a wrong first answer, is not
+/// locked in or acted on alone, and a clock that really is wrong (a
+/// firmware's clock years out, set before a restart) is still corrected.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Steps {
+    /// The last step refused: its offset, round trip, and when (ns).
+    pending: Option<(i64, i64, u64)>,
+}
+
+impl Steps {
+    pub const fn new() -> Steps {
+        Steps { pending: None }
+    }
+
+    /// [`judge`], at `now` (ns, monotonic): a step past [`STEP_MOST`] on a set
+    /// clock is [`Refused::Unconfirmed`] until a second answer agrees.
+    pub fn judge(&mut self, t1: u64, t2: u64, t3: u64, t4: u64, set: bool, now: u64) -> Result<(i64, i64), Refused> {
+        match judge(t1, t2, t3, t4, set) {
+            Err(Refused::Step(shift)) => {
+                // Within the limits judge checked but the step.
+                let delay = offset(t1, t2, t3, t4).map_or(DELAY_MOST, |(_, d)| d);
+                if let Some((before, before_delay, at)) = self.pending
+                    && now.saturating_sub(at) >= CONFIRM_APART
+                    && shift.abs_diff(before) <= (before_delay + delay) as u64 + 10_000_000
+                {
+                    self.pending = None;
+                    return Ok((shift, delay));
+                }
+                self.pending = Some((shift, delay, now));
+                Err(Refused::Unconfirmed(shift))
+            }
+            Ok(j) => {
+                self.pending = None;
+                Ok(j)
+            }
+            e => e,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,9 +242,73 @@ mod tests {
         let t2 = t1 + 10 * s + 3_000_000;
         let t3 = t2 + 2_000_000;
         let t4 = t3 - 10 * s + 1_000_000;
-        let (offset, delay) = offset(t1, t2, t3, t4);
+        let (o, delay) = offset(t1, t2, t3, t4).unwrap();
         assert_eq!(delay, 4_000_000);
-        assert_eq!(offset, 10 * s as i64 + 1_000_000, "the asymmetry is half in the offset, as NTP says");
+        assert_eq!(o, 10 * s as i64 + 1_000_000, "the asymmetry is half in the offset, as NTP says");
+    }
+
+    /// Times that cannot be are not used to set a clock: a server that
+    /// sends before it receives, an answer before its question, a round
+    /// trip below zero, an offset past 64 bits (once truncated into a
+    /// garbage clock).
+    #[test]
+    fn times_that_cannot_be_give_no_offset() {
+        let s = NS;
+        assert_eq!(offset(100 * s, 50 * s, 49 * s, 101 * s), None, "sent before received");
+        assert_eq!(offset(100 * s, 50 * s, 50 * s, 99 * s), None, "answered before asked");
+        assert_eq!(offset(100 * s, 50 * s, 60 * s, 101 * s), None, "the server held it longer than the round trip");
+        assert_eq!(offset(0, u64::MAX, u64::MAX, 1), None, "an offset past 64 bits");
+        assert!(offset(0, 1 << 62, 1 << 62, 1).is_some());
+    }
+
+    /// A slow answer is not believed, nor one that would move a clock the
+    /// network set by more than [`STEP_MOST`] either way; the first set
+    /// moves it any amount.
+    #[test]
+    fn slow_answers_and_large_steps_are_not_believed() {
+        let s = NS;
+        let t1 = 1_000_000 * s;
+        // Ten years ahead, a 4 ms round trip.
+        let far = 10 * 365 * 86_400 * s;
+        let (t2, t3, t4) = (t1 + far + 2_000_000, t1 + far + 2_000_000, t1 + 4_000_000);
+        assert_eq!(judge(t1, t2, t3, t4, false).map(|(_, d)| d), Ok(4_000_000), "the first set moves any amount");
+        assert!(matches!(judge(t1, t2, t3, t4, true), Err(Refused::Step(x)) if x > 0));
+        // Back 2,000 s on a set clock.
+        assert!(matches!(judge(t1, t1 - 2000 * s, t1 - 2000 * s, t1 + 1_000_000, true), Err(Refused::Step(x)) if x < 0));
+        // 999 s on a set clock is believed.
+        assert!(judge(t1, t1 + 999 * s, t1 + 999 * s, t1 + 1_000_000, true).is_ok());
+        // A round trip of 1.5 s.
+        assert_eq!(judge(t1, t1 + s, t1 + s, t1 + 1_500_000_000, false), Err(Refused::Slow(1_500_000_000)));
+        assert_eq!(judge(t1, t1 + s, t1 + s - 1, t1 + 1000, false), Err(Refused::Impossible));
+    }
+
+    /// A clock set before a restart (the time page says so) is not moved
+    /// ten years by the first answer after it, nor by any one answer: a lie
+    /// is not acted on alone, and a wrong first answer is not locked in.
+    /// Two answers to separate questions, a second or more apart, agreeing
+    /// within their round trips, do move it: a clock that really is wrong
+    /// is corrected. Before, the limit applied only once netd itself had set
+    /// the clock, so the first answer after a restart moved it any amount.
+    #[test]
+    fn one_answer_never_steps_a_set_clock_and_agreeing_answers_do() {
+        let s = NS;
+        let far = 10 * 365 * 86_400 * s;
+        let at = |t: u64| (t, t + far + 2_000_000, t + far + 2_000_000, t + 4_000_000);
+        let mut steps = Steps::new();
+        // After a restart: the clock is set (firmware, or the instance before).
+        let (t1, t2, t3, t4) = at(1_000_000 * s);
+        assert!(matches!(steps.judge(t1, t2, t3, t4, true, 10 * s), Err(Refused::Unconfirmed(x)) if x > 0), "a lone answer ten years out");
+        // Another answer at once, or one that disagrees, confirms nothing.
+        assert!(steps.judge(t1, t2, t3, t4, true, 10 * s + 1).is_err(), "too soon after the first");
+        let (u1, u2, u3, u4) = (1_000_005 * s, 1_000_005 * s + far + 60 * s, 1_000_005 * s + far + 60 * s, 1_000_005 * s + 4_000_000);
+        assert!(steps.judge(u1, u2, u3, u4, true, 15 * s).is_err(), "an answer a minute away from the last");
+        // Two that agree, apart: the step is taken.
+        let (v1, v2, v3, v4) = at(1_000_020 * s);
+        assert!(matches!(steps.judge(v1, v2, v3, v4, true, 30 * s), Err(Refused::Unconfirmed(_))));
+        let (w1, w2, w3, w4) = at(1_000_022 * s);
+        assert!(matches!(steps.judge(w1, w2, w3, w4, true, 32 * s), Ok((x, _)) if x > 0), "agreeing answers correct a wrong clock");
+        // Within the limit, one answer is enough, as before.
+        assert!(steps.judge(t1, t1 + 999 * s, t1 + 999 * s, t1 + 1_000_000, true, 40 * s).is_ok());
     }
 
     #[test]

@@ -49,6 +49,14 @@ pub fn wipe(b: &mut [u8]) {
     core::hint::black_box(b);
 }
 
+/// [`wipe`], for words.
+pub fn wipe_words(w: &mut [u32]) {
+    for x in w.iter_mut() {
+        *x = 0;
+    }
+    core::hint::black_box(w);
+}
+
 #[cfg(test)]
 pub(crate) fn hex(s: &str) -> [u8; 256] {
     let mut out = [0u8; 256];

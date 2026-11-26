@@ -5,7 +5,7 @@
 //! header: the test machine's second disk), and writes every one of its
 //! first [`BLOCKS`] blocks [`ROUNDS`] times, in a scattered order, [`DEPTH`] at a time,
 //! with a flush after every [`FLUSH_EVERY`] completed writes, while asking
-//! the device manager to restart the disk's driver every [`KILL_EVERY_NS`]
+//! the device manager to restart the disk's driver [`KILLS`] times, spread evenly
 //! (an abrupt end: its memory, its capabilities and its device's view of
 //! memory are taken away at once). It reports how long each recovery took,
 //! from the driver's end to the first completion after it, and fails if one
@@ -34,7 +34,10 @@ const BLOCKS: u64 = 16384;
 const ROUNDS: u64 = 4;
 const DEPTH: u64 = 32;
 const FLUSH_EVERY: u64 = 256;
-const KILL_EVERY_NS: u64 = 200_000_000;
+/// How often the driver is killed, once every `BLOCKS * ROUNDS / (KILLS + 1)`
+/// writes completed: by progress, not time, so a fast run is killed as
+/// often as a slow one.
+const KILLS: u32 = 10;
 /// The longest a recovery may take.
 const RECOVERY_NS: u64 = 250_000_000;
 const SECOND: u64 = 1_000_000_000;
@@ -51,8 +54,15 @@ fn main(_info: &'static ProcessInfo) -> i64 {
 
 /// The scratch disk: the block device whose block 1 is not a GPT header.
 fn scratch(devices: &mut manager::Client<Channel, Handle>, buffer: &Memory, m: Mmio) -> Result<(u32, Disk), &'static str> {
-    let listed: Vec<u32> =
-        devices.list(manager::Class::Block).map_err(|_| "the device manager does not answer")?.devices.iter().map(|d| d.id).collect();
+    let (mut listed, mut from) = (Vec::new(), 0);
+    loop {
+        let part = devices.list(manager::Class::Block, from).map_err(|_| "the device manager does not answer")?;
+        listed.extend(part.devices.iter().map(|d| d.id));
+        if part.next <= from {
+            break;
+        }
+        from = part.next;
+    }
     for id in listed {
         let mut disk = Disk::open(Cap(slots::FIRST_GRANT), id).map_err(|_| "cannot open a disk")?;
         disk.add_memory(0, buffer, true).map_err(|_| "cannot register memory")?;
@@ -100,6 +110,26 @@ fn run() -> Result<(), &'static str> {
     disk.add_memory(0, &buffer, true).map_err(|_| "cannot register the load buffer again")?;
     disk.run(&Request { op: Op::Read, memory: 0, block: 0, offset: 0, blocks: 1, tag: 0 }, Some(clock.now() + 5 * SECOND))
         .map_err(|_| "the replacement driver did not serve the next read")?;
+    // A write done and not flushed when the driver ends: the next driver
+    // resets the device, whose volatile cache need not keep it, so the
+    // next flush must say so (`Status::Lost`) rather than succeed, and
+    // the one after it, with nothing lost since, succeeds.
+    let flush = Request { op: Op::Flush, memory: 0, block: 0, offset: 0, blocks: 0, tag: 0 };
+    // What the restart above left unflushed is reported first, if anything.
+    match disk.run(&flush, Some(clock.now() + 5 * SECOND)) {
+        Ok(()) | Err(silica_block::client::Error::Request(silica_block::Status::Lost)) => {}
+        Err(_) => return Err("the flush after the traced write's restart failed"),
+    }
+    disk.run(&Request { op: Op::Write, memory: 0, block: 2, offset: 0, blocks: 1, tag: 1 }, Some(clock.now() + 5 * SECOND))
+        .map_err(|_| "the write before the unflushed restart failed")?;
+    devices.restart(id).map_err(|_| "cannot restart after the unflushed write")?;
+    match disk.run(&flush, Some(clock.now() + 5 * SECOND)) {
+        Err(silica_block::client::Error::Request(silica_block::Status::Lost)) => {}
+        Ok(()) => return Err("a flush after a driver ended with an unflushed write said it was durable"),
+        Err(_) => return Err("the flush after the unflushed restart failed"),
+    }
+    disk.run(&flush, Some(clock.now() + 5 * SECOND)).map_err(|_| "the flush after the lost one did not succeed")?;
+    println!("blkload: a driver's end after an unflushed write is reported by the next flush");
     disk.take_recovery();
     // Each slot of the buffer holds one write's data while it is in flight.
     let fill = |slot: u64, round: u64, block: u64| {
@@ -107,10 +137,14 @@ fn run() -> Result<(), &'static str> {
             m.write64((slot * 512 + i * 8) as usize, round << 40 | block << 16 | i);
         }
     };
-    let (start, mut next_kill) = (clock.now(), clock.now() + KILL_EVERY_NS);
+    let start = clock.now();
     let (mut sent, mut done, mut since_flush, mut kills) = (0u64, 0u64, 0u64, 0u32);
+    let mut rewrites = 0u64;
     let mut recoveries = Vec::new();
     let mut flushing = false;
+    // Where the writes the last successful flush made durable end: a lost
+    // flush sends everything after it again.
+    let mut durable = 0u64;
     // A slot is free when no write in flight uses it.
     let mut free: Vec<u64> = (0..DEPTH).collect();
     let mut slot_of = silica_rt::alloc::collections::BTreeMap::new();
@@ -133,25 +167,31 @@ fn run() -> Result<(), &'static str> {
             sent += 1;
         }
         disk.kick();
-        if clock.now() >= next_kill && kills < 10 {
+        if kills < KILLS && done >= (kills as u64 + 1) * total / (KILLS as u64 + 1) {
             // The driver ends now, with writes in flight.
             devices.restart(id).map_err(|_| "the device manager would not restart the driver")?;
             kills += 1;
-            next_kill = clock.now() + KILL_EVERY_NS;
         }
         let c = disk.wait(Some(clock.now() + 5 * SECOND)).map_err(|e| {
             println!("blkload: waiting: {e:?}");
             "a request did not complete"
         })?;
+        if let Some(r) = disk.take_recovery() {
+            recoveries.push(r.total);
+        }
+        if c.tag == 0 && c.status == Err(silica_block::Status::Lost) {
+            // A driver ended with writes not yet durable: write them again.
+            rewrites += sent - durable;
+            (sent, done, since_flush, flushing) = (durable, durable, 0, false);
+            continue;
+        }
         if c.status.is_err() {
             println!("blkload: request {} failed: {:?}", c.tag, c.status);
             return Err("a request failed");
         }
-        if let Some(r) = disk.take_recovery() {
-            recoveries.push(r.total);
-        }
         if c.tag == 0 {
             flushing = false;
+            durable = sent;
             since_flush = 0;
             continue;
         }
@@ -182,13 +222,38 @@ fn run() -> Result<(), &'static str> {
         (clock.now() - start) / 1_000_000,
         recoveries.iter().map(|r| r / 1000).collect::<Vec<_>>()
     );
-    if kills == 0 || recoveries.len() < kills as usize {
+    // Every kill must have happened, under load, and been recovered from:
+    // one kill was once enough to pass.
+    if kills < KILLS || recoveries.len() < kills as usize {
         return Err("the driver was not killed while writes were in flight");
     }
     if worst > RECOVERY_NS {
         return Err("a recovery took longer than 250 ms");
     }
+    // What is on the disk now: every block's last round, word by word.
+    verify(&mut disk, m)?;
+    println!("blkload: {rewrites} writes sent again after lost flushes; every block reads back its last round");
     println!("BENCH blk_recovery_max {} us", worst / 1000);
     println!("BLKLOAD OK");
+    Ok(())
+}
+
+/// Read every block back and check it holds its last round's words.
+fn verify(disk: &mut Disk, m: Mmio) -> Result<(), &'static str> {
+    let clock = silica_rt::clock();
+    // As many blocks as one request and the 1 MiB buffer take.
+    let per_read = (disk.info().max_blocks as u64).min(2048);
+    for at in (0..BLOCKS).step_by(per_read as usize) {
+        let r = Request { op: Op::Read, memory: 0, block: at, offset: 0, blocks: per_read.min(BLOCKS - at) as u32, tag: 0 };
+        disk.run(&r, Some(clock.now() + 5 * SECOND)).map_err(|_| "reading the disk back failed")?;
+        for b in 0..per_read.min(BLOCKS - at) {
+            for i in 0..64u64 {
+                if m.read64((b * 512 + i * 8) as usize) != ROUNDS << 40 | (at + b) << 16 | i {
+                    println!("blkload: block {} word {i} reads {:#x}", at + b, m.read64((b * 512 + i * 8) as usize));
+                    return Err("a block does not hold its last write");
+                }
+            }
+        }
+    }
     Ok(())
 }

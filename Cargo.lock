@@ -9,6 +9,7 @@ dependencies = [
  "silica-block",
  "silica-idl-rt",
  "silica-protocols",
+ "silica-queue",
  "silica-rt",
 ]
 
@@ -25,12 +26,16 @@ dependencies = [
 name = "console"
 version = "0.0.0"
 dependencies = [
+ "console-grid",
  "silica-formats",
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
+
+[[package]]
+name = "console-grid"
+version = "0.0.0"
 
 [[package]]
 name = "devmgr"
@@ -151,6 +156,7 @@ dependencies = [
  "silica-idl-rt",
  "silica-net",
  "silica-protocols",
+ "silica-queue",
  "silica-rt",
 ]
 
@@ -201,6 +207,7 @@ version = "0.0.0"
 dependencies = [
  "silica-block",
  "silica-idl-rt",
+ "silica-protocols",
  "silica-rt",
 ]
 
@@ -248,7 +255,6 @@ dependencies = [
  "silica-idlc",
  "silica-protocols",
  "silica-queue",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -316,7 +322,6 @@ version = "0.0.0"
 dependencies = [
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -325,13 +330,6 @@ name = "silica-remote"
 version = "0.0.0"
 dependencies = [
  "silica-crypto",
-]
-
-[[package]]
-name = "silica-ring"
-version = "0.0.0"
-dependencies = [
- "silica-rt",
 ]
 
 [[package]]
@@ -370,6 +368,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tcphog"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "trial-client"
 version = "0.0.0"
 dependencies = [
@@ -403,7 +410,6 @@ dependencies = [
  "silica-driver",
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -414,7 +420,6 @@ dependencies = [
  "silica-driver",
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -442,5 +447,15 @@ name = "virtio-rogue"
 version = "0.0.0"
 dependencies = [
  "silica-driver",
+ "silica-rt",
+]
+
+[[package]]
+name = "watchdog-esb"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-idl-rt",
+ "silica-protocols",
  "silica-rt",
 ]

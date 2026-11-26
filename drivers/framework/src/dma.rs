@@ -99,6 +99,11 @@ pub struct Dma {
     /// The device address space; `None` where DMA is not confined.
     space: Option<Cap>,
     top: u64,
+    /// Device addresses of shared memory let go of ([`Dma::unshare`]), as
+    /// (address, bits), for the next frame of the same size: clients may
+    /// add and remove memory any number of times, and the device's
+    /// addresses (and the IOMMU's tables under them) are not used up.
+    free: core::cell::RefCell<silica_rt::alloc::vec::Vec<(u64, u8)>>,
 }
 
 /// Someone else's memory the device was let reach ([`Dma::share`]).
@@ -106,6 +111,8 @@ pub struct Dma {
 pub struct Shared {
     /// The address the device uses for its first byte.
     pub address: u64,
+    /// Its size in bits.
+    bits: u8,
     /// The slot of the copy of the frame capability the device's mapping
     /// was made through (0 where DMA is not confined).
     copy: u64,
@@ -158,18 +165,36 @@ impl Dma {
     /// reaches exactly what this `Dma` maps for it.
     pub fn new(device: &Device) -> Result<Dma, DeviceError> {
         if device.dma_top == 0 {
-            return Ok(Dma { space: None, top: 0 });
+            return Ok(Dma { space: None, top: 0, free: Default::default() });
         }
         let block = mem::alloc(TABLE_BITS)?;
         let slot = free_slot().ok_or(sys::Error::NoMemory)?;
         sys::retype_io_space(block, TABLE_BITS, slots::SPACE, slot).inspect_err(|_| release_slot(slot))?;
         sys::device_attach(granted(grant::IDENTITY), device.id, Cap(slot))?;
-        Ok(Dma { space: Some(Cap(slot)), top: device.dma_top })
+        Ok(Dma { space: Some(Cap(slot)), top: device.dma_top, free: Default::default() })
     }
 
     /// Whether the device is confined to what this `Dma` maps.
     pub fn confined(&self) -> bool {
         self.space.is_some()
+    }
+
+    /// From now on an access of `device` the IOMMU refuses signals `faults`
+    /// (a notification) and is counted. The device is then held quiet (still
+    /// refused, nothing reported) until the count is read ([`Dma::refused`]):
+    /// a driver told of a refusal reads it, and hears of the next.
+    /// `Unsupported` where DMA is not confined.
+    pub fn watch_faults(&self, device: &Device, faults: Cap) -> Result<(), DeviceError> {
+        let space = self.space.ok_or(sys::Error::Unsupported)?;
+        sys::device_attach_noting(granted(grant::IDENTITY), device.id, space, faults)?;
+        Ok(())
+    }
+
+    /// How many refused accesses of the device were reported (0 where DMA is
+    /// not confined). Reading it takes the report: the next refusal is
+    /// reported again.
+    pub fn refused(&self) -> u64 {
+        self.space.and_then(|s| sys::inspect_io_space(s).ok()).map_or(0, |(_, n)| n)
     }
 
     /// New zeroed memory of `2^bits` bytes that the driver reads and writes
@@ -187,8 +212,18 @@ impl Dma {
     /// [`Dma::unshare`].
     pub fn share(&self, frame: Cap, bits: u8, device_writes: bool) -> Result<Shared, DeviceError> {
         let size = 1usize.checked_shl(bits as u32).ok_or(sys::Error::BadArg)?;
-        let at = mem::reserve(size, size.min(1 << sys::LARGE_BITS)).ok_or(sys::Error::NoMemory)?;
-        self.map_copy(frame, at as u64, device_writes)
+        if self.space.is_none() {
+            return self.map_copy(frame, 0, bits, device_writes);
+        }
+        let reused = {
+            let mut free = self.free.borrow_mut();
+            free.iter().position(|(_, b)| *b == bits).map(|k| free.swap_remove(k).0)
+        };
+        let at = match reused {
+            Some(at) => at,
+            None => mem::reserve(size, size.min(1 << sys::LARGE_BITS)).ok_or(sys::Error::NoMemory)? as u64,
+        };
+        self.map_copy(frame, at, bits, device_writes).inspect_err(|_| self.free.borrow_mut().push((at, bits)))
     }
 
     /// The device no longer reaches what `shared` let it reach; when this
@@ -198,18 +233,23 @@ impl Dma {
             // SAFETY: the copy `share` made, used for the device's mapping
             // and nothing else.
             #[allow(unsafe_code)]
-            let _ = unsafe { sys::cap_delete(Cap(shared.copy)) };
+            let gone = unsafe { sys::cap_delete(Cap(shared.copy)) };
             release_slot(shared.copy);
+            // The IOMMU has dropped the mapping (`Unmap` returns after it
+            // has): the device address is free for the next frame.
+            if gone.is_ok() {
+                self.free.borrow_mut().push((shared.address, shared.bits));
+            }
         }
     }
 
     fn map(&self, frame: Cap, at: u64, device_writes: bool) -> Result<u64, DeviceError> {
-        self.map_copy(frame, at, device_writes).map(|s| s.address)
+        self.map_copy(frame, at, 0, device_writes).map(|s| s.address)
     }
 
-    fn map_copy(&self, frame: Cap, at: u64, device_writes: bool) -> Result<Shared, DeviceError> {
+    fn map_copy(&self, frame: Cap, at: u64, bits: u8, device_writes: bool) -> Result<Shared, DeviceError> {
         let Some(space) = self.space else {
-            return Ok(Shared { address: sys::frame_address(granted(grant::IDENTITY), frame)?, copy: 0 });
+            return Ok(Shared { address: sys::frame_address(granted(grant::IDENTITY), frame)?, bits, copy: 0 });
         };
         if at >= self.top {
             return Err(DeviceError::Missing("device addresses as high as this driver's memory"));
@@ -226,6 +266,6 @@ impl Dma {
             release_slot(copy);
             return Err(e.into());
         }
-        Ok(Shared { address: at, copy })
+        Ok(Shared { address: at, bits, copy })
     }
 }

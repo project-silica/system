@@ -105,9 +105,13 @@ impl Config {
         })
     }
 
-    /// The function's MSI-X capability, if it has one.
+    /// The function's MSI-X capability, if it has one whose eight bytes lie
+    /// in the space that is mapped: the device says where the capability
+    /// is, and one it puts in the last four bytes of a 256-byte space has
+    /// its table register beyond them (the `virtio_transport` fuzz target's
+    /// first finding: the read panicked).
     pub fn msix(&self) -> Option<Msix> {
-        let (_, cap) = self.capabilities().find(|(id, _)| *id == CAP_MSIX)?;
+        let (_, cap) = self.capabilities().find(|(id, at)| *id == CAP_MSIX && at + 8 <= self.0.len())?;
         let table = self.0.read32(cap + 4);
         Some(Msix { cap, vectors: (self.0.read16(cap + 2) & 0x7FF) + 1, bar: (table & 7) as u8, offset: table & !7 })
     }

@@ -9,7 +9,8 @@ use libsys::root::RootInfo;
 use libsys::{self as sys, Cap, Error, MsgInfo, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
-use silica_proc::{Child, Grant, Program, report, spawn};
+use silica_proc::{Child, FAULT_BADGE, Grant, Program, report, spawn};
+use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, print, println};
@@ -22,6 +23,10 @@ const HOG: u64 = 3;
 const ONE_CALL: u64 = 4;
 const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
+const BORROWER: u64 = 7;
+const CHURN: u64 = 8;
+const CACHE: u64 = 10;
+const BLOCKS: u64 = 9;
 
 const SECOND: u64 = 1_000_000_000;
 const SEND: Rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
@@ -38,6 +43,10 @@ struct Tests {
     /// processor (0 until that test has run): its pace, which the limits
     /// on the tests after it follow ([`Tests::patience`]).
     pace: u64,
+    /// Time on each processor for the programs the tests start there:
+    /// one fair context each, made on first use (processor 0's is this
+    /// root task's own; it holds every processor's time).
+    time: Vec<Option<Object>>,
 }
 
 /// The pace the limits are sized for: a million round trips on one
@@ -55,6 +64,21 @@ const SAY_NS: u64 = 10 * SECOND;
 type Outcome = Result<(), &'static str>;
 
 impl Tests {
+    /// A scheduling context on processor `cpu`: a program runs where its
+    /// time is, and is moved by binding it to time elsewhere.
+    fn time_on(&mut self, cpu: usize) -> Result<Cap, &'static str> {
+        if cpu == 0 {
+            return Ok(Cap(libsys::root::SLOT_CONTEXT));
+        }
+        if self.time[cpu].is_none() {
+            let sc = Object::new(ObjectType::SchedContext, 0).map_err(|_| "no memory for a scheduling context")?;
+            sys::sched_fair(sc.cap(), sys::SCHED_DEFAULT_WEIGHT, cpu, Cap(libsys::root::SLOT_SCHED))
+                .map_err(|_| "cannot take a share of a processor")?;
+            self.time[cpu] = Some(sc);
+        }
+        self.time[cpu].as_ref().map(Object::cap).ok_or("no scheduling context")
+    }
+
     /// Start `stress` in `role` on processor `cpu` (modulo how many there
     /// are). Returns the program and the badge its exit report will carry.
     fn start(&mut self, role: u64, args: [u64; 2], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
@@ -64,12 +88,13 @@ impl Tests {
     /// [`Tests::start`] with a third argument (a client's: where its
     /// progress notification is among its grants).
     fn start_with(&mut self, role: u64, args: [u64; 3], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
+        let sched = self.time_on((cpu % self.root.parent.cpus) as usize)?;
         self.next_id += 1;
         let place = self.children.iter_mut().find(|c| c.is_none()).ok_or("a test starts too many programs")?;
         let prog = Program {
             grants,
             args: [role, args[0], args[1], args[2], 0, 0, 0, 0],
-            cpu: (cpu % self.root.parent.cpus) as usize,
+            sched: Some(sched),
             ..Program::new(self.stress, self.next_id)
         };
         let child = spawn(&self.root.parent, &prog).map_err(|e| {
@@ -263,7 +288,8 @@ impl Tests {
             }
             moves += 1;
             for (thread, k) in [(client, 0), (server, 3)] {
-                sys::thread_set_cpu(thread, ((moves + k) % cpus) as usize).map_err(|_| "cannot move a running program")?;
+                let time = self.time_on(((moves + k) % cpus) as usize)?;
+                sys::thread_bind(thread, time).map_err(|_| "cannot move a running program")?;
             }
         }
         println!("systest: the pair was moved {moves} times during its round trips");
@@ -313,6 +339,104 @@ impl Tests {
             return Err("reader accepted an unfinished time update");
         }
         Ok(())
+    }
+
+    /// A program that maps lent memory from lender after lender, each taking
+    /// it back while it is mapped and the program then touching every page,
+    /// is answered with zeros every time, never stopped, and maps each lend
+    /// where the last one was (`silica_rt::mem::Lent`). Before, its 65th
+    /// page of zeros was taken for a fault of its own and it was destroyed
+    /// (a service, by clients ending with memory lent to it), and every
+    /// lend took address space never used again.
+    fn lent_memory_taken_back_any_number_of_times(&mut self) -> Outcome {
+        const CYCLES: u64 = 200;
+        const BITS: u64 = 16;
+        let slot = self.children.iter().position(Option::is_none).ok_or("a test starts too many programs")?;
+        let (_, id) = self.start_with(BORROWER, [CYCLES, BITS, 0], 0, &[])?;
+        let deadline = silica_rt::clock().now() + self.patience(60 * SECOND);
+        let mut answered = 0u64;
+        loop {
+            let m = sys::recv(self.root.parent.exit, Wait::Until(deadline)).map_err(|_| "the borrower did not finish in time")?;
+            if m.badge == id | FAULT_BADGE {
+                if !self.children[slot].as_mut().is_some_and(|c| c.answer_peer_fault(&m)) {
+                    println!("systest:   the borrower faulted at {:#x} after {answered} pages of zeros", m.words[1]);
+                    return Err("the borrower was stopped for touching lent memory taken back");
+                }
+                answered += 1;
+                continue;
+            }
+            if m.badge != id || m.info.label() != EXIT_LABEL {
+                return Err("something other than the borrower's faults and exit arrived");
+            }
+            println!("systest:   {answered} pages of zeros answered over {CYCLES} lends");
+            return match m.words[0] as i64 {
+                0 if answered >= CYCLES << (BITS - 12) => Ok(()),
+                0 => Err("the borrower touched fewer pages than it was taken back from"),
+                _ => {
+                    Err("the borrower read lent memory after it was taken back, or mapped a lend at fresh addresses (its line says which)")
+                }
+            };
+        }
+    }
+
+    /// A program uses 45% of its free memory in its heap at a time, as
+    /// 2 KiB pieces, then 32 KiB blocks, then 256 KiB blocks, four rounds:
+    /// every request is served and its free memory stops falling after the
+    /// first round. Before, the heap kept what was freed at each size for
+    /// that size alone, and the first round's 32 KiB blocks were refused
+    /// (block 24, with 256 KiB of the program's memory left).
+    /// A program takes its memory in 64 KiB blocks until it is refused,
+    /// gives them all back, and takes 1 MiB blocks: they must hold what the
+    /// small ones did. Before, a block given back was kept for a request of
+    /// its own size alone, and the 1 MiB requests were refused with all the
+    /// program's memory free.
+    fn blocks_given_back_serve_any_size(&mut self) -> Outcome {
+        let (_, id) = self.start_with(BLOCKS, [16, 20, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, 0) if who == id => Ok(()),
+            (who, _) if who == id => Err("memory given back in small blocks did not serve large ones (the program's line says how many)"),
+            _ => Err("something other than the block program ended"),
+        }
+    }
+
+    /// A server whose cache grows with every request keeps serving when it
+    /// is told its memory is low (`silica_rt::mem::watch_low`): it lets
+    /// the cache go and trims its heap. Without the watch (how every
+    /// program ran before) the same server ran out in the middle of a
+    /// request; that run is made too, so the test shows the pressure is
+    /// real.
+    fn a_program_told_its_memory_is_low_keeps_serving(&mut self) -> Outcome {
+        const REQUESTS: u64 = 200;
+        let (_, id) = self.start_with(CACHE, [REQUESTS, 1, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, 0) if who == id => {}
+            (who, s) if who == id => {
+                println!("systest:   watching its memory, the server stopped at request {}", s - 100);
+                return Err("a program watching its memory ran out in the middle of a request");
+            }
+            _ => return Err("something other than the caching server ended"),
+        }
+        let (_, id) = self.start_with(CACHE, [REQUESTS, 0, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, s) if who == id && s >= 100 => {
+                println!("systest:   not watching, the same server ran out at request {}", s - 100);
+                Ok(())
+            }
+            (who, _) if who == id => Err("the caching server never ran out of memory unwatched: the test puts it under no pressure"),
+            _ => Err("something other than the caching server ended"),
+        }
+    }
+
+    fn heap_churn(&mut self) -> Outcome {
+        let (_, id) = self.start_with(CHURN, [4, 0, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, 0) if who == id => Ok(()),
+            (who, s) if who == id => {
+                println!("systest:   the churning program ended with status {s} (10 x round + size: 0 small, 1 32 KiB, 2 256 KiB)");
+                Err("a program's heap did not reuse what it freed at one size for another")
+            }
+            _ => Err("something other than the churning program ended"),
+        }
     }
 
     fn failed_spawn_returns_grants(&mut self) -> Outcome {
@@ -451,15 +575,32 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             finish(false)
         }
     };
+    // Its programs' faults come where their exits do: a fault on lent
+    // memory taken back is answered (`lent_memory_taken_back_any_number_of_times`),
+    // any other ends the test that made the program.
+    let root = Root { parent: silica_proc::Parent { fault: root.parent.exit, ..root.parent }, ..root };
     let Some(stress) = ramdisk::find(root.archive, "stress") else {
         println!("ERROR: systest: the ramdisk has no program named stress");
         finish(false)
     };
     let cpus = root.parent.cpus;
-    let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
+    let mut t = Tests {
+        root,
+        stress,
+        next_id: 0,
+        children: [const { None }; 16],
+        caps: [None; 16],
+        objects: [const { None }; 8],
+        pace: 0,
+        time: (0..cpus).map(|_| None).collect(),
+    };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 11] = [
+    let tests: [(&str, Test); 15] = [
+        ("lent_memory_taken_back_any_number_of_times", Tests::lent_memory_taken_back_any_number_of_times),
+        ("memory_freed_at_one_size_serves_another", Tests::heap_churn),
+        ("blocks_given_back_serve_any_size", Tests::blocks_given_back_serve_any_size),
+        ("a_program_told_its_memory_is_low_keeps_serving", Tests::a_program_told_its_memory_is_low_keeps_serving),
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("time_reader_survives_its_writer", Tests::abandoned_time_page),
         ("failed_spawn_returns_grants", Tests::failed_spawn_returns_grants),

@@ -5,8 +5,11 @@
 //! `i % 251`, so a client checks a body without being sent its hash;
 //! `GET /quit` answers, and the server ends (status 0) once the client
 //! has closed that connection, so the answer is never lost with the
-//! server's memory. Connections are kept alive between requests (HTTP/1.1)
-//! unless the request says `Connection: close` or is HTTP/1.0.
+//! server's memory, where the command line allows it (`httpd.quit=allowed`,
+//! for a test that ends the server so); elsewhere it is answered 404, as
+//! any other path, and said once. Connections are kept alive between
+//! requests (HTTP/1.1) unless the request says `Connection: close` or is
+//! HTTP/1.0, and let go of after a minute with nothing to read or send.
 #![no_std]
 #![no_main]
 
@@ -17,7 +20,6 @@ use silica_rt::{ProcessInfo, println, slots};
 
 silica_rt::main!(main);
 
-const PORT: u16 = 80;
 /// The largest body asked for.
 const MOST: u64 = 16 << 20;
 /// The longest request head kept (method, path, version, headers).
@@ -38,26 +40,42 @@ struct Conn {
     finished: bool,
     /// This connection asked the server to end.
     quit: bool,
+    /// When something was last read or sent: a connection idle for
+    /// [`IDLE`] is closed (one that never sends again kept its place, and
+    /// the stack's, for good).
+    last: u64,
 }
+
+/// How long a connection may be idle.
+const IDLE: u64 = 60_000_000_000;
+
+/// Whether a refused `GET /quit` has been said.
+static QUIT_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn main(_info: &'static ProcessInfo) -> i64 {
     // On its events: the stack is its need 0 (bit 0), so a restart of the
     // stack is seen and its listener set up again; its own bits from 32.
-    let mut tcp = match Tcp::on(silica_rt::sys::Cap(slots::FIRST_GRANT), 22, slots::EVENTS, 32, 1) {
+    // 8 MiB lent: 128 connections (one for every 64 KiB, the stack's rule),
+    // accepted, waiting to be, and let go of but not yet ended.
+    let mut tcp = match Tcp::on(silica_rt::sys::Cap(slots::FIRST_GRANT), 23, slots::EVENTS, 32, 1) {
         Ok(t) => t,
         Err(e) => {
             println!("ERROR: httpd: no TCP: {e:?}");
             return 1;
         }
     };
-    let listener = match tcp.listen(PORT, 64) {
+    // On the port its declaration was given (`listen=<port>`).
+    let (listener, port) = match tcp.listen(64) {
         Ok(l) => l,
         Err(e) => {
-            println!("ERROR: httpd: cannot listen on port {PORT}: {e:?}");
+            println!("ERROR: httpd: cannot listen on the port it was given: {e:?}");
             return 1;
         }
     };
-    println!("httpd: listening on port {PORT}");
+    println!("httpd: listening on port {port}");
+    // No request loop of the runtime's: it serves from here.
+    silica_rt::serving();
+    let quit_allowed = silica_rt::option("quit") == Some("allowed");
     let mut conns: Vec<Conn> = Vec::new();
     let mut buf = [0u8; 16384];
     // The body's bytes from any offset, as one slice: the pattern repeats
@@ -83,6 +101,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         peer_done: false,
                         finished: false,
                         quit: false,
+                        last: silica_rt::clock().now(),
                     });
                 }
                 Ok(None) => break,
@@ -96,14 +115,28 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                 }
             }
         }
+        let now = silica_rt::clock().now();
         for c in conns.iter_mut() {
-            progress |= step(c, &mut buf, &pattern, &mut served);
+            if step(c, &mut buf, &pattern, &mut served, quit_allowed) {
+                c.last = now;
+                progress = true;
+            } else if now >= c.last + IDLE && !c.finished {
+                // Idle for a minute: let go of, as a failed one is.
+                progress |= failed(c);
+            }
         }
-        // Done with: the answer sent and finished, and the peer done too.
+        // Done with: the answer sent and finished. The stack sends the rest
+        // and ends the connection, which stays this program's to pay for
+        // until then and gives its place when this program needs it: a
+        // peer that never reads its answer, or never finishes, holds
+        // nothing here (before, each such connection kept its block for
+        // good, and 64 of them shut the server). The one that asked the
+        // server to end is kept until its peer has finished, so that the
+        // answer is not lost with the server.
         let mut i = 0;
         while i < conns.len() {
             let c = &conns[i];
-            if c.finished && c.peer_done {
+            if c.finished && (c.peer_done || !c.quit) {
                 let c = conns.swap_remove(i);
                 let quit = c.quit;
                 let _ = tcp.close(c.s);
@@ -130,7 +163,8 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             }
         }
         if may_sleep {
-            let _ = tcp.wait(None);
+            let next = conns.iter().filter(|c| !c.finished).map(|c| c.last + IDLE).min();
+            let _ = tcp.wait(next);
         }
     }
 }
@@ -152,7 +186,7 @@ fn sending(c: &Conn) -> bool {
 }
 
 /// Read, answer and send for one connection; whether anything moved.
-fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool {
+fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64, quit_allowed: bool) -> bool {
     let mut progress = false;
     // Send what is being sent.
     while sending(c) {
@@ -175,35 +209,38 @@ fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool 
         c.body_sent += n as u64;
         progress = true;
     }
-    if c.close_after && !c.finished {
+    // The answer is sent: end this side if asked to, or if the peer ended
+    // its side while the answer was going out (it asks nothing more; before,
+    // such a connection was kept for good).
+    let more = c.input.windows(4).any(|w| w == b"\r\n\r\n");
+    if !c.finished && (c.close_after || (c.peer_done && !more)) {
         c.s.finish();
         c.finished = true;
         progress = true;
     }
-    // Read, and answer the next whole request.
-    if !c.peer_done {
+    // Read, and answer the next whole request. Not past a head's length
+    // while an answer goes out: a pipelining client waits its turn.
+    if !c.peer_done && (!sending(c) || c.input.len() <= HEAD) {
         match c.s.read(buf) {
             Ok(Read::Bytes(n)) => {
-                c.input.extend_from_slice(&buf[..n]);
+                if !c.finished {
+                    c.input.extend_from_slice(&buf[..n]);
+                }
                 progress = true;
             }
             Ok(Read::Empty) => {}
             Ok(Read::Closed(_)) | Err(_) => {
                 c.peer_done = true;
-                if !c.finished && !sending(c) {
-                    c.s.finish();
-                    c.finished = true;
-                }
                 progress = true;
             }
         }
     }
-    if !sending(c)
-        && !c.finished
-        && let Some(end) = c.input.windows(4).position(|w| w == b"\r\n\r\n")
-    {
+    if sending(c) || c.finished {
+        return progress;
+    }
+    if let Some(end) = c.input.windows(4).position(|w| w == b"\r\n\r\n") {
         let request: Vec<u8> = c.input.drain(..end + 4).collect();
-        answer(c, &request);
+        answer(c, &request, quit_allowed);
         *served += 1;
         // A line now and then: how far a test's load got (and when to act).
         if (*served).is_multiple_of(1000) {
@@ -215,11 +252,17 @@ fn step(c: &mut Conn, buf: &mut [u8], pattern: &[u8], served: &mut u64) -> bool 
         c.input.clear();
         respond(c, 431, 0, true);
         progress = true;
+    } else if c.peer_done {
+        // FIN follows all the peer's requests, including those already in
+        // input. Finish only after the last complete request was answered.
+        c.s.finish();
+        c.finished = true;
+        progress = true;
     }
     progress
 }
 
-fn answer(c: &mut Conn, request: &[u8]) {
+fn answer(c: &mut Conn, request: &[u8], quit_allowed: bool) {
     let text = core::str::from_utf8(request).unwrap_or("");
     let mut lines = text.split("\r\n");
     let mut first = lines.next().unwrap_or("").split(' ');
@@ -235,9 +278,15 @@ fn answer(c: &mut Conn, request: &[u8]) {
     if method != "GET" {
         return respond(c, 405, 0, true);
     }
-    if path == "/quit" {
+    // Only where the boot options allow it (a test that ends the server
+    // through it): otherwise any peer could stop the service.
+    if path == "/quit" && quit_allowed {
         c.quit = true;
         return respond(c, 200, 0, true);
+    }
+    if path == "/quit" && !QUIT_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        // Said once: a peer asking again and again writes nothing more.
+        println!("httpd: GET /quit refused: httpd.quit is not allowed on this machine");
     }
     match path.strip_prefix('/').and_then(|n| n.parse::<u64>().ok()) {
         Some(n) if n <= MOST => respond(c, 200, n, close),

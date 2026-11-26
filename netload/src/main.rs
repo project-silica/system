@@ -125,7 +125,7 @@ fn run() -> Result<(), &'static str> {
     let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT)));
     let deadline = silica_rt::clock().now() + 10 * SECOND;
     let id = loop {
-        let listed = devices.list(manager::Class::Network).map_err(|_| "the device manager does not answer")?;
+        let listed = devices.list(manager::Class::Network, 0).map_err(|_| "the device manager does not answer")?;
         if let Some(d) = listed.devices.iter().next() {
             break d.id;
         }

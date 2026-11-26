@@ -20,6 +20,24 @@
 //!   exits 0 if the refusal was `NoMemory` and it could still work after.
 //! - [`ONE_CALL`]: makes one call through its first grant and exits with
 //!   the kernel's status of that call (0: answered).
+//! - `BORROWER`: maps `args[1]` frames of `2^args[2]` bytes one after
+//!   another as lent memory (`silica_rt::mem::Lent`), each taken away while
+//!   mapped, every page then touched (its supervisor answers with zeros),
+//!   and let go of; exits 0 if every page read zeros and every frame after
+//!   the first was mapped where the first was.
+//! - `BLOCKS`: takes blocks of `2^args[1]` bytes from its memory (`silica_rt::mem`) until
+//!   refused, gives them all back, then takes blocks of `2^args[2]` bytes until refused; exits 0
+//!   if the large blocks hold what the small ones did (memory given back at one size serves another).
+//! - `CHURN`: `args[1]` rounds of `args[2]` bytes (0: 45% of its free memory) of the heap at a time,
+//!   as 2 KiB pieces, then 32 KiB blocks, then 256 KiB blocks, each
+//!   written and checked and given back; exits 0 if every request was
+//!   served and the program's free memory after the last round is what
+//!   it was after the first (the heap reuses what it freed at one size for
+//!   another), else the round and size that failed (its line says how).
+//! - `CACHE`: serves `args[1]` requests, each needing 256 KiB for its duration, and caches
+//!   64 KiB after each, without limit; with `args[2]` 1 it watches its memory
+//!   (`silica_rt::mem::watch_low`) and lets the cache go, and trims its heap, when told it is low.
+//!   Exits 0 if every request was served, else 100 + the request that found no memory.
 #![no_std]
 #![no_main]
 
@@ -33,6 +51,10 @@ pub const HOG: u64 = 3;
 pub const ONE_CALL: u64 = 4;
 const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
+const BORROWER: u64 = 7;
+const CHURN: u64 = 8;
+const BLOCKS: u64 = 9;
+const CACHE: u64 = 10;
 
 const PING: u64 = 1;
 const COUNT: u64 = 2;
@@ -58,6 +80,10 @@ fn main(info: &'static ProcessInfo) -> i64 {
             let Ok(page) = silica_rt::mem::peer(grant, 12, Rights::READ) else { return -1 };
             i64::from(silica_rt::time::read(&page) != (0, silica_rt::time::Source::None))
         }
+        BORROWER => borrower(info.args[1], info.args[2] as u8),
+        CHURN => churn(info.args[1], info.args[2] as usize),
+        BLOCKS => blocks(info.args[1] as u8, info.args[2] as u8),
+        CACHE => cache(info.args[1], info.args[2] != 0),
         ONE_CALL => match sys::call(grant, MsgInfo::new(PING, 1), [41, 0, 0, 0]) {
             Ok(_) => 0,
             Err(e) => e as i64,
@@ -178,4 +204,181 @@ fn hog() -> i64 {
     // Out of memory is an error to this program and nothing else: it still runs.
     println!("stress hog: {frames} frames, then {refusal:?}");
     if refusal == Some(Error::NoMemory) && frames > 0 { 0 } else { 1 }
+}
+
+/// See [`BORROWER`] in the module's documentation.
+fn borrower(cycles: u64, bits: u8) -> i64 {
+    use silica_rt::mem::{Lent, Object};
+    let mut first = None;
+    for cycle in 0..cycles {
+        let Ok(frame) = Object::new(ObjectType::Frame, bits) else { return 10 };
+        let Ok(lent) = Lent::map(frame.cap(), bits, Rights(Rights::READ.0 | Rights::WRITE.0)) else { return 11 };
+        let region = lent.region();
+        if *first.get_or_insert(region.addr()) != region.addr() {
+            println!("stress borrower: cycle {cycle} mapped at {:#x}, not where the first was", region.addr());
+            return 12;
+        }
+        region.write64(8, cycle + 1);
+        if region.read64(8) != cycle + 1 {
+            return 13;
+        }
+        // The lender takes it back: the mapping goes with the frame.
+        // SAFETY: nothing but `region` refers to it, and that reads zeros now.
+        #[allow(unsafe_code)]
+        unsafe {
+            frame.destroy()
+        };
+        for page in (0..region.len()).step_by(4096) {
+            if region.read64(page + 8) != 0 {
+                println!("stress borrower: cycle {cycle} read lent memory after it was taken back");
+                return 14;
+            }
+        }
+        drop(lent);
+    }
+    0
+}
+
+/// See `CHURN` in the module's documentation.
+fn churn(rounds: u64, bytes: usize) -> i64 {
+    use silica_rt::alloc::vec::Vec;
+    // 0: 45% of what the program has free, so that three sizes each
+    // keeping their own would need more than it has.
+    let bytes = if bytes == 0 { (silica_rt::mem::available() as usize / 100 * 45) & !0xFFFF } else { bytes };
+    let mut first = 0;
+    for round in 0..rounds {
+        for (n, size) in [2048usize, 32 << 10, 256 << 10].into_iter().enumerate() {
+            let mut blocks: Vec<Vec<u8>> = Vec::new();
+            if blocks.try_reserve_exact(bytes / size).is_err() {
+                return 100;
+            }
+            for k in 0..bytes / size {
+                let mut b = Vec::new();
+                if b.try_reserve_exact(size).is_err() {
+                    println!(
+                        "stress churn: round {round}: {size}-byte block {k} refused, {} bytes of memory free",
+                        silica_rt::mem::available()
+                    );
+                    return 10 * (round as i64 + 1) + n as i64;
+                }
+                b.resize(size, k as u8);
+                blocks.push(b);
+            }
+            for (k, b) in blocks.iter().enumerate() {
+                if b[0] != k as u8 || b[size - 1] != k as u8 {
+                    return 99;
+                }
+            }
+        }
+        let free = silica_rt::mem::available();
+        if round == 0 {
+            first = free;
+        } else if free < first {
+            println!("stress churn: round {round}: {free} bytes of memory free, {first} after the first round: the heap grew");
+            return 98;
+        }
+    }
+    println!("stress churn: {rounds} rounds of {bytes} bytes at three sizes; the heap kept what it freed for the next size");
+    0
+}
+
+/// See `BLOCKS` in the module's documentation.
+fn blocks(small: u8, large: u8) -> i64 {
+    use silica_rt::mem;
+    let mut held: [Option<sys::Cap>; 512] = [None; 512];
+    let take = |bits: u8, held: &mut [Option<sys::Cap>; 512]| {
+        let mut n = 0;
+        while n < held.len() {
+            match mem::alloc(bits) {
+                Ok(b) => {
+                    held[n] = Some(b);
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        n
+    };
+    let give_back = |bits: u8, held: &mut [Option<sys::Cap>; 512]| {
+        for b in held.iter_mut().filter_map(Option::take) {
+            // SAFETY: nothing was made from these blocks.
+            #[allow(unsafe_code)]
+            unsafe {
+                mem::free(b, bits)
+            };
+        }
+    };
+    // The heap first: 45% of the program's memory in 256 KiB blocks, then
+    // dropped. Its chunks go back to the program's memory but for one
+    // spare chunk and its records (512 KiB, here): before, the heap kept
+    // every chunk it made.
+    let start = mem::available();
+    {
+        use silica_rt::alloc::vec::Vec;
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..(start as usize / 100 * 45) / (256 << 10) {
+            let mut b = Vec::new();
+            if b.try_reserve_exact(256 << 10).is_err() {
+                return 2;
+            }
+            b.resize(256 << 10, 1);
+            v.push(b);
+        }
+    }
+    let after = mem::available();
+    println!("stress blocks: {start} bytes free, {after} after 45% of them were the heap's and given back");
+    if after + (512 << 10) < start {
+        return 3;
+    }
+    let n = take(small, &mut held);
+    give_back(small, &mut held);
+    let m = take(large, &mut held);
+    give_back(large, &mut held);
+    let (small_bytes, large_bytes) = ((n as u64) << small, (m as u64) << large);
+    println!("stress blocks: {n} of 2^{small} bytes taken and given back, then {m} of 2^{large}");
+    // The large blocks hold what the small did, but for what the program's
+    // own heap and the alignment of the large ones take.
+    if n == 0 || m == 0 || large_bytes + (1u64 << large) < small_bytes { 1 } else { 0 }
+}
+
+/// See `CACHE` in the module's documentation.
+fn cache(requests: u64, watching: bool) -> i64 {
+    use silica_rt::alloc::vec::Vec;
+    use silica_rt::mem::{OwnedObject, trim, watch_low};
+    const REQUEST: usize = 256 << 10;
+    const ENTRY: usize = 64 << 10;
+    let Ok(note) = OwnedObject::new(ObjectType::Notification, 0) else { return 10 };
+    if watching {
+        // Told when less than two requests' worth is left.
+        watch_low(2 * REQUEST as u64, note.cap());
+    }
+    let mut cache: Vec<Vec<u8>> = Vec::new();
+    let mut let_go = 0u64;
+    for r in 0..requests {
+        // Before each request, as a server looks at its events: was it told?
+        if sys::recv(note.cap(), Wait::Poll).is_ok() {
+            cache.clear();
+            cache.shrink_to_fit();
+            let _ = trim();
+            let_go += 1;
+        }
+        let mut request: Vec<u8> = Vec::new();
+        if request.try_reserve_exact(REQUEST).is_err() {
+            println!("stress cache: request {r} found no memory, {} KiB cached", cache.len() * ENTRY / 1024);
+            return 100 + r as i64;
+        }
+        request.resize(REQUEST, r as u8);
+        if request[REQUEST - 1] != r as u8 {
+            return 11;
+        }
+        drop(request);
+        // The cache is a convenience: an entry that cannot be had is skipped.
+        let mut entry: Vec<u8> = Vec::new();
+        if cache.try_reserve(1).is_ok() && entry.try_reserve_exact(ENTRY).is_ok() {
+            entry.resize(ENTRY, 1);
+            cache.push(entry);
+        }
+    }
+    println!("stress cache: {requests} requests served, the cache let go {let_go} times");
+    0
 }

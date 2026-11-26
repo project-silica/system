@@ -27,6 +27,8 @@ struct Piece {
     base: u64,
     bits: u8,
     cap: Cap,
+    /// For a frame: the Untyped it was made from, to take it back (`release`).
+    untyped: Cap,
     kind: Kind,
 }
 
@@ -43,7 +45,7 @@ impl DeviceMemory {
 
     /// The Untyped `cap` covers `2^bits` bytes of device memory at `base`.
     pub fn add(&mut self, base: u64, bits: u8, cap: Cap) {
-        self.pieces.push(Piece { base, bits, cap, kind: Kind::Whole });
+        self.pieces.push(Piece { base, bits, cap, untyped: cap, kind: Kind::Whole });
     }
 
     /// The frame of `2^bits` bytes at physical address `base` (a multiple
@@ -65,7 +67,7 @@ impl DeviceMemory {
                 Kind::Whole if p.bits == bits => {
                     let slot = free_slot().ok_or(Error::NoMemory)?;
                     sys::retype(p.cap, ObjectType::Frame, bits, slots::SPACE, slot, 1).inspect_err(|_| release_slot(slot))?;
-                    self.pieces[i] = Piece { cap: Cap(slot), kind: Kind::Frame, ..p };
+                    self.pieces[i] = Piece { cap: Cap(slot), untyped: p.cap, kind: Kind::Frame, ..p };
                     return Ok(Cap(slot));
                 }
                 _ => {
@@ -79,12 +81,61 @@ impl DeviceMemory {
                             base: p.base + (half << (p.bits - 1)),
                             bits: p.bits - 1,
                             cap: Cap(slot),
+                            untyped: Cap(slot),
                             kind: Kind::Whole,
                         });
                     }
                     self.pieces[i].kind = Kind::Halved;
                 }
             }
+        }
+    }
+
+    /// Take back the frame of `2^bits` bytes at `base` (from [`DeviceMemory::frame`]):
+    /// it and everything derived from it go, its memory is whole again, and
+    /// halves that are both whole merge back into what they were cut from.
+    /// What a device that left gives back: the next device in its slot may
+    /// lay its registers out otherwise (before, the old frames stayed and a
+    /// device with a register block of another size there was refused:
+    /// `InUse`). Nothing happens for a frame that is not there.
+    ///
+    /// # Safety
+    /// Nothing may still use the frame: its driver has ended, and the device
+    /// manager has not mapped it.
+    #[allow(unsafe_code)]
+    pub unsafe fn release(&mut self, base: u64, bits: u8) {
+        let Some(i) = self.pieces.iter().position(|p| p.kind == Kind::Frame && p.base == base && p.bits == bits) else { return };
+        let p = self.pieces[i];
+        // SAFETY: the caller's promise; the frame is the only thing made
+        // from its Untyped.
+        if unsafe { sys::cap_revoke(p.untyped) }.is_err() {
+            return;
+        }
+        release_slot(p.cap.0);
+        self.pieces[i] = Piece { cap: p.untyped, kind: Kind::Whole, ..p };
+        // Merge upward while both halves are whole.
+        let (mut base, mut bits) = (p.base, p.bits);
+        loop {
+            let parent_base = base & !((1u64 << (bits + 1)) - 1);
+            let Some(pi) = self.pieces.iter().position(|q| q.kind == Kind::Halved && q.base == parent_base && q.bits == bits + 1) else {
+                return;
+            };
+            let half = |b: u64| self.pieces.iter().position(|q| q.kind == Kind::Whole && q.base == b && q.bits == bits);
+            let (Some(lo), Some(hi)) = (half(parent_base), half(parent_base + (1 << bits))) else { return };
+            let parent = self.pieces[pi];
+            // SAFETY: both halves are whole, nothing made from them.
+            if unsafe { sys::cap_revoke(parent.cap) }.is_err() {
+                return;
+            }
+            let (lo_cap, hi_cap) = (self.pieces[lo].cap, self.pieces[hi].cap);
+            release_slot(lo_cap.0);
+            release_slot(hi_cap.0);
+            self.pieces[pi].kind = Kind::Whole;
+            // The higher index first, so the lower stays where it is.
+            let (a, b) = if lo > hi { (lo, hi) } else { (hi, lo) };
+            self.pieces.swap_remove(a);
+            self.pieces.swap_remove(b);
+            (base, bits) = (parent_base, bits + 1);
         }
     }
 }

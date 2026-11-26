@@ -35,7 +35,7 @@ pub struct Net {
 
 impl Control for Net {
     fn open(driver: Handle) -> Result<Net, client::Error> {
-        let control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+        let control = device::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         Ok(Net { _endpoint: driver, control })
     }
 
@@ -77,6 +77,20 @@ impl Interface {
         Ok(Interface { queue: Queue::<Net>::open_on(devices, id, note, first)? })
     }
 
+    /// While the driver is away (`open_on`): when to look again with
+    /// [`Interface::poll`]; the caller waits no later than this.
+    pub fn retry_at(&self) -> Option<u64> {
+        self.queue.retry_at()
+    }
+
+    /// The device manager signalled the caller's `watch` of network
+    /// interfaces (`silica_queue::client::Queue::provider_changed`): from
+    /// the first call the interface's next driver is tried when this is
+    /// said, not by the clock, and [`Interface::retry_at`] is `None`.
+    pub fn provider_changed(&mut self) {
+        self.queue.provider_changed()
+    }
+
     /// The caller received `bits` on its notification (`open_on`).
     pub fn signalled(&mut self, bits: u64) {
         self.queue.signalled(bits)
@@ -102,6 +116,12 @@ impl Interface {
     /// Withdraw the registration `id`.
     pub fn remove_memory(&mut self, id: u32) -> Result<(), Error> {
         self.queue.remove_memory(id)
+    }
+
+    /// Whether the interface's driver is away (it ended, and the next has
+    /// not taken the connection yet).
+    pub fn away(&self) -> bool {
+        self.queue.away()
     }
 
     /// How many requests are in progress.

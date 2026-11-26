@@ -17,15 +17,18 @@
 //! A class's client (`silica_block::client::Disk`) wraps a [`Queue`] with
 //! its control protocol ([`Control`]) and its records.
 
-use crate::{COMPLETION_BYTES, COMPLETIONS_AT, Completion, MEMORIES, QUEUE, REQUEST_BYTES, RINGS_BITS, Raw, Refused, tag_of};
+use crate::{
+    COMPLETION_BYTES, COMPLETIONS_AT, Completion, EVENT_BYTES, EVENT_SLOTS, EVENTS_AT, MEMORIES, QUEUE, REQUEST_BYTES, RINGS_BITS, Raw,
+    Refused, tag_of,
+};
 use silica_idl_rt::{CallError, TransportError};
 use silica_protocols::device::manager;
-use silica_ring::{Consumer, Producer};
 use silica_rt::alloc::boxed::Box;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, free_slot, release_slot};
-use silica_rt::mem::{Memory, Object};
+use silica_rt::mem::{Memory, OwnedObject, SharedMemory};
+use silica_rt::ring::{Consumer, Producer};
 use silica_rt::slots;
 use silica_rt::sys::{self, Cap, ObjectType, Rights, Wait};
 
@@ -229,6 +232,10 @@ struct Link<C> {
     control: C,
     requests: Producer<REQUEST_BYTES>,
     completions: Consumer<COMPLETION_BYTES>,
+    /// The provider's event slots (`crate::EVENTS_AT`), and the sequence
+    /// last taken from each.
+    events: silica_rt::mmio::Mmio,
+    seen: [u64; EVENT_SLOTS],
     /// The kernel's notice of `wake` going (`cap_notice`). Declared before
     /// `wake`, so dropped first: a link the client ends is no driver's end,
     /// and deleting `wake` while watched would wake the client for nothing.
@@ -236,6 +243,47 @@ struct Link<C> {
     _notice: Handle,
     /// Signalled when the driver must look at the request ring.
     wake: Handle,
+}
+
+impl<C> Link<C> {
+    /// The next event the provider wrote since it was last taken, as a
+    /// completion with its tag: a slot whose sequence is even, moved, and
+    /// the same before and after its fields were read (else it is being
+    /// written: taken on a later look, its writer wakes the client again).
+    /// A hostile provider can only make events up, which a client judges
+    /// as it judges any of the provider's words.
+    fn event(&mut self) -> Option<Completion> {
+        for k in 0..EVENT_SLOTS {
+            let at = k * EVENT_BYTES;
+            let seq = self.events.read64(at);
+            if seq & 1 != 0 || seq == self.seen[k] {
+                continue;
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            let (tag, status, value) = (self.events.read64(at + 8), self.events.read32(at + 16), self.events.read32(at + 20));
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            if self.events.read64(at) != seq || tag < EVENTS {
+                continue;
+            }
+            self.seen[k] = seq;
+            return Some(Completion { tag, status, value });
+        }
+        None
+    }
+
+    /// Say the client sleeps, unless a completion or an event is there:
+    /// the flag first, then the slots (the provider writes a slot, then
+    /// looks at the flag), so an event written meanwhile is never missed.
+    fn sleep(&mut self) -> bool {
+        if !self.completions.sleep() {
+            return false;
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        (0..EVENT_SLOTS).all(|k| {
+            let seq = self.events.read64(k * EVENT_BYTES);
+            seq & 1 != 0 || seq == self.seen[k]
+        })
+    }
 }
 
 /// How a recovery from a driver's end went, in monotonic nanoseconds from
@@ -257,14 +305,14 @@ pub struct Queue<C: Control> {
     devices: Box<dyn Opener>,
     id: u32,
     /// The frame of the two rings, reused (cleared) for each driver.
-    rings: Memory,
+    rings: SharedMemory,
     link: Option<Box<Link<C>>>,
     /// What the driver signals (`bits.completed()`) and the device manager
     /// signals when the driver ends (`bits.gone(generation)`): the queue's
     /// own, or its client's (`open_on`), which then owns it.
     note: Cap,
     /// The queue's own notification, kept while the queue lives.
-    _own_note: Option<Object>,
+    _own_note: Option<OwnedObject>,
     bits: Bits,
     /// Counts connections.
     generation: u32,
@@ -281,7 +329,25 @@ pub struct Queue<C: Control> {
     reconnected_at: u64,
     tries: u32,
     recovered_in: Option<Recovery>,
+    /// While there is no driver: when to try the next one, and the wait
+    /// before that (doubling from [`FIRST_TRY_NS`] to [`LAST_TRY_NS`]).
+    next_try: u64,
+    backoff: u64,
+    /// The queue's owner hears from the device manager when a device of
+    /// the class gains or loses its driver, and says so
+    /// ([`Queue::provider_changed`]): the next driver is then tried when
+    /// that is said, never by the clock.
+    told: bool,
+    /// What a call that cannot go on without a driver sleeps on between
+    /// tries: signalled by nobody.
+    nap: OwnedObject,
 }
+
+/// How long after a failed try to connect again, at first and at most: a
+/// driver takes from a millisecond to some tens to come back, and nothing
+/// tells the queue when it has (the waiting is a sleep, not a spin).
+const FIRST_TRY_NS: u64 = 50_000;
+const LAST_TRY_NS: u64 = 4_000_000;
 
 /// A capability of this program's own, derived from `cap` with `rights`
 /// and `badge`, to give away.
@@ -308,7 +374,7 @@ impl<C: Control> Queue<C> {
     /// Open device `id` through `opener` (which the queue keeps, to find
     /// the next provider when this one ends).
     pub fn open_with(devices: Box<dyn Opener>, id: u32) -> Result<Queue<C>, Error> {
-        let note = Object::new(ObjectType::Notification, 0)?;
+        let note = OwnedObject::new(ObjectType::Notification, 0)?;
         Queue::open_noting(devices, id, note.cap(), Some(note), Bits::OWN)
     }
 
@@ -328,14 +394,14 @@ impl<C: Control> Queue<C> {
         Queue::open_noting(opener, id, note, None, Bits { first, count: SHARED_BITS })
     }
 
-    fn open_noting(devices: Box<dyn Opener>, id: u32, note: Cap, own_note: Option<Object>, bits: Bits) -> Result<Queue<C>, Error> {
+    fn open_noting(devices: Box<dyn Opener>, id: u32, note: Cap, own_note: Option<OwnedObject>, bits: Bits) -> Result<Queue<C>, Error> {
         let mut memories = Vec::new();
         memories.try_reserve_exact(MEMORIES as usize).map_err(|_| Error::NoMemory)?;
         memories.resize(MEMORIES as usize, None);
         let mut q = Queue {
             devices,
             id,
-            rings: Memory::new(RINGS_BITS)?,
+            rings: SharedMemory::new(RINGS_BITS)?,
             link: None,
             note,
             _own_note: own_note,
@@ -348,8 +414,21 @@ impl<C: Control> Queue<C> {
             reconnected_at: 0,
             tries: 0,
             recovered_in: None,
+            next_try: 0,
+            backoff: 0,
+            told: false,
+            nap: OwnedObject::new(ObjectType::Notification, 0)?,
         };
-        q.connect()?;
+        match q.connect() {
+            Ok(()) => {}
+            // Its driver ended as this opened (it refused its device at
+            // bring-up, or was restarted): the next one is waited for as
+            // for a connection lost later, [`Queue::RECONNECT_NS`] at most.
+            // Before, the open failed at once, and whether a client got
+            // its disk depended on when it asked.
+            Err(Error::Gone) => q.recover()?,
+            Err(e) => return Err(e),
+        }
         Ok(q)
     }
 
@@ -376,7 +455,8 @@ impl<C: Control> Queue<C> {
         // connection's death notice.
         let notice = Handle::new(Cap(free_slot().ok_or(Error::NoMemory)?));
         sys::cap_notice(wake.cap(), self.note, notice.cap(), self.bits.gone(self.generation))?;
-        let mut link = Box::new(Link { control, requests, completions, _notice: notice, wake });
+        let events = region.part(EVENTS_AT, EVENT_SLOTS * EVENT_BYTES).ok_or(Error::Protocol)?;
+        let mut link = Box::new(Link { control, requests, completions, events, seen: [0; EVENT_SLOTS], _notice: notice, wake });
         for (id, m) in self.memories.iter().enumerate() {
             if let Some((frame, writable)) = *m {
                 let rights = Rights(Rights::READ.0 | if writable { Rights::WRITE.0 } else { 0 });
@@ -410,36 +490,105 @@ impl<C: Control> Queue<C> {
         }
     }
 
-    fn recover(&mut self) -> Result<(), Error> {
+    /// One try to connect to the next driver, if one is due: `true` once
+    /// connected (or never disconnected), `false` when the next try is at
+    /// [`Queue::retry_at`], `Gone` once [`Queue::RECONNECT_NS`] have passed
+    /// without one. Never waits: a service that is also a driver's client
+    /// goes on serving its own clients while the driver restarts.
+    fn try_recover(&mut self) -> Result<bool, Error> {
+        if self.link.is_some() {
+            return Ok(true);
+        }
         // Keep room for the next driver's entire completion ring. An
         // application doing only control calls across repeated restarts
         // must consume queued events before they grow without bound.
         if self.ready.len() >= QUEUE as usize {
             return Err(Error::Full);
         }
-        let clock = silica_rt::clock();
+        let now = silica_rt::clock().now();
         if self.lost_at == 0 {
-            self.lost_at = clock.now();
+            self.lost_at = now;
         }
-        let deadline = self.lost_at + Self::RECONNECT_NS;
-        loop {
-            self.tries += 1;
-            match self.connect() {
-                Ok(()) => {
-                    let now = clock.now();
-                    self.reconnected_at = now;
-                    // Nothing was sent to the new driver again (every
-                    // request in flight had its result saved): there is no
-                    // completion to wait for, so the recovery ends here.
-                    if self.in_flight.iter().all(|r| self.ready.iter().any(|c| c.tag == tag_of(r))) {
-                        self.recovered(now);
-                    }
-                    return Ok(());
+        if now < self.next_try {
+            return Ok(false);
+        }
+        self.tries += 1;
+        match self.connect() {
+            Ok(()) => {
+                let now = silica_rt::clock().now();
+                self.reconnected_at = now;
+                (self.next_try, self.backoff) = (0, 0);
+                // Nothing was sent to the new driver again (every
+                // request in flight had its result saved): there is no
+                // completion to wait for, so the recovery ends here.
+                if self.in_flight.iter().all(|r| self.ready.iter().any(|c| c.tag == tag_of(r))) {
+                    self.recovered(now);
                 }
-                // Not back yet: the device manager is starting it again.
-                Err(Error::Gone) if clock.now() < deadline => sys::yield_now(),
-                Err(e) => return Err(e),
+                Ok(true)
             }
+            // Not back yet, and the owner is told when it is: tried again
+            // then, however long that takes (a driver the device manager
+            // keeps starting, a device taken out: the owner knows which
+            // from the device manager, not from a time gone by).
+            Err(Error::Gone) if self.told => {
+                self.next_try = u64::MAX;
+                Ok(false)
+            }
+            // Not back yet: the device manager is starting it again.
+            Err(Error::Gone) if now < self.lost_at + Self::RECONNECT_NS => {
+                self.backoff = (self.backoff * 2).clamp(FIRST_TRY_NS, LAST_TRY_NS);
+                self.next_try = now + self.backoff;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Wait for the next driver: for what cannot go on without one (a
+    /// control call, registering memory). Sleeps between tries; a queue
+    /// whose owner is told of the next driver does not wait here, where
+    /// nothing would wake it: the call fails `Gone`, and the owner makes
+    /// it again when it was told.
+    fn recover(&mut self) -> Result<(), Error> {
+        while !self.try_recover()? {
+            if self.told {
+                return Err(Error::Gone);
+            }
+            let _ = sys::recv(self.nap.cap(), Wait::Until(self.next_try));
+        }
+        Ok(())
+    }
+
+    /// With no driver: sleep until the next try, or `deadline` (then
+    /// `Timeout`), whichever comes first.
+    fn nap_until(&mut self, deadline: Option<u64>) -> Result<(), Error> {
+        let until = deadline.map_or(self.next_try, |d| d.min(self.next_try));
+        if deadline.is_some_and(|d| silica_rt::clock().now() >= d) {
+            return Err(Error::Timeout);
+        }
+        let _ = sys::recv(self.nap.cap(), Wait::Until(until));
+        Ok(())
+    }
+
+    /// While the driver is away and its successor not yet connected: when
+    /// to look again ([`Queue::poll`] tries then). A client on its own
+    /// notification ([`Queue::open_on`]) waits no later than this.
+    pub fn retry_at(&self) -> Option<u64> {
+        self.link.is_none().then_some(self.next_try).filter(|t| *t != u64::MAX)
+    }
+
+    /// The device manager signalled that a device of this queue's class
+    /// gained or lost its driver (its `watch`, which the queue's owner
+    /// asked for and waits on): if the queue's driver is away, the next
+    /// one is tried at the next [`Queue::poll`]. From the first call the
+    /// queue no longer tries by the clock (50 us to 4 ms apart, for 5 s,
+    /// then `Gone`): it hears when there is a driver to try, and its
+    /// owner is never woken to look for one that is not there. Call it
+    /// once when the watch is set, and at every signal after.
+    pub fn provider_changed(&mut self) {
+        self.told = true;
+        if self.link.is_none() {
+            self.next_try = 0;
         }
     }
 
@@ -459,6 +608,13 @@ impl<C: Control> Queue<C> {
             self.recover()?;
         }
         self.link.as_mut().ok_or(Error::Gone)
+    }
+
+    /// How many drivers this queue has connected to: it changes when a
+    /// driver ended and the next took the connection (a client that must
+    /// know whether a reset came between two of its requests compares it).
+    pub fn connections(&self) -> u32 {
+        self.generation
     }
 
     /// The class's control protocol of the current driver, connecting again
@@ -509,6 +665,12 @@ impl<C: Control> Queue<C> {
         Ok(())
     }
 
+    /// Whether the driver is away: it ended, and the next has not taken
+    /// the connection yet.
+    pub fn away(&self) -> bool {
+        self.link.is_none()
+    }
+
     /// How many requests are in progress.
     pub fn in_progress(&self) -> u32 {
         self.in_flight.len as u32
@@ -521,6 +683,12 @@ impl<C: Control> Queue<C> {
         let tag = tag_of(request);
         if self.in_flight.len as u32 >= QUEUE || tag >= EVENTS || self.in_flight.contains(tag) {
             return Err(Error::Full);
+        }
+        if !self.try_recover()? {
+            // The next driver is on its way: the request waits with those
+            // in flight, all sent to it when it connects.
+            self.in_flight.insert(*request);
+            return Ok(());
         }
         self.link()?.requests.push(request).map_err(|_| Error::Full)?;
         self.in_flight.insert(*request);
@@ -555,9 +723,10 @@ impl<C: Control> Queue<C> {
             return false;
         }
         match self.link.as_mut() {
-            Some(link) => link.completions.sleep(),
-            // Connecting again happens in `poll`.
-            None => false,
+            Some(link) => link.sleep(),
+            // Connecting again happens in `poll`, at `retry_at`, which the
+            // client waits no later than.
+            None => true,
         }
     }
 
@@ -591,10 +760,13 @@ impl<C: Control> Queue<C> {
             }
             return Ok(Some(c));
         }
-        if self.link.is_none() {
-            self.recover()?;
+        if !self.try_recover()? {
+            return Ok(None);
         }
         let Some(link) = self.link.as_mut() else { return Ok(None) };
+        if let Some(e) = link.event() {
+            return Ok(Some(e));
+        }
         loop {
             match link.completions.pop() {
                 Ok(Some(raw)) => {
@@ -630,7 +802,11 @@ impl<C: Control> Queue<C> {
                 }
                 return Ok(c);
             }
-            let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
+            if self.link.is_none() {
+                self.nap_until(deadline)?;
+                continue;
+            }
+            let asleep = self.link.as_mut().is_some_and(|l| l.sleep());
             if !asleep {
                 continue;
             }
@@ -655,7 +831,11 @@ impl<C: Control> Queue<C> {
             if let Some(c) = self.take()? {
                 return Ok(c);
             }
-            let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
+            if self.link.is_none() {
+                self.nap_until(deadline)?;
+                continue;
+            }
+            let asleep = self.link.as_mut().is_some_and(|l| l.sleep());
             if !asleep {
                 continue;
             }
@@ -665,6 +845,20 @@ impl<C: Control> Queue<C> {
                 Err(_) => return Err(Error::Timeout),
             }
         }
+    }
+}
+
+/// A queue let go of ends its connection: its rings are freed, which the
+/// driver sees as the client gone (`provider::Connection::alive`), and its
+/// own notifications with them. Before, the rings stayed, so the driver
+/// kept the connection for good: a program that opened a disk again after
+/// dropping it was refused (`Busy`: one connection a client), and every
+/// open left two frames behind.
+impl<C: Control> Drop for Queue<C> {
+    fn drop(&mut self) {
+        // The link reads and writes the rings: it goes before them (the
+        // fields go after this, the rings and the notifications with them).
+        drop(self.link.take());
     }
 }
 

@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
     // The peer's sequence numbers, so that a script can follow them or not.
     let mut peer_seq = input.u32().unwrap_or(0);
     let mut c = if first & 1 == 0 {
-        Connection::connect(ends, iss, 1500, buffers)
+        Connection::connect(ends, iss, iss.rotate_left(13) ^ 0x5bd1_e995, 1500, buffers)
     } else {
         let syn = Segment {
             header: Header { src_port: 4000, dst_port: 80, seq: peer_seq, ack: 0, flags: tcp::SYN, window: input.u16().unwrap_or(0) },
@@ -56,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
             data: &[],
         };
         peer_seq = peer_seq.wrapping_add(1);
-        Connection::accept(ends, &syn, iss, 1500, buffers)
+        Connection::accept(ends, &syn, iss, iss.rotate_left(13) ^ 0x5bd1_e995, 1500, buffers)
     };
     // An interface that sums checksums and cuts segments of up to 44 MSS
     // (silica.net.Device's offloads), for inputs whose first byte says so.

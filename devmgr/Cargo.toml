@@ -9,15 +9,18 @@ publish.workspace = true
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
 provides = "silica.device.Manager"
-needs = ["silica.system.Manager"]
+needs = ["silica.system.Manager:logs+power"]
 machine = true
 memory = 26
 start = "boot"
 restart = "always"
+ends = true
+# A log for each device it starts a driver for.
+logs = 32
 
 [lib]
 path = "src/lib.rs"
-test = false
+test = true
 bench = false
 
 [[bin]]
@@ -35,6 +38,11 @@ silica-driver = { workspace = true }
 silica-idl-rt = { workspace = true }
 silica-protocols = { workspace = true }
 
+
+# Built only into test images (os/tools/lib/build.sh): what commits a device's
+# faults on purpose (silica_driver::inject). A machine's image has none of it.
+[features]
+harness = ["silica-driver/harness"]
 
 [lints]
 workspace = true

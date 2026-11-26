@@ -25,6 +25,7 @@ pub mod dhcp_client;
 pub mod ether;
 pub mod icmp;
 pub mod ipv4;
+pub mod neighbours;
 pub mod ntp;
 pub mod tcp;
 pub mod tcp_conn;

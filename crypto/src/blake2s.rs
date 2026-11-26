@@ -29,13 +29,16 @@ pub fn hmac(key: &[u8; LEN], parts: &[&[u8]]) -> [u8; LEN] {
     for p in parts {
         inner.update(p);
     }
-    let ih = inner.finish();
+    let mut ih = inner.finish();
     let mut outer = Blake2s::new();
     pad = k.map(|b| b ^ 0x5c);
     outer.update(&pad);
     outer.update(&ih);
     crate::wipe(&mut k);
     crate::wipe(&mut pad);
+    // The inner hash is a function of the key alone and what was hashed:
+    // with the outer pad, it gives the MAC of anything appended.
+    crate::wipe(&mut ih);
     outer.finish()
 }
 

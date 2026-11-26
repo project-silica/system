@@ -9,11 +9,12 @@ publish.workspace = true
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
 provides = "silica.entropy.Source"
-needs = ["silica.device.Manager"]
+needs = ["silica.device.Manager:entropy"]
 memory = 22
 start = "boot"
 restart = "always"
 seed = true
+secrets = true
 
 [lib]
 path = "src/lib.rs"

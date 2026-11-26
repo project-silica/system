@@ -27,8 +27,10 @@
 #![no_main]
 
 use silica_driver::dma::{Dma, DmaMemory, Shared};
+#[cfg(feature = "harness")]
 use silica_driver::inject;
 use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::oldest::Oldest;
 use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
 use silica_net::device::{Error, Info};
@@ -84,6 +86,8 @@ struct Nic {
     /// when they were started).
     rx_slots: Vec<Option<Ticket>>,
     tx_slots: Vec<Option<(Ticket, u64)>>,
+    /// The oldest frame being sent, found without a walk.
+    tx_oldest: Oldest,
     rx_free: Vec<u16>,
     tx_free: Vec<u16>,
     info: Info,
@@ -163,7 +167,10 @@ impl silica_net::service::Device for Nic {
                     self.tx_free.push(slot);
                     return Err(Refusal::Busy);
                 }
-                self.tx_slots[slot as usize] = Some((ticket, silica_rt::clock().now()));
+                let now = silica_rt::clock().now();
+                self.tx_slots[slot as usize] = Some((ticket, now));
+                let slots = &self.tx_slots;
+                self.tx_oldest.started(slot as u32, now, slots.len(), |s, t| slots[s as usize].is_some_and(|(_, x)| x == t));
             }
         }
         Ok(())
@@ -177,7 +184,7 @@ impl silica_net::service::Device for Nic {
         // Virtio takes back buffers it was given only by resetting the
         // queue (RING_RESET, not taken) or the device.
         println!("virtio-net: its last client ended with {} requests in the device; starting again to take them back", self.holding());
-        silica_rt::exit(3)
+        silica_rt::exit_again()
     }
 
     fn kick(&mut self) {
@@ -213,6 +220,10 @@ impl silica_net::service::Device for Nic {
             }
         }
         if bits & CONFIG != 0 {
+            // A device that gave up asks to be reset this way too.
+            if self.transport.needs_reset() {
+                self.give_up(DeviceError::Protocol("the device asks to be reset"));
+            }
             let up = self.link_up();
             if up != self.info.link_up {
                 self.info.link_up = up;
@@ -223,8 +234,9 @@ impl silica_net::service::Device for Nic {
     }
 
     fn deadline(&self) -> Option<u64> {
-        let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { TX_TIMEOUT_NS };
-        self.tx_slots.iter().flatten().map(|(_, t)| t + limit).min()
+        let limit = silica_driver::io_limit(TX_TIMEOUT_NS);
+        let slots = &self.tx_slots;
+        self.tx_oldest.oldest(|s, t| slots[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + limit)
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -279,9 +291,11 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     } else {
         interrupts.push(Interrupt::bind_to(&device, 0, signals.sender(RX | TX | CONFIG)?)?);
     }
+    #[cfg(feature = "harness")]
     inject::interrupts(signals.sender(RX | TX)?);
-    let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, Some(rx_v))?;
-    let tx = transport.queue(&dma, 1, QUEUE_SIZE, Some(tx_v))?;
+    // A frame takes a header and its data: two descriptors each way.
+    let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, 2, Some(rx_v))?;
+    let tx = transport.queue(&dma, 1, QUEUE_SIZE, 2, Some(tx_v))?;
     // A processor idling for a frame sees the device write it, without
     // waiting for the interrupt (spec/ARCHITECTURE.md section 7). Only where
     // the receive queue has an interrupt of its own (a shared one's news is
@@ -292,26 +306,32 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     {
         println!("virtio-net: completions wait for the interrupt alone: {e:?}");
     }
-    if features & F_STATUS != 0 {
-        transport.config_interrupt(cfg_v)?;
-    }
+    // The link's changes, and a device asking to be reset (`needs_reset`).
+    transport.config_interrupt(cfg_v)?;
     let config = transport.device_config().ok_or(DeviceError::Missing("the network device's configuration"))?;
     if config.len() < 12 {
         return Err(DeviceError::Protocol("the network device's configuration is too short"));
     }
     // Fields that belong together are read under one configuration generation.
-    let (address, mtu) = loop {
-        let before = transport.config_generation();
-        let address = if features & F_MAC != 0 {
-            (0..6).fold(0u64, |a, i| a | (config.read8(i) as u64) << (8 * i))
-        } else {
-            // Locally administered, unicast, from the device's identity.
-            0x02 | 0x5E << 8 | (device.id as u64) << 16
-        };
+    let (reported, mtu) = transport.read_config(|| {
+        let reported = (features & F_MAC != 0).then(|| (0..6).fold(0u64, |a, i| a | (config.read8(i) as u64) << (8 * i)));
         let mtu = if features & F_MTU != 0 { config.read16(10) as u32 } else { 1500 };
-        if transport.config_generation() == before {
-            break (address, mtu);
+        (reported, mtu)
+    })?;
+    // An address the device reports that no interface may have
+    // (multicast, zeros) is not used (`silica_driver::mac`).
+    let address = match reported {
+        Some(a) if silica_driver::mac::usable(a) => a,
+        Some(a) => {
+            let local = silica_driver::mac::local(device.id);
+            println!(
+                "virtio-net: the device's address {} is multicast or zero; the interface uses {}",
+                silica_driver::mac::Shown(a),
+                silica_driver::mac::Shown(local)
+            );
+            local
         }
+        None => silica_driver::mac::local(device.id),
     };
     if !(68..=65535).contains(&mtu) {
         return Err(DeviceError::Protocol("an MTU below 68 or above 65535"));
@@ -324,6 +344,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         tx_headers: dma.memory(12, false)?,
         rx_slots: (0..rx_count).map(|_| None).collect(),
         tx_slots: (0..tx_count).map(|_| None).collect(),
+        tx_oldest: Oldest::for_slots(tx_count)?,
         rx_free: (0..rx_count as u16).rev().collect(),
         tx_free: (0..tx_count as u16).rev().collect(),
         // (Each receive descriptor bounds what the device writes: a buffer

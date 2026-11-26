@@ -12,11 +12,13 @@
 //! [`Session::flush`].
 
 use crate::{
-    COMPLETION_BYTES, COMPLETIONS_AT, Completion, MEMORIES, NO_MEMORY, QUEUE, REQUEST_BYTES, RINGS_BITS, Raw, Refused, memory_of, tag_of,
+    COMPLETION_BYTES, COMPLETIONS_AT, Completion, EVENT_BYTES, EVENT_SLOTS, EVENTS_AT, MEMORIES, NO_MEMORY, QUEUE, REQUEST_BYTES,
+    RINGS_BITS, Raw, Refused, memory_of, tag_of,
 };
-use silica_ring::{Consumer, Producer};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::Handle;
+use silica_rt::mmio::Mmio;
+use silica_rt::ring::{Consumer, Producer};
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{mem, slots};
 
@@ -44,6 +46,8 @@ pub struct Ticket {
     /// The connection's slot, and which connection in it (its generation).
     slot: u16,
     connection: u32,
+    /// The service's own mark on the request (`Ticket::marked`).
+    marked: bool,
 }
 
 impl Ticket {
@@ -56,6 +60,25 @@ impl Ticket {
     pub fn without_memory(self) -> Ticket {
         Ticket { memory: NO_MEMORY, ..self }
     }
+
+    /// The same ticket with the service's mark: a class's service tells
+    /// its own kinds of request apart when they complete (a block
+    /// service, its writes).
+    pub fn marked(self) -> Ticket {
+        Ticket { marked: true, ..self }
+    }
+
+    /// Whether [`Ticket::marked`] made it.
+    pub fn is_marked(&self) -> bool {
+        self.marked
+    }
+
+    /// A ticket for a request the service makes itself, no client's (a
+    /// block service's flush as it ends): completing it reaches no
+    /// connection.
+    pub fn own(tag: u64) -> Ticket {
+        Ticket { tag, memory: NO_MEMORY, slot: u16::MAX, connection: u32::MAX, marked: false }
+    }
 }
 
 /// Why a service did not start a request.
@@ -63,7 +86,8 @@ impl Ticket {
 pub enum Refusal {
     /// The device is full: offer the request again after a completion.
     Busy,
-    /// Complete it now with this status (the class's, not 0).
+    /// Complete it now with this status (the class's; 0: done, at once:
+    /// what a service can answer without its device).
     Fail(u32),
 }
 
@@ -94,6 +118,9 @@ struct Connection<M> {
     client: u64,
     /// The frame of the rings: gone when the client is.
     rings: Handle,
+    /// Where they are mapped, with `requests` and `completions` in it: let
+    /// go of with them when the connection ends.
+    _mapped: mem::Lent,
     requests: Consumer<REQUEST_BYTES>,
     completions: Producer<COMPLETION_BYTES>,
     /// What to signal when completions were added and the client sleeps.
@@ -103,6 +130,11 @@ struct Connection<M> {
     stalled: Option<Raw>,
     /// Completions were added since the client was last told.
     completed: bool,
+    /// The event slots in the client's frame (`EVENTS_AT`), and what this
+    /// provider wrote in each: the tag and the sequence, its own copy (the
+    /// client may write the shared one).
+    event_area: Option<Mmio>,
+    event_slots: [(u64, u64); EVENT_SLOTS],
 }
 
 impl<M> Connection<M> {
@@ -114,9 +146,31 @@ impl<M> Connection<M> {
     }
 }
 
+/// Memory of an ended connection that requests on the device still use.
+struct Draining<M> {
+    slot: u16,
+    connection: u32,
+    id: u32,
+    /// Requests using it still on the device.
+    busy: u32,
+    mapping: M,
+    /// The client's frame, kept: the device's mapping is made from it.
+    _frame: Handle,
+}
+
 /// A service's connections to its clients.
 pub struct Session<M> {
     connections: Vec<Option<Connection<M>>>,
+    /// Memory of connections that ended while requests using it were on
+    /// the device: kept reachable until the last of them completes, so a
+    /// client that breaks its ring cannot pull memory from under the
+    /// device (where DMA is confined the device would fault, on a device
+    /// other clients share; where it is not, it would write memory reused
+    /// by then).
+    draining: Vec<Draining<M>>,
+    /// Mappings whose last request has completed, to give back
+    /// ([`Session::unmap_finished`]).
+    finished: Vec<M>,
     /// Counts connections.
     generation: u32,
     /// The capability clients are given to wake the service.
@@ -133,7 +187,7 @@ impl<M> Session<M> {
     pub fn new(wake: Cap) -> Session<M> {
         let mut connections = Vec::new();
         connections.resize_with(CONNECTIONS, || None);
-        Session { connections, generation: 0, wake, next: 0, exclusive: false }
+        Session { connections, draining: Vec::new(), finished: Vec::new(), generation: 0, wake, next: 0, exclusive: false }
     }
 
     /// As [`Session::new`], for a device that serves one client at a time:
@@ -145,12 +199,33 @@ impl<M> Session<M> {
         Session { exclusive: true, ..Session::new(wake) }
     }
 
-    /// End connection `slot`: the device loses the client's memory.
+    /// End connection `slot`: the device loses the client's memory, each
+    /// piece once no request using it is on the device.
     fn close_slot(&mut self, slot: usize, mapper: &mut impl Mapper<Mapping = M>) {
         if let Some(c) = self.connections.get_mut(slot).and_then(Option::take) {
-            for m in c.memories.into_iter().flatten() {
-                mapper.unmap(m.mapping);
+            for (id, m) in c.memories.into_iter().enumerate() {
+                match m {
+                    Some(m) if m.busy != 0 => self.draining.push(Draining {
+                        slot: slot as u16,
+                        connection: c.generation,
+                        id: id as u32,
+                        busy: m.busy,
+                        mapping: m.mapping,
+                        _frame: m.frame,
+                    }),
+                    Some(m) => mapper.unmap(m.mapping),
+                    None => {}
+                }
             }
+        }
+    }
+
+    /// Give back the mappings of ended connections whose last request on
+    /// the device has completed. The service calls it after it has given
+    /// the device's completions to [`Session::complete`].
+    pub fn unmap_finished(&mut self, mapper: &mut impl Mapper<Mapping = M>) {
+        for m in self.finished.drain(..) {
+            mapper.unmap(m);
         }
     }
 
@@ -160,6 +235,15 @@ impl<M> Session<M> {
             if broken & 1 << slot != 0 {
                 self.close_slot(slot, mapper);
             }
+        }
+    }
+
+    /// End the connection of the client calling with badge `caller`, if it
+    /// has one: what a service does when the capability it gave that
+    /// client no longer reaches what it did.
+    pub fn disconnect(&mut self, caller: u64, mapper: &mut impl Mapper<Mapping = M>) {
+        if let Some(slot) = self.connections.iter().position(|c| c.as_ref().is_some_and(|c| c.client == caller)) {
+            self.close_slot(slot, mapper);
         }
     }
 
@@ -207,7 +291,8 @@ impl<M> Session<M> {
         }
         // If the client takes it back, the range reads as zeros, which the
         // rings report as a broken ring.
-        let region = mem::peer(rings.cap(), RINGS_BITS, Rights(3)).map_err(|_| Refused::NoRoom)?;
+        let mapped = mem::Lent::map(rings.cap(), RINGS_BITS, Rights(3)).map_err(|_| Refused::NoRoom)?;
+        let region = mapped.region();
         let (Some(req), Some(cpl)) = (region.part(0, COMPLETIONS_AT), region.part(COMPLETIONS_AT, region.len() - COMPLETIONS_AT)) else {
             return Err(Refused::BadMemory);
         };
@@ -230,12 +315,15 @@ impl<M> Session<M> {
             generation: self.generation,
             client: caller,
             rings,
+            _mapped: mapped,
             requests,
             completions: completions_ring,
             done: completions,
             memories,
             stalled: None,
             completed: false,
+            event_area: region.part(EVENTS_AT, EVENT_SLOTS * EVENT_BYTES),
+            event_slots: [(0, 0); EVENT_SLOTS],
         });
         Ok(Handle::new(Cap(wake)))
     }
@@ -314,7 +402,7 @@ impl<M> Session<M> {
                     },
                 };
                 let memory = memory_of(&raw);
-                let ticket = Ticket { tag: tag_of(&raw), memory, slot: slot as u16, connection: c.generation };
+                let ticket = Ticket { tag: tag_of(&raw), memory, slot: slot as u16, connection: c.generation, marked: false };
                 let region = c.memories.get(memory as usize).and_then(Option::as_ref).map(|m| m.region);
                 match start(&raw, ticket, region, c.client) {
                     Ok(t) => {
@@ -343,6 +431,15 @@ impl<M> Session<M> {
     pub fn complete(&mut self, ticket: Ticket, status: u32, value: u32) {
         let Some(c) = self.connections.get_mut(ticket.slot as usize).and_then(Option::as_mut).filter(|c| c.generation == ticket.connection)
         else {
+            // Its connection ended: the memory it used may now go.
+            let of = |d: &Draining<M>| (d.slot, d.connection, d.id) == (ticket.slot, ticket.connection, ticket.memory);
+            if let Some(k) = self.draining.iter().position(of) {
+                self.draining[k].busy -= 1;
+                if self.draining[k].busy == 0 {
+                    let d = self.draining.swap_remove(k);
+                    self.finished.push(d.mapping);
+                }
+            }
             return;
         };
         if let Some(m) = c.memories.get_mut(ticket.memory as usize).and_then(Option::as_mut) {
@@ -354,11 +451,29 @@ impl<M> Session<M> {
         c.completed = true;
     }
 
-    /// Add a record that answers no request (a class's event, such as a
-    /// link coming up) for every client, with `tag` a value no request uses.
+    /// Tell every client of news that answers no request (a class's event,
+    /// such as a link coming up), with `tag` a value no request uses: its
+    /// event slot holds the latest of each tag (`crate::EVENTS_AT`), never a
+    /// place a completion needs. A provider with more kinds of event than
+    /// slots tells of the first [`EVENT_SLOTS`] kinds.
     pub fn event(&mut self, tag: u64, status: u32, value: u32) {
         for c in self.connections.iter_mut().flatten() {
-            let _ = c.completions.push(&Completion { tag, status, value }.encode());
+            let Some(area) = c.event_area else { continue };
+            let Some(k) = c.event_slots.iter().position(|s| s.0 == tag).or_else(|| c.event_slots.iter().position(|s| s.1 == 0)) else {
+                continue;
+            };
+            let seq = c.event_slots[k].1;
+            let at = k * EVENT_BYTES;
+            // Odd while it is written; even, and higher, when it is whole.
+            area.write64(at, seq + 1);
+            area.write64(at + 8, tag);
+            area.write32(at + 16, status);
+            area.write32(at + 20, value);
+            area.write64(at, seq + 2);
+            // Written before the client's sleep flag is looked at (`flush`):
+            // a client that said it sleeps after this sees the slot.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            c.event_slots[k] = (tag, seq + 2);
             c.completed = true;
         }
     }

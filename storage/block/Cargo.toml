@@ -8,7 +8,6 @@ publish.workspace = true
 
 [dependencies]
 silica-rt = { workspace = true }
-silica-ring = { workspace = true }
 silica-queue = { workspace = true }
 silica-idl-rt = { workspace = true }
 silica-protocols = { workspace = true }

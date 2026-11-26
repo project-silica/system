@@ -43,8 +43,11 @@ pub const FAULT_BADGE: u64 = 1 << 62;
 pub const MAX_GRANTS: usize = 2048;
 /// The lowest slot of a child's CapSpace used for its image, stack and record.
 const FIRST_IMAGE_SLOT: u64 = 64;
-/// Most pages of zeros one run of a child is given in place of lent memory
-/// taken back ([`Child::answer_peer_fault`]).
+/// Most pages of zeros a child holds at once in place of lent memory taken
+/// back ([`Child::answer_peer_fault`]): past them the oldest is moved to
+/// where the child touched now, so the parent's memory for them stays
+/// bounded and the child is never stopped for touching lent memory, however
+/// many lenders take theirs back over its life.
 pub const ZERO_PAGES: usize = 64;
 
 /// What the parent spawns with: its own capabilities and working space.
@@ -76,6 +79,10 @@ pub struct Parent {
     /// The time page children are given read-only when their `Program`
     /// names none ([`Cap::NONE`]: none).
     pub time: Cap,
+    /// The parent's own scheduling context (`slots::SCHED`; the root
+    /// task's `libsys::root::SLOT_CONTEXT`): what a child runs on when its
+    /// `Program` names none.
+    pub sched: Cap,
 }
 
 /// One capability to give the child.
@@ -156,6 +163,7 @@ impl Parent {
             cpus: info.cpus,
             clock: info.clock,
             time: if matches!(sys::inspect_slot(slots::SPACE, slots::TIME.0), Ok(Some(_))) { slots::TIME } else { Cap::NONE },
+            sched: slots::SCHED,
         }
     }
 }
@@ -186,26 +194,29 @@ impl Child {
         self.aspace
     }
 
-    /// Move the child's first thread to processor `cpu`. It carries on
-    /// with what it was doing (a call in progress included) there.
-    pub fn place(&self, cpu: usize) -> Result<(), Error> {
-        sys::thread_set_cpu(self.thread, cpu)
-    }
-
     /// Answer the kernel's report of the child's fault `m` (on
     /// [`Parent::fault`]) if it is the child touching memory a peer lent it
     /// and took back (an address from [`mem::PEER_BASE`] to
     /// [`mem::PEER_END`]): a page of zeros is mapped there and the child
     /// carries on, as `silica_rt::mem` promises every program. Returns
-    /// whether it was answered; any other fault, or more than
-    /// [`ZERO_PAGES`] of them in one run, is the child's own.
+    /// whether it was answered; any other fault is the child's own. The
+    /// child holds at most [`ZERO_PAGES`] of them: past that, the one it
+    /// was given longest ago goes (touched again, that place is answered
+    /// again), and its memory makes the new one.
     pub fn answer_peer_fault(&mut self, m: &sys::Message) -> bool {
         let at = m.words[1];
-        if m.info.label() != sys::FAULT_LABEL + sys::Fault::Page as u64
-            || !(mem::PEER_BASE..mem::PEER_END).contains(&at)
-            || self.zero_pages.len() >= ZERO_PAGES
-        {
+        if m.info.label() != sys::FAULT_LABEL + sys::Fault::Page as u64 || !(mem::PEER_BASE..mem::PEER_END).contains(&at) {
             return false;
+        }
+        if self.zero_pages.len() >= ZERO_PAGES {
+            let oldest = self.zero_pages.remove(0);
+            // SAFETY: the parent maps it nowhere; destroying it unmaps it
+            // from the child, which faults again if it touches that place
+            // once more. Its memory comes back for the fresh page below.
+            #[allow(unsafe_code)]
+            unsafe {
+                oldest.destroy()
+            };
         }
         let Ok(page) = Object::new(ObjectType::Frame, 12) else { return false };
         if sys::fault_map(self.aspace, page.cap(), at as usize & !0xFFF, Rights(Rights::READ.0 | Rights::WRITE.0)).is_ok() {
@@ -302,8 +313,6 @@ pub struct Program<'a> {
     pub grants: &'a [Grant],
     /// Words the child reads from `ProcessInfo::args`.
     pub args: [u64; 8],
-    /// The processor its first thread runs on (an index below `Parent::cpus`).
-    pub cpu: usize,
     /// Slots in its CapSpace, in bits (at least 8; room is needed for the
     /// grants, one slot per megabyte of image, and what it makes itself).
     pub space_bits: u8,
@@ -328,10 +337,27 @@ pub struct Program<'a> {
     /// Its options (`silica_rt::options`), at most
     /// `silica_rt::OPTIONS_MAX` bytes: longer is refused.
     pub options: &'a [u8],
+    /// The scheduling context it runs on (`libsys::sched_fair`: one share
+    /// of one processor): its first thread is bound to it and runs on its
+    /// processor, and the child holds it readable (`slots::SCHED`), which
+    /// is all it can bind the threads it makes to, so its threads together
+    /// take that one share however many it makes. `None`: the parent's own
+    /// (`Parent::sched`), which the child then shares with its parent.
+    pub sched: Option<Cap>,
+    /// Its address space isolated against speculative execution
+    /// (`libsys::ASPACE_ISOLATED`): for a program that holds secrets. Every
+    /// switch into or out of it flushes the processor's predictors.
+    pub isolated: bool,
+    /// The parent hears when it first waits for requests: a notification
+    /// and the badge the child signals it with, from `slots::SERVING`
+    /// (`silica_rt::serving`). What the service manager asks of a program
+    /// an update installed.
+    pub says_serving: Option<(Cap, u64)>,
 }
 
 impl<'a> Program<'a> {
-    /// `image` with 4 MiB, no grants, no arguments, on processor 0.
+    /// `image` with 4 MiB, no grants, no arguments, on its parent's
+    /// scheduling context.
     pub fn new(image: &'a [u8], id: u64) -> Self {
         Program {
             image,
@@ -339,7 +365,6 @@ impl<'a> Program<'a> {
             id,
             grants: &[],
             args: [0; 8],
-            cpu: 0,
             space_bits: SPACE_BITS,
             aspace_bits: ASPACE_BITS,
             log: None,
@@ -347,6 +372,9 @@ impl<'a> Program<'a> {
             keep: None,
             time: None,
             options: &[],
+            sched: None,
+            isolated: false,
+            says_serving: None,
         }
     }
 }
@@ -385,12 +413,13 @@ pub fn check_image(image: &[u8]) -> Result<Vec<(u64, u64)>, SpawnError> {
     Ok(pages)
 }
 
-/// Start `prog`: its first thread runs on `prog.cpu` from its first
-/// instruction. A given grant leaves the parent only on success. Keep
-/// its source slot reserved for the duration of this call.
+/// Start `prog`: its first thread runs from its first instruction, on
+/// the processor of the scheduling context it is given. A given grant
+/// leaves the parent only on success. Keep its source slot reserved for
+/// the duration of this call.
 pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
-    let Program { image, mem_bits, cpu, .. } = *prog;
-    if cpu as u64 >= p.cpus || !(8..=20).contains(&prog.space_bits) || prog.options.len() > silica_rt::OPTIONS_MAX {
+    let Program { image, mem_bits, .. } = *prog;
+    if !(8..=20).contains(&prog.space_bits) || prog.options.len() > silica_rt::OPTIONS_MAX {
         return Err(SpawnError::Kernel(Error::BadArg));
     }
     // Three slots for the child's objects and two to work with.
@@ -431,7 +460,7 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
 }
 
 fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Program) -> Result<(), SpawnError> {
-    let Program { mem_bits, id, grants, args, cpu, space_bits, aspace_bits, .. } = *prog;
+    let Program { mem_bits, id, grants, args, space_bits, aspace_bits, isolated, .. } = *prog;
     let pages = check_image(image)?;
     let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
     // The image's slots follow the grants, from slot 64 at the lowest: the
@@ -445,7 +474,11 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     // The child's own allocatable memory comes first: half the budget.
     sys::retype(c.untyped, ObjectType::Untyped, mem_bits - 1, p.space, own.0, 1)?;
     sys::retype(c.untyped, ObjectType::CapSpace, space_bits, p.space, c.space.0, 1)?;
-    sys::retype(c.untyped, ObjectType::AddressSpace, aspace_bits, p.space, c.aspace.0, 1)?;
+    if isolated {
+        sys::retype_isolated_space(c.untyped, aspace_bits, p.space, c.aspace.0)?;
+    } else {
+        sys::retype(c.untyped, ObjectType::AddressSpace, aspace_bits, p.space, c.aspace.0, 1)?;
+    }
     sys::retype(c.untyped, ObjectType::Thread, 0, p.space, c.thread.0, 1)?;
 
     // A frame of `bits` filled by `fill` (given the address it is mapped at
@@ -508,6 +541,7 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
         cpus: p.cpus,
         clock: p.clock,
         args,
+        says_serving: prog.says_serving.is_some() as u64,
     };
     // The program's own page, read-write: the runtime takes the seed of its
     // random number generator from it and overwrites it (`silica_rt::random`).
@@ -563,7 +597,16 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     if let Some(events) = prog.events {
         sys::cap_derive(c.space, slots::EVENTS.0, events, Rights::ALL, 0)?;
     }
-    sys::thread_set_cpu(c.thread, cpu)?;
+    if let Some((note, badge)) = prog.says_serving {
+        sys::cap_derive(c.space, slots::SERVING.0, note, Rights::WRITE, badge)?;
+    }
+    // Processor time: the context named, or the parent's own. The child
+    // holds it readable, to bind what it makes and to pass on; its first
+    // thread has no time until it is bound, and runs on the context's
+    // processor.
+    let sched = prog.sched.unwrap_or(p.sched);
+    sys::cap_derive(c.space, slots::SCHED.0, sched, Rights::READ, 0)?;
+    sys::thread_bind(c.thread, sched)?;
     let mut installed = 0;
     let result = (|| {
         for (i, g) in grants.iter().enumerate() {
@@ -685,8 +728,17 @@ pub fn report(out: &mut dyn core::fmt::Write, name: &str, space: Cap) -> Result<
         let rights = [(1, 'r'), (2, 'w'), (4, 'x'), (8, 'g')].map(|(b, c)| if r & b != 0 { c } else { '-' });
         let _ = writeln!(
             out,
-            "  slot {i}: {:?} rights {}{}{}{} bits {} object {:#x} badge {:#x} depth {}",
-            info.ty, rights[0], rights[1], rights[2], rights[3], info.bits, info.object, info.badge, info.depth
+            "  slot {i}: {:?} rights {}{}{}{} bits {} object {:#x} badge {:#x} depth {}{}",
+            info.ty,
+            rights[0],
+            rights[1],
+            rights[2],
+            rights[3],
+            info.bits,
+            info.object,
+            info.badge,
+            info.depth,
+            if info.isolated { " isolated against speculation" } else { "" }
         );
         if info.ty == ObjectType::Thread && !listed[..n].contains(&info.object) {
             if n < listed.len() {
@@ -756,5 +808,153 @@ mod tests {
         assert!(check_image(&image(&many[..MAX_SEGMENTS])).is_ok());
         // Not ELF at all.
         assert_eq!(check_image(b"not a program\n"), Err(SpawnError::Image(ElfError::NotElf)));
+    }
+}
+
+/// When a program that fails is started again: the service manager's
+/// services, the device manager's drivers. The first failure is restarted
+/// at once, so a program that fails once costs its clients only the start;
+/// each further failure soon after its start waits twice as long as the one
+/// before, from [`Restarts::SECOND`] up to [`Restarts::LONGEST`], so a
+/// program that fails as it starts does not take a processor with it. One
+/// that ran [`Restarts::STEADY`] before failing begins the count again: on
+/// a machine that runs for months, failures far apart are each the first.
+/// Nothing is given up on for good: a program that always fails is tried
+/// once a [`Restarts::LONGEST`], and shown as failed meanwhile. (Before, a
+/// service's fourth failure in the machine's life stopped it until reboot,
+/// restarts were immediate, and a start that failed was never tried again.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Restarts {
+    /// Failures in a row, each soon after its start.
+    pub streak: u32,
+    /// Failures since the machine started.
+    pub total: u32,
+    /// When it last started.
+    started: u64,
+    /// When to start it again (0: it is not waiting to be).
+    pub due: u64,
+}
+
+impl Restarts {
+    /// The wait before the second restart in a row.
+    pub const SECOND: u64 = 100_000_000;
+    /// The longest wait.
+    pub const LONGEST: u64 = 60_000_000_000;
+    /// How long a program must run for its next failure to count as a
+    /// first.
+    pub const STEADY: u64 = 60_000_000_000;
+
+    /// It started at `now`.
+    pub fn started(&mut self, now: u64) {
+        self.started = now;
+        self.due = 0;
+    }
+
+    /// It failed (or could not be started) at `now`: returns when to start
+    /// it again.
+    pub fn failed(&mut self, now: u64) -> u64 {
+        self.total = self.total.saturating_add(1);
+        if now.saturating_sub(self.started) >= Self::STEADY {
+            self.streak = 0;
+        }
+        self.streak = self.streak.saturating_add(1);
+        let wait = match self.streak {
+            1 => 0,
+            n => Self::SECOND.saturating_mul(1 << (n - 2).min(20)).min(Self::LONGEST),
+        };
+        // The start that follows is measured from when it is due.
+        self.started = now + wait;
+        self.due = (now + wait).max(1);
+        self.due
+    }
+
+    /// Not to be started again by itself (its owner stopped it).
+    pub fn cancel(&mut self) {
+        self.due = 0;
+    }
+}
+
+#[cfg(test)]
+mod restarts {
+    use super::{Restarts, Vec};
+    const S: u64 = 1_000_000_000;
+
+    #[test]
+    fn the_first_failure_restarts_at_once_and_a_loop_backs_off_to_a_minute() {
+        let mut r = Restarts::default();
+        r.started(10 * S);
+        assert_eq!(r.failed(11 * S), 11 * S);
+        r.started(11 * S);
+        let mut now = 11 * S;
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let due = r.failed(now);
+            waits.push(due - now);
+            now = due;
+            r.started(now);
+        }
+        assert_eq!(&waits[..4], &[Restarts::SECOND, 2 * Restarts::SECOND, 4 * Restarts::SECOND, 8 * Restarts::SECOND]);
+        assert!(waits.iter().all(|w| *w <= Restarts::LONGEST));
+        assert_eq!(*waits.last().unwrap(), Restarts::LONGEST, "an endless loop settles at a try a minute, never stops");
+        assert_eq!(r.total, 13);
+    }
+
+    #[test]
+    fn failures_far_apart_are_each_a_first() {
+        let mut r = Restarts::default();
+        let mut now = 0;
+        for _ in 0..100 {
+            r.started(now);
+            now += Restarts::STEADY + S;
+            assert_eq!(r.failed(now), now, "a failure after a steady run waits for nothing");
+        }
+        assert_eq!((r.streak, r.total), (1, 100));
+    }
+}
+
+/// Where a service asks to run (its declaration's `cpu=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// On this processor.
+    Fixed(u32),
+    /// Wherever its parent chooses.
+    Any,
+}
+
+/// The processor each of `wanted` runs on, on a machine of `cpus`
+/// processors: the one it names, or processor 0 when the machine has no
+/// such processor (`true` beside it: the caller says so); for
+/// [`Placement::Any`], the processors after the first in turn (processor 0
+/// on a machine of one), so what the declarations let go is spread over
+/// what processor 0, where everything else runs, does not.
+pub fn place(wanted: &[Placement], cpus: usize) -> Vec<(usize, bool)> {
+    let mut next = 1;
+    wanted
+        .iter()
+        .map(|w| match *w {
+            Placement::Fixed(n) if (n as usize) < cpus => (n as usize, false),
+            Placement::Fixed(_) => (0, true),
+            Placement::Any if cpus <= 1 => (0, false),
+            Placement::Any => {
+                let c = next;
+                next = if next + 1 < cpus { next + 1 } else { 1 };
+                (c, false)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod placement {
+    use super::{Placement as P, place};
+
+    #[test]
+    fn named_processors_are_kept_missing_ones_fall_back_and_any_is_spread_past_the_first() {
+        let wanted = [P::Fixed(0), P::Any, P::Fixed(3), P::Any, P::Any, P::Fixed(9)];
+        assert_eq!(place(&wanted, 4), [(0, false), (1, false), (3, false), (2, false), (3, false), (0, true)]);
+        // `any` wraps past the last processor, never onto the first.
+        assert_eq!(place(&[P::Any, P::Any, P::Any], 3), [(1, false), (2, false), (1, false)]);
+        // One processor: everything on it, a named other one said to be missing.
+        assert_eq!(place(&[P::Any, P::Fixed(1)], 1), [(0, false), (0, true)]);
     }
 }

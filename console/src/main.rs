@@ -19,17 +19,18 @@
 mod keys;
 mod screen;
 
-use screen::{Display, Grid};
+use console_grid::Grid;
+use screen::Display;
 use silica_idl_rt::CapList;
 use silica_protocols::console::port;
 use silica_protocols::console::terminal::{self, ReadLineReply, SizeReply, WriteReply};
 use silica_protocols::device::manager;
 use silica_protocols::input::device as input;
-use silica_ring::Consumer;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::string::String;
 use silica_rt::ipc::{Channel, Handle, Parked, Waiting, serve_parked};
 use silica_rt::mem::{Memory, Object};
+use silica_rt::ring::Consumer;
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{ProcessInfo, print, println, slots};
 
@@ -71,8 +72,9 @@ struct Console {
     modifiers: keys::Modifiers,
     line: String,
     lines: VecDeque<String>,
-    /// A `read_line` waiting for the next line.
-    waiting: Option<Parked>,
+    /// The `read_line` calls waiting for the next line, oldest first: at
+    /// most one for each holder (its badge), answered in turn.
+    waiting: VecDeque<(u64, Parked)>,
     wants_wait: bool,
     /// The line `read_line` answers with now (its reply borrows it).
     line_out: String,
@@ -145,7 +147,7 @@ impl Console {
     fn char(&mut self, c: char) {
         if self.line.len() < 1000 {
             self.line.push(c);
-            if self.waiting.is_some() {
+            if self.reading() {
                 let mut b = [0u8; 4];
                 self.show(c.encode_utf8(&mut b));
             }
@@ -153,7 +155,7 @@ impl Console {
     }
 
     fn backspace(&mut self) {
-        if self.line.pop().is_some() && self.waiting.is_some() {
+        if self.line.pop().is_some() && self.reading() {
             self.grid.backspace();
             self.update();
             print!("\u{8} \u{8}");
@@ -161,23 +163,47 @@ impl Console {
         }
     }
 
+    /// Whether a reader waits for the line being typed (it is shown then).
+    fn reading(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// The oldest reader whose caller still waits.
+    fn next_reader(&mut self) -> Option<Parked> {
+        while let Some((_, p)) = self.waiting.pop_front() {
+            if p.waiting() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     fn enter(&mut self) {
         let line = core::mem::take(&mut self.line);
-        match self.waiting.take() {
+        match self.next_reader() {
             Some(p) => {
                 self.show("\n");
                 answer_line(p, &line);
+            }
+            // Typed ahead, up to [`TYPEAHEAD`] lines: past them a line is
+            // dropped and said (a stuck key, or a peer at the port, grew the
+            // queue without bound, and every line was later run).
+            None if self.lines.len() >= TYPEAHEAD => {
+                self.show("\nconsole: a line typed ahead was dropped: 16 wait already\n");
             }
             None => self.lines.push_back(line),
         }
     }
 }
 
+/// Lines typed before anyone asks, kept for the next reader.
+const TYPEAHEAD: usize = 16;
+
 /// Answer a waiting `read_line` with `line`.
 fn answer_line(p: Parked, line: &str) {
     let mut buf = [0u8; silica_idl_rt::MAX_MESSAGE];
     let mut caps = CapList::new();
-    match (ReadLineReply { line }).encode_message(&mut buf, &mut caps) {
+    match (ReadLineReply { line, busy: false }).encode_message(&mut buf, &mut caps) {
         Ok(n) => p.answer(&buf[..n], caps),
         Err(_) => drop(p),
     }
@@ -185,7 +211,17 @@ fn answer_line(p: Parked, line: &str) {
 
 impl terminal::Server<Handle> for Console {
     fn write(&mut self, text: &str) -> WriteReply {
-        self.show(text);
+        // Printable text only: an escape sequence or a carriage return
+        // from a program would move the cursor, rewrite what another
+        // wrote, or reach a terminal beyond the console. A line ended for a
+        // serial terminal (`\r\n`, as `println!` writes) is ended once: the
+        // console ends lines for its port itself.
+        let shown = silica_rt::text::printable(text);
+        if shown.contains("\r\n") {
+            self.show(&shown.replace("\r\n", "\n"));
+        } else {
+            self.show(&shown);
+        }
         WriteReply {}
     }
 
@@ -197,11 +233,13 @@ impl terminal::Server<Handle> for Console {
                 self.show(&l);
                 self.show("\n");
                 self.line_out = l;
-                ReadLineReply { line: &self.line_out }
+                ReadLineReply { line: &self.line_out, busy: false }
             }
             None => {
                 self.wants_wait = true;
-                ReadLineReply { line: "" }
+                // A parked caller gets the actual line from answer_line.
+                // This immediate reply is sent only if we cannot keep it.
+                ReadLineReply { line: "", busy: true }
             }
         }
     }
@@ -215,7 +253,7 @@ impl terminal::Server<Handle> for Console {
 impl Waiting for Console {
     fn call(
         &mut self,
-        _badge: u64,
+        badge: u64,
         request: &[u8],
         caps: CapList<Handle>,
         reply: &mut [u8],
@@ -224,14 +262,20 @@ impl Waiting for Console {
     ) -> usize {
         self.wants_wait = false;
         let n = terminal::dispatch(self, request, caps, reply, reply_caps);
-        if self.wants_wait && !self.waiting.as_ref().is_some_and(Parked::waiting) {
-            // Kept until the next line. A reader whose caller has gone (a
-            // shell restarted under its call) gives way to the new one; a
-            // second reader while the first still waits gets an empty line.
-            self.waiting = parked.take();
-            // Typeahead belongs after the reader's prompt, including a
-            // partial line typed while the preceding command was running.
-            if self.waiting.is_some() && !self.line.is_empty() {
+        // Kept until a line comes for it, after the readers that asked
+        // before. A reader whose caller has gone (a shell restarted under
+        // its call) is nobody's and gives way; the same holder asking again
+        // while its read still waits gets busy, so a holder keeps one place.
+        if self.wants_wait {
+            self.waiting.retain(|(_, p)| p.waiting());
+            if !self.waiting.iter().any(|(b, _)| *b == badge)
+                && let Some(p) = parked.take()
+            {
+                self.waiting.push_back((badge, p));
+            }
+            // Typeahead belongs after the first reader's prompt, including
+            // a partial line typed while the preceding command was running.
+            if self.waiting.len() == 1 && !self.line.is_empty() {
                 let typed = core::mem::take(&mut self.line);
                 self.show(&typed);
                 self.line = typed;
@@ -246,7 +290,7 @@ impl Waiting for Console {
             println!("console: the keyboard's driver ended; {}", if self.keys.is_some() { "reading its successor" } else { "no keyboard" });
         }
         if bits & DISPLAY_GONE != 0 {
-            self.display = display(&mut self.devices, self.note, &self.grid);
+            self.display = display(&mut self.devices, self.note, &mut self.grid);
             self.update();
             println!(
                 "console: the display's driver ended; {}",
@@ -309,13 +353,18 @@ pub(crate) fn lend(cap: Cap, rights: Rights, badge: u64) -> Option<Handle> {
 /// The first device of `class`, opened: its driver, which signals `gone`
 /// on `note` when it ends.
 fn open(devices: &mut manager::Client<Channel, Handle>, class: manager::Class, note: Cap, gone: u64) -> Option<Handle> {
-    let id = devices.list(class).ok()?.devices.iter().next()?.id;
+    let id = devices.list(class, 0).ok()?.devices.iter().next()?.id;
     Some(devices.open(id, Some(lend(note, Rights::WRITE, gone)?)).ok()?.driver)
 }
 
 /// The display, attached, showing `grid` whole.
-fn display(devices: &mut manager::Client<Channel, Handle>, note: Cap, grid: &Grid) -> Option<Display> {
-    let (mut d, _, _) = Display::new(open(devices, manager::Class::Display, note, DISPLAY_GONE)?)?;
+fn display(devices: &mut manager::Client<Channel, Handle>, note: Cap, grid: &mut Grid) -> Option<Display> {
+    let (mut d, columns, rows) = Display::new(open(devices, manager::Class::Display, note, DISPLAY_GONE)?)?;
+    // A driver started again may have set another mode: the text
+    // follows the display, rather than the display being given up.
+    if grid.size() != (columns, rows) {
+        grid.resize(columns, rows);
+    }
     d.show(grid).then_some(d)
 }
 
@@ -330,7 +379,7 @@ fn input_ring() -> Option<(Consumer<8>, Memory)> {
 /// The keyboard, connected: its ring and the notification it signals.
 fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option<(Consumer<8>, Memory, Handle)> {
     let driver = open(devices, manager::Class::Input, note, KEYBOARD_GONE)?;
-    let mut kb = input::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+    let mut kb = input::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
     let (consumer, ring) = input_ring()?;
     kb.connect(lend(ring.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, KEYS)?).ok()?;
     Some((consumer, ring, driver))
@@ -339,7 +388,7 @@ fn keyboard(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option
 /// The console port, connected: its ring, and the driver it came from.
 fn console_port(devices: &mut manager::Client<Channel, Handle>, note: Cap) -> Option<Port> {
     let handle = open(devices, manager::Class::Port, note, PORT_GONE)?;
-    let mut driver = port::Client::<Channel, Handle>::from(Channel::new(handle.cap()));
+    let mut driver = port::Client::<Channel, Handle>::from(Channel::within(handle.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
     let (ring, memory) = input_ring()?;
     driver.connect(lend(memory.frame(), Rights(3), 0)?, lend(note, Rights::WRITE, PORT_BYTES)?).ok()?;
     Some(Port { ring, _memory: memory, driver, _handle: handle, after_cr: false })
@@ -375,7 +424,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         modifiers: keys::Modifiers::default(),
         line: String::new(),
         lines: VecDeque::new(),
-        waiting: None,
+        waiting: VecDeque::new(),
         wants_wait: false,
         line_out: String::new(),
     };

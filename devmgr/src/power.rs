@@ -11,7 +11,7 @@ use silica_formats::acpi;
 const PWRBTN: u16 = 1 << 8;
 
 /// The bit of the device manager's notification the button sets.
-pub const BUTTON: u64 = 1;
+pub const BUTTON: u64 = 1 << 32;
 
 /// The power button, its interrupt bound to a notification.
 pub struct Button {

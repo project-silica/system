@@ -9,7 +9,7 @@ publish.workspace = true
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
 provides = "silica.net.Tcp"
-needs = ["silica.device.Manager"]
+needs = ["silica.device.Manager:network"]
 memory = 25
 start = "boot"
 restart = "always"

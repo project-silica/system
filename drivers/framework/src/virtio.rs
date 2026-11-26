@@ -14,6 +14,7 @@
 //! the driver did not offer is a protocol error, reported, not followed.
 
 use crate::dma::{self, Dma};
+#[cfg(feature = "harness")]
 use crate::inject::{self, Fault};
 use crate::pci::CAP_VENDOR;
 use crate::{Device, DeviceError};
@@ -48,6 +49,17 @@ const CONFIG_VECTOR: usize = 0x10;
 const NUM_QUEUES: usize = 0x12;
 const DEVICE_STATUS: usize = 0x14;
 const CONFIG_GENERATION: usize = 0x15;
+/// How often [`Transport::read_config`] reads a configuration that changes
+/// underneath before it gives the device up: a configuration changes when
+/// something happens to the device (a disk resized, a link changed), not
+/// sixty-four times in a row.
+pub const CONFIG_READS: u32 = 64;
+/// An injected `generation` was committed: every read after reports a new
+/// generation ([`Transport::config_generation`]).
+#[cfg(feature = "harness")]
+static CHURN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "harness")]
+static TURNS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
 const QUEUE_SELECT: usize = 0x16;
 const QUEUE_SIZE: usize = 0x18;
 const QUEUE_VECTOR: usize = 0x1A;
@@ -59,7 +71,10 @@ const QUEUE_DEVICE: usize = 0x30;
 /// "No MSI-X vector."
 const NO_VECTOR: u16 = 0xFFFF;
 
-/// How long a device gets to finish a reset.
+/// How long a device gets to finish a reset. The virtio specification
+/// gives no time (1.2, 2.4.2: the driver waits until the status reads 0,
+/// which a device in a virtual machine does before the write returns); a
+/// device still resetting after a second is treated as one that never will.
 const RESET_NS: u64 = 1_000_000_000;
 
 /// A virtio device's registers.
@@ -118,10 +133,64 @@ impl Transport {
         self.device
     }
 
+    /// Fields of the device-specific configuration that belong together,
+    /// as `read` reads them, under one configuration generation (virtio 1.2,
+    /// 4.1.4.3.1): read again while the generation changes underneath, at
+    /// most [`CONFIG_READS`] times, then the device is refused. A device
+    /// whose configuration never settles spun its driver at bring-up for
+    /// ever, and never said so (the 2026-11-25 drivers review).
+    pub fn read_config<T>(&self, mut read: impl FnMut() -> T) -> Result<T, DeviceError> {
+        for _ in 0..CONFIG_READS {
+            let before = self.config_generation();
+            let fields = read();
+            if self.config_generation() == before {
+                return Ok(fields);
+            }
+        }
+        Err(DeviceError::Protocol("the configuration changes on every read"))
+    }
+
     /// Changes every time the device-specific configuration changes: read
-    /// it before and after reading several fields that belong together.
+    /// it before and after reading several fields that belong together
+    /// ([`Transport::read_config`]).
     pub fn config_generation(&self) -> u8 {
-        self.common.read8(CONFIG_GENERATION)
+        let generation = self.common.read8(CONFIG_GENERATION);
+        // Injected (`generation`): from here on the device reports a new
+        // generation at every read, as one whose configuration never
+        // settles would.
+        #[cfg(feature = "harness")]
+        if CHURN.load(core::sync::atomic::Ordering::Relaxed)
+            || (inject::planned() == Some(Fault::Generation)
+                && inject::due() == Some(Fault::Generation)
+                && inject::pending(Fault::Generation))
+        {
+            CHURN.store(true, core::sync::atomic::Ordering::Relaxed);
+            return generation.wrapping_add(TURNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
+        }
+        generation
+    }
+
+    /// Whether the device has given up and asks to be reset (virtio 1.2,
+    /// 2.1.2: it sets DEVICE_NEEDS_RESET and interrupts as for a change of
+    /// its configuration). Nothing it does from then on can be trusted,
+    /// and requests in flight may never complete: the driver ends, and the
+    /// device manager starts it again, which resets the device. Asked on
+    /// the configuration interrupt ([`Transport::config_vector`]), not on
+    /// every completion: reading the register leaves a virtual machine.
+    pub fn needs_reset(&self) -> bool {
+        self.status() & STATUS_NEEDS_RESET != 0
+    }
+
+    /// The MSI-X entry for configuration changes (a device asking to be
+    /// reset among them) on `device`, its queues using entries from 0 to
+    /// `queues - 1`: an entry of its own when the device has one, so its
+    /// interrupt says what it is; otherwise entry 0, shared with the
+    /// first queue, whose driver then asks [`Transport::needs_reset`]
+    /// when an interrupt brings no completion. Set with
+    /// [`Transport::config_interrupt`] before [`Transport::start`].
+    pub fn config_vector(device: &Device, queues: u16) -> u16 {
+        let vectors = device.config().msix().map_or(0, |m| m.vectors);
+        if vectors > queues { queues } else { 0 }
     }
 
     /// The device's status register.
@@ -133,15 +202,7 @@ impl Transport {
     /// touching memory. Returns when the device says it has.
     pub fn reset(&self) -> Result<(), DeviceError> {
         self.common.write8(DEVICE_STATUS, 0);
-        let clock = silica_rt::clock();
-        let start = clock.now();
-        while self.status() != 0 {
-            if clock.now() - start > RESET_NS {
-                return Err(DeviceError::Timeout("the device did not finish its reset"));
-            }
-            core::hint::spin_loop();
-        }
-        Ok(())
+        crate::settle(RESET_NS, "the device did not finish its reset", || Ok(self.status() == 0))
     }
 
     /// Reset the device and agree on features: the device must offer all
@@ -187,13 +248,23 @@ impl Transport {
         self.common.read16(NUM_QUEUES)
     }
 
-    /// Set up queue `index` with at most `max_size` descriptors, its
+    /// Set up queue `index` with at most `max_size` descriptors and at least
+    /// `per_request` (what one request of the driver's takes: a device that
+    /// offers fewer is refused here, not found unusable request by request),
+    /// its
     /// completions raising MSI-X entry `vector` (`None`: no interrupt; the
     /// driver polls). After [`Transport::negotiate`], before
     /// [`Transport::start`].
-    pub fn queue(&self, dma: &Dma, index: u16, max_size: u16, vector: Option<u16>) -> Result<Queue, DeviceError> {
+    pub fn queue(&self, dma: &Dma, index: u16, max_size: u16, per_request: u16, vector: Option<u16>) -> Result<Queue, DeviceError> {
         self.common.write16(QUEUE_SELECT, index);
         let offered = self.common.read16(QUEUE_SIZE);
+        // An injected fault (`inject`): the device offers two descriptors.
+        #[cfg(feature = "harness")]
+        let offered = if inject::planned() == Some(Fault::Tiny) && inject::due() == Some(Fault::Tiny) && inject::pending(Fault::Tiny) {
+            2
+        } else {
+            offered
+        };
         if offered == 0 {
             return Err(DeviceError::Missing("the queue"));
         }
@@ -202,6 +273,9 @@ impl Transport {
         let size = if size == 0 { 0 } else { 1u16 << (15 - size.leading_zeros()) };
         if size == 0 {
             return Err(DeviceError::Protocol("a queue of no descriptors"));
+        }
+        if size < per_request.max(1) {
+            return Err(DeviceError::Protocol("a queue too small for one request"));
         }
         self.common.write16(QUEUE_SIZE, size);
         let (q, addresses) = Queue::new(dma, size)?;
@@ -224,7 +298,14 @@ impl Transport {
             .filter(|n| n.addr() % 2 == 0)
             .ok_or(DeviceError::Protocol("the queue's notification register lies outside its structure or is misaligned"))?;
         self.common.write16(QUEUE_ENABLE, 1);
-        Ok(Queue { notify, index, common: self.common, event_idx: self.event_idx.get(), ..q })
+        Ok(Queue {
+            notify,
+            index,
+            #[cfg(feature = "harness")]
+            common: self.common,
+            event_idx: self.event_idx.get(),
+            ..q
+        })
     }
 
     /// Changes of the device-specific configuration raise MSI-X entry `vector`.
@@ -293,6 +374,7 @@ pub struct Queue {
     /// The next used-ring entry to read.
     used: u16,
     /// The transport's common configuration: where an injected reset goes.
+    #[cfg(feature = "harness")]
     common: Mmio,
     /// Event indices were agreed (`F_RING_EVENT_IDX`).
     event_idx: bool,
@@ -372,6 +454,7 @@ impl Queue {
             driver_frame: Cap::NONE,
             kernel_quiet: false,
             notify,
+            #[cfg(feature = "harness")]
             common: notify,
             event_idx: false,
             free: 0,
@@ -427,9 +510,21 @@ impl Queue {
         self.free_count -= buffers.len() as u16;
         let writable = buffers.iter().filter(|b| b.device_writes).map(|b| b.len as u64).sum();
         self.offered[head as usize] = Some(Offered { token, count: buffers.len() as u16, writable });
-        // An injected fault (`inject`): the device never sees this one.
-        if inject::due() == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
-            return Ok(());
+        // Injected faults (`inject`): the device never sees this one, or
+        // sees a chain it must refuse (its last descriptor says another
+        // follows, at an index past the queue: the device gives up and
+        // asks to be reset).
+        #[cfg(feature = "harness")]
+        {
+            let due = inject::due();
+            if due == Some(Fault::Broken) && inject::pending(Fault::Broken) {
+                let o = at as usize * 16;
+                d.write16(o + 12, d.read16(o + 12) | DESC_NEXT);
+                d.write16(o + 14, self.size);
+            }
+            if due == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
+                return Ok(());
+            }
         }
         // Into the available ring; the index that makes it visible is
         // written after the entry.
@@ -451,6 +546,7 @@ impl Queue {
         let added = self.pending;
         self.pending = 0;
         // An injected fault: the device resets itself instead.
+        #[cfg(feature = "harness")]
         if inject::pending(Fault::Reset) {
             self.common.write8(DEVICE_STATUS, 0);
             return;
@@ -498,11 +594,14 @@ impl Queue {
         let o = 4 + 8 * (self.used & (self.size - 1)) as usize;
         // Injected faults: no interrupt brought this one, or the device
         // wrote nonsense in it.
-        if inject::pending(Fault::Missed) {
-            return Ok(None);
-        }
-        if inject::pending(Fault::Garbage) {
-            u.write32(o, 0xFFFF_FF00);
+        #[cfg(feature = "harness")]
+        {
+            if inject::pending(Fault::Missed) {
+                return Ok(None);
+            }
+            if inject::pending(Fault::Garbage) {
+                u.write32(o, 0xFFFF_FF00);
+            }
         }
         let (id, written) = (u.read32(o), u.read32(o + 4));
         let Some(slot) = self.offered.get_mut(id as usize) else {
@@ -511,6 +610,10 @@ impl Queue {
         let Some(Offered { token, count, writable }) = *slot else {
             return Err(DeviceError::Protocol("the device completed a request the driver never offered"));
         };
+        // Injected (`short`): a request with data for the driver completed
+        // as if the device wrote only its last byte.
+        #[cfg(feature = "harness")]
+        let written = if writable > 1 && inject::pending(Fault::Short) { 1 } else { written };
         // A length past the buffers would have a client read what the
         // device never wrote: the device is not believed.
         if written as u64 > writable {

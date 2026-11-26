@@ -19,7 +19,6 @@ bench = false
 [dependencies]
 silica-rt = { workspace = true }
 silica-driver = { workspace = true }
-silica-ring = { workspace = true }
 silica-idl-rt = { workspace = true }
 silica-protocols = { workspace = true }
 

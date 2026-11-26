@@ -18,7 +18,8 @@
 //! It provides TCP to programs (`silica.net.Tcp`, the `tcp` module), in the
 //! same thread and the same wait as its interface: one notification, the
 //! interface's bits below `tcp::GONE`, then the kernel's notice that a
-//! program using TCP ended, then the programs' bits.
+//! program using TCP ended, the device manager's word that an interface
+//! gained or lost its driver ([`DEVICES_CHANGED`]), then the programs' bits.
 //!
 //! What it does not do yet (spec/MILESTONES.md, M4): UDP for programs,
 //! IPv6, more than one interface, reassembly; a program's call made before
@@ -29,6 +30,7 @@
 
 use silica_idl_rt::CapList;
 use silica_inet::dhcp_client::{self, Client, Event, Lease, To};
+use silica_inet::neighbours::{NEIGHBOURS, Neighbours};
 use silica_inet::{Ipv4, Mac, Malformed, arp, dhcp, ether, icmp, ipv4, ntp, udp};
 use silica_net::client::Interface;
 use silica_net::{Completion, LINK, Op, Request};
@@ -63,14 +65,14 @@ const SENT: u64 = 1 << 32;
 /// interface that cuts. A frame of 64 KiB holds 45 segments of 1448 bytes.
 const BURSTS: usize = 4;
 const BURST: usize = 1 << 16;
-/// Neighbours remembered, and for how long.
-const NEIGHBOURS: usize = 16;
-const NEIGHBOUR_LIFE: u64 = 300 * SECOND;
+/// Packets waiting for their next hop's address: one for each hop asked
+/// about at once (a newer one for the same hop replaces it).
+const HELD: usize = 4;
 /// How long an address is asked for before what waits for it is dropped.
 const RESOLVE_WAIT: u64 = 3 * SECOND;
 
-fn main(_info: &'static ProcessInfo) -> i64 {
-    match run() {
+fn main(info: &'static ProcessInfo) -> i64 {
+    match run(info) {
         Ok(never) => match never {},
         Err(e) => {
             println!("ERROR: netd: {e}");
@@ -79,30 +81,38 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     }
 }
 
-/// A copy of `cap` in a free slot of this program, with `rights`, to hand
-/// to another program in a call.
-fn lend(cap: Cap, rights: Rights) -> Result<Handle, &'static str> {
+/// A copy of `cap` in a free slot of this program, with `rights` and
+/// `badge`, to hand to another program in a call.
+fn lend(cap: Cap, rights: Rights, badge: u64) -> Result<Handle, &'static str> {
     let slot = free_slot().ok_or("no free capability slot")?;
-    if sys::cap_derive(slots::SPACE, slot, cap, rights, 0).is_err() {
+    if sys::cap_derive(slots::SPACE, slot, cap, rights, badge).is_err() {
         release_slot(slot);
         return Err("cannot lend a capability");
     }
     Ok(Handle::new(Cap(slot)))
 }
 
+/// The bit of the stack's notification the device manager signals when a
+/// network interface gains or loses its driver (its `watch`): how the stack
+/// hears that the driver of the interface it uses is back, and that there
+/// is an interface at all. Between `tcp::GONE` and the programs' bits.
+const DEVICES_CHANGED: u64 = 1 << 9;
+
 /// The device manager, watched for network interfaces gaining or losing
 /// their drivers.
 struct Devices {
     client: manager::Client<Channel, Handle>,
-    changed: Object,
+    changed: Cap,
 }
 
 impl Devices {
-    fn new() -> Result<Devices, &'static str> {
+    /// Watching on `note`, the stack's one notification, bit [`DEVICES_CHANGED`].
+    fn new(note: Cap) -> Result<Devices, &'static str> {
         let mut client = manager::Client::<Channel, Handle>::from(Channel::new(DEVICES));
-        let changed = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
-        client.watch(manager::Class::Network, lend(changed.cap(), Rights::WRITE)?).map_err(|_| "the device manager does not answer")?;
-        Ok(Devices { client, changed })
+        client
+            .watch(manager::Class::Network, lend(note, Rights::WRITE, DEVICES_CHANGED)?)
+            .map_err(|_| "the device manager does not answer")?;
+        Ok(Devices { client, changed: note })
     }
 
     /// The first network interface with a driver, waited for (no wake-ups
@@ -110,7 +120,7 @@ impl Devices {
     fn interface(&mut self) -> Result<u32, &'static str> {
         let mut said = false;
         loop {
-            let listed = self.client.list(manager::Class::Network).map_err(|_| "the device manager does not answer")?;
+            let listed = self.client.list(manager::Class::Network, 0).map_err(|_| "the device manager does not answer")?;
             if let Some(d) = listed.devices.iter().next() {
                 println!("netd: interface {:#x}, driven by {}", d.id, d.driver);
                 return Ok(d.id);
@@ -123,38 +133,51 @@ impl Devices {
         }
     }
 
-    /// Until an interface gains or loses a driver.
+    /// Until an interface gains or loses a driver (whatever else signals
+    /// the notification meanwhile is nothing to wait for here).
     fn wait(&mut self) -> Result<(), &'static str> {
-        sys::recv(self.changed.cap(), Wait::Forever).map(|_| ()).map_err(|_| "cannot wait for an interface")
+        loop {
+            let m = sys::recv(self.changed, Wait::Forever).map_err(|_| "cannot wait for an interface")?;
+            if m.badge & DEVICES_CHANGED != 0 {
+                return Ok(());
+            }
+        }
     }
 }
 
-fn run() -> Result<core::convert::Infallible, &'static str> {
+fn run(start: &ProcessInfo) -> Result<core::convert::Infallible, &'static str> {
     // Options that do not parse stop the stack, rather than have it guess.
     let fixed = fixed_lease()?;
-    let mut devices = Devices::new()?;
+    // One notification for everything, for as long as the stack runs: the
+    // interface's bits, the device manager's, then the programs' (`tcp`).
+    let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
+    let mut devices = Devices::new(note.cap())?;
+    // The page the program before this one left, when this is the first
+    // instance of a new one: the service manager's last grant, beyond the
+    // two every instance has. Looked at once.
+    let mut left = (start.grants > 2).then(|| Cap(slots::FIRST_GRANT + start.grants - 1));
     loop {
         let id = devices.interface()?;
         // An interface whose driver cannot be talked to (failing, or not
         // keeping to its protocol) is not the stack's to give up on: the
         // device manager restarts a failing driver, and a change is waited
         // for before the interface is tried again.
-        let Err(why) = use_interface(id, fixed);
+        let Err(why) = use_interface(id, fixed, left.take(), note.cap());
         println!("netd: interface {id:#x}: {why}; waiting for its driver to change");
         devices.wait()?;
     }
 }
 
 /// Run the stack on the interface `id` until it cannot be used.
-fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infallible, &'static str> {
-    // One notification for everything: the interface's bits, then the
-    // programs' (`tcp`).
-    let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
-    let mut nic = Interface::open_on(DEVICES, id, note.cap(), 0).map_err(|e| match e {
+fn use_interface(id: u32, fixed: Option<Lease>, left: Option<Cap>, note: Cap) -> Result<core::convert::Infallible, &'static str> {
+    let mut nic = Interface::open_on(DEVICES, id, note, 0).map_err(|e| match e {
         silica_net::client::Error::Refused(silica_queue::Refused::Busy) => "another program has it",
         silica_net::client::Error::Gone => "its driver ended",
         _ => "it cannot be opened (its driver does not keep to the protocol)",
     })?;
+    // The device manager says when the interface's driver changes: its next
+    // driver is tried then, not by the clock.
+    nic.provider_changed();
     let info = nic.info().map_err(|_| "the interface says nothing about itself")?;
     let a = info.address.to_le_bytes();
     let mac = Mac([a[0], a[1], a[2], a[3], a[4], a[5]]);
@@ -209,8 +232,28 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         }
         _ => Vec::new(),
     };
+    // What the program before this one left, when this is the first
+    // instance of a new one (the service manager's last grant, read-only):
+    // another program's page, of which only its connections are taken, to
+    // reset them as a stack that was killed resets its own, and the
+    // address they were on, to compare with the one this stack comes to
+    // hold. Its lease is not taken: this program asks for its own.
+    let left = left.and_then(|c| mem::peer(c, 12, Rights::READ).ok());
+    let (left_resets, resets_from) = match left.as_ref().and_then(|k| Some((k, k.part(128, 4096 - 128)?))) {
+        Some((k, r)) if k.read64(120) == tcp::RECORDS_MARK => {
+            (tcp::left_connections(&r), (k.read64(0) == KEPT_LEASE).then(|| Ipv4::from_u32(k.read64(16) as u32)))
+        }
+        _ => (Vec::new(), None),
+    };
+    if !left_resets.is_empty() {
+        println!("netd: {} connections of the program before this one to reset", left_resets.len());
+    }
+    let resets_from = if resets.is_empty() { resets_from } else { None };
+    let resets = if resets.is_empty() { left_resets } else { resets };
     let mut s = Stack {
         nic,
+        id,
+        devices: manager::Client::<Channel, Handle>::from(Channel::new(DEVICES)),
         m: memory.shared(),
         mac,
         free: (1 << SLOTS) - 1,
@@ -219,15 +262,18 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         dhcp,
         lease,
         keep,
-        neighbours: [Neighbour::EMPTY; NEIGHBOURS],
-        held: None,
+        neighbours: Neighbours::new(),
+        defended: 0,
+        held: [const { None }; HELD],
         ip_id: (silica_rt::random::u64() & 0xFFFF) as u16,
         frame: [0; BUFFER],
         out: [0; BUFFER],
         probe: None,
         dropped: Dropped::default(),
-        tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
+        tcp: Some(tcp::Tcp::new(note, info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
         resets,
+        resets_until: 0,
+        resets_from,
         time: TimeClient::new(clock, now),
         caller: 0,
         more: true,
@@ -256,11 +302,12 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
             s.ping(now, r);
         }
     }
-    silica_rt::ipc::serve_events(ENDPOINT, note.cap(), &mut s)
+    silica_rt::ipc::serve_events(ENDPOINT, note, &mut s)
 }
 
-/// The port the time-server client asks from.
-const TIME_PORT: u16 = 50123;
+/// The ports the time-server client asks from: a random one of these for
+/// each question, so that an answer must reach the one it was asked from.
+const TIME_PORTS: core::ops::Range<u16> = 50_000..60_000;
 
 /// The time-server client's state (SNTP to one server).
 struct TimeClient {
@@ -269,15 +316,20 @@ struct TimeClient {
     page: Option<Mmio>,
     /// The server the boot options name (`ntp=<address>[:<port>]`).
     configured: Option<(Ipv4, u16)>,
-    /// The question in flight: its transmit timestamp, and its time (ns
-    /// since 1970 by this clock).
-    asked: Option<(u64, u64)>,
+    /// The question in flight: the random number it carried as its
+    /// transmit timestamp, its time (ns since 1970 by this clock), and
+    /// the port it was asked from.
+    asked: Option<(u64, u64, u16)>,
     /// When to ask next, questions sent since the last answer, seconds
-    /// between answers, and whether the clock was ever set.
+    /// between answers, and whether the clock was set: by the firmware, by
+    /// this instance, or by one before it (the time page says which), so
+    /// that the step limit holds from the first answer after a restart.
     next: u64,
     tries: u32,
     poll: u64,
     set: bool,
+    /// Steps past the limit, taken only when answers agree.
+    steps: ntp::Steps,
 }
 
 impl TimeClient {
@@ -289,7 +341,8 @@ impl TimeClient {
         if silica_rt::option("ntp").is_some() && configured.is_none() {
             println!("ERROR: netd: the ntp option is not <address>[:<port>]");
         }
-        TimeClient { page, configured, asked: None, next: now, tries: 0, poll: 64, set: false }
+        let set = page.as_ref().is_some_and(|p| silica_rt::time::read(p).1 != silica_rt::time::Source::None);
+        TimeClient { page, configured, asked: None, next: now, tries: 0, poll: 64, set, steps: ntp::Steps::new() }
     }
 
     /// The server to ask: the configured one, else the lease's.
@@ -370,17 +423,6 @@ fn kept_lease(k: &Mmio, mac: Mac) -> Option<Lease> {
     })
 }
 
-#[derive(Clone, Copy)]
-struct Neighbour {
-    ip: Ipv4,
-    mac: Mac,
-    expires: u64,
-}
-
-impl Neighbour {
-    const EMPTY: Neighbour = Neighbour { ip: Ipv4::UNSPECIFIED, mac: Mac::ZERO, expires: 0 };
-}
-
 /// A packet waiting for its next hop's Ethernet address.
 struct Held {
     hop: Ipv4,
@@ -414,6 +456,9 @@ struct Probe {
 
 struct Stack {
     nic: Interface,
+    /// The interface's identity, and the device manager to ask about it.
+    id: u32,
+    devices: manager::Client<Channel, Handle>,
     m: Mmio,
     mac: Mac,
     /// Free transmit slots, a bit each.
@@ -426,8 +471,11 @@ struct Stack {
     lease: Option<Lease>,
     /// The page kept across restarts (`slots::KEEP`), the lease in it.
     keep: Option<Mmio>,
-    neighbours: [Neighbour; NEIGHBOURS],
-    held: Option<Held>,
+    /// Who is where on the link, and the questions in flight.
+    neighbours: Neighbours<NEIGHBOURS>,
+    /// When another host was last told this address is ours (a conflict).
+    defended: u64,
+    held: [Option<Held>; HELD],
     ip_id: u16,
     /// The frame being read (copied out of its buffer) and the one being built.
     frame: [u8; BUFFER],
@@ -441,6 +489,12 @@ struct Stack {
     /// Resets owed to the peers of the last stack's connections, sent once
     /// their next hop's address is known.
     resets: Vec<tcp::Kept>,
+    /// When the resets not sent by then are given up (their peers' hops
+    /// never answered ARP); set when the first one waits.
+    resets_until: u64,
+    /// The address those connections were on, when another program's
+    /// page says so: they are reset only from that address.
+    resets_from: Option<Ipv4>,
     time: TimeClient,
     /// Work is left (a completion there, segments with no transmit slot):
     /// look again at once rather than wait.
@@ -557,31 +611,43 @@ impl Stack {
         if let Some(t) = self.tcp.as_ref().and_then(|t| t.deadline()) {
             d = d.min(t);
         }
-        if let Some(h) = &self.held {
+        for h in self.held.iter().flatten() {
             d = d.min(h.asked + SECOND).min(h.since + RESOLVE_WAIT);
         }
+        // A neighbour in use, asked again before its entry ends.
+        d = d.min(self.neighbours.refresh_at());
         if let Some(p) = &self.probe {
             d = d.min(p.until);
         }
         if self.time.server(self.lease.as_ref()).is_some() && self.time.page.is_some() {
             d = d.min(self.time.next);
         }
+        // The interface's driver is restarting: its next try.
+        if let Some(t) = self.nic.retry_at() {
+            d = d.min(t);
+        }
         d
     }
 
     fn timers(&mut self, now: u64) {
-        if let Some(h) = &self.held {
+        for k in 0..HELD {
+            let Some(h) = &self.held[k] else { continue };
             if now >= h.since + RESOLVE_WAIT {
                 println!("netd: {} does not answer ARP; what was for it is dropped", h.hop);
-                self.held = None;
+                self.held[k] = None;
                 self.dropped.unresolved += 1;
             } else if now >= h.asked + SECOND {
                 let hop = h.hop;
                 self.ask(hop);
-                if let Some(h) = self.held.as_mut() {
+                if let Some(h) = self.held[k].as_mut() {
                     h.asked = now;
                 }
             }
+        }
+        // Neighbours in use whose entries end soon: asked again, so what
+        // is sent to them never waits for an answer.
+        while let Some(ip) = self.neighbours.refresh(now) {
+            self.arp_request(ip);
         }
         if let Some(p) = &self.probe
             && now >= p.until
@@ -594,6 +660,13 @@ impl Stack {
     fn dhcp_step(&mut self, now: u64, step: dhcp_client::Step) {
         match step.event {
             Some(Event::Bound(l)) => {
+                // A new address (the old lease ended while the stack was not
+                // running, or another was given): nothing on the old one lives.
+                if self.lease.is_some_and(|old| old.address != l.address)
+                    && let Some(tcp) = self.tcp.as_mut()
+                {
+                    tcp.address_gone();
+                }
                 let dns = l.dns.iter().filter(|d| **d != Ipv4::UNSPECIFIED);
                 let mut servers = silica_rt::alloc::string::String::new();
                 for d in dns {
@@ -615,7 +688,10 @@ impl Stack {
             }
             Some(Event::Lost) => {
                 if let Some(l) = self.lease.take() {
-                    println!("netd: the lease of {} ended; asking again", l.address);
+                    println!("netd: the lease of {} ended; its connections end, and the stack asks again", l.address);
+                    if let Some(tcp) = self.tcp.as_mut() {
+                        tcp.address_gone();
+                    }
                 }
                 self.keep_lease();
             }
@@ -626,6 +702,25 @@ impl Stack {
         }
     }
 
+    /// The interface's driver is away and the device manager says the
+    /// machine's interfaces changed. A driver being started again is
+    /// waited for, for as long as the device manager takes: it signals
+    /// again when there is one, and the connections wait as they do for a
+    /// cable put back. If the device itself is gone and the machine has
+    /// another interface, the stack starts again on that one. (Before, the
+    /// stack looked every 50 us to 4 ms for 5 s and then ended, whatever
+    /// the device manager knew.)
+    fn interface_away(&mut self) {
+        let Ok(listed) = self.devices.list(manager::Class::Network, 0) else { return };
+        let mut others = listed.devices.iter().filter(|d| d.id != self.id);
+        if listed.devices.iter().all(|d| d.id != self.id)
+            && let Some(other) = others.next()
+        {
+            println!("netd: interface {:#x} is gone and {:#x} is there: starting again on it", self.id, other.id);
+            silica_rt::exit(1);
+        }
+    }
+
     /// Reset the connections the last stack had (`tcp::kept_connections`),
     /// once the lease is held and the first hop's Ethernet address known.
     fn send_resets(&mut self, now: u64) {
@@ -633,14 +728,41 @@ impl Stack {
         if self.resets.is_empty() {
             return;
         }
+        if let Some(from) = self.resets_from.take()
+            && from != l.address
+        {
+            println!("netd: {} connections of the program before this one were on {from}, not {}: not reset", self.resets.len(), l.address);
+            self.resets.clear();
+            return;
+        }
         let hop = |r: Ipv4| if l.address.same_subnet(r, l.prefix) { Some(r) } else { l.router };
+        if self.resets_until == 0 {
+            self.resets_until = now + 2 * RESOLVE_WAIT;
+        }
+        if now >= self.resets_until {
+            println!("netd: {} connections of the stack before it are not reset: their peers do not answer ARP", self.resets.len());
+            self.resets.clear();
+            return;
+        }
         let mut sent = 0;
-        while let Some(k) = self.resets.last() {
-            let Some(h) = hop(k.remote) else { break };
-            if self.neighbour(h, now).is_none() || self.free == 0 {
-                break;
+        // Every reset whose next hop is known goes; one whose hop is not is
+        // kept, its hop asked for (once while it is unanswered). Before,
+        // the first peer not known stopped all those behind it, and nothing
+        // asked for it.
+        let mut i = self.resets.len();
+        while i > 0 && self.free > 0 {
+            i -= 1;
+            let Some(h) = hop(self.resets[i].remote) else {
+                self.resets.swap_remove(i);
+                continue;
+            };
+            if self.neighbour(h, now).is_none() {
+                if !self.neighbours.asking(h) {
+                    self.ask(h);
+                }
+                continue;
             }
-            let k = self.resets.pop().expect("looked at");
+            let k = self.resets.swap_remove(i);
             let header = silica_inet::tcp::Header {
                 src_port: k.local_port,
                 dst_port: k.remote_port,
@@ -664,40 +786,70 @@ impl Stack {
     fn ask_time(&mut self, now: u64) {
         let Some((server, port)) = self.time.server(self.lease.as_ref()) else { return };
         let Some(page) = self.time.page else { return };
-        if now < self.time.next {
+        // Not before the address: a question sent without one goes nowhere
+        // and used up one of the quick tries.
+        if now < self.time.next || self.lease.is_none() {
             return;
         }
         // The question's time, by this clock (the firmware's, or none yet:
         // the offset is relative to whatever it says).
         let (offset, _) = silica_rt::time::read(&page);
         let t1 = offset.wrapping_add(now);
-        let transmit = ntp::from_unix_ns(t1);
+        // Not the clock (anyone can guess it) but a random number, and a
+        // random port: an answer comes from whoever got the question.
+        let r = silica_rt::random::u64();
+        let nonce = r | 1 << 63;
+        let from = TIME_PORTS.start + (r as u32 % TIME_PORTS.len() as u32) as u16;
         let mut q = [0u8; ntp::LEN];
-        ntp::request(&mut q, transmit);
-        self.time.asked = Some((transmit, t1));
+        ntp::request(&mut q, nonce);
+        self.time.asked = Some((nonce, t1, from));
         self.time.tries += 1;
         self.time.next = if self.time.tries < 3 { now + 2 * SECOND } else { now + self.time.poll * SECOND };
         if self.time.tries >= 3 {
             self.time.tries = 0;
         }
-        self.send_udp(server, TIME_PORT, port, &q);
+        self.send_udp(server, from, port, &q);
     }
 
     /// The time server answered: set the clock if it answers our question.
     fn time_answer(&mut self, now: u64, r: &ntp::Reply) {
         let Some(page) = self.time.page else { return };
-        let Some((transmit, t1)) = self.time.asked else { return };
+        let Some((nonce, t1, _)) = self.time.asked else { return };
         // Only the answer to the question in flight: a blind sender does
-        // not know its time.
-        if r.originate != transmit {
+        // not know its number.
+        if r.originate != nonce {
             return;
         }
         let (Some(t2), Some(t3)) = (ntp::to_unix_ns(r.receive), ntp::to_unix_ns(r.transmit)) else { return };
         self.time.asked = None;
         let (offset, _) = silica_rt::time::read(&page);
         let t4 = offset.wrapping_add(now);
-        let (shift, delay) = ntp::offset(t1, t2, t3, t4);
-        let wall = t4.wrapping_add_signed(shift);
+        let (shift, delay) = match self.time.steps.judge(t1, t2, t3, t4, self.time.set, now) {
+            Ok(j) => j,
+            Err(ntp::Refused::Impossible) => {
+                println!("netd: a time server's answer gives times that cannot be; not believed");
+                return;
+            }
+            Err(ntp::Refused::Slow(delay)) => {
+                println!("netd: a time server's answer took {} ms; not believed", delay / 1_000_000);
+                return;
+            }
+            Err(ntp::Refused::Step(shift)) => {
+                println!("netd: a time server would move the clock by {} s; not believed", shift / SECOND as i64);
+                return;
+            }
+            Err(ntp::Refused::Unconfirmed(shift)) => {
+                // Asked again soon, from another port with another number:
+                // a second answer that agrees takes the step.
+                println!(
+                    "netd: a time server would move the clock by {} s; not believed until another answer agrees",
+                    shift / SECOND as i64
+                );
+                self.time.next = now + 2 * SECOND;
+                return;
+            }
+        };
+        let Some(wall) = t4.checked_add_signed(shift) else { return };
         silica_rt::time::set(&page, wall, now, silica_rt::time::Source::Network);
         if !self.time.set || shift.unsigned_abs() > SECOND {
             let (server, port) = self.time.server(self.lease.as_ref()).unwrap_or((Ipv4::UNSPECIFIED, 0));
@@ -796,13 +948,19 @@ impl Stack {
         match self.neighbour(hop, now) {
             Some(mac) => self.frame_out(mac, &packet[..len]),
             None => {
-                // One packet waits for an address at a time: a newer one
-                // replaces it (what is sent before the router answers is
-                // DHCP's and a ping's, each sent again if lost).
-                if self.held.is_some() {
+                // One packet waits for each hop asked about: a newer one
+                // for the same hop replaces it, and with every place taken
+                // the oldest goes (each is sent again if lost).
+                let k = self
+                    .held
+                    .iter()
+                    .position(|h| h.as_ref().is_some_and(|h| h.hop == hop))
+                    .or_else(|| self.held.iter().position(Option::is_none))
+                    .unwrap_or_else(|| (0..HELD).min_by_key(|&k| self.held[k].as_ref().map_or(0, |h| h.since)).unwrap_or(0));
+                if self.held[k].is_some() {
                     self.dropped.unresolved += 1;
                 }
-                self.held = Some(Held { hop, since: now, asked: now, len, packet });
+                self.held[k] = Some(Held { hop, since: now, asked: now, len, packet });
                 self.ask(hop);
             }
         }
@@ -897,36 +1055,30 @@ impl Stack {
         self.transmit(ether::HEADER + packet.len());
     }
 
-    fn neighbour(&self, ip: Ipv4, now: u64) -> Option<Mac> {
-        self.neighbours.iter().find(|n| n.ip == ip && n.expires > now).map(|n| n.mac)
+    fn neighbour(&mut self, ip: Ipv4, now: u64) -> Option<Mac> {
+        self.neighbours.lookup(ip, now)
     }
 
-    /// Remember that `ip` is at `mac`: in its old place, else the oldest.
-    fn learn(&mut self, ip: Ipv4, mac: Mac, now: u64) {
-        if ip == Ipv4::UNSPECIFIED || mac.is_group() {
-            return;
-        }
-        let at = self.neighbours.iter().position(|n| n.ip == ip).unwrap_or_else(|| {
-            let mut oldest = 0;
-            for (i, n) in self.neighbours.iter().enumerate() {
-                if n.expires < self.neighbours[oldest].expires {
-                    oldest = i;
-                }
-            }
-            oldest
-        });
-        self.neighbours[at] = Neighbour { ip, mac, expires: now + NEIGHBOUR_LIFE };
-        if let Some(h) = self.held.take() {
-            if h.hop == ip {
+    /// `ip` was learned to be at `mac`: what waited for it goes.
+    fn learned(&mut self, ip: Ipv4, mac: Mac) {
+        for k in 0..HELD {
+            if self.held[k].as_ref().is_some_and(|h| h.hop == ip)
+                && let Some(h) = self.held[k].take()
+            {
                 self.frame_out(mac, &h.packet[..h.len]);
-            } else {
-                self.held = Some(h);
             }
         }
     }
 
-    /// Ask who has `ip`.
+    /// Ask who has `ip`: its answer is believed (`Neighbours`).
     fn ask(&mut self, ip: Ipv4) {
+        self.neighbours.asked(ip);
+        self.arp_request(ip);
+    }
+
+    /// Send an ARP request for `ip` from the leased address (for our own
+    /// address: an announcement that it is ours).
+    fn arp_request(&mut self, ip: Ipv4) {
         let Some(l) = self.lease else { return };
         let a = arp::Arp { op: arp::REQUEST, sender_mac: self.mac, sender_ip: l.address, target_mac: Mac::ZERO, target_ip: ip };
         let mac = self.mac;
@@ -971,16 +1123,27 @@ impl Stack {
 
     fn arp(&mut self, now: u64, a: &arp::Arp) {
         let Some(l) = self.lease else { return };
-        if a.target_ip != l.address {
-            // Not about us: only an answer to our own question teaches.
-            if a.op == arp::REPLY && self.held.as_ref().is_some_and(|h| h.hop == a.sender_ip) {
-                self.learn(a.sender_ip, a.sender_mac, now);
+        // What the packet teaches is the table's to say: only answers to
+        // our questions and strangers asking for us (one unsolicited packet
+        // redirected all our traffic for a host, the router's included).
+        let h = self.neighbours.heard(a, (l.address, self.mac), l.router, now);
+        if let Some(other) = h.conflict {
+            // Another host says our address is its: a conflict. Said, and
+            // our claim announced, no more than every ten seconds.
+            if now >= self.defended + 10 * SECOND {
+                self.defended = now;
+                println!("netd: {other} says {} is its address too", l.address);
+                self.arp_request(l.address);
             }
             return;
         }
-        // Someone who asks for us, or answers us, is a neighbour.
-        self.learn(a.sender_ip, a.sender_mac, now);
-        if a.op == arp::REQUEST {
+        if let Some((ip, mac)) = h.learned {
+            self.learned(ip, mac);
+        }
+        if let Some(ip) = h.ask {
+            self.ask(ip);
+        }
+        if h.answer {
             let r =
                 arp::Arp { op: arp::REPLY, sender_mac: self.mac, sender_ip: l.address, target_mac: a.sender_mac, target_ip: a.sender_ip };
             let mac = self.mac;
@@ -1013,7 +1176,11 @@ impl Stack {
                     }
                     Err(e) => self.dropped.malformed(e),
                 },
-                Ok(d) if ours && d.dst_port == TIME_PORT && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) => {
+                Ok(d)
+                    if ours
+                        && self.time.asked.is_some_and(|(_, _, from)| from == d.dst_port)
+                        && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) =>
+                {
                     match ntp::parse(d.data) {
                         Ok(r) => self.time_answer(now, &r),
                         Err(e) => self.dropped.malformed(e),
@@ -1059,6 +1226,15 @@ impl Stack {
                     self.probe = None;
                 }
             }
+            icmp::UNREACHABLE => {
+                // A router says a segment was too large for the path: the
+                // connection it quotes cuts smaller, if it is ours and the
+                // segment is one in flight (`Connection::path_mtu`).
+                let (Some((mtu, q)), Some(l), Some(t)) = (icmp::too_big(m), self.lease, self.tcp.as_mut()) else { return };
+                if q.src == l.address {
+                    t.path_mtu(q.src, q.src_port, q.dst, q.dst_port, mtu, q.seq);
+                }
+            }
             _ => {}
         }
     }
@@ -1092,12 +1268,21 @@ impl Events for Stack {
 
     fn signals(&mut self, signals: u64) {
         self.nic.signalled(signals);
-        if signals & tcp::GONE != 0
-            && let Some(t) = self.tcp.as_mut()
-        {
-            t.forget_ended();
+        let changed = signals & DEVICES_CHANGED != 0;
+        if changed {
+            self.nic.provider_changed();
+        }
+        if let Some(t) = self.tcp.as_mut() {
+            if signals & tcp::GONE != 0 {
+                t.forget_ended();
+            }
+            // The connections whose programs signalled.
+            t.signalled(signals);
         }
         self.work();
+        if changed && self.nic.away() {
+            self.interface_away();
+        }
     }
 
     fn deadline(&self) -> Option<u64> {
@@ -1119,9 +1304,14 @@ impl proto::Server<Handle> for Stack {
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.add_memory(badge, memory)
     }
 
-    fn listen(&mut self, port: u16, backlog: u32, ready: Handle) -> Result<proto::ListenReply, proto::Error> {
+    /// Retired: naming a port is never the authority to listen on it.
+    fn listen(&mut self, _port: u16, _backlog: u32, _ready: Handle) -> Result<proto::ListenReply, proto::Error> {
+        Err(proto::Error::NotGranted)
+    }
+
+    fn listen_given(&mut self, backlog: u32, ready: Handle) -> Result<proto::ListenGivenReply, proto::Error> {
         let badge = self.caller;
-        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, port, backlog, ready)
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, backlog, ready)
     }
 
     fn accept(&mut self, listener: u32, offset: u64, bits: u8, wake: Handle) -> Result<proto::AcceptReply<Handle>, proto::Error> {
@@ -1137,6 +1327,11 @@ impl proto::Server<Handle> for Stack {
     fn close(&mut self, connection: u32) -> Result<proto::CloseReply, proto::Error> {
         let badge = self.caller;
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.close(badge, connection)
+    }
+
+    fn reset(&mut self, connection: u32) -> Result<proto::ResetReply, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.reset_conn(badge, connection)
     }
 
     fn unlisten(&mut self, listener: u32) -> Result<proto::UnlistenReply, proto::Error> {

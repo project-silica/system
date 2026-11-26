@@ -1,0 +1,13 @@
+[package]
+name = "console-grid"
+description = "The console's text: a grid of character cells, its cursor, and the size a display mode gives it (tested on the host)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[lints]
+workspace = true

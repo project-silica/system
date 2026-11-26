@@ -105,6 +105,13 @@ pub enum Status {
     /// The provider gave up on the device (it was reset or is gone); the
     /// request may or may not have taken effect.
     Aborted = 3,
+    /// Only a flush, and only from the client's own side ([`client::Disk`]),
+    /// never the device: a driver ended while writes made since the last
+    /// successful flush were done or under way, and the device was reset
+    /// before this flush reached it. A device's volatile write cache need
+    /// not keep what it held across a reset, so those writes may not be
+    /// on it: write them again, then flush.
+    Lost = 4,
 }
 
 /// One completion, as it lies in the completion ring.
@@ -135,6 +142,7 @@ impl From<silica_queue::Completion> for Completion {
             0 => Ok(()),
             1 => Err(Status::Io),
             2 => Err(Status::Invalid),
+            4 => Err(Status::Lost),
             _ => Err(Status::Aborted),
         };
         Completion { tag: c.tag, status }
@@ -160,7 +168,7 @@ mod tests {
         raw[8] = 200;
         assert_eq!(Completion::decode(&raw).status, Err(Status::Aborted));
         // The rings fit the frame, one after the other.
-        assert!(silica_ring::size(QUEUE, REQUEST_BYTES) <= COMPLETIONS_AT);
-        assert!(COMPLETIONS_AT + silica_ring::size(QUEUE, COMPLETION_BYTES) <= 1 << RINGS_BITS);
+        assert!(silica_rt::ring::size(QUEUE, REQUEST_BYTES) <= COMPLETIONS_AT);
+        assert!(COMPLETIONS_AT + silica_rt::ring::size(QUEUE, COMPLETION_BYTES) <= 1 << RINGS_BITS);
     }
 }

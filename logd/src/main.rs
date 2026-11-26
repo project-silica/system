@@ -3,18 +3,20 @@
 //! The service manager gives every other service a ring to print into
 //! (`silica_rt::log`), creates the rings and the notification their writers
 //! signal before it starts anything, and gives them all to this service:
-//! grants 0 its endpoint, 1 the notification, 2 a notification of the
-//! service manager's to answer flushes on, 3 the ring directory
+//! grants 0 its endpoint, 1 the notification (its own events notification,
+//! which the writers signal too), 2 the ring directory
 //! (`silica_rt::log::directory`), then a slot per entry of the directory
 //! (`args[0]` of them), holding that entry's ring. A service that runs
 //! programs of its own gives each a ring through the service manager too
 //! (the device manager, one per device for its drivers: `add_log`), which
 //! puts it in the next slot, names it in the directory and signals
 //! [`ADDED`]: those are sources named `<service>/<name>`. This service
-//! never calls the service manager, which waits for its flushes. A signal
-//! with [`FLUSH`] asks for
-//! everything to be on the console now: the service manager's way to put a
-//! service's last lines before its own verdict, without calling the log. On every wake-up it takes the
+//! never calls the service manager. Asked to end (`silica_rt::END`, as the
+//! machine turns off, when every other service has ended), it puts
+//! everything the rings hold on the console and exits: the service
+//! manager hears of the exit from the kernel, so the services' last lines
+//! are out before the power goes and nothing waits out a time for them.
+//! On every wake-up it takes the
 //! text out of every ring, keeps the last [`KEPT`] bytes of each service's,
 //! and puts it on the console as it was written: another source's text
 //! starts on a fresh line, and a line it cut short (a prompt, and what was
@@ -27,6 +29,7 @@
 
 use silica_idl_rt::{Array, CapList};
 use silica_protocols::log::reader::{self as proto, Error, ReadReply, SourcesReply};
+use silica_protocols::paging;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
@@ -52,16 +55,19 @@ const OWN: usize = usize::MAX;
 /// Rounds of taking text (a ring's worth of each source) between looking
 /// at calls.
 const ROUNDS: usize = 4;
-/// The bit of the notification that asks for a flush (the service manager's).
-const FLUSH: u64 = 2;
 /// The bit of the notification that says services gave their programs logs
 /// (`silica.system.Manager`'s `add_log`): this service asks for the rings.
 const ADDED: u64 = 4;
 
 struct Source {
-    /// Made once, at start, and kept as long as the program runs.
+    /// As the directory names it; an entry reused for another name (a log
+    /// whose maker ended for good gives its place to a new one) starts a
+    /// new source in its place. Each name is kept once (`Log::names`):
+    /// only the device manager names logs, from a bounded set.
     name: &'static str,
     ring: Consumer<RECORD>,
+    /// Where the ring is mapped: replaced with it.
+    _mapped: mem::Lent,
     kept: VecDeque<u8>,
     written: u64,
     /// Its ring made no sense, and that was said.
@@ -88,12 +94,12 @@ struct Log {
     /// The source whose unfinished line another's text cut short, until
     /// it is shown again.
     cut: Option<usize>,
-    /// Signalled when a flush asked for is done.
-    flushed: Cap,
     /// The page the service manager keeps across this service's restarts
     /// (`slots::KEEP`), with `open` and `cut` and their lines in it.
     keep: Option<silica_rt::mmio::Mmio>,
     listed: Vec<proto::Source<'static>>,
+    /// Every source name seen, each kept once.
+    names: Vec<&'static str>,
     text: String,
 }
 
@@ -106,7 +112,7 @@ impl Log {
     fn drain(&mut self) {
         // A round takes at most a ring's worth from each source, so one
         // that writes without pause cannot keep the others waiting, and a
-        // few rounds at a time, so it cannot keep callers (a flush, the
+        // few rounds at a time, so it cannot keep callers (the
         // shell) waiting either: what is left is taken at once after them
         // (`deadline`).
         for _ in 0..ROUNDS {
@@ -232,7 +238,9 @@ impl Log {
         // In pieces of whole lines where it can, each written whole.
         for piece in out.split_inclusive(|b| *b == b'\n') {
             for part in piece.chunks(LINE) {
-                print!("{}", String::from_utf8_lossy(part));
+                // Another program's text: shown, not obeyed
+                // (`silica_rt::text`).
+                print!("{}", silica_rt::text::printable(&String::from_utf8_lossy(part)));
             }
         }
         if let Some(s) = self.sources.get_mut(from) {
@@ -262,7 +270,7 @@ impl Log {
         if s.partial.len() > LINE {
             return false;
         }
-        print!("{}", String::from_utf8_lossy(&s.partial));
+        print!("{}", silica_rt::text::printable(&String::from_utf8_lossy(&s.partial)));
         true
     }
 
@@ -281,20 +289,31 @@ impl Log {
             }
             // Not there (its maker already ended): looked at again with the
             // next change.
-            let Some(ring) = ring_in(ring_slot(entry)) else { continue };
+            let Some((ring, mapped)) = ring_in(ring_slot(entry)) else { continue };
+            let name = String::from_utf8_lossy(&name[..n]);
+            let name: &'static str = match self.names.iter().find(|k| **k == name) {
+                Some(k) => k,
+                None => {
+                    let k: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_owned().into_boxed_str());
+                    self.names.push(k);
+                    k
+                }
+            };
             match known {
                 // Read on from the new ring under the same source, its text kept.
-                Some(i) => {
+                Some(i) if self.sources[i].name == name => {
                     let s = &mut self.sources[i];
-                    (s.ring, s.broken, s.generation) = (ring, false, generation);
+                    (s.ring, s._mapped, s.broken, s.generation) = (ring, mapped, false, generation);
                 }
-                None => {
-                    let name = String::from_utf8_lossy(&name[..n]);
-                    // Names last as long as the program: sources are never removed.
-                    let name: &'static str = silica_rt::alloc::boxed::Box::leak(name.into_owned().into_boxed_str());
+                // The entry is another log's now: a new source in its place.
+                known => {
+                    if let Some(i) = known {
+                        self.sources.swap_remove(i);
+                    }
                     self.sources.push(Source {
                         name,
                         ring,
+                        _mapped: mapped,
                         kept: VecDeque::new(),
                         written: 0,
                         broken: false,
@@ -313,13 +332,17 @@ impl Log {
 }
 
 impl proto::Server<Handle> for Log {
-    fn sources<'a>(&'a mut self) -> SourcesReply<'a, Handle> {
+    fn sources<'a>(&'a mut self, from: u32) -> SourcesReply<'a, Handle> {
         self.drain();
         self.listed.clear();
-        for s in &self.sources {
-            self.listed.push(proto::Source { name: s.name, written: s.written });
-        }
-        SourcesReply { sources: Array::new(&self.listed) }
+        let listed = &mut self.listed;
+        let next = paging::part(
+            &self.sources,
+            from,
+            |s| paging::record(paging::text(s.name.len()) + 8),
+            |s| listed.push(proto::Source { name: s.name, written: s.written }),
+        );
+        SourcesReply { sources: Array::new(&self.listed), next }
     }
 
     fn read<'a>(&'a mut self, name: &str, from: u64) -> Result<ReadReply<'a>, Error> {
@@ -355,8 +378,8 @@ impl Events for Log {
             self.take_rings();
         }
         self.drain();
-        if bits & FLUSH != 0 {
-            // Everything written so far on the console before the answer
+        if bits & silica_rt::END != 0 {
+            // Everything written so far on the console, then the end
             // (within reason: a writer that never pauses is not waited for).
             for _ in 0..16 {
                 if !self.more {
@@ -364,31 +387,32 @@ impl Events for Log {
                 }
                 self.drain();
             }
-            let _ = sys::signal(self.flushed);
+            self.save();
+            silica_rt::exit(0);
         }
     }
 }
 
 /// The log ring in the frame `cap`, mapped, if it is one.
-fn ring_in(cap: Cap) -> Option<Consumer<RECORD>> {
+fn ring_in(cap: Cap) -> Option<(Consumer<RECORD>, mem::Lent)> {
     let Ok(Some(slot)) = sys::inspect_slot(slots::SPACE, cap.0) else { return None };
     if slot.ty != ObjectType::Frame || slot.bits != BITS {
         return None;
     }
-    let region = mem::peer(cap, BITS, Rights(Rights::READ.0 | Rights::WRITE.0)).ok()?;
-    let mut ring = Consumer::new(region, RECORDS)?;
+    let mapped = mem::Lent::map(cap, BITS, Rights(Rights::READ.0 | Rights::WRITE.0)).ok()?;
+    let mut ring = Consumer::new(mapped.region(), RECORDS)?;
     let _ = ring.sleep();
-    Some(ring)
+    Some((ring, mapped))
 }
 
 /// The slot holding directory entry `entry`'s ring.
 fn ring_slot(entry: usize) -> Cap {
-    Cap(slots::FIRST_GRANT + 4 + entry as u64)
+    Cap(slots::FIRST_GRANT + 3 + entry as u64)
 }
 
 fn main(info: &'static ProcessInfo) -> i64 {
     let grant = |n: u64| Cap(slots::FIRST_GRANT + n);
-    let directory = match mem::peer(grant(3), directory::BITS, Rights::READ) {
+    let directory = match mem::peer(grant(2), directory::BITS, Rights::READ) {
         Ok(d) => d,
         Err(e) => {
             println!("ERROR: logd: no ring directory: {e:?}");
@@ -402,9 +426,9 @@ fn main(info: &'static ProcessInfo) -> i64 {
         more: false,
         open: None,
         cut: None,
-        flushed: grant(2),
         keep: mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok(),
         listed: Vec::new(),
+        names: Vec::new(),
         text: String::new(),
     };
     // Every ring there is, and what was written before this service

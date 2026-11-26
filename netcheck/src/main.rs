@@ -64,8 +64,15 @@ fn why<E: core::fmt::Debug>(e: E, what: &'static str) -> &'static str {
 fn interfaces(devices: &mut manager::Client<Channel, Handle>) -> Result<Vec<(u32, String)>, &'static str> {
     let deadline = silica_rt::clock().now() + 10 * SECOND;
     loop {
-        let listed = devices.list(manager::Class::Network).map_err(|e| why(e, "the device manager does not answer"))?;
-        let found: Vec<_> = listed.devices.iter().map(|d| (d.id, String::from(d.driver))).collect();
+        let (mut found, mut from) = (Vec::new(), 0);
+        loop {
+            let part = devices.list(manager::Class::Network, from).map_err(|e| why(e, "the device manager does not answer"))?;
+            found.extend(part.devices.iter().map(|d| (d.id, String::from(d.driver))));
+            if part.next <= from {
+                break;
+            }
+            from = part.next;
+        }
         if !found.is_empty() {
             return Ok(found);
         }
@@ -196,6 +203,11 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
     }
     let memory = Memory::new(16).map_err(|e| why(e, "no memory"))?;
     nic.add_memory(0, &memory, true).map_err(|e| why(e, "cannot register memory with the driver"))?;
+    // In the same boot as the checks below (they need the same image): a
+    // full queue while the link changes, then the interface goes on as ever.
+    if silica_rt::option("crowd").is_some() {
+        crowd(&mut nic, memory.shared(), mac)?;
+    }
     let mut c = Check { nic, m: memory.shared(), mac, sent: 0 };
     for tag in 1..=BUFFERS {
         c.offer(tag)?;
@@ -269,9 +281,81 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
         times.push(clock.now() - t);
     }
     pass("ping");
+    if silica_rt::option("unplug").is_some() {
+        unplug(&mut c, gateway)?;
+        pass("unplug");
+    }
     times.sort_unstable();
     println!("BENCH {driver}_ping_user_mode {} ns", times[times.len() / 2]);
     bench(&mut c, driver)
+}
+
+/// `netcheck.unplug`: the cable pulled during traffic. It says it is ready
+/// (the harness takes the link down), sends eight frames while the link is
+/// down, and waits longer than the driver's transmit limit: every one must
+/// be answered (sent or dropped) and the driver must carry on, not end as a
+/// device that died (the 2026-11-25 drivers review: an 82574 holds
+/// transmits while its link is down, and its driver timed them out and gave
+/// the device up, so every cable pull restarted it). Then it says so (the
+/// harness brings the link back) and the gateway must answer an ARP again.
+fn unplug(c: &mut Check, gateway: [u8; 6]) -> Result<(), &'static str> {
+    let clock = silica_rt::clock();
+    let o = OUT as usize;
+    println!("netcheck: ready for unplug");
+    loop {
+        let e = c.nic.kick_wait(Some(clock.now() + 5 * SECOND)).map_err(|e| why(e, "the link never went down"))?;
+        if e.tag == LINK && e.result == Ok(0) {
+            break;
+        }
+    }
+    let first = c.sent + 1;
+    for _ in 0..8 {
+        c.put(o, &[0xFF; 6]);
+        c.put(o + 6, &c.mac);
+        c.put(o + 12, &[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+        c.put(o + 22, &c.mac);
+        c.put(o + 28, &ME);
+        c.put(o + 32, &[0; 6]);
+        c.put(o + 38, &GATEWAY);
+        c.put(o + 42, &[0; 18]);
+        c.send(42)?;
+    }
+    c.nic.kick();
+    // Longer than the driver's transmit limit (1 s while a fault is armed,
+    // 5 s otherwise).
+    let until = clock.now() + 6 * SECOND;
+    let mut answered = 0;
+    while clock.now() < until {
+        match c.nic.kick_wait(Some(until)) {
+            Ok(x) if x.tag >= SENT + first && x.tag < SENT + first + 8 => answered += 1,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    println!("netcheck: unplugged: {answered} of 8 transmits answered while the link was down");
+    if answered != 8 {
+        return Err("transmits while the link was down were never answered");
+    }
+    println!("netcheck: ready for link up");
+    loop {
+        let e = c.nic.kick_wait(Some(clock.now() + 5 * SECOND)).map_err(|e| why(e, "the link never came back"))?;
+        if e.tag == LINK && e.result == Ok(1) {
+            break;
+        }
+    }
+    c.put(o, &[0xFF; 6]);
+    c.put(o + 6, &c.mac);
+    c.put(o + 12, &[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+    c.put(o + 22, &c.mac);
+    c.put(o + 28, &ME);
+    c.put(o + 32, &[0; 6]);
+    c.put(o + 38, &GATEWAY);
+    c.put(o + 42, &[0; 18]);
+    c.send(42)?;
+    c.receive(clock.now() + 3 * SECOND, &mut |c, at, n| {
+        let f = c.get(at, n.min(42));
+        n >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2] && f[22..28] == gateway
+    })
 }
 
 /// The benchmarks, where the host's echo answers.
@@ -367,5 +451,71 @@ fn bench(c: &mut Check, driver: &str) -> Result<(), &'static str> {
     }
     let ns = clock.now() - start;
     println!("BENCH {prefix}_tx {} frames/s", done * SECOND / ns.max(1));
+    Ok(())
+}
+
+/// `netcheck.crowd`: a client at full queue depth while the link changes.
+/// It says it is ready (the harness takes the link down: the driver tells
+/// the client), submits as many transmits as the queue holds, and does not
+/// look at its completions for a second (the harness brings the link back
+/// up meanwhile): every one of them must then be there. Before (the
+/// 2026-11-24 audit), the link's news was a record in the completion ring,
+/// which holds as many records as requests can be in flight: it took the
+/// place of the last transmit's completion, which was dropped, and the
+/// client waited for it for ever.
+fn crowd(nic: &mut Interface, m: Mmio, mac: [u8; 6]) -> Result<(), &'static str> {
+    // A broadcast frame of a type nobody answers.
+    let o = OUT as usize;
+    for (i, b) in [[0xFF; 6], mac].concat().iter().chain(SINK.iter()).enumerate() {
+        m.write8(o + i, *b);
+    }
+    println!("netcheck: crowd: ready for the link to change");
+    let pause = |ns: u64| {
+        let until = silica_rt::clock().now() + ns;
+        while silica_rt::clock().now() < until {
+            silica_rt::sys::yield_now();
+        }
+    };
+    // The link goes down meanwhile, with nothing in flight.
+    pause(SECOND);
+    let depth = silica_queue::QUEUE as u64;
+    for n in 0..depth {
+        let r = Request { op: Op::Transmit, memory: 0, offset: OUT, length: 60, tag: SENT + n, offload: silica_net::Offload::NONE };
+        nic.submit(&r).map_err(|e| why(e, "cannot send"))?;
+    }
+    nic.kick();
+    println!("netcheck: crowd: {depth} transmits in flight");
+    // The device completes them, and the link comes back up, while the
+    // client does not look.
+    pause(SECOND);
+    let (mut sent, mut links) = (0u64, 0u64);
+    let deadline = silica_rt::clock().now() + 5 * SECOND;
+    while sent < depth {
+        match nic.wait(Some(deadline)) {
+            Ok(c) if c.tag == LINK => links += 1,
+            Ok(c) if (SENT..SENT + depth).contains(&c.tag) => {
+                c.result.map_err(|e| why(e, "a frame could not be sent"))?;
+                sent += 1;
+            }
+            Ok(_) => return Err("a completion of a request never made"),
+            Err(_) => {
+                println!("netcheck: crowd: {sent} of {depth} transmits completed, {links} link changes heard");
+                return Err("a completion was lost while the link changed at full queue depth");
+            }
+        }
+    }
+    // The link's news, after its completions: its latest state, up.
+    let deadline = silica_rt::clock().now() + 2 * SECOND;
+    while nic.info().map_err(|e| why(e, "cannot read the link"))?.link_up && links == 0 {
+        match nic.wait(Some(deadline)) {
+            Ok(c) if c.tag == LINK => links += 1,
+            _ => break,
+        }
+    }
+    println!("netcheck: crowd: {sent} of {depth} transmits completed, {links} link changes heard");
+    if links == 0 {
+        return Err("the link's changes were never told");
+    }
+    println!("TEST crowd PASS");
     Ok(())
 }
