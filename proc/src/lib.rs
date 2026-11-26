@@ -888,3 +888,50 @@ mod restarts {
         assert_eq!((r.streak, r.total), (1, 100));
     }
 }
+
+/// Where a service asks to run (its declaration's `cpu=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// On this processor.
+    Fixed(u32),
+    /// Wherever its parent chooses.
+    Any,
+}
+
+/// The processor each of `wanted` runs on, on a machine of `cpus`
+/// processors: the one it names, or processor 0 when the machine has no
+/// such processor (`true` beside it: the caller says so); for
+/// [`Placement::Any`], the processors after the first in turn (processor 0
+/// on a machine of one), so what the declarations let go is spread over
+/// what processor 0, where everything else runs, does not.
+pub fn place(wanted: &[Placement], cpus: usize) -> Vec<(usize, bool)> {
+    let mut next = 1;
+    wanted
+        .iter()
+        .map(|w| match *w {
+            Placement::Fixed(n) if (n as usize) < cpus => (n as usize, false),
+            Placement::Fixed(_) => (0, true),
+            Placement::Any if cpus <= 1 => (0, false),
+            Placement::Any => {
+                let c = next;
+                next = if next + 1 < cpus { next + 1 } else { 1 };
+                (c, false)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod placement {
+    use super::{Placement as P, place};
+
+    #[test]
+    fn named_processors_are_kept_missing_ones_fall_back_and_any_is_spread_past_the_first() {
+        let wanted = [P::Fixed(0), P::Any, P::Fixed(3), P::Any, P::Any, P::Fixed(9)];
+        assert_eq!(place(&wanted, 4), [(0, false), (1, false), (3, false), (2, false), (3, false), (0, true)]);
+        // `any` wraps past the last processor, never onto the first.
+        assert_eq!(place(&[P::Any, P::Any, P::Any], 3), [(1, false), (2, false), (1, false)]);
+        // One processor: everything on it, a named other one said to be missing.
+        assert_eq!(place(&[P::Any, P::Fixed(1)], 1), [(0, false), (0, true)]);
+    }
+}
