@@ -260,3 +260,30 @@ fn random_requests_never_overlap_or_corrupt() {
     // Every large frame went back; what is held is chunks.
     assert!(h.src.live.values().all(|b| *b <= CHUNK_MAX_BITS));
 }
+
+/// Chunks whose every unit is free again go back to the program's memory
+/// (which, with its buddy tree, serves any size with them), but for one
+/// spare: after 8 MiB of 256 KiB blocks is given back, the heap holds one
+/// chunk at most, and the next request is served from it without a new
+/// frame. Before, chunks were kept once made: the 8 MiB stayed the heap's.
+#[test]
+fn free_chunks_go_back_but_one_stays() {
+    let mut h = heap(16 << 20);
+    phase(&mut h, 256 << 10, 8 << 20);
+    assert!(held(&h) <= 1 << CHUNK_MAX_BITS, "the heap kept {} bytes with nothing in use", held(&h));
+    assert!(h.src.unmapped > 0, "no chunk went back");
+    let made = h.src.made;
+    let p = h.alloc(layout(64 << 10));
+    assert!(!p.is_null());
+    assert_eq!(h.src.made, made, "the spare chunk did not serve the next request");
+    // SAFETY: handed out above, unused.
+    unsafe { h.dealloc(p, layout(64 << 10)) };
+    // A request at a time, taken and given back over and over, makes no frames.
+    for _ in 0..1000 {
+        let p = h.alloc(layout(128 << 10));
+        assert!(!p.is_null());
+        // SAFETY: as above.
+        unsafe { h.dealloc(p, layout(128 << 10)) };
+    }
+    assert_eq!(h.src.made, made, "a hot take-and-give pair made and gave back frames");
+}

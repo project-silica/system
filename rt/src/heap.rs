@@ -18,10 +18,9 @@
 //! its peak of small and medium memory taken together, not the sum of each
 //! size's peak (the 2026-11-24 audit: freed pieces stayed on their class's
 //! list for good, and a long-running service ran out with most of its heap
-//! free). Chunks are kept once made: a chunk's memory is reused for any
-//! size, while the program's memory gives back a block only for a request
-//! of the same size (`mem::alloc`), so giving chunks back would mostly
-//! strand it.
+//! free). A chunk whose every unit is free again goes back to the program's
+//! memory, which serves any size with it (`mem`'s buddy tree), but for one
+//! spare kept so that taking and giving back in turn costs no system calls.
 //!
 //! The bookkeeping is out of the memory handed out: the heap takes one
 //! window of address space (64 GiB of it; address space costs nothing
@@ -134,6 +133,10 @@ pub(crate) struct Core<S: Source> {
     free: [u32; ORDERS],
     /// Ranges of the window free to map a frame in, by size in bits.
     ranges: [u32; 64],
+    /// A chunk wholly free, kept for the next request rather than given
+    /// back (its first unit; 0: none): a hot allocate-and-free pair costs
+    /// no system calls.
+    spare: u32,
     /// Chunks made (each larger as more are).
     chunks: u32,
 }
@@ -151,6 +154,7 @@ impl<S: Source> Core<S> {
             free: [0; ORDERS],
             ranges: [0; 64],
             chunks: 0,
+            spare: 0,
         }
     }
 
@@ -269,10 +273,17 @@ impl<S: Source> Core<S> {
         self.ranges[bits as usize] = i;
     }
 
-    /// A new chunk with a free block of at least `order`.
+    /// A new chunk with a free block of at least `order`: as large as the
+    /// chunks the program holds call for, or smaller, down to `order`, when
+    /// its memory has no room for that.
     fn chunk(&mut self, order: usize) -> bool {
         let grown = CHUNK_MIN_BITS + (self.chunks / 4).min((CHUNK_MAX_BITS - CHUNK_MIN_BITS) as u32) as u8;
-        let bits = grown.max(CHUNK_MIN_BITS + order as u8);
+        let least = CHUNK_MIN_BITS + order as u8;
+        (least..=grown.max(least)).rev().any(|bits| self.chunk_of(bits))
+    }
+
+    /// A new chunk of `2^bits` bytes, its whole a free block.
+    fn chunk_of(&mut self, bits: u8) -> bool {
         let Some(at) = self.range(bits) else { return false };
         let first = self.index(at);
         let units = 1u32 << (bits as u32 - UNIT_BITS);
@@ -320,6 +331,9 @@ impl<S: Source> Core<S> {
         };
         let i = self.free[k];
         self.unlink(List::Free(k), i);
+        if i == self.spare {
+            self.spare = 0;
+        }
         for o in (order..k).rev() {
             self.give_block(i + (1 << o), o);
         }
@@ -347,7 +361,35 @@ impl<S: Source> Core<S> {
             i = i.min(b);
             order += 1;
         }
+        if order == chunk_order && self.spare != 0 {
+            return self.give_chunk(i, order);
+        }
+        if order == chunk_order {
+            self.spare = i;
+        }
         self.give_block(i, order);
+    }
+
+    /// The chunk at unit `i`, of 2^order units, is wholly free, and a spare
+    /// is kept already: its frame goes back to the program's memory, which
+    /// serves any size with it (`mem`), and its range of the window to the
+    /// next chunk or frame of its size.
+    fn give_chunk(&mut self, i: u32, order: usize) {
+        // Chunks held, not made: a program that needs less is given smaller ones.
+        self.chunks = self.chunks.saturating_sub(1);
+        let units = 1u32 << order;
+        // SAFETY: a chunk's first unit holds its frame from when it was made
+        // (`chunk`) until now, and nothing else reads it after this.
+        let frame = unsafe { self.rec(i).frame.assume_init_read() };
+        for u in i..i + units {
+            let r = self.rec(u);
+            r.kind = Kind::None;
+            r.chunk_bits = 0;
+        }
+        // SAFETY: every unit of the chunk is free: nothing refers to it.
+        unsafe { self.src.unmap(frame) };
+        let at = self.at(i);
+        self.give_range(at, order as u8 + CHUNK_MIN_BITS);
     }
 
     fn piece(&mut self, class: usize) -> *mut u8 {
