@@ -25,6 +25,12 @@
 //!   mapped, every page then touched (its supervisor answers with zeros),
 //!   and let go of; exits 0 if every page read zeros and every frame after
 //!   the first was mapped where the first was.
+//! - `CHURN`: `args[1]` rounds of `args[2]` bytes (0: 45% of its free memory) of the heap at a time,
+//!   as 2 KiB pieces, then 32 KiB blocks, then 256 KiB blocks, each
+//!   written and checked and given back; exits 0 if every request was
+//!   served and the program's free memory after the last round is what
+//!   it was after the first (the heap reuses what it freed at one size for
+//!   another), else the round and size that failed (its line says how).
 #![no_std]
 #![no_main]
 
@@ -39,6 +45,7 @@ pub const ONE_CALL: u64 = 4;
 const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
 const BORROWER: u64 = 7;
+const CHURN: u64 = 8;
 
 const PING: u64 = 1;
 const COUNT: u64 = 2;
@@ -65,6 +72,7 @@ fn main(info: &'static ProcessInfo) -> i64 {
             i64::from(silica_rt::time::read(&page) != (0, silica_rt::time::Source::None))
         }
         BORROWER => borrower(info.args[1], info.args[2] as u8),
+        CHURN => churn(info.args[1], info.args[2] as usize),
         ONE_CALL => match sys::call(grant, MsgInfo::new(PING, 1), [41, 0, 0, 0]) {
             Ok(_) => 0,
             Err(e) => e as i64,
@@ -217,5 +225,48 @@ fn borrower(cycles: u64, bits: u8) -> i64 {
         }
         drop(lent);
     }
+    0
+}
+
+/// See `CHURN` in the module's documentation.
+fn churn(rounds: u64, bytes: usize) -> i64 {
+    use silica_rt::alloc::vec::Vec;
+    // 0: 45% of what the program has free, so that three sizes each
+    // keeping their own would need more than it has.
+    let bytes = if bytes == 0 { (silica_rt::mem::available() as usize / 100 * 45) & !0xFFFF } else { bytes };
+    let mut first = 0;
+    for round in 0..rounds {
+        for (n, size) in [2048usize, 32 << 10, 256 << 10].into_iter().enumerate() {
+            let mut blocks: Vec<Vec<u8>> = Vec::new();
+            if blocks.try_reserve_exact(bytes / size).is_err() {
+                return 100;
+            }
+            for k in 0..bytes / size {
+                let mut b = Vec::new();
+                if b.try_reserve_exact(size).is_err() {
+                    println!(
+                        "stress churn: round {round}: {size}-byte block {k} refused, {} bytes of memory free",
+                        silica_rt::mem::available()
+                    );
+                    return 10 * (round as i64 + 1) + n as i64;
+                }
+                b.resize(size, k as u8);
+                blocks.push(b);
+            }
+            for (k, b) in blocks.iter().enumerate() {
+                if b[0] != k as u8 || b[size - 1] != k as u8 {
+                    return 99;
+                }
+            }
+        }
+        let free = silica_rt::mem::available();
+        if round == 0 {
+            first = free;
+        } else if free < first {
+            println!("stress churn: round {round}: {free} bytes of memory free, {first} after the first round: the heap grew");
+            return 98;
+        }
+    }
+    println!("stress churn: {rounds} rounds of {bytes} bytes at three sizes; the heap kept what it freed for the next size");
     0
 }
