@@ -273,6 +273,7 @@ fn use_interface(id: u32, fixed: Option<Lease>, left: Option<Cap>, note: Cap) ->
         tcp: Some(tcp::Tcp::new(note, info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
         resets,
         resets_until: 0,
+        resets_next: 0,
         resets_from,
         time: TimeClient::new(clock, now),
         caller: 0,
@@ -486,12 +487,14 @@ struct Stack {
     tcp: Option<tcp::Tcp>,
     /// The badge of the call being answered.
     caller: u64,
-    /// Resets owed to the peers of the last stack's connections, sent once
-    /// their next hop's address is known.
+    /// The last stack's connections whose peers have not yet said they no
+    /// longer hold them (`send_resets`).
     resets: Vec<tcp::Kept>,
-    /// When the resets not sent by then are given up (their peers' hops
-    /// never answered ARP); set when the first one waits.
+    /// When those still unanswered are given up (their peers, or their
+    /// hops, never answered); set when the first is asked.
     resets_until: u64,
+    /// When they are asked again.
+    resets_next: u64,
     /// The address those connections were on, when another program's
     /// page says so: they are reset only from that address.
     resets_from: Option<Ipv4>,
@@ -619,6 +622,10 @@ impl Stack {
         if let Some(p) = &self.probe {
             d = d.min(p.until);
         }
+        // The last stack's peers, asked again.
+        if !self.resets.is_empty() && self.lease.is_some() && self.resets_until != 0 {
+            d = d.min(self.resets_next).min(self.resets_until);
+        }
         if self.time.server(self.lease.as_ref()).is_some() && self.time.page.is_some() {
             d = d.min(self.time.next);
         }
@@ -722,7 +729,18 @@ impl Stack {
     }
 
     /// Reset the connections the last stack had (`tcp::kept_connections`),
-    /// once the lease is held and the first hop's Ethernet address known.
+    /// once the lease is held and each first hop's Ethernet address known.
+    /// What the last stack wrote down (how far each side had sent) is not
+    /// what a peer expects when segments were in flight, and a reset at
+    /// another number is dropped without a word (RFC 5961): sent once at
+    /// that number, a session's peer waited for an answer that would never
+    /// come (the `remote` test, 2026-11-26). So each peer is asked
+    /// (`tcp::reset_probe`) once a second: while it holds the connection it
+    /// answers with the byte it expects, and the reset to that answer
+    /// (`Tcp::segment`, as to any segment no connection takes) ends it;
+    /// once it does not, it answers with a reset, and that connection is
+    /// done ([`Stack::reset_answered`]). A peer that answers nothing is a
+    /// network peer: given up on after `2 * RESOLVE_WAIT`.
     fn send_resets(&mut self, now: u64) {
         let Some(l) = self.lease else { return };
         if self.resets.is_empty() {
@@ -740,17 +758,21 @@ impl Stack {
             self.resets_until = now + 2 * RESOLVE_WAIT;
         }
         if now >= self.resets_until {
-            println!("netd: {} connections of the stack before it are not reset: their peers do not answer ARP", self.resets.len());
+            println!(
+                "netd: {} connections of the stack before it are not known to be reset: their peers did not answer",
+                self.resets.len()
+            );
             self.resets.clear();
             return;
         }
-        let mut sent = 0;
-        // Every reset whose next hop is known goes; one whose hop is not is
-        // kept, its hop asked for (once while it is unanswered). Before,
-        // the first peer not known stopped all those behind it, and nothing
-        // asked for it.
+        if now < self.resets_next {
+            return;
+        }
+        // Every peer whose next hop is known is asked; one whose hop is
+        // not waits, its hop asked for (once while it is unanswered).
+        let mut asked_all = true;
         let mut i = self.resets.len();
-        while i > 0 && self.free > 0 {
+        while i > 0 {
             i -= 1;
             let Some(h) = hop(self.resets[i].remote) else {
                 self.resets.swap_remove(i);
@@ -762,22 +784,35 @@ impl Stack {
                 }
                 continue;
             }
-            let k = self.resets.swap_remove(i);
-            let header = silica_inet::tcp::Header {
-                src_port: k.local_port,
-                dst_port: k.remote_port,
-                seq: k.sequence,
-                ack: k.acknowledges,
-                flags: silica_inet::tcp::RST | silica_inet::tcp::ACK,
-                window: 0,
-            };
+            if self.free == 0 {
+                asked_all = false;
+                break;
+            }
+            let k = &self.resets[i];
+            let header = silica_inet::tcp::reset_probe(k.local_port, k.remote_port, k.sequence, k.acknowledges);
+            let remote = k.remote;
             let mut seg = [0u8; 64];
-            if let Some(n) = silica_inet::tcp::build(&mut seg, l.address, k.remote, &header, &silica_inet::tcp::Options::default(), &[]) {
-                self.send_ip(k.remote, ipv4::TCP, &seg[..n]);
-                sent += 1;
+            if let Some(n) = silica_inet::tcp::build(&mut seg, l.address, remote, &header, &silica_inet::tcp::Options::default(), &[]) {
+                self.send_ip(remote, ipv4::TCP, &seg[..n]);
             }
         }
-        if sent > 0 && self.resets.is_empty() {
+        // Those not asked for want of a transmit buffer are asked on the
+        // next turn, the rest in a second.
+        self.resets_next = if asked_all { now + SECOND } else { now };
+    }
+
+    /// A segment `s` from `remote` that no connection took: if it is the
+    /// answer of a peer of the last stack's connections that it no longer
+    /// holds one (a reset), that connection is done; when the last is, the
+    /// stack says so.
+    fn reset_answered(&mut self, remote: Ipv4, s: &silica_inet::tcp::Segment<'_>) {
+        if self.resets.is_empty() || !s.has(silica_inet::tcp::RST) {
+            return;
+        }
+        let h = &s.header;
+        let before = self.resets.len();
+        self.resets.retain(|k| !(k.remote == remote && k.remote_port == h.src_port && k.local_port == h.dst_port));
+        if self.resets.len() < before && self.resets.is_empty() {
             println!("netd: the connections of the stack before it are reset");
         }
     }
@@ -1197,6 +1232,7 @@ impl Stack {
                         tcp.reset(l.address, p.src, &reset, self);
                     }
                     self.tcp = Some(tcp);
+                    self.reset_answered(p.src, &seg);
                 }
                 Err(e) => self.dropped.malformed(e),
             },
