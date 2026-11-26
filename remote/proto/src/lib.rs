@@ -17,6 +17,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 pub use silica_crypto::aead::TAG;
 pub use silica_crypto::noise;
 
@@ -154,17 +156,105 @@ pub fn key_text(key: &[u8; 32]) -> [u8; 64] {
     out
 }
 
-/// A line of an owners file that is not a key and a name.
+/// Why a piece of a program was not kept ([`Sending::write`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotKept {
+    /// Past the largest program, or past the end of what was sent so far.
+    TooLarge,
+    /// No memory for it.
+    NoRoom,
+}
+
+/// A program an owner is sending, a piece a call, as the machine's service
+/// keeps it until the owner's `update`: in blocks of [`Sending::BLOCK`]
+/// bytes, so a longer program costs one more block and never a copy of
+/// what came before (a growing vector needed twice the program's size).
+#[derive(Debug, Default)]
+pub struct Sending {
+    blocks: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    len: usize,
+}
+
+impl Sending {
+    /// The bytes of one block.
+    pub const BLOCK: usize = 1 << 16;
+
+    /// The bytes it has memory for now: a piece ending past them needs more.
+    pub fn room(&self) -> usize {
+        self.blocks.len() * Self::BLOCK
+    }
+
+    /// The bytes sent so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing was sent.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Write `data` at byte `at`, the program at most `most` bytes. In
+    /// order: a piece starts where the last one ended, or earlier; one at
+    /// byte 0 starts another program, and the last one's memory goes
+    /// first. A piece not kept changes nothing but that.
+    pub fn write(&mut self, at: u64, data: &[u8], most: u64) -> Result<(), NotKept> {
+        if at == 0 {
+            *self = Sending::default();
+        }
+        let end = at.checked_add(data.len() as u64).filter(|e| *e <= most && at <= self.len as u64).ok_or(NotKept::TooLarge)?;
+        let (at, end) = (at as usize, end as usize);
+        while self.blocks.len() * Self::BLOCK < end {
+            let mut block = alloc::vec::Vec::new();
+            block.try_reserve_exact(Self::BLOCK).map_err(|_| NotKept::NoRoom)?;
+            block.resize(Self::BLOCK, 0);
+            self.blocks.try_reserve(1).map_err(|_| NotKept::NoRoom)?;
+            self.blocks.push(block);
+        }
+        let mut done = 0;
+        while done < data.len() {
+            let (block, offset) = ((at + done) / Self::BLOCK, (at + done) % Self::BLOCK);
+            let n = (Self::BLOCK - offset).min(data.len() - done);
+            self.blocks[block][offset..offset + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+        self.len = self.len.max(end);
+        Ok(())
+    }
+
+    /// The first `length` bytes, in order, as the offset and bytes of each
+    /// part; `None` when fewer were sent.
+    pub fn parts(&self, length: usize) -> Option<impl Iterator<Item = (usize, &[u8])>> {
+        (length <= self.len).then(|| {
+            self.blocks.iter().enumerate().map_while(move |(i, b)| {
+                let at = i * Self::BLOCK;
+                (at < length).then(|| (at, &b[..Self::BLOCK.min(length - at)]))
+            })
+        })
+    }
+}
+
+/// A line of an owners file that is not an owner (see [`owners`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadLine(pub usize);
 
+/// An owner an owners file names: its key, its name, what it may do
+/// (`None`: all the remote service has) and how long its sessions may
+/// stay without a whole message, in seconds (`None`: the service's own
+/// bound).
+pub type Owner<'a> = ([u8; 32], &'a str, Option<&'a str>, Option<u64>);
+
 /// The owners an owners file names: each line a public key, space, the
-/// owner's name (no spaces in it), and optionally what the owner may do
+/// owner's name (no spaces in it), optionally what the owner may do
 /// (`silica.system.Manager` scopes joined with `+`, as a service
 /// declaration gives them: `observe+control`; without them, all the
-/// remote service has); blank lines and lines from `#` are skipped. The first line that is neither is an error naming it (from 1),
-/// so that a mistyped key is never silently nobody.
-pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str, Option<&str>), BadLine>> {
+/// remote service has), and optionally `idle=<seconds>` (from 1): how
+/// long a session of that owner's is kept with no whole message arriving,
+/// a bound on a peer set where the peer is named. Blank lines and lines
+/// from `#` are skipped. The first line that is none of these is an error
+/// naming it (from 1), so that a mistyped key, scope or bound is never
+/// silently nobody's or nothing.
+pub fn owners(text: &str) -> impl Iterator<Item = Result<Owner<'_>, BadLine>> {
     text.lines().enumerate().filter_map(|(n, line)| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -173,9 +263,12 @@ pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str, Option
         let mut words = line.split_ascii_whitespace();
         let key = words.next().and_then(parse_key);
         let name = words.next();
-        let scopes = words.next();
-        Some(match (key, name, words.next()) {
-            (Some(k), Some(name), None) => Ok((k, name, scopes)),
+        let mut rest = words.peekable();
+        let scopes = rest.next_if(|w| !w.contains('='));
+        let idle = rest.next_if(|w| w.starts_with("idle=")).map(|w| w[5..].parse::<u64>().ok().filter(|s| *s > 0));
+        Some(match (key, name, idle, rest.next()) {
+            (Some(k), Some(name), None, None) => Ok((k, name, scopes, None)),
+            (Some(k), Some(name), Some(Some(s)), None) => Ok((k, name, scopes, Some(s))),
             _ => Err(BadLine(n + 1)),
         })
     })
@@ -238,10 +331,29 @@ mod tests {
             let mut it = owners(&text);
             [it.next().unwrap(), it.next().unwrap()]
         };
-        assert_eq!(got[0], Ok(([0; 32], "alice@laptop", None)));
-        assert_eq!(got[1], Ok(([0x11; 32], "ci", None)));
+        assert_eq!(got[0], Ok(([0; 32], "alice@laptop", None, None)));
+        assert_eq!(got[1], Ok(([0x11; 32], "ci", None, None)));
         let scoped = std::format!("{a} watcher observe\n");
-        assert_eq!(owners(&scoped).next(), Some(Ok(([0; 32], "watcher", Some("observe")))));
+        assert_eq!(owners(&scoped).next(), Some(Ok(([0; 32], "watcher", Some("observe"), None))));
+        // A bound on that owner's idle sessions, with or without scopes;
+        // one that is no number of seconds, zero, given twice or before
+        // the scopes is the line's error.
+        let line = |rest: &str| owners(&std::format!("{a} w {rest}\n")).next().unwrap().map(|(_, _, s, i)| (s.map(String::from), i));
+        assert_eq!(line("idle=6"), Ok((None, Some(6))));
+        assert_eq!(line("observe+control idle=3600"), Ok((Some(String::from("observe+control")), Some(3600))));
+        for bad in [
+            "idle=",
+            "idle=0",
+            "idle=-1",
+            "idle=six",
+            "idle=6 idle=7",
+            "idle=6 observe",
+            "observe idle=6 more",
+            "mode=1",
+            "idle=99999999999999999999",
+        ] {
+            assert_eq!(line(bad), Err(BadLine(1)), "{bad}");
+        }
         assert_eq!(owners(&std::format!("{a} x observe more\n")).next(), Some(Err(BadLine(1))));
         assert_eq!(owners(&text).count(), 2);
         assert_eq!(owners("# none\n\n").count(), 0);
@@ -251,6 +363,39 @@ mod tests {
         assert_eq!(owners(&no_name).next(), Some(Err(BadLine(2))));
     }
 
+    #[test]
+    fn a_program_is_kept_in_order_and_within_its_bound() {
+        let mut s = Sending::default();
+        let most = 3 * Sending::BLOCK as u64;
+        // Past what was sent so far, past the bound, or wrapping: not kept.
+        assert_eq!(s.write(1, b"x", most), Err(NotKept::TooLarge));
+        assert_eq!(s.write(u64::MAX, b"xy", most), Err(NotKept::TooLarge));
+        assert_eq!(s.write(1 << 40, b"x", most), Err(NotKept::TooLarge));
+        assert!(s.is_empty());
+        // Pieces across a block's end, one rewritten in place.
+        let bytes: std::vec::Vec<u8> = (0..2 * Sending::BLOCK + 100).map(|i| (i % 251) as u8).collect();
+        for (k, piece) in bytes.chunks(3900).enumerate() {
+            assert_eq!(s.write((k * 3900) as u64, piece, most), Ok(()));
+        }
+        assert_eq!(s.write(3900, &bytes[3900..7800], most), Ok(()));
+        assert_eq!(s.len(), bytes.len());
+        let mut got = std::vec![0u8; bytes.len()];
+        for (at, part) in s.parts(bytes.len()).unwrap() {
+            got[at..at + part.len()].copy_from_slice(part);
+        }
+        assert_eq!(got, bytes);
+        // A shorter length is the first bytes; a longer one is not there.
+        assert_eq!(s.parts(5).unwrap().map(|(at, p)| (at, p.len())).collect::<std::vec::Vec<_>>(), [(0, 5)]);
+        assert!(s.parts(bytes.len() + 1).is_none());
+        // Past the bound: refused, and what was sent stays.
+        assert_eq!(s.write(bytes.len() as u64, &[0; 3900], bytes.len() as u64 + 10), Err(NotKept::TooLarge));
+        assert_eq!(s.len(), bytes.len());
+        // A piece at byte 0 starts another program.
+        assert_eq!(s.write(0, b"new", most), Ok(()));
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.parts(3).unwrap().next(), Some((0, &b"new"[..])));
+        assert!(s.parts(4).is_none());
+    }
     extern crate std;
     use std::string::String;
 

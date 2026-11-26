@@ -237,12 +237,12 @@ impl partitions::Server<Handle> for Server {
 
 fn main(_info: &'static ProcessInfo) -> i64 {
     let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(DEVICES));
-    // The device manager answers once it has started a driver for every
-    // device it found; a disk may still be on its way, so it is waited for
-    // a while: told by the device manager (`watch`) when a disk gains a
-    // driver, not asked again in a loop (on a machine with no disk that
-    // spun a processor for the whole ten seconds).
-    let deadline = silica_rt::clock().now() + 10 * SECOND;
+    // Served at once with the disks that have drivers now: one still on its
+    // way is read when the device manager says it gained its driver
+    // (`watch`, looked at before each call: `refresh`). This service
+    // watches from its start, before any client can, and the device manager
+    // signals watchers in the order they asked, so a client woken by its own
+    // watch finds the new disk's table here.
     let changed = silica_rt::mem::Object::new(silica_rt::sys::ObjectType::Notification, 0).ok();
     if let Some(n) = &changed
         && let Some(slot) = silica_rt::ipc::free_slot()
@@ -253,18 +253,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             silica_rt::ipc::release_slot(slot);
         }
     }
-    let disks: Vec<u32> = loop {
-        let found: Vec<u32> = block_disks(&mut devices);
-        if !found.is_empty() || silica_rt::clock().now() > deadline {
-            break found;
-        }
-        match &changed {
-            Some(n) => {
-                let _ = silica_rt::sys::recv(n.cap(), silica_rt::sys::Wait::Until(deadline));
-            }
-            None => silica_rt::sys::yield_now(),
-        }
-    };
+    let disks: Vec<u32> = block_disks(&mut devices);
     let mut names = Vec::new();
     let (parts, unread) = read_tables(&disks, &mut names);
     let mut server = Server { devices, parts, listed: Vec::new(), changed, unread, names, caller: 0 };

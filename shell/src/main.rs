@@ -292,18 +292,17 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             Ok(_) | Err(CallError::Transport(TransportError::PeerGone)) => {}
             Err(_) => return 1,
         }
-        let line = loop {
-            match shell.term.read_line() {
-                Ok(r) if !r.busy => break String::from(r.line),
-                Ok(_) => {
-                    // Another program is reading. Wait between attempts,
-                    // without printing another prompt or consuming input.
-                    let until = silica_rt::clock().now() + 1_000_000_000;
-                    let _ = silica_rt::sys::recv(slots::EVENTS, silica_rt::sys::Wait::Until(until));
-                }
-                Err(CallError::Transport(TransportError::PeerGone)) => continue 'prompt,
-                Err(_) => return 1,
+        let line = match shell.term.read_line() {
+            Ok(r) if !r.busy => String::from(r.line),
+            // The console keeps one waiting read a holder and answers
+            // them in turn, so busy means it had no place to keep this
+            // one: said, and the shell ends to be started again.
+            Ok(_) => {
+                silica_rt::println!("shell: the console could not keep a read waiting");
+                return 1;
             }
+            Err(CallError::Transport(TransportError::PeerGone)) => continue 'prompt,
+            Err(_) => return 1,
         };
         match shell.run(&line) {
             Ok(()) | Err(CallError::Transport(TransportError::PeerGone)) => {}

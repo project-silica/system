@@ -16,7 +16,7 @@
 //! second gives its place to newer ones, the oldest first, and one an
 //! owner's handshake was answered on never does (`make_room`). A session
 //! is closed when no whole message has come for an hour
-//! (`remote.idle=<seconds>` on the command line sets another); bytes that
+//! (or what that owner's line of `remote.owners` says: `idle=<seconds>`); bytes that
 //! make no message keep nothing open.
 //!
 //! After the handshake every call a session makes is the same IDL request
@@ -28,10 +28,12 @@
 //! `control`, `update`, `power`, joined with `+`; all four when it says
 //! none), and a call beyond it is refused here and said in the log. The
 //! providers check every request as they check a local one: nothing a
-//! session sends is trusted here beyond its framing. One session at a
-//! time sends a program (`stage`, then `update`): the one whose piece the
-//! service manager last took, until its `update` is answered, it ends, or
-//! it stages nothing for a minute; a piece refused takes nothing.
+//! session sends is trusted here beyond its framing. A program an owner
+//! sends (`send`, a piece a call) is held here, in this service's own
+//! memory, one for each owner, until that owner's `update`: the service
+//! manager then lends memory for it (`program`), this service writes the
+//! program there and passes the `update` on. The service manager holds
+//! nothing an owner sent before that, and no owner waits for another.
 //!
 //! The log names who did what: every session's start and end with its
 //! owner's name and address, and every call that changes the system
@@ -83,11 +85,9 @@ const STAMP_WINDOW: u64 = 300_000_000_000;
 /// How long a new connection has to give an owner's handshake before a
 /// newer one may take its place.
 const GRACE: u64 = 1_000_000_000;
-/// A sender of a program (`stage`) that sends nothing more for this long
-/// lets another owner send one.
-const STAGE_IDLE: u64 = 60_000_000_000;
-/// A session no whole message arrived on for this long is closed (the
-/// owner sets another with `remote.idle=<seconds>` on the command line).
+/// A session no whole message arrived on for this long is closed, unless
+/// its owner's line of `remote.owners` sets another (`idle=<seconds>`): the
+/// bound on a peer is given where the peer is named.
 const IDLE: u64 = 3_600_000_000_000;
 
 enum State {
@@ -98,7 +98,6 @@ enum State {
 
 struct Session {
     s: Stream,
-    id: u64,
     peer: String,
     /// The owner, once the handshake named one.
     owner: Option<usize>,
@@ -127,20 +126,17 @@ struct Session {
 /// What the service holds for every session.
 struct Machine {
     key: Keypair,
-    /// Each owner's key, name, and what of the service manager it may use
-    /// (`silica_protocols::scope`).
-    owners: Vec<([u8; 32], String, u64)>,
+    /// Each owner's key, name, what of the service manager it may use
+    /// (`silica_protocols::scope`), and how long its sessions may stay
+    /// without a whole message ([`IDLE`], or its line's `idle=`).
+    owners: Vec<([u8; 32], String, u64, u64)>,
     manager: Channel,
     log: Channel,
-    /// The session whose program is being staged with the service manager:
-    /// the service manager keeps one per caller, and every session calls as
-    /// this service, so two sessions sending programs at once would mix
-    /// them. The second is refused until the first's `update` is answered,
-    /// its session ends, or it stages nothing for [`STAGE_IDLE`]. As the
-    /// session and when it last staged.
-    stager: Option<(u64, u64)>,
-    /// How long a session may be idle ([`IDLE`]).
-    idle: u64,
+    /// The program each owner is sending (`send`), held here until that
+    /// owner's `update` takes it or its last session ends: at most
+    /// [`MAX_PROGRAM`] bytes an owner, and no more than this service's own
+    /// memory holds.
+    sending: Vec<silica_remote::Sending>,
     /// The time of the newest first message taken from each owner
     /// (`silica_remote::stamp`), kept in the page the service manager keeps
     /// across this service's restarts (`keep`): one taken before a restart
@@ -195,7 +191,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     if let Some(text) = read_file(OWNERS_FILE) {
         for o in silica_remote::owners(&text) {
             match o {
-                Ok((k, name, spec)) => {
+                Ok((k, name, spec, idle)) => {
                     let all = scope::SYSTEM_OBSERVE | scope::SYSTEM_CONTROL | scope::SYSTEM_UPDATE | scope::SYSTEM_POWER;
                     let Ok(may) = spec.map_or(Ok(all), |s| scope::parse(manager::NAME, s)) else {
                         println!(
@@ -203,10 +199,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         );
                         return 1;
                     };
-                    owners.push((k, String::from(name), may & all));
+                    owners.push((k, String::from(name), may & all, idle.map_or(IDLE, |s| s.saturating_mul(1_000_000_000))));
                 }
                 Err(silica_remote::BadLine(n)) => {
-                    println!("ERROR: remote: line {n} of remote.owners is not a key and a name; remote management is off");
+                    println!(
+                        "ERROR: remote: line {n} of remote.owners is not an owner (a key, a name, then its scopes and idle=<seconds> if any); remote management is off"
+                    );
                     return 1;
                 }
             }
@@ -236,14 +234,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         if owners.len() == 1 { "" } else { "s" },
         core::str::from_utf8(&silica_remote::key_text(&key.public)).unwrap_or("?")
     );
-    let idle =
-        silica_rt::option("idle").and_then(|s| s.parse::<u64>().ok()).filter(|s| *s > 0).map_or(IDLE, |s| s.saturating_mul(1_000_000_000));
     // A page of 4 KiB, read and written one access at a time.
     let keep = silica_rt::mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
     let newest = Machine::kept(keep.as_ref(), owners.len());
-    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), stager: None, idle, newest, keep };
+    let sending = owners.iter().map(|_| silica_remote::Sending::default()).collect();
+    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), sending, newest, keep };
     let mut sessions: Vec<Session> = Vec::new();
-    let mut next_id = 1u64;
     loop {
         let now = silica_rt::clock().now();
         let mut progress = false;
@@ -255,7 +251,6 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                     let from = s.peer.as_ref().map_or(0, |p| p.address);
                     let mut session = Session {
                         s,
-                        id: next_id,
                         peer,
                         owner: None,
                         from,
@@ -270,7 +265,6 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         closing: false,
                         done: false,
                     };
-                    next_id += 1;
                     if sessions.iter().filter(|s| s.proven && !s.closing).count() >= MAX_SESSIONS {
                         println!("remote: a connection from {} closed: {MAX_SESSIONS} sessions are open", session.peer);
                         session.close();
@@ -295,11 +289,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         while i < sessions.len() {
             if sessions[i].done {
                 let s = sessions.swap_remove(i);
-                if m.stager.is_some_and(|(id, _)| id == s.id) {
-                    m.stager = None;
-                }
                 if let Some(o) = s.owner {
                     println!("remote: {}'s session from {} ended after {} calls", m.owners[o].1, s.peer, s.calls);
+                    // What the owner was sending goes with its last session.
+                    if !sessions.iter().any(|other| other.owner == Some(o)) {
+                        m.sending[o] = silica_remote::Sending::default();
+                    }
                 }
                 let _ = tcp.close(s.s);
                 progress = true;
@@ -321,7 +316,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             if s.sent < s.output.len() && !s.s.sleep_write() {
                 may_sleep = false;
             }
-            deadline = deadline.min(s.deadline(m.idle));
+            deadline = deadline.min(s.deadline(&m));
             // A stranger past its second may be closed for room (`make_room`).
             if !s.proven && matches!(s.state, State::Handshake) && s.since + GRACE > now {
                 deadline = deadline.min(s.since + GRACE);
@@ -368,8 +363,13 @@ fn make_room(sessions: &mut [Session], now: u64) -> bool {
 }
 
 impl Session {
-    fn deadline(&self, idle: u64) -> u64 {
-        if self.proven { self.last.saturating_add(idle) } else { self.since + HANDSHAKE }
+    /// How long this session may stay without a whole message: its owner's.
+    fn idle(&self, m: &Machine) -> u64 {
+        self.owner.map_or(IDLE, |o| m.owners[o].3)
+    }
+
+    fn deadline(&self, m: &Machine) -> u64 {
+        if self.proven { self.last.saturating_add(self.idle(m)) } else { self.since + HANDSHAKE }
     }
 
     /// Send what is pending, then end.
@@ -406,9 +406,9 @@ impl Session {
         if self.closing {
             return progress;
         }
-        if now >= self.deadline(m.idle) {
+        if now >= self.deadline(m) {
             if self.proven {
-                println!("remote: {}'s session from {} closed: no message for {} s", self.who(m), self.peer, m.idle / 1_000_000_000);
+                println!("remote: {}'s session from {} closed: no message for {} s", self.who(m), self.peer, self.idle(m) / 1_000_000_000);
             } else {
                 println!("remote: a connection from {} closed: no owner proven within 10 s", self.peer);
             }
@@ -471,7 +471,7 @@ impl Session {
                     println!("remote: {} connected from {}", self.who(m), self.peer);
                 }
                 let mut answer = [0u8; MAX_FRAME];
-                let Some(len) = self.call(m, &frame[..n], &mut answer, now) else {
+                let Some(len) = self.call(m, &frame[..n], &mut answer) else {
                     println!("remote: {}'s session from {} closed: a message is not a call", self.who(m), self.peer);
                     return self.close();
                 };
@@ -501,7 +501,7 @@ impl Session {
                 return self.close();
             }
         };
-        let Some(o) = m.owners.iter().position(|(k, _, _)| silica_crypto::equal(k, r.peer())) else {
+        let Some(o) = m.owners.iter().position(|(k, ..)| silica_crypto::equal(k, r.peer())) else {
             println!(
                 "remote: a connection from {} closed: its key {} is no owner's",
                 self.peer,
@@ -558,7 +558,7 @@ impl Session {
 
     /// Answer the call in `plain` into `answer` (channel, status, reply);
     /// the answer's length, or `None` for a plaintext that is no call.
-    fn call(&mut self, m: &mut Machine, plain: &[u8], answer: &mut [u8; MAX_FRAME], now: u64) -> Option<usize> {
+    fn call(&mut self, m: &mut Machine, plain: &[u8], answer: &mut [u8; MAX_FRAME]) -> Option<usize> {
         let (channel, request) = silica_remote::call(plain)?;
         if request.len() > MAX_MESSAGE {
             return None;
@@ -568,7 +568,14 @@ impl Session {
         let reply = &mut answer[2..2 + MAX_MESSAGE];
         let mut caps = CapList::new();
         let (status, n) = match channel {
-            silica_remote::SESSION => (Status::Reply, session::dispatch(&mut SessionServer, request, CapList::new(), reply, &mut caps)),
+            silica_remote::SESSION => {
+                let mut none = silica_remote::Sending::default();
+                let (may, program) = match self.owner {
+                    Some(o) => (m.owners[o].2, &mut m.sending[o]),
+                    None => (0, &mut none),
+                };
+                (Status::Reply, session::dispatch(&mut SessionServer { may, program }, request, CapList::new(), reply, &mut caps))
+            }
             1 => {
                 let ordinal = silica_idl_rt::request_ordinal(request).unwrap_or(0);
                 let may = self.owner.map_or(0, |o| m.owners[o].2);
@@ -587,29 +594,22 @@ impl Session {
                     let name = name_in(request).unwrap_or("?");
                     println!("remote: {} asks the service manager to {what} {name}", self.who(m));
                 }
-                // A sender that went quiet lets the next one send.
-                if m.stager.is_some_and(|(_, at)| now >= at + STAGE_IDLE) {
-                    m.stager = None;
-                }
-                let staging = ordinal == manager::StageRequest::ORDINAL || ordinal == manager::UpdateRequest::ORDINAL;
-                if staging && m.stager.is_some_and(|(s, _)| s != self.id) {
-                    // Another session is sending a program: refused, as
-                    // the service manager would refuse what it cannot do.
-                    let n = silica_idl_rt::encode_error_reply(reply, &mut caps, ordinal, manager::VERSION, &manager::Error::Refused)
-                        .unwrap_or(0);
-                    (Status::Reply, n)
-                } else {
-                    let (status, n) = forward(&mut m.manager, request, reply);
-                    // The lock is this session's once a piece is staged, and
-                    // until the update is answered: not when staging failed.
-                    let ok = status == Status::Reply
-                        && silica_idl_rt::Header::decode(&reply[..n]).is_ok_and(|h| h.status == silica_idl_rt::Status::Ok);
-                    if ordinal == manager::StageRequest::ORDINAL && ok {
-                        m.stager = Some((self.id, now));
-                    } else if ordinal == manager::UpdateRequest::ORDINAL && m.stager.is_some_and(|(s, _)| s == self.id) {
-                        m.stager = None;
+                // An update runs what this owner sent: written into memory
+                // the service manager lends for it, in this one turn, so no
+                // other session's update comes between the two calls. What
+                // was sent is let go of whatever the answer.
+                let lent = match self.owner {
+                    Some(o) if ordinal == manager::UpdateRequest::ORDINAL => {
+                        let program = core::mem::take(&mut m.sending[o]);
+                        lend_program(&program, request)
                     }
-                    (status, n)
+                    _ => Ok(()),
+                };
+                match lent {
+                    Ok(()) => forward(&mut m.manager, request, reply),
+                    Err(e) => {
+                        (Status::Reply, silica_idl_rt::encode_error_reply(reply, &mut caps, ordinal, manager::VERSION, &e).unwrap_or(0))
+                    }
                 }
             }
             // The log is what `observe` lets an owner see.
@@ -676,11 +676,73 @@ fn name_in(request: &[u8]) -> Option<&str> {
     (ordinal == manager::ShutdownRequest::ORDINAL).then_some("the machine")
 }
 
-struct SessionServer;
+/// The largest program an owner sends: the largest the service manager
+/// runs a service on.
+const MAX_PROGRAM: u64 = 16 << 20;
+/// What this service keeps of its own memory for its sessions and its
+/// answers: a program an owner sends is given none of the last of it.
+const RESERVE: u64 = 1 << 20;
 
-impl session::Server<Handle> for SessionServer {
+/// Write the first bytes of `program` (as many as the `update` in
+/// `request` names) into memory the service manager lends for them
+/// (`program`), for the `update` that follows to run. `too_large` when the
+/// owner sent fewer; a request that is no `update` is the service
+/// manager's to refuse.
+fn lend_program(program: &silica_remote::Sending, request: &[u8]) -> Result<(), manager::Error> {
+    let ordinal = manager::UpdateRequest::ORDINAL;
+    let Ok(update) = silica_idl_rt::decode_request::<Handle, manager::UpdateRequest<'_>>(request, CapList::new(), ordinal) else {
+        return Ok(());
+    };
+    let length = usize::try_from(update.length).map_err(|_| manager::Error::TooLarge)?;
+    let parts = program.parts(length).ok_or(manager::Error::TooLarge)?;
+    let mut system = manager::Client::<Channel, Handle>::from(Channel::new(Cap(MANAGER)));
+    let memory = match system.program(update.length) {
+        Ok(r) => r.memory,
+        Err(silica_idl_rt::CallError::Error(e)) => return Err(e),
+        Err(_) => return Err(manager::Error::Refused),
+    };
+    let bits = sys::inspect_slot(slots::SPACE, memory.cap().0).ok().flatten().ok_or(manager::Error::Refused)?.bits;
+    let lent =
+        silica_rt::mem::Lent::map(memory.cap(), bits, Rights(Rights::READ.0 | Rights::WRITE.0)).map_err(|_| manager::Error::Refused)?;
+    if lent.region().len() < length {
+        return Err(manager::Error::Refused);
+    }
+    for (at, part) in parts {
+        lent.region().write_bytes(at, part);
+    }
+    Ok(())
+}
+
+/// A session's own calls: `may` is what its owner may do, `program` what
+/// that owner is sending.
+struct SessionServer<'a> {
+    may: u64,
+    program: &'a mut silica_remote::Sending,
+}
+
+impl session::Server<Handle> for SessionServer<'_> {
     fn protocols<'a>(&'a mut self) -> session::ProtocolsReply<'a, Handle> {
         session::ProtocolsReply { names: silica_idl_rt::Array::new(&PROTOCOLS) }
+    }
+
+    fn send(&mut self, at: u64, data: &[u8]) -> Result<session::SendReply, session::Error> {
+        if self.may & scope::SYSTEM_UPDATE == 0 {
+            return Err(session::Error::NotAllowed);
+        }
+        if at == 0 {
+            // Another program: the last one's memory goes first.
+            *self.program = silica_remote::Sending::default();
+        }
+        // Held in this service's own memory (its declaration's), down to
+        // what it keeps for itself: never in the service manager's.
+        if at.saturating_add(data.len() as u64) > self.program.room() as u64 && silica_rt::mem::available() < RESERVE {
+            return Err(session::Error::NoRoom);
+        }
+        match self.program.write(at, data, MAX_PROGRAM) {
+            Ok(()) => Ok(session::SendReply {}),
+            Err(silica_remote::NotKept::TooLarge) => Err(session::Error::TooLarge),
+            Err(silica_remote::NotKept::NoRoom) => Err(session::Error::NoRoom),
+        }
     }
 }
 

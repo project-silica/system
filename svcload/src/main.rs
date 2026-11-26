@@ -122,6 +122,7 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
         other => Err(format!("{what} with observe+control+logs only: {other:?}, not refused")),
     };
     refused("stage", system.stage(0, b"\x7fELF").map(|_| ()).map_err(err))?;
+    refused("program", system.program(1 << 24).map(|_| ()).map_err(err))?;
     refused("update", system.update("httpd", 4).map(|_| ()).map_err(err))?;
     refused("revert", system.revert("httpd").map(|_| ()).map_err(err))?;
     refused("shutdown", system.shutdown(false).map(|_| ()).map_err(err))?;
@@ -139,7 +140,7 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
     if listed.services.iter().next().is_none() {
         return Err(String::from("list, which observe allows, answered no service"));
     }
-    println!("svcload: the service manager refuses stage, update, revert and shutdown to a holder of observe+control+logs");
+    println!("svcload: the service manager refuses stage, program, update, revert and shutdown to a holder of observe+control+logs");
     Ok(())
 }
 
@@ -439,11 +440,19 @@ fn logd(load: &mut Load) -> Result<(), String> {
 }
 
 fn console(load: &mut Load) -> Result<(), String> {
-    let mut term = terminal::Client::<Channel, Handle>::from(Channel::new(grant(3)));
-    let second = term.read_line().map_err(|e| format!("console: second reader: {e:?}"))?;
-    if !second.busy || !second.line.is_empty() {
-        return Err(format!("console: a second reader received a line while the shell was waiting: {:?}", second.line));
+    // A second reader while the shell waits is kept waiting behind it: it
+    // neither takes the shell's line nor is refused (it was answered busy,
+    // and the shell asked again every second until it was the only one).
+    // Its own call's limit ends the wait here; the console then finds its
+    // caller gone and keeps nothing for it.
+    let mut second = terminal::Client::<Channel, Handle>::from(Channel::within(grant(3), 300_000_000));
+    match second.read_line() {
+        Err(silica_idl_rt::CallError::Transport(silica_idl_rt::TransportError::Cancelled)) => {}
+        Ok(r) if r.busy => return Err(String::from("console: a second reader was refused (busy) instead of waiting its turn")),
+        Ok(r) => return Err(format!("console: a second reader received a line while the shell was waiting: {:?}", r.line)),
+        Err(e) => return Err(format!("console: second reader: {e:?}")),
     }
+    let mut term = terminal::Client::<Channel, Handle>::from(Channel::new(grant(3)));
     for _ in 0..ROUNDS {
         let until = now() + EVERY_NS;
         while now() < until {
