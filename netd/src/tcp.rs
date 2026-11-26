@@ -72,7 +72,7 @@ use silica_rt::{mem, slots};
 pub const GONE: u64 = 1 << 8;
 /// The first bit of the stack's notification that programs signal for
 /// their connections.
-pub const FIRST_BIT: u32 = 9;
+pub const FIRST_BIT: u32 = 10;
 const BITS: u32 = 64 - FIRST_BIT;
 /// The most listeners and programs with memory at once, and the
 /// connections the stack's own memory holds: each has `2 * BUFFER` bytes

@@ -83,6 +83,14 @@ impl Interface {
         self.queue.retry_at()
     }
 
+    /// The device manager signalled the caller's `watch` of network
+    /// interfaces (`silica_queue::client::Queue::provider_changed`): from
+    /// the first call the interface's next driver is tried when this is
+    /// said, not by the clock, and [`Interface::retry_at`] is `None`.
+    pub fn provider_changed(&mut self) {
+        self.queue.provider_changed()
+    }
+
     /// The caller received `bits` on its notification (`open_on`).
     pub fn signalled(&mut self, bits: u64) {
         self.queue.signalled(bits)
@@ -108,6 +116,12 @@ impl Interface {
     /// Withdraw the registration `id`.
     pub fn remove_memory(&mut self, id: u32) -> Result<(), Error> {
         self.queue.remove_memory(id)
+    }
+
+    /// Whether the interface's driver is away (it ended, and the next has
+    /// not taken the connection yet).
+    pub fn away(&self) -> bool {
+        self.queue.away()
     }
 
     /// How many requests are in progress.
