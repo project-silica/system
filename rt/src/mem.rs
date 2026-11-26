@@ -81,7 +81,7 @@ const POOL_BITS: u8 = 20;
 
 /// An empty Untyped of `2^bits` bytes, or `NoMemory`.
 ///
-/// Small blocks come from pools of their own ([`POOL_BITS`]): the kernel
+/// Small blocks come from pools of their own (`POOL_BITS`): the kernel
 /// makes each block at the next multiple of its size in its source, so a
 /// large block made after small ones skips up to its whole size, and a
 /// parent whose children's large blocks alternated with its own small

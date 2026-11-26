@@ -247,7 +247,7 @@ struct Trace {
 }
 
 /// The blocks a narrowed capability reaches, and how it came to be.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct Window {
     /// The badge of the capability it was narrowed from.
     owner: u64,
@@ -261,10 +261,10 @@ struct Window {
     made: u64,
     /// This service's capability with the window's badge: what each holder
     /// is given is derived from it, so deleting it takes every one back.
-    keep: Cap,
+    keep: Handle,
 }
 
-/// Every window, by index ([`NARROWED`]): the first [`FIRST_WINDOWS`] are
+/// Every window, by index ([`NARROWED`]): the first `FIRST_WINDOWS` are
 /// first windows, the rest inner ones. An index is used again only after
 /// its window's capabilities are all gone and its client disconnected.
 struct Windows {
@@ -514,12 +514,11 @@ impl<D: Device> Service<D> {
     fn end_window(&mut self, k: usize) {
         let Some(w) = self.windows.all[k].take() else { return };
         self.session.disconnect(NARROWED + k as u64, &mut Map(&mut self.device));
-        // SAFETY: this service's own capability; what was derived from it
-        // (the holders') goes with it, which is the point.
-        #[allow(unsafe_code)]
-        let _ = unsafe { sys::cap_delete(w.keep) };
-        release_slot(w.keep.0);
-        match w.under {
+        // Its capability goes, and with it every one derived from it (the
+        // holders'), which is the point (`Handle` deletes it when dropped).
+        let under = w.under;
+        drop(w);
+        match under {
             Some(f) => {
                 if let Some(first) = self.windows.all[f].as_mut() {
                     first.inner = first.inner.saturating_sub(1);
@@ -527,7 +526,7 @@ impl<D: Device> Service<D> {
             }
             None => {
                 for i in FIRST_WINDOWS..FIRST_WINDOWS + INNER_WINDOWS {
-                    if self.windows.all[i].is_some_and(|w| w.under == Some(k)) {
+                    if self.windows.all[i].as_ref().is_some_and(|w| w.under == Some(k)) {
                         self.end_window(i);
                     }
                 }
@@ -537,7 +536,7 @@ impl<D: Device> Service<D> {
 
     /// A capability derived from window `k`'s, for its next holder.
     fn give_window(&self, k: usize) -> Result<NarrowReply<Handle>, Error> {
-        let keep = self.windows.all[k].as_ref().ok_or(Error::NoRoom)?.keep;
+        let keep = self.windows.all[k].as_ref().ok_or(Error::NoRoom)?.keep.cap();
         let slot = free_slot().ok_or(Error::NoRoom)?;
         if sys::cap_derive(slots::SPACE, slot, keep, Rights(Rights::WRITE.0 | Rights::GRANT.0), 0).is_err() {
             release_slot(slot);
@@ -564,11 +563,11 @@ impl<D: Device> device::Server<Handle> for Service<D> {
     /// its range alone: every holder of the whole device may reach it, so
     /// whoever narrows the same range again (a partition opened again, by
     /// the same or another opener) is given the same window; there are
-    /// [`FIRST_WINDOWS`], and past them the oldest ends (its capabilities
+    /// `FIRST_WINDOWS`, and past them the oldest ends (its capabilities
     /// are taken back, its client disconnected). An inner window (narrowed
     /// from a narrowed capability) is named by its range and the window it
     /// was narrowed from; under one first window there are at most
-    /// [`INNER_PER_FIRST`], past them `no_room`.
+    /// `INNER_PER_FIRST`, past them `no_room`.
     fn narrow(&mut self, first: u64, blocks: u64) -> Result<NarrowReply<Handle>, Error> {
         let info = self.device.info();
         let caller = self.caller;
@@ -585,11 +584,11 @@ impl<D: Device> device::Server<Handle> for Service<D> {
         // Under which first window it lies, if the caller's is narrowed.
         let under = (caller >= NARROWED).then(|| {
             let k = (caller - NARROWED) as usize;
-            self.windows.all[k].and_then(|w| w.under).unwrap_or(k)
+            self.windows.all[k].as_ref().and_then(|w| w.under).unwrap_or(k)
         });
         let k = match under {
             Some(f) => {
-                if self.windows.all[f].is_none_or(|w| w.inner >= INNER_PER_FIRST) {
+                if self.windows.all[f].as_ref().is_none_or(|w| w.inner >= INNER_PER_FIRST) {
                     return Err(Error::NoRoom);
                 }
                 (FIRST_WINDOWS..FIRST_WINDOWS + INNER_WINDOWS).find(|i| self.windows.all[*i].is_none()).ok_or(Error::NoRoom)?
@@ -598,8 +597,9 @@ impl<D: Device> device::Server<Handle> for Service<D> {
                 Some(k) => k,
                 None => {
                     // The oldest goes.
-                    let oldest =
-                        (0..FIRST_WINDOWS).min_by_key(|i| self.windows.all[*i].map_or(u64::MAX, |w| w.made)).ok_or(Error::NoRoom)?;
+                    let oldest = (0..FIRST_WINDOWS)
+                        .min_by_key(|i| self.windows.all[*i].as_ref().map_or(u64::MAX, |w| w.made))
+                        .ok_or(Error::NoRoom)?;
                     self.end_window(oldest);
                     oldest
                 }
@@ -612,7 +612,8 @@ impl<D: Device> device::Server<Handle> for Service<D> {
             return Err(Error::NoRoom);
         }
         self.windows.made += 1;
-        self.windows.all[k] = Some(Window { owner: caller, first, blocks, under, inner: 0, made: self.windows.made, keep: Cap(keep) });
+        self.windows.all[k] =
+            Some(Window { owner: caller, first, blocks, under, inner: 0, made: self.windows.made, keep: Handle::new(Cap(keep)) });
         if let Some(f) = under
             && let Some(w) = self.windows.all[f].as_mut()
         {

@@ -5,7 +5,7 @@
 //! header: the test machine's second disk), and writes every one of its
 //! first [`BLOCKS`] blocks [`ROUNDS`] times, in a scattered order, [`DEPTH`] at a time,
 //! with a flush after every [`FLUSH_EVERY`] completed writes, while asking
-//! the device manager to restart the disk's driver every [`KILL_EVERY_NS`]
+//! the device manager to restart the disk's driver [`KILLS`] times, spread evenly
 //! (an abrupt end: its memory, its capabilities and its device's view of
 //! memory are taken away at once). It reports how long each recovery took,
 //! from the driver's end to the first completion after it, and fails if one
@@ -34,7 +34,10 @@ const BLOCKS: u64 = 16384;
 const ROUNDS: u64 = 4;
 const DEPTH: u64 = 32;
 const FLUSH_EVERY: u64 = 256;
-const KILL_EVERY_NS: u64 = 200_000_000;
+/// How often the driver is killed, once every `BLOCKS * ROUNDS / (KILLS + 1)`
+/// writes completed: by progress, not time, so a fast run is killed as
+/// often as a slow one.
+const KILLS: u32 = 10;
 /// The longest a recovery may take.
 const RECOVERY_NS: u64 = 250_000_000;
 const SECOND: u64 = 1_000_000_000;
@@ -127,7 +130,7 @@ fn run() -> Result<(), &'static str> {
             m.write64((slot * 512 + i * 8) as usize, round << 40 | block << 16 | i);
         }
     };
-    let (start, mut next_kill) = (clock.now(), clock.now() + KILL_EVERY_NS);
+    let start = clock.now();
     let (mut sent, mut done, mut since_flush, mut kills) = (0u64, 0u64, 0u64, 0u32);
     let mut rewrites = 0u64;
     let mut recoveries = Vec::new();
@@ -157,11 +160,10 @@ fn run() -> Result<(), &'static str> {
             sent += 1;
         }
         disk.kick();
-        if clock.now() >= next_kill && kills < 10 {
+        if kills < KILLS && done >= (kills as u64 + 1) * total / (KILLS as u64 + 1) {
             // The driver ends now, with writes in flight.
             devices.restart(id).map_err(|_| "the device manager would not restart the driver")?;
             kills += 1;
-            next_kill = clock.now() + KILL_EVERY_NS;
         }
         let c = disk.wait(Some(clock.now() + 5 * SECOND)).map_err(|e| {
             println!("blkload: waiting: {e:?}");
@@ -215,7 +217,7 @@ fn run() -> Result<(), &'static str> {
     );
     // Every kill must have happened, under load, and been recovered from:
     // one kill was once enough to pass.
-    if kills < 10 || recoveries.len() < kills as usize {
+    if kills < KILLS || recoveries.len() < kills as usize {
         return Err("the driver was not killed while writes were in flight");
     }
     if worst > RECOVERY_NS {

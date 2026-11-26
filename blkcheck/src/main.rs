@@ -109,27 +109,29 @@ fn why<E: core::fmt::Debug>(e: E, what: &'static str) -> &'static str {
 fn run() -> Result<(), &'static str> {
     let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT)));
     let found = disks(&mut devices)?;
+    // One megabyte the device reads and writes, for every disk's checks and
+    // the attacks after them (taken once: a program's memory is not given
+    // back piece by piece).
+    let memory = Memory::new(20).map_err(|e| why(e, "no memory"))?;
     for (id, driver) in found.iter().cloned() {
         println!("blkcheck: disk {id:#x}, driven by {driver}");
         let disk = Disk::open(Cap(slots::FIRST_GRANT), id).map_err(|e| why(e, "cannot open the disk"))?;
         // The gated block benchmarks are virtio-blk's (blk_*); another
         // driver's are named after it.
         let prefix = if driver == "virtio-blk" { "blk" } else { driver.as_str() };
-        check(disk, &driver, prefix)?;
+        check(disk, &driver, prefix, &memory)?;
     }
     // After the disks' checks, so an injected fault lands where it did.
-    hostile(&mut devices, found[0].0)?;
+    hostile(&mut devices, found[0].0, &memory)?;
     Ok(())
 }
 
-fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str> {
+fn check(mut disk: Disk, driver: &str, prefix: &str, memory: &Memory) -> Result<(), &'static str> {
     let pass = |name: &str| println!("TEST {driver}.{name} PASS");
     let info = disk.info().clone();
     let bs = info.block_size as usize;
     println!("blkcheck: {} blocks of {} bytes{}", info.blocks, bs, if info.write_cache { ", write cache" } else { "" });
-    // One megabyte the device reads and writes.
-    let memory = Memory::new(20).map_err(|e| why(e, "no memory"))?;
-    disk.add_memory(0, &memory, true).map_err(|e| why(e, "cannot register memory with the driver"))?;
+    disk.add_memory(0, memory, true).map_err(|e| why(e, "cannot register memory with the driver"))?;
     // The device writes it, so it is read as registers are.
     let m = memory.shared();
     let deadline = || Some(silica_rt::clock().now() + 5 * SECOND);
@@ -178,7 +180,7 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
     ];
     // Memory the device may read but not write: registered for a read
     // above, which must be refused.
-    disk.add_memory(1, &memory, false).map_err(|e| why(e, "cannot register read-only memory"))?;
+    disk.add_memory(1, memory, false).map_err(|e| why(e, "cannot register read-only memory"))?;
     for (r, what) in refused {
         match disk.run(&r, deadline()) {
             Err(Error::Request(Status::Invalid)) => {}
@@ -377,14 +379,6 @@ fn check(mut disk: Disk, driver: &str, prefix: &str) -> Result<(), &'static str>
     }
     let ns = clock.now() - start;
     println!("BENCH {prefix}_read4k_qd32 {} ops/s", total * SECOND / ns.max(1));
-    // The connection goes, then the memory it reached comes back for the
-    // next disk (a check of two disks ran out of it).
-    drop(disk);
-    // SAFETY: nothing refers to the memory now: the connection is gone.
-    #[allow(unsafe_code)]
-    unsafe {
-        memory.free()
-    };
     Ok(())
 }
 
@@ -401,7 +395,7 @@ fn lend(cap: Cap, rights: silica_rt::sys::Rights) -> Result<Handle, &'static str
 /// Clients that attack the drivers and the device manager through what
 /// any client holds. Each prints `TEST hostile.<name> PASS`; a class with
 /// no device is said and not tested.
-fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32) -> Result<(), &'static str> {
+fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32, buffer: &Memory) -> Result<(), &'static str> {
     use silica_rt::sys::{ObjectType, Rights};
     let pass = |name: &str| println!("TEST hostile.{name} PASS");
     let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
@@ -423,8 +417,7 @@ fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32) -> Result<
     }
     let mut again =
         Disk::open(Cap(slots::FIRST_GRANT), disk).map_err(|e| why(e, "after 9000 opens and watches, the disk cannot be opened"))?;
-    let buffer = Memory::new(20).map_err(|e| why(e, "no memory"))?;
-    again.add_memory(0, &buffer, true).map_err(|e| why(e, "cannot register memory"))?;
+    again.add_memory(0, buffer, true).map_err(|e| why(e, "cannot register memory"))?;
     let deadline = || Some(silica_rt::clock().now() + 5 * SECOND);
     again
         .run(&Request { op: Op::Read, memory: 0, block: 1, offset: 0, blocks: 1, tag: 1 }, deadline())
@@ -449,11 +442,6 @@ fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32) -> Result<
     }
     again.remove_memory(1).map_err(|e| why(e, "withdrawing memory failed"))?;
     println!("blkcheck: 4 MiB registered and withdrawn {cycles} times");
-    // SAFETY: withdrawn: nothing refers to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        churn.free()
-    };
     again
         .run(&Request { op: Op::Read, memory: 0, block: 1, offset: 0, blocks: 1, tag: 2 }, deadline())
         .map_err(|e| why(e, "after the registrations, a read failed"))?;
@@ -471,9 +459,12 @@ fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32) -> Result<
         let mut control = silica_block::device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
         let max = control.info().map_err(|e| why(e, "info failed"))?.info.max_blocks.min(2048);
         let rings = Memory::new(silica_queue::RINGS_BITS).map_err(|e| why(e, "no memory"))?;
+        // What the driver is given derives from this, so dropping it takes
+        // the rings back from the driver alone.
+        let lent_rings = lend(rings.frame(), rw)?;
 
         let wake = control
-            .connect(lend(rings.frame(), rw)?, lend(note.cap(), Rights::WRITE)?)
+            .connect(lend(lent_rings.cap(), rw)?, lend(note.cap(), Rights::WRITE)?)
             .map_err(|e| why(e, "a raw connection was refused"))?
             .requests;
         control.add_memory(0, lend(buffer.frame(), rw)?, true).map_err(|e| why(e, "registering memory on the raw connection failed"))?;
@@ -496,11 +487,9 @@ fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32) -> Result<
             }
             silica_rt::sys::yield_now();
         }
-        // SAFETY: nothing of this program's refers to the rings any more.
-        #[allow(unsafe_code)]
-        unsafe {
-            rings.free()
-        };
+        // The driver's capability to the rings goes (deleting the one it
+        // was derived from deletes it), and its mapping with it.
+        drop(lent_rings);
         // The driver is woken at once: it finds the ring broken while
         // the device still works on the requests.
         let _ = silica_rt::sys::signal(wake.cap());
