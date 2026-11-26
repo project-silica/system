@@ -5,16 +5,33 @@
 //! `silica_remote` the framing) and answers only owners: a connection's
 //! first message is a Noise IK handshake whose initiator key must be one
 //! of the owners the machine was given (the boot archive's `remote.owners`),
-//! sealed to this machine's key (`remote.key`). Anyone else is closed on
-//! without an answer and said in the log. After the handshake every call
-//! a session makes is the same IDL request a program here would make, and
-//! goes on to the provider unchanged: channel 1 is the service manager
-//! (`silica.system.Manager`), channel 2 the log (`silica.log.Reader`).
-//! The service holds a capability to each, badged as itself; what a
-//! session may do is exactly what this service may, and a request that
-//! needs a capability is refused by its provider, which sees none. The
+//! sealed to this machine's key (`remote.key`), and made later than every
+//! first message taken from that owner before (`silica_remote::stamp`;
+//! the newest time of each kept across this service's restarts in its kept
+//! page), so a recorded one sent again is refused at once. Anyone else is
+//! closed on without an answer and said in the log. A connection is an
+//! owner's session only once its first sealed message opens: until then
+//! (10 s at most) it holds one of eight places, two from any one address:
+//! a connection that has not given an owner's handshake in its first
+//! second gives its place to newer ones, the oldest first, and one an
+//! owner's handshake was answered on never does (`make_room`). A session
+//! is closed when no whole message has come for an hour
+//! (`remote.idle=<seconds>` on the command line sets another); bytes that
+//! make no message keep nothing open.
+//!
+//! After the handshake every call a session makes is the same IDL request
+//! a program here would make, and goes on to the provider unchanged:
+//! channel 1 is the service manager (`silica.system.Manager`), channel 2
+//! the log (`silica.log.Reader`). The service holds a capability to each,
+//! badged as itself and scoped to what owners may do through it; each
+//! owner may do what its line of `remote.owners` says (`observe`,
+//! `control`, `update`, `power`, joined with `+`; all four when it says
+//! none), and a call beyond it is refused here and said in the log. The
 //! providers check every request as they check a local one: nothing a
-//! session sends is trusted here beyond its framing.
+//! session sends is trusted here beyond its framing. One session at a
+//! time sends a program (`stage`, then `update`): the one whose piece the
+//! service manager last took, until its `update` is answered, it ends, or
+//! it stages nothing for a minute; a piece refused takes nothing.
 //!
 //! The log names who did what: every session's start and end with its
 //! owner's name and address, and every call that changes the system
@@ -60,10 +77,14 @@ const MAX_UNPROVEN: usize = 8;
 const MAX_UNPROVEN_FROM_ONE: usize = 2;
 /// A connection not proven an owner's in this long is closed.
 const HANDSHAKE: u64 = 10_000_000_000;
+/// How long a new connection has to give an owner's handshake before a
+/// newer one may take its place.
+const GRACE: u64 = 1_000_000_000;
 /// A sender of a program (`stage`) that sends nothing more for this long
 /// lets another owner send one.
 const STAGE_IDLE: u64 = 60_000_000_000;
-/// A session nothing arrived on for this long is closed.
+/// A session no whole message arrived on for this long is closed (the
+/// owner sets another with `remote.idle=<seconds>` on the command line).
 const IDLE: u64 = 3_600_000_000_000;
 
 enum State {
@@ -115,16 +136,48 @@ struct Machine {
     /// its session ends, or it stages nothing for [`STAGE_IDLE`]. As the
     /// session and when it last staged.
     stager: Option<(u64, u64)>,
+    /// How long a session may be idle ([`IDLE`]).
+    idle: u64,
+    /// The time of the newest first message taken from each owner
+    /// (`silica_remote::stamp`), kept in the page the service manager keeps
+    /// across this service's restarts (`keep`): one taken before a restart
+    /// is no more taken after it.
+    newest: Vec<u64>,
+    keep: Option<silica_rt::mmio::Mmio>,
+}
+
+/// The keep page: this word, the number of owners, then each one's newest
+/// time. Another program (an update) is given a fresh page, and the times
+/// start again from zero.
+const KEPT: u64 = u64::from_be_bytes(*b"rmtnewst");
+
+impl Machine {
+    /// The newest times kept for `owners` owners, or zeros.
+    fn kept(keep: Option<&silica_rt::mmio::Mmio>, owners: usize) -> Vec<u64> {
+        match keep {
+            Some(k) if k.read64(0) == KEPT && k.read64(8) == owners as u64 => {
+                (0..owners).map(|o| if 16 + 8 * o + 8 <= k.len() { k.read64(16 + 8 * o) } else { 0 }).collect()
+            }
+            _ => silica_rt::alloc::vec![0; owners],
+        }
+    }
+
+    /// A first message of owner `o` made at `made` was taken.
+    fn took(&mut self, o: usize, made: u64) {
+        self.newest[o] = made;
+        if let Some(k) = &self.keep
+            && 16 + 8 * o + 8 <= k.len()
+        {
+            k.write64(0, KEPT);
+            k.write64(8, self.newest.len() as u64);
+            k.write64(16 + 8 * o, made);
+        }
+    }
 }
 
 fn main(_info: &'static ProcessInfo) -> i64 {
-    // The key's text is as secret as the key: wiped once read.
-    let mut text = read_file(KEY_FILE);
-    let parsed = text.as_deref().and_then(silica_remote::parse_key);
-    if let Some(t) = text.take() {
-        silica_crypto::wipe(&mut t.into_bytes());
-    }
-    let key = match parsed {
+    // The key's text is as secret as the key (`read_key` wipes it).
+    let key = match read_key(KEY_FILE) {
         Some(mut k) => {
             let pair = Keypair::new(k);
             silica_crypto::wipe(&mut k);
@@ -180,7 +233,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         if owners.len() == 1 { "" } else { "s" },
         core::str::from_utf8(&silica_remote::key_text(&key.public)).unwrap_or("?")
     );
-    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), stager: None };
+    let idle =
+        silica_rt::option("idle").and_then(|s| s.parse::<u64>().ok()).filter(|s| *s > 0).map_or(IDLE, |s| s.saturating_mul(1_000_000_000));
+    // A page of 4 KiB, read and written one access at a time.
+    let keep = silica_rt::mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
+    let newest = Machine::kept(keep.as_ref(), owners.len());
+    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), stager: None, idle, newest, keep };
     let mut sessions: Vec<Session> = Vec::new();
     let mut next_id = 1u64;
     loop {
@@ -210,20 +268,6 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         done: false,
                     };
                     next_id += 1;
-                    // Room among those not yet proven: the oldest of them (from
-                    // this address, if it has its share) gives its place.
-                    let unproven = |s: &&Session| !s.proven && !s.closing;
-                    let mine = sessions.iter().filter(unproven).filter(|s| s.from == from).count();
-                    if mine >= MAX_UNPROVEN_FROM_ONE || sessions.iter().filter(unproven).count() >= MAX_UNPROVEN {
-                        let oldest = sessions
-                            .iter_mut()
-                            .filter(|s| !s.proven && !s.closing && (mine < MAX_UNPROVEN_FROM_ONE || s.from == from))
-                            .min_by_key(|s| s.since);
-                        if let Some(o) = oldest {
-                            println!("remote: a connection from {} closed: a newer one takes its place", o.peer);
-                            o.close();
-                        }
-                    }
                     if sessions.iter().filter(|s| s.proven && !s.closing).count() >= MAX_SESSIONS {
                         println!("remote: a connection from {} closed: {MAX_SESSIONS} sessions are open", session.peer);
                         session.close();
@@ -242,6 +286,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         for s in sessions.iter_mut() {
             progress |= s.step(&mut m, now);
         }
+        progress |= make_room(&mut sessions, now);
         // Ended: closed and sent, or broken.
         let mut i = 0;
         while i < sessions.len() {
@@ -273,7 +318,11 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             if s.sent < s.output.len() && !s.s.sleep_write() {
                 may_sleep = false;
             }
-            deadline = deadline.min(s.deadline());
+            deadline = deadline.min(s.deadline(m.idle));
+            // A stranger past its second may be closed for room (`make_room`).
+            if !s.proven && matches!(s.state, State::Handshake) && s.since + GRACE > now {
+                deadline = deadline.min(s.since + GRACE);
+            }
         }
         if may_sleep {
             let _ = tcp.wait((deadline != u64::MAX).then_some(deadline));
@@ -281,9 +330,43 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     }
 }
 
+/// Keep the connections not yet proven an owner's within their room, once
+/// every one has been read: a connection that has given no owner's
+/// handshake (a stranger, so far) and has had [`GRACE`] to give one gives
+/// its place, the oldest first, while its address has more than
+/// [`MAX_UNPROVEN_FROM_ONE`] such or all together more than
+/// [`MAX_UNPROVEN`]. Younger ones wait their second (the stack bounds how
+/// many there are), so a stream of newcomers cannot push out an owner's
+/// connection before its first message is read; one whose owner's
+/// handshake was answered (a fresh one: a replay is refused, `stamp`) is
+/// the owner's, a round trip from proving it, and is never closed for room.
+/// Whether any was closed.
+fn make_room(sessions: &mut [Session], now: u64) -> bool {
+    let stranger = |s: &Session| !s.proven && !s.closing && matches!(s.state, State::Handshake) && now >= s.since + GRACE;
+    let mut closed = false;
+    loop {
+        let waiting = sessions.iter().filter(|s| !s.proven && !s.closing).count();
+        let crowded = sessions
+            .iter()
+            .filter(|s| stranger(s))
+            .map(|s| s.from)
+            .find(|&a| sessions.iter().filter(|s| stranger(s) && s.from == a).count() > MAX_UNPROVEN_FROM_ONE);
+        if crowded.is_none() && waiting <= MAX_UNPROVEN {
+            return closed;
+        }
+        let Some(oldest) = sessions.iter_mut().filter(|s| stranger(s) && crowded.is_none_or(|a| s.from == a)).min_by_key(|s| s.since)
+        else {
+            return closed;
+        };
+        println!("remote: a connection from {} closed: newer ones need its place", oldest.peer);
+        oldest.close();
+        closed = true;
+    }
+}
+
 impl Session {
-    fn deadline(&self) -> u64 {
-        if self.proven { self.last + IDLE } else { self.since + HANDSHAKE }
+    fn deadline(&self, idle: u64) -> u64 {
+        if self.proven { self.last.saturating_add(idle) } else { self.since + HANDSHAKE }
     }
 
     /// Send what is pending, then end.
@@ -320,9 +403,9 @@ impl Session {
         if self.closing {
             return progress;
         }
-        if now >= self.deadline() {
+        if now >= self.deadline(m.idle) {
             if self.proven {
-                println!("remote: {}'s session from {} closed: nothing for an hour", self.who(m), self.peer);
+                println!("remote: {}'s session from {} closed: no message for {} s", self.who(m), self.peer, m.idle / 1_000_000_000);
             } else {
                 println!("remote: a connection from {} closed: no owner proven within 10 s", self.peer);
             }
@@ -423,10 +506,20 @@ impl Session {
             );
             return self.close();
         };
-        if payload != 0 {
-            println!("remote: a connection from {} closed: its handshake carries a payload", self.peer);
+        // Made after every first message taken from this owner: one seen
+        // before, by anyone who saw it pass, opens nothing (`stamp`).
+        let Some(made) = silica_remote::stamp_of(&frame[..payload]) else {
+            println!("remote: a connection from {} closed: its handshake carries no time", self.peer);
+            return self.close();
+        };
+        if made <= m.newest[o] {
+            println!(
+                "remote: a connection from {} closed: a handshake of {} made no later than the last taken from them (replayed, or their clock went back)",
+                self.peer, m.owners[o].1
+            );
             return self.close();
         }
+        m.took(o, made);
         let mut e = [0u8; 32];
         silica_rt::random::fill(&mut e);
         let mut out = [0u8; noise::SECOND];
@@ -597,4 +690,21 @@ fn read_file(slot: u64) -> Option<String> {
 fn address(a: u32, port: u16) -> String {
     let [x, y, z, w] = a.to_be_bytes();
     silica_rt::alloc::format!("{x}.{y}.{z}.{w}:{port}")
+}
+/// The machine's key from the file in `slot` (`remote.key`): its 64
+/// hexadecimal digits, read into a buffer of this function's that is wiped
+/// before it returns, the file's mapping let go of with it. (The text was
+/// read into a growing string before, every copy of it left behind.)
+fn read_key(slot: u64) -> Option<[u8; 32]> {
+    let info = sys::inspect_slot(slots::SPACE, slot).ok()??;
+    let lent = silica_rt::mem::Lent::map(Cap(slot), info.bits, Rights::READ).ok()?;
+    let region = lent.region();
+    let mut text = [0u8; 128];
+    let n = text.len().min(region.len());
+    region.read_bytes(0, &mut text[..n]);
+    let end = text[..n].iter().position(|b| *b == 0).unwrap_or(n);
+    let key = core::str::from_utf8(&text[..end]).ok().and_then(silica_remote::parse_key);
+    silica_crypto::wipe(&mut text);
+    drop(lent);
+    key
 }

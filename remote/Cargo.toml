@@ -14,6 +14,7 @@ publish.workspace = true
 [package.metadata.silica.service]
 needs = ["silica.net.Tcp", "silica.system.Manager:observe+control+update+power", "silica.log.Reader"]
 files = ["remote.key", "remote.owners"]
+keeps = true
 memory = 23
 start = "boot"
 restart = "always"
