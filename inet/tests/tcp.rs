@@ -548,6 +548,55 @@ fn closing_at_once_from_both_sides_ends_both() {
     assert!(net.log.iter().filter(|l| l.1.flags & FIN != 0).count() >= 2);
 }
 
+/// A segment from B's address to A, put on the wire as a stack sends it.
+fn send_from_b(net: &mut Net, h: &Header) {
+    let mut b = [0u8; 64];
+    let n = tcp::build(&mut b, B, A, h, &Options::default(), &[]).unwrap();
+    net.put(false, b[..n].to_vec());
+}
+
+/// B's stack is replaced, and the next one resets B's connections from what
+/// the last one wrote down: how far each side had sent. A reset at that
+/// number is dropped without a word whenever it is not what the peer
+/// expects; here B filled A's window with segments that were all lost, so
+/// it is at the window's right edge. Instead the next stack asks
+/// (`tcp::reset_probe`), every second until the peer says it has no such
+/// connection: the peer's answer names the byte it expects, the reset to
+/// that answer ends its connection, a reset that is lost is made again to
+/// the next answer, and the stack knows when it is done.
+#[test]
+fn a_replaced_stack_resets_its_peers_by_asking_them_not_by_its_records() {
+    let mut net = Net::new((4096, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    // B fills A's window, and none of it arrives.
+    net.drop = Box::new(|_, s| s.header.src_port == 80 && !s.data.is_empty());
+    assert_eq!(net.b().send(&pattern(4096)), 4096);
+    net.flush();
+    let (sent_to, received_to) = (net.b().sent_to(), net.b().received_to());
+    // B's stack ends: what reaches B now is answered as no connection's.
+    net.b = None;
+    net.run_until(SECOND, |_| false);
+    // The reset the last stack's records make: dropped.
+    send_from_b(&mut net, &Header { src_port: 80, dst_port: 40000, seq: sent_to, ack: received_to, flags: RST | ACK, window: 0 });
+    net.run_until(SECOND, |n| n.a.is_closed());
+    assert!(!net.a.is_closed(), "a reset at the window's edge ended the connection");
+    // The first reset made to A's answer is lost as well.
+    let mut lost = false;
+    net.drop = Box::new(move |_, s| s.has(RST) && s.header.src_port == 80 && !std::mem::replace(&mut lost, true));
+    net.log.clear();
+    let mut probes = 0;
+    while !net.log.iter().any(|l| l.0 && l.1.flags & RST != 0) {
+        probes += 1;
+        assert!(probes <= 5, "A never said it has no such connection: {:?}", net.log);
+        send_from_b(&mut net, &tcp::reset_probe(80, 40000, sent_to, received_to));
+        net.run_until(SECOND, |_| false);
+        net.now += SECOND;
+    }
+    assert!(net.a.is_closed());
+    assert_eq!(net.a.error(), Some(Error::Reset), "A took the reset to its own answer");
+    assert_eq!(probes, 3, "the first answer's reset was lost, the second's ended A, the third probe was refused");
+}
+
 #[test]
 fn an_abort_sends_a_reset_the_peer_takes() {
     let mut net = Net::new((4096, 4096), (4096, 4096));

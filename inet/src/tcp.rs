@@ -240,6 +240,20 @@ pub fn build(out: &mut [u8], src: Ipv4, dst: Ipv4, h: &Header, options: &Options
     Some(end)
 }
 
+/// A question to the peer of a connection this stack no longer holds (the
+/// last stack's, kept as how far each side had sent): a bare ACK a
+/// quarter of the sequence space behind what was sent, which no window
+/// takes, so a peer that still holds the connection answers it with an
+/// ACK naming exactly the next byte it expects (RFC 9293 3.10.7.4), and
+/// one that does not, with a reset. That answer reaches no connection
+/// here, and [`reset_reply`] to it is the reset the peer takes: its own
+/// number, not the one the last stack wrote down, which may be behind
+/// what it sent or at the edge of the peer's window (where a reset is
+/// dropped without a word, RFC 5961).
+pub fn reset_probe(local_port: u16, remote_port: u16, sent_to: u32, received_to: u32) -> Header {
+    Header { src_port: local_port, dst_port: remote_port, seq: sent_to.wrapping_sub(1 << 30), ack: received_to, flags: ACK, window: 0 }
+}
+
 /// What answers a segment that reaches no connection (RFC 9293 3.10.7.1):
 /// a reset that the sender will take as meant for it, or nothing to a
 /// reset.
