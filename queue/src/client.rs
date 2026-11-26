@@ -17,7 +17,10 @@
 //! A class's client (`silica_block::client::Disk`) wraps a [`Queue`] with
 //! its control protocol ([`Control`]) and its records.
 
-use crate::{COMPLETION_BYTES, COMPLETIONS_AT, Completion, MEMORIES, QUEUE, REQUEST_BYTES, RINGS_BITS, Raw, Refused, tag_of};
+use crate::{
+    COMPLETION_BYTES, COMPLETIONS_AT, Completion, EVENT_BYTES, EVENT_SLOTS, EVENTS_AT, MEMORIES, QUEUE, REQUEST_BYTES, RINGS_BITS, Raw,
+    Refused, tag_of,
+};
 use silica_idl_rt::{CallError, TransportError};
 use silica_protocols::device::manager;
 use silica_ring::{Consumer, Producer};
@@ -229,6 +232,10 @@ struct Link<C> {
     control: C,
     requests: Producer<REQUEST_BYTES>,
     completions: Consumer<COMPLETION_BYTES>,
+    /// The provider's event slots (`crate::EVENTS_AT`), and the sequence
+    /// last taken from each.
+    events: silica_rt::mmio::Mmio,
+    seen: [u64; EVENT_SLOTS],
     /// The kernel's notice of `wake` going (`cap_notice`). Declared before
     /// `wake`, so dropped first: a link the client ends is no driver's end,
     /// and deleting `wake` while watched would wake the client for nothing.
@@ -236,6 +243,47 @@ struct Link<C> {
     _notice: Handle,
     /// Signalled when the driver must look at the request ring.
     wake: Handle,
+}
+
+impl<C> Link<C> {
+    /// The next event the provider wrote since it was last taken, as a
+    /// completion with its tag: a slot whose sequence is even, moved, and
+    /// the same before and after its fields were read (else it is being
+    /// written: taken on a later look, its writer wakes the client again).
+    /// A hostile provider can only make events up, which a client judges
+    /// as it judges any of the provider's words.
+    fn event(&mut self) -> Option<Completion> {
+        for k in 0..EVENT_SLOTS {
+            let at = k * EVENT_BYTES;
+            let seq = self.events.read64(at);
+            if seq & 1 != 0 || seq == self.seen[k] {
+                continue;
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            let (tag, status, value) = (self.events.read64(at + 8), self.events.read32(at + 16), self.events.read32(at + 20));
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            if self.events.read64(at) != seq || tag < EVENTS {
+                continue;
+            }
+            self.seen[k] = seq;
+            return Some(Completion { tag, status, value });
+        }
+        None
+    }
+
+    /// Say the client sleeps, unless a completion or an event is there:
+    /// the flag first, then the slots (the provider writes a slot, then
+    /// looks at the flag), so an event written meanwhile is never missed.
+    fn sleep(&mut self) -> bool {
+        if !self.completions.sleep() {
+            return false;
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        (0..EVENT_SLOTS).all(|k| {
+            let seq = self.events.read64(k * EVENT_BYTES);
+            seq & 1 != 0 || seq == self.seen[k]
+        })
+    }
 }
 
 /// How a recovery from a driver's end went, in monotonic nanoseconds from
@@ -392,7 +440,8 @@ impl<C: Control> Queue<C> {
         // connection's death notice.
         let notice = Handle::new(Cap(free_slot().ok_or(Error::NoMemory)?));
         sys::cap_notice(wake.cap(), self.note, notice.cap(), self.bits.gone(self.generation))?;
-        let mut link = Box::new(Link { control, requests, completions, _notice: notice, wake });
+        let events = region.part(EVENTS_AT, EVENT_SLOTS * EVENT_BYTES).ok_or(Error::Protocol)?;
+        let mut link = Box::new(Link { control, requests, completions, events, seen: [0; EVENT_SLOTS], _notice: notice, wake });
         for (id, m) in self.memories.iter().enumerate() {
             if let Some((frame, writable)) = *m {
                 let rights = Rights(Rights::READ.0 | if writable { Rights::WRITE.0 } else { 0 });
@@ -624,7 +673,7 @@ impl<C: Control> Queue<C> {
             return false;
         }
         match self.link.as_mut() {
-            Some(link) => link.completions.sleep(),
+            Some(link) => link.sleep(),
             // Connecting again happens in `poll`, at `retry_at`, which the
             // client waits no later than.
             None => true,
@@ -665,6 +714,9 @@ impl<C: Control> Queue<C> {
             return Ok(None);
         }
         let Some(link) = self.link.as_mut() else { return Ok(None) };
+        if let Some(e) = link.event() {
+            return Ok(Some(e));
+        }
         loop {
             match link.completions.pop() {
                 Ok(Some(raw)) => {
@@ -704,7 +756,7 @@ impl<C: Control> Queue<C> {
                 self.nap_until(deadline)?;
                 continue;
             }
-            let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
+            let asleep = self.link.as_mut().is_some_and(|l| l.sleep());
             if !asleep {
                 continue;
             }
@@ -733,7 +785,7 @@ impl<C: Control> Queue<C> {
                 self.nap_until(deadline)?;
                 continue;
             }
-            let asleep = self.link.as_mut().is_some_and(|l| l.completions.sleep());
+            let asleep = self.link.as_mut().is_some_and(|l| l.sleep());
             if !asleep {
                 continue;
             }

@@ -203,6 +203,9 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
     }
     let memory = Memory::new(16).map_err(|e| why(e, "no memory"))?;
     nic.add_memory(0, &memory, true).map_err(|e| why(e, "cannot register memory with the driver"))?;
+    if silica_rt::option("crowd").is_some() {
+        return crowd(nic, memory.shared(), mac);
+    }
     let mut c = Check { nic, m: memory.shared(), mac, sent: 0 };
     for tag in 1..=BUFFERS {
         c.offer(tag)?;
@@ -374,5 +377,71 @@ fn bench(c: &mut Check, driver: &str) -> Result<(), &'static str> {
     }
     let ns = clock.now() - start;
     println!("BENCH {prefix}_tx {} frames/s", done * SECOND / ns.max(1));
+    Ok(())
+}
+
+/// `netcheck.crowd`: a client at full queue depth while the link changes.
+/// It says it is ready (the harness takes the link down: the driver tells
+/// the client), submits as many transmits as the queue holds, and does not
+/// look at its completions for a second (the harness brings the link back
+/// up meanwhile): every one of them must then be there. Before (the
+/// 2026-11-24 audit), the link's news was a record in the completion ring,
+/// which holds as many records as requests can be in flight: it took the
+/// place of the last transmit's completion, which was dropped, and the
+/// client waited for it for ever.
+fn crowd(mut nic: Interface, m: Mmio, mac: [u8; 6]) -> Result<(), &'static str> {
+    // A broadcast frame of a type nobody answers.
+    let o = OUT as usize;
+    for (i, b) in [[0xFF; 6], mac].concat().iter().chain(SINK.iter()).enumerate() {
+        m.write8(o + i, *b);
+    }
+    println!("netcheck: crowd: ready for the link to change");
+    let pause = |ns: u64| {
+        let until = silica_rt::clock().now() + ns;
+        while silica_rt::clock().now() < until {
+            silica_rt::sys::yield_now();
+        }
+    };
+    // The link goes down meanwhile, with nothing in flight.
+    pause(SECOND);
+    let depth = silica_queue::QUEUE as u64;
+    for n in 0..depth {
+        let r = Request { op: Op::Transmit, memory: 0, offset: OUT, length: 60, tag: SENT + n, offload: silica_net::Offload::NONE };
+        nic.submit(&r).map_err(|e| why(e, "cannot send"))?;
+    }
+    nic.kick();
+    println!("netcheck: crowd: {depth} transmits in flight");
+    // The device completes them, and the link comes back up, while the
+    // client does not look.
+    pause(SECOND);
+    let (mut sent, mut links) = (0u64, 0u64);
+    let deadline = silica_rt::clock().now() + 5 * SECOND;
+    while sent < depth {
+        match nic.wait(Some(deadline)) {
+            Ok(c) if c.tag == LINK => links += 1,
+            Ok(c) if (SENT..SENT + depth).contains(&c.tag) => {
+                c.result.map_err(|e| why(e, "a frame could not be sent"))?;
+                sent += 1;
+            }
+            Ok(_) => return Err("a completion of a request never made"),
+            Err(_) => {
+                println!("netcheck: crowd: {sent} of {depth} transmits completed, {links} link changes heard");
+                return Err("a completion was lost while the link changed at full queue depth");
+            }
+        }
+    }
+    // The link's news, after its completions: its latest state, up.
+    let deadline = silica_rt::clock().now() + 2 * SECOND;
+    while nic.info().map_err(|e| why(e, "cannot read the link"))?.link_up && links == 0 {
+        match nic.wait(Some(deadline)) {
+            Ok(c) if c.tag == LINK => links += 1,
+            _ => break,
+        }
+    }
+    println!("netcheck: crowd: {sent} of {depth} transmits completed, {links} link changes heard");
+    if links == 0 {
+        return Err("the link's changes were never told");
+    }
+    println!("TEST crowd PASS");
     Ok(())
 }

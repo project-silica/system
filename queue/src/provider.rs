@@ -12,11 +12,13 @@
 //! [`Session::flush`].
 
 use crate::{
-    COMPLETION_BYTES, COMPLETIONS_AT, Completion, MEMORIES, NO_MEMORY, QUEUE, REQUEST_BYTES, RINGS_BITS, Raw, Refused, memory_of, tag_of,
+    COMPLETION_BYTES, COMPLETIONS_AT, Completion, EVENT_BYTES, EVENT_SLOTS, EVENTS_AT, MEMORIES, NO_MEMORY, QUEUE, REQUEST_BYTES,
+    RINGS_BITS, Raw, Refused, memory_of, tag_of,
 };
 use silica_ring::{Consumer, Producer};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::Handle;
+use silica_rt::mmio::Mmio;
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{mem, slots};
 
@@ -121,29 +123,11 @@ struct Connection<M> {
     stalled: Option<Raw>,
     /// Completions were added since the client was last told.
     completed: bool,
-    /// Requests taken and not yet completed.
-    in_flight: u32,
-    /// Events not yet in the completion ring (one per tag, the latest):
-    /// an event takes a slot only beyond those the client's requests
-    /// will need, so no completion is ever crowded out.
-    events: Vec<Completion>,
-}
-
-impl<M> Connection<M> {
-    /// Completion slots the client's requests still need: those taken and
-    /// not completed, those waiting in its ring, a stalled one.
-    fn owed(&self) -> u32 {
-        self.in_flight + self.requests.waiting_now() + u32::from(self.stalled.is_some())
-    }
-
-    /// Put waiting events into the completion ring where they fit.
-    fn post_events(&mut self) {
-        while !self.events.is_empty() && self.completions.room() > self.owed() {
-            let e = self.events.remove(0);
-            let _ = self.completions.push(&e.encode());
-            self.completed = true;
-        }
-    }
+    /// The event slots in the client's frame (`EVENTS_AT`), and what this
+    /// provider wrote in each: the tag and the sequence, its own copy (the
+    /// client may write the shared one).
+    event_area: Option<Mmio>,
+    event_slots: [(u64, u64); EVENT_SLOTS],
 }
 
 impl<M> Connection<M> {
@@ -331,8 +315,8 @@ impl<M> Session<M> {
             memories,
             stalled: None,
             completed: false,
-            in_flight: 0,
-            events: Vec::new(),
+            event_area: region.part(EVENTS_AT, EVENT_SLOTS * EVENT_BYTES),
+            event_slots: [(0, 0); EVENT_SLOTS],
         });
         Ok(Handle::new(Cap(wake)))
     }
@@ -415,7 +399,6 @@ impl<M> Session<M> {
                 let region = c.memories.get(memory as usize).and_then(Option::as_ref).map(|m| m.region);
                 match start(&raw, ticket, region, c.client) {
                     Ok(t) => {
-                        c.in_flight += 1;
                         if let Some(m) = c.memories.get_mut(t.memory as usize).and_then(Option::as_mut) {
                             m.busy += 1;
                         }
@@ -459,20 +442,32 @@ impl<M> Session<M> {
         // that does loses the completions that do not fit.
         let _ = c.completions.push(&Completion { tag: ticket.tag, status, value }.encode());
         c.completed = true;
-        c.in_flight = c.in_flight.saturating_sub(1);
-        c.post_events();
     }
 
-    /// Add a record that answers no request (a class's event, such as a
-    /// link coming up) for every client, with `tag` a value no request uses.
+    /// Tell every client of news that answers no request (a class's event,
+    /// such as a link coming up), with `tag` a value no request uses: its
+    /// event slot holds the latest of each tag (`crate::EVENTS_AT`), never a
+    /// place a completion needs. A provider with more kinds of event than
+    /// slots tells of the first [`EVENT_SLOTS`] kinds.
     pub fn event(&mut self, tag: u64, status: u32, value: u32) {
         for c in self.connections.iter_mut().flatten() {
-            // The latest of a kind replaces one not yet posted.
-            c.events.retain(|e| e.tag != tag);
-            if c.events.len() < 8 {
-                c.events.push(Completion { tag, status, value });
-            }
-            c.post_events();
+            let Some(area) = c.event_area else { continue };
+            let Some(k) = c.event_slots.iter().position(|s| s.0 == tag).or_else(|| c.event_slots.iter().position(|s| s.1 == 0)) else {
+                continue;
+            };
+            let seq = c.event_slots[k].1;
+            let at = k * EVENT_BYTES;
+            // Odd while it is written; even, and higher, when it is whole.
+            area.write64(at, seq + 1);
+            area.write64(at + 8, tag);
+            area.write32(at + 16, status);
+            area.write32(at + 20, value);
+            area.write64(at, seq + 2);
+            // Written before the client's sleep flag is looked at (`flush`):
+            // a client that said it sleeps after this sees the slot.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            c.event_slots[k] = (tag, seq + 2);
+            c.completed = true;
         }
     }
 

@@ -53,6 +53,30 @@ pub const MEMORIES: u32 = 64;
 /// The memory number of a request with no data.
 pub const NO_MEMORY: u32 = u32::MAX;
 
+/// A provider's events (a class's news that answers no request, such as a
+/// network link going up) are not records in the completion ring but state:
+/// a slot each, at the end of the rings' frame, holding the latest of its
+/// kind. The completion ring holds [`QUEUE`] records, as many as a client
+/// may have requests in flight, so every completion has its place whatever
+/// happened meanwhile. (Before, events were completion records: one posted
+/// while the ring had room took the place a completion needed later, the
+/// completion was dropped and its client waited for it for ever: the
+/// 2026-11-24 audit.)
+///
+/// A slot is 32 bytes: a sequence word (odd while the provider writes the
+/// slot, even and higher after each event), the tag, the status and the
+/// value. A client takes a slot whose sequence is even and moved since it
+/// last looked, read twice the same around the fields.
+pub const EVENT_SLOTS: usize = 8;
+/// Bytes of an event slot.
+pub const EVENT_BYTES: usize = 32;
+/// Where the event slots start in the rings' frame.
+pub const EVENTS_AT: usize = (1 << RINGS_BITS) - EVENT_SLOTS * EVENT_BYTES;
+const _: () = assert!(
+    COMPLETIONS_AT >= silica_rt::ring::size(QUEUE, REQUEST_BYTES)
+        && EVENTS_AT >= COMPLETIONS_AT + silica_rt::ring::size(QUEUE, COMPLETION_BYTES)
+);
+
 /// A request record as it lies in the ring.
 pub type Raw = [u8; REQUEST_BYTES];
 
