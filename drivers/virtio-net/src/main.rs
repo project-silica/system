@@ -29,6 +29,7 @@
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject;
 use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::oldest::Oldest;
 use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
 use silica_net::device::{Error, Info};
@@ -84,6 +85,8 @@ struct Nic {
     /// when they were started).
     rx_slots: Vec<Option<Ticket>>,
     tx_slots: Vec<Option<(Ticket, u64)>>,
+    /// The oldest frame being sent, found without a walk.
+    tx_oldest: Oldest,
     rx_free: Vec<u16>,
     tx_free: Vec<u16>,
     info: Info,
@@ -163,7 +166,10 @@ impl silica_net::service::Device for Nic {
                     self.tx_free.push(slot);
                     return Err(Refusal::Busy);
                 }
-                self.tx_slots[slot as usize] = Some((ticket, silica_rt::clock().now()));
+                let now = silica_rt::clock().now();
+                self.tx_slots[slot as usize] = Some((ticket, now));
+                let slots = &self.tx_slots;
+                self.tx_oldest.started(slot as u32, now, slots.len(), |s, t| slots[s as usize].is_some_and(|(_, x)| x == t));
             }
         }
         Ok(())
@@ -213,6 +219,10 @@ impl silica_net::service::Device for Nic {
             }
         }
         if bits & CONFIG != 0 {
+            // A device that gave up asks to be reset this way too.
+            if self.transport.needs_reset() {
+                self.give_up(DeviceError::Protocol("the device asks to be reset"));
+            }
             let up = self.link_up();
             if up != self.info.link_up {
                 self.info.link_up = up;
@@ -224,7 +234,8 @@ impl silica_net::service::Device for Nic {
 
     fn deadline(&self) -> Option<u64> {
         let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { TX_TIMEOUT_NS };
-        self.tx_slots.iter().flatten().map(|(_, t)| t + limit).min()
+        let slots = &self.tx_slots;
+        self.tx_oldest.oldest(|s, t| slots[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + limit)
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -280,8 +291,9 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         interrupts.push(Interrupt::bind_to(&device, 0, signals.sender(RX | TX | CONFIG)?)?);
     }
     inject::interrupts(signals.sender(RX | TX)?);
-    let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, Some(rx_v))?;
-    let tx = transport.queue(&dma, 1, QUEUE_SIZE, Some(tx_v))?;
+    // A frame takes a header and its data: two descriptors each way.
+    let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, 2, Some(rx_v))?;
+    let tx = transport.queue(&dma, 1, QUEUE_SIZE, 2, Some(tx_v))?;
     // A processor idling for a frame sees the device write it, without
     // waiting for the interrupt (spec/ARCHITECTURE.md section 7). Only where
     // the receive queue has an interrupt of its own (a shared one's news is
@@ -292,9 +304,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     {
         println!("virtio-net: completions wait for the interrupt alone: {e:?}");
     }
-    if features & F_STATUS != 0 {
-        transport.config_interrupt(cfg_v)?;
-    }
+    // The link's changes, and a device asking to be reset (`needs_reset`).
+    transport.config_interrupt(cfg_v)?;
     let config = transport.device_config().ok_or(DeviceError::Missing("the network device's configuration"))?;
     if config.len() < 12 {
         return Err(DeviceError::Protocol("the network device's configuration is too short"));
@@ -324,6 +335,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         tx_headers: dma.memory(12, false)?,
         rx_slots: (0..rx_count).map(|_| None).collect(),
         tx_slots: (0..tx_count).map(|_| None).collect(),
+        tx_oldest: Oldest::new(),
         rx_free: (0..rx_count as u16).rev().collect(),
         tx_free: (0..tx_count as u16).rev().collect(),
         // (Each receive descriptor bounds what the device writes: a buffer

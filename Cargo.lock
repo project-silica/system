@@ -9,6 +9,7 @@ dependencies = [
  "silica-block",
  "silica-idl-rt",
  "silica-protocols",
+ "silica-queue",
  "silica-rt",
 ]
 
@@ -206,6 +207,7 @@ version = "0.0.0"
 dependencies = [
  "silica-block",
  "silica-idl-rt",
+ "silica-protocols",
  "silica-rt",
 ]
 

@@ -39,6 +39,8 @@ struct Service {
     boot: bool,
     device_bytes: u64,
     mixes: u32,
+    /// Each device's last read (its identity, the bytes), for the health tests.
+    last: [(u32, [u8; FROM_DEVICE as usize]); 4],
     /// When devices were last mixed in (0: never asked).
     mixed_at: u64,
     out: [u8; MOST as usize],
@@ -54,8 +56,25 @@ impl Service {
             let Ok(opened) = self.devices.open(id, None) else { continue };
             let mut device = rng::Client::<Channel, Handle>::from(Channel::within(opened.driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
             if let Ok(r) = device.read(FROM_DEVICE) {
+                // Mixed in whatever they are; counted towards being seeded
+                // only if they pass the health tests (`entropy::healthy`): a
+                // broken device's constant or repeated bytes made the
+                // service say it was seeded after any 32 of them.
                 self.pool.mix(r.data);
-                self.device_bytes += r.data.len() as u64;
+                let k = self
+                    .last
+                    .iter()
+                    .position(|(d, _)| *d == id)
+                    .or_else(|| self.last.iter().position(|(d, _)| *d == u32::MAX))
+                    .unwrap_or(0);
+                let verdict = entropy::healthy(r.data, &self.last[k].1[..]);
+                self.last[k].0 = id;
+                let n = r.data.len().min(FROM_DEVICE as usize);
+                self.last[k].1[..n].copy_from_slice(&r.data[..n]);
+                match verdict {
+                    Ok(()) => self.device_bytes += r.data.len() as u64,
+                    Err(why) => println!("entropy: device {id:#x}'s bytes failed a health test ({why}); not counted"),
+                }
                 self.mixes += 1;
             }
         }
@@ -97,6 +116,7 @@ fn main(info: &'static ProcessInfo) -> i64 {
         device_bytes: 0,
         mixes: 0,
         mixed_at: 0,
+        last: [(u32::MAX, [0; FROM_DEVICE as usize]); 4],
         out: [0; MOST as usize],
     };
     seed.fill(0);

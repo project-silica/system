@@ -68,8 +68,8 @@ fn bring_up(device: &Device, dma: &Dma) -> Result<Box<dyn Weapon>, DeviceError> 
     if device.config().device() == NET_DEVICE {
         transport.negotiate(dma, F_MAC, 0)?;
         let interrupt = Interrupt::bind(device, 0)?;
-        let rx = transport.queue(dma, 0, 64, Some(0))?;
-        let tx = transport.queue(dma, 1, 64, Some(0))?;
+        let rx = transport.queue(dma, 0, 64, 3, Some(0))?;
+        let tx = transport.queue(dma, 1, 64, 2, Some(0))?;
         let config = transport.device_config().ok_or(DeviceError::Missing("a network configuration"))?;
         let mac = core::array::from_fn(|i| config.read8(i));
         transport.start();
@@ -77,7 +77,7 @@ fn bring_up(device: &Device, dma: &Dma) -> Result<Box<dyn Weapon>, DeviceError> 
     }
     transport.negotiate(dma, 0, 0)?;
     let interrupt = Interrupt::bind(device, 0)?;
-    let queue = transport.queue(dma, 0, 64, Some(0))?;
+    let queue = transport.queue(dma, 0, 64, 3, Some(0))?;
     transport.start();
     Ok(Box::new(Disk { transport, queue, interrupt, request: dma.memory(13, true)? }))
 }
@@ -322,7 +322,12 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     let mut disk = bring_up(&device, &dma)?;
     let read_only = dma.memory(12, false)?;
     read_only.shared().write64(0, 0x5EA1_ED00_5EA1_ED00);
+    // Unchanged bytes alone would prove nothing (a request that failed for
+    // any other reason leaves them so): the address is said, and the
+    // harness requires the kernel's line refusing the device that write.
     let outcome = disk.aim(T_IN, read_only.device_address())?;
+    println!("virtio-rogue: told the device to write its read-only page at {:#x}: {outcome:?}", read_only.device_address());
+    pause(50_000_000);
     if read_only.shared().read64(0) != 0x5EA1_ED00_5EA1_ED00 {
         return Err(fail("rogue_write_read_only", format_args!("the device wrote memory mapped for reading only ({outcome:?})")));
     }

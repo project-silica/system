@@ -46,6 +46,7 @@ use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject::{self, Fault};
 use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::oldest::Oldest;
 use silica_driver::{Device, DeviceError};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::mmio::Mmio;
@@ -93,6 +94,9 @@ const PRP_LIST_BYTES: usize = (MAX_TRANSFER / PAGE) as usize * 8;
 const ADMIN_TIMEOUT_NS: u64 = 5_000_000_000;
 /// How often a register is read while waiting for the controller.
 const POLL_NS: u64 = 50_000;
+/// The longest between two looks at the admin queue while a command is in
+/// progress (the interval doubles from `POLL_NS` up to this).
+const ADMIN_POLL_MAX_NS: u64 = 10_000_000;
 
 // The bits of the driver's notification: interrupt n signals 2 << n.
 const ADMIN_BIT: u64 = 2;
@@ -195,11 +199,26 @@ impl Controller {
     fn admin(&mut self, mut command: [u32; 16], what: &'static str) -> Result<u32, DeviceError> {
         self.cid = (self.cid + 1) & 0x7FFF;
         command[0] |= (self.cid as u32) << 16;
+        // An injected fault (`inject`): this command's interrupt is lost.
+        let lose_interrupt = inject::planned() == Some(Fault::AdminMissed) && inject::due() == Some(Fault::AdminMissed);
         self.admin.push(&command);
         self.admin.ring();
-        let deadline = now() + ADMIN_TIMEOUT_NS;
+        let start = now();
+        let deadline = start + ADMIN_TIMEOUT_NS;
+        // The interrupt normally ends the wait; the queue is looked at
+        // again after a poll interval that doubles from POLL_NS, so a lost
+        // interrupt costs milliseconds, not the whole timeout, and a
+        // controller that has died is seen as soon (CSTS).
+        let mut poll = POLL_NS;
+        let mut woken = true;
         loop {
             if let Some(c) = self.admin.pop()? {
+                if !woken {
+                    println!(
+                        "nvme: {what}: its completion came without its interrupt; found by polling after {} us",
+                        (now() - start) / 1000
+                    );
+                }
                 self.admin.release();
                 if c.cid != self.cid {
                     return Err(DeviceError::Protocol("an admin completion names a command not in progress"));
@@ -213,10 +232,18 @@ impl Controller {
             if self.status()? & CSTS_CFS != 0 {
                 return Err(DeviceError::Protocol("the controller reports fatal status"));
             }
-            if now() >= deadline {
+            let t = now();
+            if t >= deadline {
                 return Err(DeviceError::Timeout(what));
             }
-            self.sleep(deadline);
+            let until = (t + poll).min(deadline);
+            woken = sys::recv(self.listen, Wait::Until(until)).is_ok();
+            if woken && lose_interrupt && inject::pending(Fault::AdminMissed) {
+                // Lost: the driver does not know it came, and waits on.
+                woken = false;
+                let _ = sys::recv(self.listen, Wait::Until(until));
+            }
+            poll = (poll * 2).min(ADMIN_POLL_MAX_NS);
         }
     }
 
@@ -275,6 +302,8 @@ struct Disk {
     /// The request each command identifier carries, while the device has
     /// it, and when it was started.
     tickets: Vec<Option<(Ticket, u64)>>,
+    /// The oldest of them, found without a walk.
+    oldest: Oldest,
     free: Vec<u16>,
     /// Commands pushed since the doorbell was last rung.
     unrung: bool,
@@ -364,7 +393,10 @@ impl BlockDevice for Disk {
             c[11] = (request.block >> 32) as u32;
             c[12] = request.blocks - 1;
         }
-        self.tickets[cid as usize] = Some((ticket, now()));
+        let at = now();
+        self.tickets[cid as usize] = Some((ticket, at));
+        let tickets = &self.tickets;
+        self.oldest.started(cid as u32, at, tickets.len(), |s, t| tickets[s as usize].is_some_and(|(_, x)| x == t));
         // An injected fault (`silica_driver::inject`): the controller never
         // sees this command.
         if inject::due() == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
@@ -424,7 +456,8 @@ impl BlockDevice for Disk {
 
     fn deadline(&self) -> Option<u64> {
         let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { IO_TIMEOUT_NS };
-        self.tickets.iter().flatten().map(|(_, t)| t + limit).min()
+        let tickets = &self.tickets;
+        self.oldest.oldest(|s, t| tickets[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + limit)
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -578,6 +611,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         prp_mem: prp.shared(),
         prp,
         tickets: (0..io_entries).map(|_| None).collect(),
+        oldest: Oldest::new(),
         free: (0..io_entries).rev().collect(),
         unrung: false,
         io_bit,

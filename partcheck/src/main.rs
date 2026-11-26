@@ -13,7 +13,9 @@
 
 use silica_block::client::{Disk, Error};
 use silica_block::partitions;
-use silica_block::{Op, Request, Status};
+use silica_block::service::TRACED;
+use silica_block::{Op, Request, Status, device};
+use silica_protocols::device::manager;
 use silica_rt::ipc::{Channel, Handle};
 use silica_rt::mem::Memory;
 use silica_rt::sys::Cap;
@@ -91,5 +93,84 @@ fn run() -> Result<(), &'static str> {
         return Err("a write to the partition did not land where it belongs on the disk");
     }
     pass("write");
+
+    // What a capability's scopes allow (`silica_protocols::scope`): the
+    // third grant may list partitions and not open them.
+    let mut listing = partitions::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT + 2)));
+    match listing.open(id, None) {
+        Err(silica_idl_rt::CallError::Error(partitions::Error::Refused)) => {}
+        Ok(_) => return Err("a capability given only `list` opened a partition"),
+        Err(e) => {
+            println!("partcheck: open through the list-only capability: {e:?}");
+            return Err("open through the list-only capability failed otherwise than refused");
+        }
+    }
+    if listing.list().map_or(true, |r| r.partitions.iter().next().is_none()) {
+        return Err("the list-only capability lists nothing");
+    }
+    pass("scopes");
+
+    // Opening a partition again and again (each open asks the driver to
+    // narrow the disk's capability): the same range is the same window,
+    // so the driver's windows are not used up (they were, at 256 opens).
+    for n in 0..300 {
+        if let Err(e) = list.open(id, None) {
+            println!("partcheck: open {n} of the same partition: {e:?}");
+            return Err("opening one partition again and again used up the driver's windows");
+        }
+    }
+    pass("opens_bounded");
+
+    // A partition's client narrowing its capability as often as it likes:
+    // it gets a few windows under its own, and the disk's holders can
+    // still narrow theirs (a client once used up every window there was,
+    // and no partition could be opened after it).
+    // The capability is kept while it is used: dropping it deletes it.
+    let opened = list.open(id, None).map_err(|_| "the partition cannot be opened")?.device;
+    let mut inside = device::Client::<Channel, Handle>::from(Channel::new(opened.cap()));
+    let mut granted = 0;
+    for i in 0..300u64 {
+        if inside.narrow(i % blocks, 1).is_ok() {
+            granted += 1;
+        }
+    }
+    println!("partcheck: a partition's client asked for 300 windows under its own and was given {granted}");
+    let mut devices_client = manager::Client::<Channel, Handle>::from(Channel::new(devices));
+    let driver = devices_client.open(disk_id, None).map_err(|_| "the disk's driver cannot be opened")?.driver;
+    let mut disk_control = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+    if let Err(e) = disk_control.narrow(first + blocks / 2, 7) {
+        println!("partcheck: after a partition's client narrowed 300 times ({granted} granted), a new window of the disk: {e:?}");
+        return Err("a partition's client narrowing used up the windows of the disk's other holders");
+    }
+    if granted > 4 {
+        println!("partcheck: a partition's client was granted {granted} windows under its own");
+        return Err("a partition's client is not bounded in the windows it makes");
+    }
+    pass("narrowing_bounded");
+
+    // A flush through a partition reaches the device only when a write
+    // needs it: one with nothing written since the last makes the device
+    // do nothing (any partition's client could make the whole disk flush
+    // at any rate). Traced (bit 62 of the tag), so the driver says whether
+    // the device was given it.
+    let flush = |tag| Request { op: Op::Flush, memory: 0, block: 0, offset: 0, blocks: 0, tag: TRACED | tag };
+    if part.info().write_cache {
+        part.run(&flush(20), deadline()).map_err(|_| "a flush failed")?;
+        for tag in 21..31 {
+            part.run(&flush(tag), deadline()).map_err(|_| "a flush failed")?;
+            let (_, started, _) = part.trace(TRACED | tag).map_err(|_| "the driver lost a traced flush")?;
+            if started != 0 {
+                return Err("a flush with nothing written since the last made the device flush the whole disk");
+            }
+        }
+        // And one after a write does reach it.
+        part.run(&req(Op::Write, last, 0, 1, 31), deadline()).map_err(|_| "a write failed")?;
+        part.run(&flush(32), deadline()).map_err(|_| "a flush after a write failed")?;
+        let (_, started, _) = part.trace(TRACED | 32).map_err(|_| "the driver lost a traced flush")?;
+        if started == 0 {
+            return Err("a flush after a write did not reach the device");
+        }
+    }
+    pass("flush_bounded");
     Ok(())
 }

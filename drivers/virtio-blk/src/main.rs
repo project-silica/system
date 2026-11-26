@@ -30,6 +30,7 @@ use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject;
 use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::oldest::Oldest;
 use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
 use silica_rt::alloc::vec::Vec;
@@ -47,6 +48,9 @@ const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
 /// The notification bit of the queue's interrupt.
 const INTERRUPT: u64 = 2;
+/// The notification bit of the configuration interrupt (when it has its own
+/// entry: `Transport::config_vector`).
+const CONFIG: u64 = 4;
 /// Descriptors in the queue, and so requests in flight at most a third of that.
 const QUEUE_SIZE: u16 = 256;
 /// Most bytes in one request.
@@ -59,6 +63,9 @@ struct Disk {
     dma: Dma,
     queue: Queue,
     _interrupt: Interrupt,
+    _config: Option<Interrupt>,
+    /// The configuration interrupt shares the queue's.
+    config_shared: bool,
     /// A 16-byte header per request slot: the device reads them.
     headers: DmaMemory,
     /// A status byte per request slot: the device writes them.
@@ -66,6 +73,8 @@ struct Disk {
     /// The request in each slot while the device has it, and when it was
     /// started.
     slots: Vec<Option<(Ticket, u64)>>,
+    /// The oldest of them, found without a walk.
+    oldest: Oldest,
     free: Vec<u16>,
     info: Info,
     /// 512-byte sectors in a block.
@@ -130,7 +139,10 @@ impl silica_block::service::Device for Disk {
             self.free.push(slot);
             return Err(Refusal::Busy);
         }
-        self.slots[at] = Some((ticket, silica_rt::clock().now()));
+        let now = silica_rt::clock().now();
+        self.slots[at] = Some((ticket, now));
+        let slots = &self.slots;
+        self.oldest.started(slot as u32, now, slots.len(), |s, t| slots[s as usize].is_some_and(|(_, x)| x == t));
         Ok(())
     }
 
@@ -139,7 +151,8 @@ impl silica_block::service::Device for Disk {
     }
 
     fn deadline(&self) -> Option<u64> {
-        self.slots.iter().flatten().map(|(_, t)| t + Disk::timeout_ns()).min()
+        let slots = &self.slots;
+        self.oldest.oldest(|s, t| slots[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + Disk::timeout_ns())
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -150,10 +163,18 @@ impl silica_block::service::Device for Disk {
         }
     }
 
-    fn signals(&mut self, _bits: u64, done: &mut Completions<'_>) {
+    fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
+        // A device that gave up asks to be reset with a configuration
+        // interrupt (on the queue's entry when it has no other: then an
+        // interrupt that brings no completion is asked about).
+        if bits & CONFIG != 0 && self.transport.needs_reset() {
+            self.give_up(DeviceError::Protocol("the device asks to be reset"));
+        }
+        let mut any = false;
         loop {
             match self.queue.pop() {
                 Ok(Some((token, _))) => {
+                    any = true;
                     let Some((ticket, _)) = self.slots.get_mut(token as usize).and_then(Option::take) else { continue };
                     self.free.push(token as u16);
                     done(
@@ -165,7 +186,12 @@ impl silica_block::service::Device for Disk {
                         },
                     );
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    if !any && self.config_shared && bits & INTERRUPT != 0 && self.transport.needs_reset() {
+                        self.give_up(DeviceError::Protocol("the device asks to be reset"));
+                    }
+                    return;
+                }
                 Err(e) => self.give_up(e),
             }
         }
@@ -190,7 +216,11 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let signals = Signals::new()?;
     let interrupt = Interrupt::bind_to(&device, 0, signals.sender(INTERRUPT)?)?;
     inject::interrupts(signals.sender(INTERRUPT)?);
-    let mut queue = transport.queue(&dma, 0, QUEUE_SIZE, Some(0))?;
+    // A request is a header, its data and a status byte.
+    let mut queue = transport.queue(&dma, 0, QUEUE_SIZE, 3, Some(0))?;
+    let config_vector = Transport::config_vector(&device, 1);
+    let config_irq = if config_vector != 0 { Some(Interrupt::bind_to(&device, config_vector, signals.sender(CONFIG)?)?) } else { None };
+    transport.config_interrupt(config_vector)?;
     // A processor idling for a completion sees the device write it, without
     // waiting for the interrupt to arrive (spec/ARCHITECTURE.md section 7).
     if let Err(e) = queue.watch(&interrupt) {
@@ -218,6 +248,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         headers: dma.memory(12, false)?,
         status: dma.memory(12, true)?,
         slots: (0..slots).map(|_| None).collect(),
+        oldest: Oldest::new(),
         free: (0..slots as u16).rev().collect(),
         info: Info {
             block_size,
@@ -231,6 +262,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         dma,
         queue,
         _interrupt: interrupt,
+        _config: config_irq,
+        config_shared: config_vector == 0,
     };
     disk.transport.start();
     println!(

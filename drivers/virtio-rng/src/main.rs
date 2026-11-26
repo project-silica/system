@@ -35,6 +35,7 @@ struct Rng {
     /// The buffer the device writes (one page; the first [`MOST`] bytes).
     buffer: DmaMemory,
     interrupt: Interrupt,
+    transport: Transport,
     /// The bytes answered, copied out of the device's buffer.
     out: [u8; MOST as usize],
 }
@@ -69,6 +70,12 @@ impl device::Server<Handle> for Rng {
                     return Ok(ReadReply { data: &self.out[..written as usize] });
                 }
                 Ok(None) => {
+                    // A device that gave up asks to be reset (its configuration
+                    // interrupt is the queue's): it fills nothing now.
+                    if self.transport.needs_reset() {
+                        self.transport.fail();
+                        give_up(DeviceError::Protocol("the device asks to be reset"));
+                    }
                     if !self.interrupt.wait(Some(deadline)) {
                         give_up(DeviceError::Timeout("the device filled no buffer"));
                     }
@@ -95,11 +102,12 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let transport = Transport::new(&device)?;
     transport.negotiate(&dma, 0, 0)?;
     let interrupt = Interrupt::bind(&device, 0)?;
-    let queue = transport.queue(&dma, 0, 8, Some(0))?;
+    let queue = transport.queue(&dma, 0, 8, 1, Some(0))?;
+    transport.config_interrupt(0)?;
     let buffer = dma.memory(12, true)?;
     transport.start();
     println!("virtio-rng: an entropy source, {}", if dma.confined() { "DMA confined by the IOMMU" } else { "DMA not confined" });
-    let mut rng = Rng { queue, buffer, interrupt, out: [0; MOST as usize] };
+    let mut rng = Rng { queue, buffer, interrupt, transport, out: [0; MOST as usize] };
     serve(granted(grant::SERVICE), |_badge, request, caps: CapList<Handle>, reply, reply_caps| {
         device::dispatch(&mut rng, request, caps, reply, reply_caps)
     })

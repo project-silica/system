@@ -517,6 +517,13 @@ impl<C: Control> Queue<C> {
         self.link.as_mut().ok_or(Error::Gone)
     }
 
+    /// How many drivers this queue has connected to: it changes when a
+    /// driver ended and the next took the connection (a client that must
+    /// know whether a reset came between two of its requests compares it).
+    pub fn connections(&self) -> u32 {
+        self.generation
+    }
+
     /// The class's control protocol of the current driver, connecting again
     /// first if the last one ended.
     pub fn control(&mut self) -> Result<&mut C, Error> {

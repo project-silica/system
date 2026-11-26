@@ -46,6 +46,26 @@ fn run() -> Result<(), String> {
     let mut system = system::Client::<Channel, Handle>::from(grant(1));
 
     let st = s.status().map_err(|e| format!("status: {e:?}"))?.status;
+    // On a machine with no trusted boot source whose randomness device is
+    // broken (constant bytes: `entropycheck.expect=unseeded`), the service
+    // must refuse to answer: what it would give is guessable. It said it
+    // was seeded after any 32 bytes of the device.
+    if silica_rt::option("expect") == Some("unseeded") {
+        if st.boot || st.mixes == 0 {
+            return Err(format!("not the machine this check is for (boot sources trusted: {}, {} mixes)", st.boot, st.mixes));
+        }
+        return match s.fill(32) {
+            Err(silica_idl_rt::CallError::Error(source::Error::NotSeeded)) if st.device_bytes == 0 => {
+                println!("TEST entropy.a_broken_device_does_not_seed PASS");
+                Ok(())
+            }
+            r => Err(format!(
+                "with only a broken device, the service counted {} of its bytes and answered {:?}",
+                st.device_bytes,
+                r.map(|r| r.data.len())
+            )),
+        };
+    }
     if st.device_bytes == 0 || st.mixes == 0 {
         return Err(format!("no device bytes went in ({} bytes, {} mixes)", st.device_bytes, st.mixes));
     }
