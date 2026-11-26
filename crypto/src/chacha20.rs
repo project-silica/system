@@ -42,6 +42,9 @@ pub fn block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     for i in 0..16 {
         out[4 * i..4 * i + 4].copy_from_slice(&s[i].wrapping_add(init[i]).to_le_bytes());
     }
+    // Both hold the key, and the state the key stream is from.
+    crate::wipe_words(&mut init);
+    crate::wipe_words(&mut s);
     out
 }
 
