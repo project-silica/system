@@ -42,8 +42,8 @@ use manifest::{Cpu, Service, Start};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
 use silica_proc::{Child, FAULT_BADGE, Grant, Program, Restarts, spawn};
-use silica_protocols::scope;
 use silica_protocols::device::manager as devices;
+use silica_protocols::scope;
 use silica_protocols::system::manager;
 use silica_protocols::watchdog::device as watchdog;
 use silica_rt::alloc::string::String;
@@ -506,7 +506,7 @@ impl Manager {
     fn watch_watchdog(&mut self) {
         let Some(p) = self.services.iter().position(|s| s.provides == Some("silica.device.Manager")) else { return };
         let Some(ep) = self.endpoints[p].as_ref().map(Object::cap) else { return };
-        let badge = CONSUMERS + self.services.len() as u64 | scope::DEVICE_WATCHDOG << scope::SHIFT;
+        let badge = (CONSUMERS + self.services.len() as u64) | (scope::DEVICE_WATCHDOG << scope::SHIFT);
         let Some(slot) = silica_rt::ipc::free_slot() else { return };
         if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), slot, ep, Rights(Rights::WRITE.0 | Rights::GRANT.0), badge).is_err() {
             silica_rt::ipc::release_slot(slot);
@@ -579,7 +579,11 @@ impl Manager {
         // A pet at a third of its timeout: two may be late and the machine
         // still stands.
         self.dog.every = (info.timeout_ms as u64 * 1_000_000 / 3).max(1_000_000);
-        println!("init: the watchdog resets this machine {} s after the last pet; petted every {} s", info.timeout_ms / 1000, self.dog.every / SECOND);
+        println!(
+            "init: the watchdog resets this machine {} s after the last pet; petted every {} s",
+            info.timeout_ms / 1000,
+            self.dog.every / SECOND
+        );
         self.dog.driver = Some(driver);
         self.dog.next = 0;
         self.pet_watchdog();
