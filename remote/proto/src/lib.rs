@@ -234,17 +234,27 @@ impl Sending {
     }
 }
 
-/// A line of an owners file that is not a key and a name.
+/// A line of an owners file that is not an owner (see [`owners`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadLine(pub usize);
 
+/// An owner an owners file names: its key, its name, what it may do
+/// (`None`: all the remote service has) and how long its sessions may
+/// stay without a whole message, in seconds (`None`: the service's own
+/// bound).
+pub type Owner<'a> = ([u8; 32], &'a str, Option<&'a str>, Option<u64>);
+
 /// The owners an owners file names: each line a public key, space, the
-/// owner's name (no spaces in it), and optionally what the owner may do
+/// owner's name (no spaces in it), optionally what the owner may do
 /// (`silica.system.Manager` scopes joined with `+`, as a service
 /// declaration gives them: `observe+control`; without them, all the
-/// remote service has); blank lines and lines from `#` are skipped. The first line that is neither is an error naming it (from 1),
-/// so that a mistyped key is never silently nobody.
-pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str, Option<&str>), BadLine>> {
+/// remote service has), and optionally `idle=<seconds>` (from 1): how
+/// long a session of that owner's is kept with no whole message arriving,
+/// a bound on a peer set where the peer is named. Blank lines and lines
+/// from `#` are skipped. The first line that is none of these is an error
+/// naming it (from 1), so that a mistyped key, scope or bound is never
+/// silently nobody's or nothing.
+pub fn owners(text: &str) -> impl Iterator<Item = Result<Owner<'_>, BadLine>> {
     text.lines().enumerate().filter_map(|(n, line)| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -253,9 +263,12 @@ pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str, Option
         let mut words = line.split_ascii_whitespace();
         let key = words.next().and_then(parse_key);
         let name = words.next();
-        let scopes = words.next();
-        Some(match (key, name, words.next()) {
-            (Some(k), Some(name), None) => Ok((k, name, scopes)),
+        let mut rest = words.peekable();
+        let scopes = rest.next_if(|w| !w.contains('='));
+        let idle = rest.next_if(|w| w.starts_with("idle=")).map(|w| w[5..].parse::<u64>().ok().filter(|s| *s > 0));
+        Some(match (key, name, idle, rest.next()) {
+            (Some(k), Some(name), None, None) => Ok((k, name, scopes, None)),
+            (Some(k), Some(name), Some(Some(s)), None) => Ok((k, name, scopes, Some(s))),
             _ => Err(BadLine(n + 1)),
         })
     })
@@ -318,10 +331,29 @@ mod tests {
             let mut it = owners(&text);
             [it.next().unwrap(), it.next().unwrap()]
         };
-        assert_eq!(got[0], Ok(([0; 32], "alice@laptop", None)));
-        assert_eq!(got[1], Ok(([0x11; 32], "ci", None)));
+        assert_eq!(got[0], Ok(([0; 32], "alice@laptop", None, None)));
+        assert_eq!(got[1], Ok(([0x11; 32], "ci", None, None)));
         let scoped = std::format!("{a} watcher observe\n");
-        assert_eq!(owners(&scoped).next(), Some(Ok(([0; 32], "watcher", Some("observe")))));
+        assert_eq!(owners(&scoped).next(), Some(Ok(([0; 32], "watcher", Some("observe"), None))));
+        // A bound on that owner's idle sessions, with or without scopes;
+        // one that is no number of seconds, zero, given twice or before
+        // the scopes is the line's error.
+        let line = |rest: &str| owners(&std::format!("{a} w {rest}\n")).next().unwrap().map(|(_, _, s, i)| (s.map(String::from), i));
+        assert_eq!(line("idle=6"), Ok((None, Some(6))));
+        assert_eq!(line("observe+control idle=3600"), Ok((Some(String::from("observe+control")), Some(3600))));
+        for bad in [
+            "idle=",
+            "idle=0",
+            "idle=-1",
+            "idle=six",
+            "idle=6 idle=7",
+            "idle=6 observe",
+            "observe idle=6 more",
+            "mode=1",
+            "idle=99999999999999999999",
+        ] {
+            assert_eq!(line(bad), Err(BadLine(1)), "{bad}");
+        }
         assert_eq!(owners(&std::format!("{a} x observe more\n")).next(), Some(Err(BadLine(1))));
         assert_eq!(owners(&text).count(), 2);
         assert_eq!(owners("# none\n\n").count(), 0);

@@ -16,7 +16,7 @@
 //! second gives its place to newer ones, the oldest first, and one an
 //! owner's handshake was answered on never does (`make_room`). A session
 //! is closed when no whole message has come for an hour
-//! (`remote.idle=<seconds>` on the command line sets another); bytes that
+//! (or what that owner's line of `remote.owners` says: `idle=<seconds>`); bytes that
 //! make no message keep nothing open.
 //!
 //! After the handshake every call a session makes is the same IDL request
@@ -85,8 +85,9 @@ const STAMP_WINDOW: u64 = 300_000_000_000;
 /// How long a new connection has to give an owner's handshake before a
 /// newer one may take its place.
 const GRACE: u64 = 1_000_000_000;
-/// A session no whole message arrived on for this long is closed (the
-/// owner sets another with `remote.idle=<seconds>` on the command line).
+/// A session no whole message arrived on for this long is closed, unless
+/// its owner's line of `remote.owners` sets another (`idle=<seconds>`): the
+/// bound on a peer is given where the peer is named.
 const IDLE: u64 = 3_600_000_000_000;
 
 enum State {
@@ -125,9 +126,10 @@ struct Session {
 /// What the service holds for every session.
 struct Machine {
     key: Keypair,
-    /// Each owner's key, name, and what of the service manager it may use
-    /// (`silica_protocols::scope`).
-    owners: Vec<([u8; 32], String, u64)>,
+    /// Each owner's key, name, what of the service manager it may use
+    /// (`silica_protocols::scope`), and how long its sessions may stay
+    /// without a whole message ([`IDLE`], or its line's `idle=`).
+    owners: Vec<([u8; 32], String, u64, u64)>,
     manager: Channel,
     log: Channel,
     /// The program each owner is sending (`send`), held here until that
@@ -135,8 +137,6 @@ struct Machine {
     /// [`MAX_PROGRAM`] bytes an owner, and no more than this service's own
     /// memory holds.
     sending: Vec<silica_remote::Sending>,
-    /// How long a session may be idle ([`IDLE`]).
-    idle: u64,
     /// The time of the newest first message taken from each owner
     /// (`silica_remote::stamp`), kept in the page the service manager keeps
     /// across this service's restarts (`keep`): one taken before a restart
@@ -191,7 +191,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     if let Some(text) = read_file(OWNERS_FILE) {
         for o in silica_remote::owners(&text) {
             match o {
-                Ok((k, name, spec)) => {
+                Ok((k, name, spec, idle)) => {
                     let all = scope::SYSTEM_OBSERVE | scope::SYSTEM_CONTROL | scope::SYSTEM_UPDATE | scope::SYSTEM_POWER;
                     let Ok(may) = spec.map_or(Ok(all), |s| scope::parse(manager::NAME, s)) else {
                         println!(
@@ -199,10 +199,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         );
                         return 1;
                     };
-                    owners.push((k, String::from(name), may & all));
+                    owners.push((k, String::from(name), may & all, idle.map_or(IDLE, |s| s.saturating_mul(1_000_000_000))));
                 }
                 Err(silica_remote::BadLine(n)) => {
-                    println!("ERROR: remote: line {n} of remote.owners is not a key and a name; remote management is off");
+                    println!(
+                        "ERROR: remote: line {n} of remote.owners is not an owner (a key, a name, then its scopes and idle=<seconds> if any); remote management is off"
+                    );
                     return 1;
                 }
             }
@@ -232,13 +234,11 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         if owners.len() == 1 { "" } else { "s" },
         core::str::from_utf8(&silica_remote::key_text(&key.public)).unwrap_or("?")
     );
-    let idle =
-        silica_rt::option("idle").and_then(|s| s.parse::<u64>().ok()).filter(|s| *s > 0).map_or(IDLE, |s| s.saturating_mul(1_000_000_000));
     // A page of 4 KiB, read and written one access at a time.
     let keep = silica_rt::mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
     let newest = Machine::kept(keep.as_ref(), owners.len());
     let sending = owners.iter().map(|_| silica_remote::Sending::default()).collect();
-    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), sending, idle, newest, keep };
+    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), sending, newest, keep };
     let mut sessions: Vec<Session> = Vec::new();
     loop {
         let now = silica_rt::clock().now();
@@ -316,7 +316,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             if s.sent < s.output.len() && !s.s.sleep_write() {
                 may_sleep = false;
             }
-            deadline = deadline.min(s.deadline(m.idle));
+            deadline = deadline.min(s.deadline(&m));
             // A stranger past its second may be closed for room (`make_room`).
             if !s.proven && matches!(s.state, State::Handshake) && s.since + GRACE > now {
                 deadline = deadline.min(s.since + GRACE);
@@ -363,8 +363,13 @@ fn make_room(sessions: &mut [Session], now: u64) -> bool {
 }
 
 impl Session {
-    fn deadline(&self, idle: u64) -> u64 {
-        if self.proven { self.last.saturating_add(idle) } else { self.since + HANDSHAKE }
+    /// How long this session may stay without a whole message: its owner's.
+    fn idle(&self, m: &Machine) -> u64 {
+        self.owner.map_or(IDLE, |o| m.owners[o].3)
+    }
+
+    fn deadline(&self, m: &Machine) -> u64 {
+        if self.proven { self.last.saturating_add(self.idle(m)) } else { self.since + HANDSHAKE }
     }
 
     /// Send what is pending, then end.
@@ -401,9 +406,9 @@ impl Session {
         if self.closing {
             return progress;
         }
-        if now >= self.deadline(m.idle) {
+        if now >= self.deadline(m) {
             if self.proven {
-                println!("remote: {}'s session from {} closed: no message for {} s", self.who(m), self.peer, m.idle / 1_000_000_000);
+                println!("remote: {}'s session from {} closed: no message for {} s", self.who(m), self.peer, self.idle(m) / 1_000_000_000);
             } else {
                 println!("remote: a connection from {} closed: no owner proven within 10 s", self.peer);
             }
@@ -496,7 +501,7 @@ impl Session {
                 return self.close();
             }
         };
-        let Some(o) = m.owners.iter().position(|(k, _, _)| silica_crypto::equal(k, r.peer())) else {
+        let Some(o) = m.owners.iter().position(|(k, ..)| silica_crypto::equal(k, r.peer())) else {
             println!(
                 "remote: a connection from {} closed: its key {} is no owner's",
                 self.peer,
