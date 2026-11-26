@@ -44,6 +44,8 @@ pub struct Ticket {
     /// The connection's slot, and which connection in it (its generation).
     slot: u16,
     connection: u32,
+    /// The service's own mark on the request (`Ticket::marked`).
+    marked: bool,
 }
 
 impl Ticket {
@@ -56,6 +58,18 @@ impl Ticket {
     pub fn without_memory(self) -> Ticket {
         Ticket { memory: NO_MEMORY, ..self }
     }
+
+    /// The same ticket with the service's mark: a class's service tells
+    /// its own kinds of request apart when they complete (a block
+    /// service, its writes).
+    pub fn marked(self) -> Ticket {
+        Ticket { marked: true, ..self }
+    }
+
+    /// Whether [`Ticket::marked`] made it.
+    pub fn is_marked(&self) -> bool {
+        self.marked
+    }
 }
 
 /// Why a service did not start a request.
@@ -63,7 +77,8 @@ impl Ticket {
 pub enum Refusal {
     /// The device is full: offer the request again after a completion.
     Busy,
-    /// Complete it now with this status (the class's, not 0).
+    /// Complete it now with this status (the class's; 0: done, at once:
+    /// what a service can answer without its device).
     Fail(u32),
 }
 
@@ -232,6 +247,15 @@ impl<M> Session<M> {
         }
     }
 
+    /// End the connection of the client calling with badge `caller`, if it
+    /// has one: what a service does when the capability it gave that
+    /// client no longer reaches what it did.
+    pub fn disconnect(&mut self, caller: u64, mapper: &mut impl Mapper<Mapping = M>) {
+        if let Some(slot) = self.connections.iter().position(|c| c.as_ref().is_some_and(|c| c.client == caller)) {
+            self.close_slot(slot, mapper);
+        }
+    }
+
     /// Whether a client is connected and still there.
     pub fn has_client(&self) -> bool {
         self.connections.iter().flatten().any(Connection::alive)
@@ -387,7 +411,7 @@ impl<M> Session<M> {
                     },
                 };
                 let memory = memory_of(&raw);
-                let ticket = Ticket { tag: tag_of(&raw), memory, slot: slot as u16, connection: c.generation };
+                let ticket = Ticket { tag: tag_of(&raw), memory, slot: slot as u16, connection: c.generation, marked: false };
                 let region = c.memories.get(memory as usize).and_then(Option::as_ref).map(|m| m.region);
                 match start(&raw, ticket, region, c.client) {
                     Ok(t) => {

@@ -11,7 +11,7 @@
 
 use crate::device::{self, Info};
 use crate::partitions;
-use crate::{Completion, QUEUE, Request, Status};
+use crate::{Completion, Op, QUEUE, Request, Status};
 use silica_queue::Refused;
 use silica_queue::client::{self, Control, Opener, Queue};
 use silica_rt::ipc::{Channel, Handle};
@@ -120,9 +120,34 @@ impl Opener for partitions::Client<Channel, Handle> {
 }
 
 /// A connection to a block device that outlives its driver.
+///
+/// A driver that ends is replaced by one that resets the device, and a
+/// device's volatile write cache need not keep across a reset what it
+/// held. So the disk remembers whether a driver ended while writes made
+/// since the last successful flush were done or under way; if one did,
+/// the next flush to complete says [`Status::Lost`] instead of success
+/// (once): the program writes them again and flushes. Without that, a
+/// flush after a driver's end succeeded while what it was to make
+/// durable might be gone. (A write still under way when the driver ended
+/// is sent again and may well be on the disk: the report errs on the
+/// side of being told.)
 pub struct Disk {
     queue: Queue<Block>,
     info: Info,
+    /// Writes submitted, ever.
+    writes: u64,
+    /// Writes completed, ever, and the tags of those under way.
+    completed: u64,
+    writing: silica_rt::alloc::vec::Vec<u64>,
+    /// `completed` when the last flush that succeeded was submitted: the
+    /// writes it made durable.
+    durable: u64,
+    /// Flushes in progress: their tags, and `completed` when each was submitted.
+    flushes: silica_rt::alloc::vec::Vec<(u64, u64)>,
+    /// The queue's connections when last looked at.
+    connections: u32,
+    /// A driver ended with writes not known to be durable: the next flush says so.
+    lost: bool,
 }
 
 impl Disk {
@@ -138,7 +163,7 @@ impl Disk {
     pub fn open(devices: Cap, id: u32) -> Result<Disk, Error> {
         let mut queue = Queue::<Block>::open(devices, id)?;
         let info = queue.control()?.info.clone();
-        Ok(Disk { queue, info })
+        Ok(Disk::over(queue, info))
     }
 
     /// Open partition `id` through the partitions service behind
@@ -148,7 +173,48 @@ impl Disk {
         let opener = silica_rt::alloc::boxed::Box::new(partitions::Client::<Channel, Handle>::from(Channel::new(partitions)));
         let mut queue = Queue::<Block>::open_with(opener, id)?;
         let info = queue.control()?.info.clone();
-        Ok(Disk { queue, info })
+        Ok(Disk::over(queue, info))
+    }
+
+    fn over(queue: Queue<Block>, info: Info) -> Disk {
+        let connections = queue.connections();
+        Disk {
+            queue,
+            info,
+            writes: 0,
+            completed: 0,
+            writing: silica_rt::alloc::vec::Vec::new(),
+            durable: 0,
+            flushes: silica_rt::alloc::vec::Vec::new(),
+            connections,
+            lost: false,
+        }
+    }
+
+    /// A completion, as the program is to see it: a flush after a driver
+    /// ended with writes not known to be durable says so (see [`Disk`]).
+    fn seen(&mut self, mut c: Completion) -> Completion {
+        let now = self.queue.connections();
+        if now != self.connections {
+            self.connections = now;
+            // Without a volatile cache a completed write is durable already.
+            self.lost |= self.info.write_cache && self.writes > self.durable;
+        }
+        if let Some(k) = self.writing.iter().position(|tag| *tag == c.tag) {
+            self.writing.swap_remove(k);
+            self.completed += 1;
+        }
+        if let Some(k) = self.flushes.iter().position(|(tag, _)| *tag == c.tag) {
+            let (_, at) = self.flushes.swap_remove(k);
+            if c.status.is_ok() {
+                if self.lost {
+                    self.lost = false;
+                    c.status = Err(Status::Lost);
+                }
+                self.durable = self.durable.max(at);
+            }
+        }
+        c
     }
 
     /// What the device is.
@@ -185,7 +251,16 @@ impl Disk {
     /// once for any number of requests. Its tag must be below 2^63 and not
     /// in use.
     pub fn submit(&mut self, request: &Request) -> Result<(), Error> {
-        Ok(self.queue.submit(&request.encode())?)
+        self.queue.submit(&request.encode())?;
+        match request.op {
+            Op::Write => {
+                self.writes += 1;
+                self.writing.push(request.tag);
+            }
+            Op::Flush => self.flushes.push((request.tag, self.completed)),
+            Op::Read => {}
+        }
+        Ok(())
     }
 
     /// Tell the driver about submitted requests, if it sleeps.
@@ -196,18 +271,20 @@ impl Disk {
     /// [`Disk::kick`] and [`Disk::wait`] in one system call when the client
     /// must sleep (`silica_queue::client::Queue::kick_wait`).
     pub fn kick_wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
-        Ok(self.queue.kick_wait(deadline)?.into())
+        let c = self.queue.kick_wait(deadline)?.into();
+        Ok(self.seen(c))
     }
 
     /// The next completion, if one is there.
     pub fn poll(&mut self) -> Result<Option<Completion>, Error> {
-        Ok(self.queue.poll()?.map(Completion::from))
+        Ok(self.queue.poll()?.map(Completion::from).map(|c| self.seen(c)))
     }
 
     /// The next completion, waiting for it until the monotonic time
     /// `deadline` (nanoseconds; `None`: for ever).
     pub fn wait(&mut self, deadline: Option<u64>) -> Result<Completion, Error> {
-        Ok(self.queue.wait(deadline)?.into())
+        let c = self.queue.wait(deadline)?.into();
+        Ok(self.seen(c))
     }
 
     /// Where the traced request `tag` (bit [`crate::service::TRACED`] set)
@@ -223,6 +300,7 @@ impl Disk {
     pub fn run(&mut self, request: &Request, deadline: Option<u64>) -> Result<(), Error> {
         self.submit(request)?;
         let c: Completion = self.queue.kick_wait(deadline)?.into();
+        let c = self.seen(c);
         if c.tag != request.tag {
             return Err(Error::Protocol);
         }
