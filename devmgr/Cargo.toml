@@ -37,5 +37,10 @@ silica-idl-rt = { workspace = true }
 silica-protocols = { workspace = true }
 
 
+# Built only into test images (os/tools/lib/build.sh): what commits a device's
+# faults on purpose (silica_driver::inject). A machine's image has none of it.
+[features]
+harness = ["silica-driver/harness"]
+
 [lints]
 workspace = true

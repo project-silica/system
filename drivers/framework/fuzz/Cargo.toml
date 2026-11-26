@@ -21,6 +21,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "virtio_transport"
+path = "fuzz_targets/virtio_transport.rs"
+test = false
+doc = false
+bench = false
+
 # Not part of the system workspace: cargo-fuzz builds it on its own.
 [workspace]
 

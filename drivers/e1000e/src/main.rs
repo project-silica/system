@@ -31,7 +31,8 @@
 //! [`TX_TIMEOUT_NS`]; the device manager starts it again, which resets the
 //! device, and the client offers its buffers and frames again.
 //!
-//! The five device faults of `silica_driver::inject` are committed where an
+//! In a test image (built with the `harness` feature, never a machine's
+//! image) the device faults of `silica_driver::inject` are committed where an
 //! 82574 would commit them: `garbage`, the oldest receive descriptor written
 //! back done with a length past its buffer and no end of frame; `stuck`, a
 //! transmit the device never sees (the transmit tail no longer advanced; on
@@ -46,8 +47,11 @@
 #![no_std]
 #![no_main]
 
-use e1000e::{DD, DESC, RECEIVE_BYTES, RING, Ring, TX_EOP, TX_IFCS, TX_RS, receive};
+#[cfg(feature = "harness")]
+use e1000e::DD;
+use e1000e::{DESC, RECEIVE_BYTES, RING, Ring, TX_EOP, TX_IFCS, TX_RS, receive};
 use silica_driver::dma::{self, Dma, DmaMemory, Shared};
+#[cfg(feature = "harness")]
 use silica_driver::inject::{self, Fault};
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::{Device, DeviceError, grant, granted};
@@ -149,14 +153,25 @@ struct Nic {
     dma: Dma,
     rx: Ring<Ticket>,
     tx: Ring<Ticket>,
-    /// The rings' memory (receive, transmit), kept while the device has it.
+    /// The rings' memory (receive, transmit), kept while the device has it
+    /// (and written by an injected `garbage`, in a test image).
+    #[cfg_attr(not(feature = "harness"), allow(dead_code))]
     rings: [DmaMemory; 2],
     info: Info,
     _interrupts: Vec<Interrupt>,
-    /// An injected `stuck`: the device no longer sees transmits.
+    /// What an injected fault left the device doing.
+    #[cfg(feature = "harness")]
+    injected: Injected,
+}
+
+/// What an injected fault left the device doing (test images only).
+#[cfg(feature = "harness")]
+#[derive(Default)]
+struct Injected {
+    /// `stuck`: the device no longer sees transmits.
     stuck: bool,
-    /// An injected `unplugged`: the device holds transmits while its link
-    /// is down, as an 82574 does (QEMU's model sends them nowhere at once).
+    /// `unplugged`: the device holds transmits while its link is down, as
+    /// an 82574 does (QEMU's model sends them nowhere at once).
     unplugged: bool,
 }
 
@@ -232,12 +247,14 @@ impl silica_net::service::Device for Nic {
     }
 
     fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Refusal> {
-        // An injected fault comes due with the nth request offered.
-        inject::due();
-        // Injected: from here on the device holds transmits while its link
-        // is down (`kick`).
-        if inject::pending(Fault::Unplugged) {
-            self.unplugged = true;
+        // An injected fault comes due with the nth request offered; from an
+        // `unplugged` on, the device holds transmits while its link is down.
+        #[cfg(feature = "harness")]
+        {
+            inject::due();
+            if inject::pending(Fault::Unplugged) {
+                self.injected.unplugged = true;
+            }
         }
         match r.op {
             // The device writes the length back; the buffer is RECEIVE_BYTES
@@ -256,11 +273,14 @@ impl silica_net::service::Device for Nic {
                 }
                 // A device that stops seeing transmits, or resets itself as
                 // one is handed over (injected).
-                if inject::pending(Fault::Stuck) {
-                    self.stuck = true;
-                }
-                if inject::pending(Fault::Reset) {
-                    self.regs.write32(CTRL, self.regs.read32(CTRL) | CTRL_RST);
+                #[cfg(feature = "harness")]
+                {
+                    if inject::pending(Fault::Stuck) {
+                        self.injected.stuck = true;
+                    }
+                    if inject::pending(Fault::Reset) {
+                        self.regs.write32(CTRL, self.regs.read32(CTRL) | CTRL_RST);
+                    }
                 }
                 Ok(())
             }
@@ -287,7 +307,12 @@ impl silica_net::service::Device for Nic {
             self.regs.write32(RDT, self.rx.tail as u32);
             self.rx.added = false;
         }
-        if self.tx.added && !self.stuck {
+        // (An injected `stuck`: the device no longer sees transmits.)
+        #[cfg(feature = "harness")]
+        let seen = !self.injected.stuck;
+        #[cfg(not(feature = "harness"))]
+        let seen = true;
+        if self.tx.added && seen {
             self.regs.write32(TDT, self.tx.tail as u32);
         }
         self.tx.added = false;
@@ -297,12 +322,19 @@ impl silica_net::service::Device for Nic {
         // Injected: the oldest receive descriptor written back done, with a
         // length past its buffer and no end of frame; or this interrupt
         // missed (what it reports is found at the next).
-        if self.rx.holding() > 0 && inject::pending(Fault::Garbage) {
-            let words = self.rings[0].shared();
-            words.write16(self.rx.next * DESC + 8, u16::MAX);
-            words.write8(self.rx.next * DESC + 12, DD);
-        }
-        let missed = bits != 0 && inject::pending(Fault::Missed);
+        // And `unplugged`: while its link is down the device reports no
+        // transmit done, as an 82574 holding its queue does.
+        #[cfg(feature = "harness")]
+        let (missed, holding) = {
+            if self.rx.holding() > 0 && inject::pending(Fault::Garbage) {
+                let words = self.rings[0].shared();
+                words.write16(self.rx.next * DESC + 8, u16::MAX);
+                words.write8(self.rx.next * DESC + 12, DD);
+            }
+            (bits != 0 && inject::pending(Fault::Missed), self.injected.unplugged && !self.info.link_up)
+        };
+        #[cfg(not(feature = "harness"))]
+        let (missed, holding) = (false, false);
         while let Some(d) = if missed { None } else { self.rx.pop() } {
             match receive(&d) {
                 Ok(Ok(length)) => done(d.ticket, Ok(length)),
@@ -310,9 +342,6 @@ impl silica_net::service::Device for Nic {
                 Err(broken) => self.give_up(DeviceError::Protocol(broken.why())),
             }
         }
-        // Injected `unplugged`: while its link is down the device reports
-        // no transmit done, as an 82574 holding its queue does.
-        let holding = self.unplugged && !self.info.link_up;
         while let Some(d) = if missed || holding { None } else { self.tx.pop() } {
             done(d.ticket, Ok(0));
         }
@@ -341,8 +370,7 @@ impl silica_net::service::Device for Nic {
     }
 
     fn deadline(&self) -> Option<u64> {
-        let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { TX_TIMEOUT_NS };
-        self.tx.oldest().map(|t| t + limit)
+        self.tx.oldest().map(|t| t + silica_driver::io_limit(TX_TIMEOUT_NS))
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -372,15 +400,10 @@ fn reset(regs: &Mmio) -> Result<(), DeviceError> {
     regs.write32(TCTL, 0);
     let _ = regs.read32(STATUS);
     regs.write32(CTRL, regs.read32(CTRL) | CTRL_RST);
-    let deadline = now() + RESET_TIMEOUT_NS;
-    loop {
-        match regs.read32(CTRL) {
-            u32::MAX => return Err(DeviceError::Protocol("the registers read as all ones: the device is gone")),
-            c if c & CTRL_RST == 0 => break,
-            _ if now() >= deadline => return Err(DeviceError::Timeout("the reset to finish (CTRL.RST to clear)")),
-            _ => silica_rt::sys::yield_now(),
-        }
-    }
+    silica_driver::settle(RESET_TIMEOUT_NS, "the reset to finish (CTRL.RST to clear)", || match regs.read32(CTRL) {
+        u32::MAX => Err(DeviceError::Protocol("the registers read as all ones: the device is gone")),
+        c => Ok(c & CTRL_RST == 0),
+    })?;
     regs.write32(IMC, u32::MAX);
     let _ = regs.read32(ICR);
     Ok(())
@@ -399,13 +422,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     // before the load is done, RAL/RAH hold nothing yet, and the driver
     // would replace the burned-in address with one of its own (82574
     // datasheet, EECD.AUTO_RD).
-    let deadline = now() + NVM_TIMEOUT_NS;
-    while regs.read32(EECD) & EECD_AUTO_RD == 0 {
-        if now() >= deadline {
-            println!("e1000e: the NVM did not finish loading within 10 ms; its address may be missing");
-            break;
-        }
-        silica_rt::sys::yield_now();
+    if silica_driver::settle(NVM_TIMEOUT_NS, "the NVM to load (EECD.AUTO_RD)", || Ok(regs.read32(EECD) & EECD_AUTO_RD != 0)).is_err() {
+        println!("e1000e: the NVM did not finish loading within 10 ms; its address may be missing");
     }
     // The Ethernet address: the NVM's, or one made from the device's identity.
     let (low, high) = (regs.read32(RAL0), regs.read32(RAH0));
@@ -443,6 +461,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     };
     regs.write32(IVAR, ivar | IVAR_TX_EVERY);
     // Where an injected spurious interrupt goes.
+    #[cfg(feature = "harness")]
     inject::interrupts(signals.sender(RX | TX)?);
     regs.write32(CTRL_EXT, regs.read32(CTRL_EXT) | CTRL_EXT_PBA_CLR | CTRL_EXT_EIAME);
     // A queue's cause clears itself when its message is sent (EIAC), and
@@ -481,8 +500,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         tx,
         rings: [rx_memory, tx_memory],
         _interrupts: interrupts,
-        stuck: false,
-        unplugged: false,
+        #[cfg(feature = "harness")]
+        injected: Injected::default(),
     };
     nic.info.link_up = nic.link_up();
     let a = address.to_le_bytes();

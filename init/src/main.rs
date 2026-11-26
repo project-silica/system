@@ -160,9 +160,17 @@ struct Running {
 
 /// The machine's hardware watchdog (`silica.watchdog.Device`), which the
 /// service manager alone pets, from its own loop: when it stops (the
-/// service manager or the kernel hung) the machine is reset. The device
-/// manager says when one appears (`watch`, on `note`), so nothing polls; a
-/// machine without one wakes nothing for it.
+/// service manager or the kernel hung) the machine is reset.
+///
+/// The device manager says when its watchdog's driver changes by signalling
+/// `note`, through a capability it is given at each of its starts (among a
+/// machine service's grants): the kernel keeps the signal until the service
+/// manager listens, so nothing is asked for, nothing is asked again and
+/// nothing polls; a machine without one wakes nothing for it. (Before, the
+/// service manager called the device manager to be told, with a time limit,
+/// again after a wait that doubled, and gave up after a minute; and a
+/// device manager started again had never been asked, so the watchdog of
+/// its new driver went unpetted and reset the machine.)
 #[derive(Default)]
 struct Watchdog {
     /// The device manager, called with the watchdog's scope, which no
@@ -177,11 +185,6 @@ struct Watchdog {
     every: u64,
     /// Whether the absence of one was said.
     said_none: bool,
-    /// When to ask the device manager again (0: not), how long the wait
-    /// after that one is, and since when it has been asked.
-    retry: u64,
-    wait: u64,
-    since: u64,
 }
 
 struct Manager {
@@ -317,6 +320,9 @@ impl Manager {
             // The I/O ports, on a machine that has them (x86_64).
             let has_ports = matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), self.root.ports.0), Ok(Some(_)));
             grants.push(if has_ports { Grant::lend(self.root.ports, Rights::ALL) } else { Grant::none() });
+            // What it signals when the watchdog's driver changes: the
+            // watchdog's notification, to signal and nothing else.
+            grants.push(self.dog.note.as_ref().map_or(Grant::none(), |n| Grant::badged(n.cap(), Rights::WRITE, 1)));
             grants.extend(self.root.ramdisk.iter().map(|f| Grant::lend(*f, Rights::READ)));
             // Device registers and the firmware's memory (its tables), given outright.
             let untyped = &info.untyped[..info.untyped_count as usize];
@@ -563,9 +569,12 @@ impl Manager {
     /// Take one message from the endpoint: a call of `silica.system.Manager`
     /// is answered, a service's end looked after. Returns the end of a
     /// service the caller is waiting for (`watch`), or `Err` at the deadline.
-    /// Ask the device manager to say when a watchdog comes, and take the one
-    /// there is now. The capability carries the watchdog's scope, which only
-    /// this program can give (no declaration names it).
+    /// Make the capability the watchdog is taken through: the device
+    /// manager's, with the watchdog's scope, which only this program can
+    /// give (no declaration names it). Nothing is asked here: the device
+    /// manager signals `dog.note` when it has a watchdog's driver (and once
+    /// when it starts, so a machine without one is said to have none), and
+    /// `find_watchdog` takes it then.
     fn watch_watchdog(&mut self) {
         let Some(p) = self.services.iter().position(|s| s.provides == Some("silica.device.Manager")) else { return };
         let Some(ep) = self.endpoints[p].as_ref().map(Object::cap) else { return };
@@ -575,52 +584,28 @@ impl Manager {
             silica_rt::ipc::release_slot(slot);
             return;
         }
-        let Ok(note) = Object::new(ObjectType::Notification, 0) else { return };
         // The device manager parses what devices say: a call to it has a
         // time limit, as every call to something trusted less does.
         self.dog.devices = Some(devices::Client::from(Channel::within(sys::Cap(slot), silica_rt::ipc::DRIVER_CALL_LIMIT)));
-        self.dog.note = Some(note);
-        self.dog.since = silica_rt::clock().now();
-        self.dog.wait = SECOND / 2;
-        self.try_watch();
     }
 
-    /// Ask the device manager to signal the watchdog's notification when a
-    /// watchdog comes or goes. It may still be bringing its drivers up and
-    /// not answer in time: asked again later (half a second, then twice as
-    /// long each time, up to 8 s, for a minute), so nothing waits on it and
-    /// nothing polls once it has answered.
-    fn try_watch(&mut self) {
-        self.dog.retry = 0;
-        let (Some(devs), Some(note)) = (self.dog.devices.as_mut(), self.dog.note.as_ref()) else { return };
-        let Some(to) = silica_rt::ipc::free_slot() else { return };
-        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, note.cap(), Rights::WRITE, 1).is_err() {
-            silica_rt::ipc::release_slot(to);
+    /// The device manager signalled: take the watchdog it has, if any, say
+    /// what it is, and pet it. The device manager signals from its own
+    /// loop, as it turns to listen, and again each time it does until it
+    /// has seen its watchdog taken: a call here that it does not answer in
+    /// time (it went on to something long) is made again at its next
+    /// signal, not after a wait of this program's choosing.
+    fn find_watchdog(&mut self) {
+        // The driver held still answers: the signal was for nothing new.
+        if self.dog.driver.as_mut().is_some_and(|d| d.pet().is_ok()) {
             return;
         }
-        // The capability moves with the call, and is released if it fails.
-        match devs.watch(devices::Class::Watchdog, Handle::new(sys::Cap(to))) {
-            Ok(_) => self.find_watchdog(),
-            Err(e) => {
-                let now = silica_rt::clock().now();
-                if now - self.dog.since > 60 * SECOND {
-                    println!("init: the device manager did not say whether there is a watchdog within a minute ({e:?}): none is petted");
-                    return;
-                }
-                self.dog.retry = now + self.dog.wait;
-                self.dog.wait = (self.dog.wait * 2).min(8 * SECOND);
-            }
-        }
-    }
-
-    /// Take the watchdog the device manager has, if any, say what it is,
-    /// and pet it.
-    fn find_watchdog(&mut self) {
+        self.dog.driver = None;
         let Some(devs) = self.dog.devices.as_mut() else { return };
         let id = match devs.list(devices::Class::Watchdog, 0) {
             Ok(r) => r.devices.iter().next().map(|d| d.id),
             Err(e) => {
-                println!("init: the device manager did not list watchdogs: {e:?}");
+                println!("init: the device manager did not list watchdogs ({e:?}); asked again when it next says it has one");
                 return;
             }
         };
@@ -632,10 +617,29 @@ impl Manager {
             }
             return;
         };
-        let Ok(opened) = devs.open(id, None) else { return };
+        let opened = match devs.open(id, None) {
+            Ok(o) => o,
+            Err(e) => {
+                println!(
+                    "init: the device manager did not hand over the watchdog's driver ({e:?}); asked again when it next says it has one"
+                );
+                return;
+            }
+        };
         let mut driver = watchdog::Client::from(Channel::within(opened.driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         core::mem::forget(opened.driver);
-        let Ok(info) = driver.info() else { return };
+        let info = match driver.info() {
+            Ok(i) => i,
+            Err(e) => {
+                // The watchdog runs from the moment its device was found:
+                // unpetted, it resets the machine, which is the answer to a
+                // watchdog nobody can reach.
+                println!(
+                    "ERROR: init: the watchdog's driver did not say what it is ({e:?}): nothing pets the watchdog, which resets this machine"
+                );
+                return;
+            }
+        };
         if info.reset_last_boot {
             println!("init: the last boot was reset by the watchdog");
         }
@@ -668,17 +672,10 @@ impl Manager {
         Some(self.dog.next)
     }
 
-    /// The watchdog's chores that are due: asking the device manager again,
-    /// petting. When the next one is (`None`: none).
+    /// The watchdog's one chore: its pet, when due. When the next one is
+    /// (`None`: no watchdog, and nothing to wake for).
     fn tend_watchdog(&mut self) -> Option<u64> {
-        if self.dog.retry != 0 && silica_rt::clock().now() >= self.dog.retry {
-            self.try_watch();
-        }
-        let retry = (self.dog.retry != 0).then_some(self.dog.retry);
-        match (self.pet_watchdog(), retry) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        self.pet_watchdog()
     }
 
     fn step(&mut self, listener: &mut Listener, wait: Wait, watch: Option<usize>) -> Result<Option<(usize, Option<i64>)>, ()> {
@@ -1425,7 +1422,9 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         lent: Vec::new(),
         hashes: Vec::new(),
         log,
-        dog: Watchdog::default(),
+        // The watchdog's notification exists before the device manager is
+        // started: it is among that program's grants.
+        dog: Watchdog { note: Object::new(ObjectType::Notification, 0).ok(), ..Watchdog::default() },
     };
     if let Some(l) = &m.log {
         let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for the log"));

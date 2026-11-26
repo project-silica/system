@@ -28,6 +28,7 @@ use silica_block::device::{Error, Info};
 use silica_block::service::{CLIENT, Completions, Refusal, Service, Ticket};
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
+#[cfg(feature = "harness")]
 use silica_driver::inject;
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::oldest::Oldest;
@@ -93,7 +94,7 @@ impl Disk {
     }
 
     fn timeout_ns() -> u64 {
-        if inject::armed() { inject::ARMED_TIMEOUT_NS } else { IO_TIMEOUT_NS }
+        silica_driver::io_limit(IO_TIMEOUT_NS)
     }
 }
 
@@ -225,6 +226,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let features = transport.negotiate(&dma, F_RO | F_BLK_SIZE | F_FLUSH, 0)?;
     let signals = Signals::new()?;
     let interrupt = Interrupt::bind_to(&device, 0, signals.sender(INTERRUPT)?)?;
+    #[cfg(feature = "harness")]
     inject::interrupts(signals.sender(INTERRUPT)?);
     // A request is a header, its data and a status byte.
     let mut queue = transport.queue(&dma, 0, QUEUE_SIZE, 3, Some(0))?;

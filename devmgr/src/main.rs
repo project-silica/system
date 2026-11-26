@@ -25,12 +25,17 @@
 //! memory, which happens when the driver's device address space goes), and
 //! the driver is started again (at once the first time, then backing off,
 //! never for good: `silica_proc::Restarts`); the driver is told how many
-//! times it has been started. A driver may be replaced:
-//! `driver=<vendor>:<device>=<program>` on the kernel command line (four
-//! hexadecimal digits each) starts `<program>` from the boot archive for
-//! that kind of device instead of the driver the device manager would pick.
-//! `inject=<driver>:<fault>@<n>` has the first run of `<driver>` commit a
-//! device's fault at its `n`th request (`silica_driver::inject`).
+//! times it has been started. Which program drives a device is said by the
+//! boot archive's `drivers` list and by nothing else: the list is part of
+//! the archive the kernel checked, and no word of the boot command line
+//! reaches this program's choice (before, `driver=<ids>=<program>` there
+//! gave any program in the archive a device's authority).
+//!
+//! In a test image only (the `harness` feature, which a machine's image is
+//! never built with), the device manager's own option
+//! `inject=<driver>:<fault>@<n>` (`devmgr.inject=...` to the service
+//! manager) has the first run of `<driver>` commit a device's fault at its
+//! `n`th request (`silica_driver::inject`).
 //!
 //! It provides `silica.device.Manager`: a program that uses devices (the
 //! block server, a filesystem, the network stack) lists the devices of a
@@ -51,8 +56,10 @@
 //! as grants: 0 its endpoint (to receive on, and to give drivers their way
 //! to report), 1 the service manager's (`silica.system.Manager`), 2 the
 //! frame of the kernel's `RootInfo` (read-only), 3 the device identities,
-//! 4 the interrupt lines, 5 the I/O ports (or nothing), then `args[0]`
-//! frames of the ramdisk (in
+//! 4 the interrupt lines, 5 the I/O ports (or nothing), 6 a capability that
+//! signals the service manager's watchdog notification (how it is told
+//! that the watchdog's driver changed: `Manager::tell_watchdog`), then
+//! `args[0]` frames of the ramdisk (in
 //! `RootInfo` order, read-only), then `args[1]` Untyped capabilities, given
 //! outright: the machine's device memory and the firmware's memory (where
 //! its ACPI tables are), in `RootInfo` order.
@@ -88,7 +95,8 @@ const GRANT_INFO: u64 = 2;
 const GRANT_DEVICES: u64 = 3;
 const GRANT_IRQS: u64 = 4;
 const GRANT_PORTS: u64 = 5;
-const GRANT_FIRST_RAMDISK: u64 = 6;
+const GRANT_WATCHDOG: u64 = 6;
+const GRANT_FIRST_RAMDISK: u64 = 7;
 /// Badges of the capabilities clients call through start here (and stay
 /// below `silica_proc::FAULT_BADGE`); below are the drivers'.
 pub const CLIENTS: u64 = 1 << 32;
@@ -165,9 +173,6 @@ struct Manager {
     described: silica_rt::alloc::string::String,
     /// Badges of driver capabilities handed out, so each client is told apart.
     next_client: u64,
-    /// The kernel command line: `inject=<driver>:<fault>@<n>`
-    /// (`silica_driver::inject`) is read at each driver's first start.
-    cmdline: &'static [u8],
     /// Hot-plug capable ports, with the configuration space base (ECAM)
     /// and segment of the buses behind them.
     /// (Each with the segment's last bus.)
@@ -196,6 +201,14 @@ struct Manager {
     /// What clients asked to have signalled when a device of a class gains
     /// or loses its driver (`watch`).
     watchers: Vec<(u64, manager::Class, Handle)>,
+    /// The service manager has not been seen to act on the watchdog as it
+    /// now is (`tell_watchdog`): true from the start, so a machine without
+    /// a watchdog is said to have none, and again whenever a watchdog's
+    /// driver starts or ends.
+    watchdog_news: bool,
+    /// It was told of that news, and this program has done nothing since
+    /// but answer it: not told again until it has.
+    watchdog_told: bool,
     /// The badge of the call being answered: whose capability, and its
     /// scopes (`silica_protocols::scope`).
     caller: u64,
@@ -266,6 +279,11 @@ impl manager::Server<Handle> for Manager {
         }
         let functions = &self.functions;
         let of_class = self.running.iter().map(|r| (&functions[r.function], r.name)).filter(|(f, _)| class_of(f) == Some(class));
+        // The service manager asked what watchdog there is, and there is
+        // none: it knows (`tell_watchdog`).
+        if class == manager::Class::Watchdog && of_class.clone().next().is_none() {
+            self.watchdog_news = false;
+        }
         let listing = &mut self.listing;
         let next = paging::part(
             of_class,
@@ -295,6 +313,11 @@ impl manager::Server<Handle> for Manager {
             // later notice (its reconnecting) replaces its earlier one.
             r.gone.retain(|(c, _)| *c != caller);
             r.gone.push((caller, g));
+        }
+        if class == Some(manager::Class::Watchdog) {
+            // The service manager takes the watchdog's driver: it knows
+            // (`tell_watchdog`).
+            self.watchdog_news = false;
         }
         Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
     }
@@ -350,30 +373,26 @@ impl manager::Server<Handle> for Manager {
     }
 }
 
-/// The value of `key` on a command line of space-separated `key=value` words.
-/// The fault `inject=<driver>:<fault>@<n>` asks `driver` to commit, as
-/// `silica_driver::inject::Fault::plan` makes it (0: none).
-fn inject_plan(cmdline: &[u8], driver: &str) -> u32 {
-    for choice in option(cmdline, "inject") {
-        let Some(colon) = choice.iter().position(|&b| b == b':') else { continue };
-        if &choice[..colon] != driver.as_bytes() {
+/// The fault this program's `inject=<driver>:<fault>@<n>` options ask
+/// `driver` to commit, as `silica_driver::inject::Fault::plan` makes it (0:
+/// none). Test images only: a machine's device manager has no such option.
+#[cfg(feature = "harness")]
+fn inject_plan(driver: &str) -> u32 {
+    for choice in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("inject=")) {
+        let Some((name, rest)) = choice.split_once(':') else { continue };
+        if name != driver {
             continue;
         }
-        let rest = &choice[colon + 1..];
-        let (fault, n) = match rest.iter().position(|&b| b == b'@') {
-            Some(at) => (&rest[..at], core::str::from_utf8(&rest[at + 1..]).ok().and_then(|n| n.parse().ok()).unwrap_or(1)),
+        let (fault, n) = match rest.split_once('@') {
+            Some((fault, n)) => (fault, n.parse().unwrap_or(1)),
             None => (rest, 1),
         };
-        match silica_driver::inject::Fault::named(fault) {
+        match silica_driver::inject::Fault::named(fault.as_bytes()) {
             Some(f) => return f.plan(n),
-            None => println!("devmgr: inject: no fault named {}", core::str::from_utf8(fault).unwrap_or("?")),
+            None => println!("devmgr: inject: no fault named {fault}"),
         }
     }
     0
-}
-
-fn option<'a>(cmdline: &'a [u8], key: &str) -> impl Iterator<Item = &'a [u8]> {
-    cmdline.split(|b| b.is_ascii_whitespace()).filter_map(move |w| w.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
 }
 
 /// What a driver says it drives: a line of the boot archive's `drivers`
@@ -474,19 +493,9 @@ fn write_allowed(w: ConfigWrite, caps: &[(u8, usize)]) -> bool {
         && caps.iter().all(|&(id, cap)| at + n <= cap || at >= cap + length(id))
 }
 
-/// The driver for a function: the owner's choice on the command line
-/// (`driver=<vendor>:<device>=<program>`), else the first in the archive's
-/// list that names its identifiers, else the first that names its class.
-fn driver_for(f: &Function, cmdline: &'static [u8], table: &[(Match, &'static str)]) -> Option<&'static str> {
-    let hex = |b: &[u8]| core::str::from_utf8(b).ok().and_then(|s| u16::from_str_radix(s, 16).ok());
-    for choice in option(cmdline, "driver") {
-        let mut parts = choice.splitn(2, |b| *b == b'=');
-        let (Some(ids), Some(program)) = (parts.next(), parts.next()) else { continue };
-        let mut ids = ids.splitn(2, |b| *b == b':');
-        if (ids.next().and_then(hex), ids.next().and_then(hex)) == (Some(f.vendor), Some(f.device)) {
-            return core::str::from_utf8(program).ok();
-        }
-    }
+/// The driver for a function: the first in the archive's list that names
+/// its identifiers, else the first that names its class.
+fn driver_for(f: &Function, table: &[(Match, &'static str)]) -> Option<&'static str> {
     let by_id = table.iter().find(|(m, _)| matches!(m, Match::Id(v, d) if (*v, *d) == (f.vendor, f.device)));
     let by_class = || table.iter().find(|(m, _)| matches!(m, Match::Class(c, s, p) if (*c, *s, *p) == f.class));
     by_id.or_else(by_class).map(|(_, program)| *program)
@@ -618,9 +627,14 @@ impl Manager {
                     println!("devmgr: {}: a device arrived, but its link never came up", PciAddress(ports[*k].0.id));
                     return false;
                 } else {
-                    // The link's own interrupt may say it first; look again
-                    // soon anyway (a port need not send one).
-                    next = Some(next.map_or(now + 5_000_000, |n| n.min(now + 5_000_000)));
+                    // The port's interrupt says when the link comes up (it
+                    // turns this loop, which asks here again): nothing looks
+                    // meanwhile, and the second PCI Express gives a link is
+                    // the wait's only other end. A port that could not be
+                    // armed, or reports no link changes, sends none: its
+                    // link is looked at every 5 ms within that second.
+                    let look = if ports[*k].0.link_interrupt { *until + 1 } else { (now + 5_000_000).min(*until + 1) };
+                    next = Some(next.map_or(look, |n| n.min(look)));
                     return true;
                 }
             }
@@ -681,7 +695,7 @@ impl Manager {
                     }
                 };
                 let f = &self.functions[index];
-                let driver = driver_for(f, self.cmdline, &self.table);
+                let driver = driver_for(f, &self.table);
                 println!(
                     "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x} arrived: {}",
                     PciAddress(id),
@@ -987,8 +1001,12 @@ impl Manager {
             registers.write16(msix.cap + 2, (registers.read16(msix.cap + 2) | 1 << 15) & !(1 << 14));
         }
         self.next_id += 1;
-        // A fault to commit on purpose, in the driver's first run only.
-        let inject = if f.starts == 0 { inject_plan(self.cmdline, driver) } else { 0 };
+        // A test image's fault to commit on purpose, in the driver's first
+        // run only; a machine's image has no such thing to pass.
+        #[cfg(feature = "harness")]
+        let inject = if f.starts == 0 { inject_plan(driver) } else { 0 };
+        #[cfg(not(feature = "harness"))]
+        let inject = 0u32;
         let starts = f.starts;
         let log = self.log_of(index, driver);
         let events = OwnedObject::new(ObjectType::Notification, 0).map_err(|_| {
@@ -1055,6 +1073,28 @@ impl Manager {
     fn changed(&mut self, index: usize) {
         let Some(class) = class_of(&self.functions[index]) else { return };
         self.watchers.retain(|(_, c, n)| *c != class || sys::signal(n.cap()).is_ok());
+        self.watchdog_news |= class == manager::Class::Watchdog;
+    }
+
+    /// Tell the service manager that the watchdog's driver changed, by the
+    /// capability it gave this program at its start (`GRANT_WATCHDOG`): the
+    /// service manager alone pets a watchdog, and takes its driver when it
+    /// hears. Called as the loop turns to listen, so the calls that follow
+    /// (`list`, `open`) are answered at once; and again after every turn
+    /// this program spent on something else, until the service manager has
+    /// been seen to act (it opened the watchdog's driver, or asked and
+    /// there is none), so one that gave up on a call while this program was
+    /// busy hears again when it no longer is. The kernel keeps the signal
+    /// until the service manager listens: nothing is asked for beforehand.
+    fn tell_watchdog(&mut self) {
+        if !self.watchdog_news || self.watchdog_told {
+            return;
+        }
+        self.watchdog_told = true;
+        if sys::signal(granted(GRANT_WATCHDOG)).is_err() {
+            // Started by something that pets no watchdog: nobody to tell.
+            self.watchdog_news = false;
+        }
     }
 
     /// The log of the drivers of function `index` (`driver` names it with
@@ -1239,7 +1279,6 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         listing: Vec::new(),
         described: silica_rt::alloc::string::String::new(),
         next_client: CLIENTS,
-        cmdline: &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())],
         ports: Vec::new(),
         bridges: Vec::new(),
         settling: Vec::new(),
@@ -1250,10 +1289,11 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         writes: config_writes(archive),
         configs: BTreeMap::new(),
         watchers: Vec::new(),
+        watchdog_news: true,
+        watchdog_told: false,
         caller: 0,
     };
     m.enumerate()?;
-    let cmdline = m.cmdline;
     let table = m.table.clone();
     if table.is_empty() {
         println!("devmgr: the boot archive lists no drivers");
@@ -1265,7 +1305,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     let mut failed = false;
     let mut wanted = Vec::new();
     for (i, f) in m.functions.iter().enumerate() {
-        let driver = driver_for(f, cmdline, &table);
+        let driver = driver_for(f, &table);
         println!(
             "devmgr: {} {:04x}:{:04x} class {:02x}.{:02x}.{:02x}, {} interrupts: {}",
             PciAddress(f.id),
@@ -1327,8 +1367,15 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        // About to listen: the service manager hears of a watchdog now.
+        m.tell_watchdog();
         let got = listener.recv_listening(happened, next.map_or(Wait::Forever, Wait::Until));
         took = silica_rt::clock().now();
+        // Anything but the service manager's answer to that news is this
+        // program busy with something else: the news is told again after.
+        let answering = matches!(&got, Ok(msg) if msg.signals().is_none()
+            && msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 && scope::has(msg.badge, scope::DEVICE_WATCHDOG));
+        m.watchdog_told &= answering;
         if matches!(got, Err(sys::Error::Timeout)) {
             continue;
         }

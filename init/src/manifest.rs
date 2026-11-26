@@ -19,7 +19,8 @@
 //!   what of it the service may call, carried in the capability's badge.
 //! - `machine`: it is given the machine, as grants after those: its
 //!   description, the device authority, the interrupt lines, the I/O ports
-//!   (an empty slot where there are none), the boot archive's frames, and
+//!   (an empty slot where there are none), a capability that signals the
+//!   service manager's watchdog notification, the boot archive's frames, and
 //!   the device and firmware memory, given outright; `args[0]` and `args[1]`
 //!   count the last two. The device manager alone; when it ends, the
 //!   service manager takes the memory given outright back first, emptied,

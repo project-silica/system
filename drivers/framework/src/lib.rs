@@ -17,7 +17,8 @@
 //! interrupt line, 2 how many lines it has, 3 one past the highest address
 //! a device can be given on this machine (0: the machine cannot confine
 //! DMA), 4 how many times a driver was started for this device before (low
-//! half; the high half is a fault to inject, [`inject`]).
+//! half; in a test image, built with the `harness` feature, the high half is
+//! a fault for this run to commit on purpose, `inject`).
 //!
 //! A device gets one interrupt line per MSI-X table entry it has, up to 8
 //! ([`Device::lines`]); [`irq`] binds them. A 64-bit BAR is the BAR of its
@@ -46,9 +47,11 @@
 //! that kind, as the PCI class code says (`01.08.02` is an NVMe controller).
 //! The image build collects these into the boot archive's `drivers` list,
 //! and the device manager starts the first driver that names a device's
-//! identifiers, else the first that names its class. The owner can put
-//! another program in a driver's place for one kind of device with
-//! `driver=<vendor>:<device>=<program>` on the kernel command line.
+//! identifiers, else the first that names its class. Which program gets a
+//! device's authority is said by that list alone, which is part of the
+//! checked boot archive: an image that wants another program in a driver's
+//! place for one kind of device (a test image's hostile driver) is built
+//! with a `pci` line for it ahead of the others.
 //!
 //! The device manager knows what a device is for from its class code (01:
 //! storage, a provider of `silica.block.Device`) and hands clients the
@@ -60,11 +63,13 @@
 //!
 //! A driver that faults, or exits with a status other than 0, is destroyed
 //! (its memory, its capabilities, and its device's view of memory with
-//! them), its device is silenced, and it is started again, at most three
-//! times; [`Device::starts`] says how many times it has been. Its clients
-//! see `peer_gone` and open the new one. A driver that exits with 0 is not
-//! started again. Reading memory a client lent it (`silica_rt::mem::map_peer`)
-//! never faults: memory the client took back reads as zeros.
+//! them), its device is silenced, and it is started again: at once the
+//! first time, then after a wait that doubles up to a minute, never given
+//! up for good (`silica_proc::Restarts`); [`Device::starts`] says how many
+//! times it has been. Its clients see `peer_gone` and open the new one. A
+//! driver that exits with 0 is not started again. Reading memory a client
+//! lent it (`silica_rt::mem::map_peer`) never faults: memory the client
+//! took back reads as zeros.
 //!
 //! A driver that cannot go on ends with a nonzero status (or
 //! `silica_rt::exit`, from anywhere) and is restarted, which resets its
@@ -72,10 +77,21 @@
 //! not know) says why and ends with status 0: it is not restarted, and the
 //! device is left alone.
 //!
-//! Not yet: a driver is not told the system is shutting down before it is
-//! ended, so it cannot put its device in a clean state first (an NVMe
-//! controller's shutdown notification). Data is safe regardless: what a
-//! client was told is flushed is on the medium.
+//! A driver is told when the machine is turning off: its parent signals
+//! `silica_rt::END` on the notification it listens on ([`irq::Signals`]),
+//! and a driver with something to finish does so and exits 0 (a block
+//! driver's service flushes the device's write cache and lets the device
+//! shut down as its specification asks: an NVMe controller's normal
+//! shutdown). A driver that does not exit within the device manager's bound
+//! is ended where it stands; what a client was told is flushed is on the
+//! medium regardless.
+//!
+//! # Waiting for a device
+//!
+//! A register that changes when the device is ready (a reset finished, a
+//! controller enabled) is waited for with [`settle`]: it looks, sleeps and
+//! looks again until the bound the device's own specification gives for
+//! that step, and no driver spins a processor meanwhile.
 //!
 //! A driver's `Cargo.toml` needs only the runtime, this crate, and its
 //! class's crate:
@@ -118,6 +134,7 @@
 
 pub mod dma;
 pub mod framebuffer;
+#[cfg(feature = "harness")]
 pub mod inject;
 pub mod irq;
 pub mod mac;
@@ -129,6 +146,66 @@ use core::ops::Range;
 use silica_rt::mmio::Mmio;
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{ProcessInfo, mem, slots};
+
+/// How long a driver waits for its device to answer a request: `limit`, the
+/// device's own. (In a test image, built with the `harness` feature, a run
+/// with a fault armed waits `inject::ARMED_TIMEOUT_NS` instead, so the
+/// test of a device that never answers takes a second.)
+#[inline]
+pub fn io_limit(limit: u64) -> u64 {
+    #[cfg(feature = "harness")]
+    if inject::armed() {
+        return inject::ARMED_TIMEOUT_NS;
+    }
+    limit
+}
+
+/// What a driver sleeps on between looks at a register ([`settle`]): a
+/// notification nobody signals (a receive with a deadline is how a program
+/// sleeps), made the first time it is needed and kept.
+static NAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The first sleep between two looks at a register; each one after is twice
+/// as long, up to [`SETTLE_LONGEST_NS`].
+const SETTLE_FIRST_NS: u64 = 50_000;
+const SETTLE_LONGEST_NS: u64 = 10_000_000;
+
+/// Wait for the device to finish a step it reports in a register: `done`
+/// reads it (`Ok(true)`: finished; an error ends the wait with that error),
+/// now and after each sleep, until `bound_ns` have passed, when the wait
+/// fails with `DeviceError::Timeout(what)`. `bound_ns` is what the device's
+/// specification gives the step (NVMe's CAP.TO and RTD3E, the 82574's reset
+/// time), not a number of the driver's own. A device that is ready at once
+/// costs one read; one that takes its whole time costs no processor, and
+/// nothing the driver listens on is consumed meanwhile.
+pub fn settle(bound_ns: u64, what: &'static str, mut done: impl FnMut() -> Result<bool, DeviceError>) -> Result<(), DeviceError> {
+    use core::sync::atomic::Ordering;
+    let clock = silica_rt::clock();
+    let deadline = clock.now().saturating_add(bound_ns);
+    let mut nap = SETTLE_FIRST_NS;
+    loop {
+        if done()? {
+            return Ok(());
+        }
+        let now = clock.now();
+        if now >= deadline {
+            return Err(DeviceError::Timeout(what));
+        }
+        if NAP.load(Ordering::Relaxed) == 0
+            && let Ok(n) = mem::Object::new(ObjectType::Notification, 0)
+        {
+            NAP.store(n.cap().0, Ordering::Relaxed);
+        }
+        match NAP.load(Ordering::Relaxed) {
+            // No memory for it: the bound still holds, the sleep does not.
+            0 => sys::yield_now(),
+            n => {
+                // The deadline passing is the wake-up.
+                let _ = sys::recv(Cap(n), sys::Wait::Until((now + nap).min(deadline)));
+            }
+        }
+        nap = (nap * 2).min(SETTLE_LONGEST_NS);
+    }
+}
 
 /// Grant numbers of what the device manager gives a driver.
 pub mod grant {
@@ -227,7 +304,9 @@ impl Device {
             }
         }
         let first = info.args[1] as u32;
-        // A fault to commit on purpose (`inject`), for this run only.
+        // A fault to commit on purpose, for this run only: test images
+        // alone are built with it (`inject`, the `harness` feature).
+        #[cfg(feature = "harness")]
         inject::arm((info.args[4] >> 32) as u32);
         Ok(Device {
             id: info.args[0] as u32,

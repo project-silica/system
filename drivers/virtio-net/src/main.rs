@@ -27,6 +27,7 @@
 #![no_main]
 
 use silica_driver::dma::{Dma, DmaMemory, Shared};
+#[cfg(feature = "harness")]
 use silica_driver::inject;
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::oldest::Oldest;
@@ -233,7 +234,7 @@ impl silica_net::service::Device for Nic {
     }
 
     fn deadline(&self) -> Option<u64> {
-        let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { TX_TIMEOUT_NS };
+        let limit = silica_driver::io_limit(TX_TIMEOUT_NS);
         let slots = &self.tx_slots;
         self.tx_oldest.oldest(|s, t| slots[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + limit)
     }
@@ -290,6 +291,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     } else {
         interrupts.push(Interrupt::bind_to(&device, 0, signals.sender(RX | TX | CONFIG)?)?);
     }
+    #[cfg(feature = "harness")]
     inject::interrupts(signals.sender(RX | TX)?);
     // A frame takes a header and its data: two descriptors each way.
     let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, 2, Some(rx_v))?;

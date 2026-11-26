@@ -1,2 +1,3 @@
 target	edges
-virtqueue	537
+virtio_transport	202
+virtqueue	530

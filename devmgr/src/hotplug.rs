@@ -23,6 +23,11 @@ pub const HOTPLUG: u64 = 1 << 33;
 
 // The PCI Express capability's registers, from its start.
 const CAPS: usize = 0x02;
+const LINK_CAPS: usize = 0x0C;
+/// Link Capabilities: the port reports whether its link is active, and
+/// interrupts when that changes (Data Link Layer Link Active Reporting
+/// Capable).
+const LINK_REPORTING: u32 = 1 << 20;
 const LINK_STATUS: usize = 0x12;
 const SLOT_CAPS: usize = 0x14;
 const SLOT_CONTROL: usize = 0x18;
@@ -167,6 +172,13 @@ pub struct Port {
     pub occupied: bool,
     /// Whether the slot's power is the system's to switch.
     powered: bool,
+    /// Whether the port interrupts when its link comes up or goes: it was
+    /// armed ([`Port::arm`]) and reports its link's state (Link
+    /// Capabilities, Data Link Layer Link Active Reporting Capable, which
+    /// the specification requires of a hot-plug capable port). The wait
+    /// for an arrived device's link is then the interrupt's, with the
+    /// hardware's bound as its only other end.
+    pub link_interrupt: bool,
 }
 
 impl Port {
@@ -200,13 +212,15 @@ impl Port {
             windows,
             occupied,
             powered,
+            link_interrupt: false,
         })
     }
 
     /// Let the slot interrupt, through the port's MSI-X entry 0 (already
     /// written by the caller): the port may send it, and its MSI-X is on.
-    pub fn arm(&self) {
+    pub fn arm(&mut self) {
         let r = self.config.registers();
+        self.link_interrupt = r.read32(self.express + LINK_CAPS) & LINK_REPORTING != 0;
         r.write16(4, r.read16(4) | COMMAND_MEMORY | COMMAND_MASTER);
         if let Some(m) = self.config.msix() {
             // Enabled, the function's mask off.
