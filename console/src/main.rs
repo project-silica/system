@@ -72,8 +72,9 @@ struct Console {
     modifiers: keys::Modifiers,
     line: String,
     lines: VecDeque<String>,
-    /// A `read_line` waiting for the next line.
-    waiting: Option<Parked>,
+    /// The `read_line` calls waiting for the next line, oldest first: at
+    /// most one for each holder (its badge), answered in turn.
+    waiting: VecDeque<(u64, Parked)>,
     wants_wait: bool,
     /// The line `read_line` answers with now (its reply borrows it).
     line_out: String,
@@ -146,7 +147,7 @@ impl Console {
     fn char(&mut self, c: char) {
         if self.line.len() < 1000 {
             self.line.push(c);
-            if self.waiting.is_some() {
+            if self.reading() {
                 let mut b = [0u8; 4];
                 self.show(c.encode_utf8(&mut b));
             }
@@ -154,7 +155,7 @@ impl Console {
     }
 
     fn backspace(&mut self) {
-        if self.line.pop().is_some() && self.waiting.is_some() {
+        if self.line.pop().is_some() && self.reading() {
             self.grid.backspace();
             self.update();
             print!("\u{8} \u{8}");
@@ -162,9 +163,24 @@ impl Console {
         }
     }
 
+    /// Whether a reader waits for the line being typed (it is shown then).
+    fn reading(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// The oldest reader whose caller still waits.
+    fn next_reader(&mut self) -> Option<Parked> {
+        while let Some((_, p)) = self.waiting.pop_front() {
+            if p.waiting() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     fn enter(&mut self) {
         let line = core::mem::take(&mut self.line);
-        match self.waiting.take() {
+        match self.next_reader() {
             Some(p) => {
                 self.show("\n");
                 answer_line(p, &line);
@@ -237,7 +253,7 @@ impl terminal::Server<Handle> for Console {
 impl Waiting for Console {
     fn call(
         &mut self,
-        _badge: u64,
+        badge: u64,
         request: &[u8],
         caps: CapList<Handle>,
         reply: &mut [u8],
@@ -246,14 +262,20 @@ impl Waiting for Console {
     ) -> usize {
         self.wants_wait = false;
         let n = terminal::dispatch(self, request, caps, reply, reply_caps);
-        if self.wants_wait && !self.waiting.as_ref().is_some_and(Parked::waiting) {
-            // Kept until the next line. A reader whose caller has gone (a
-            // shell restarted under its call) gives way to the new one; a
-            // second reader while the first still waits gets busy.
-            self.waiting = parked.take();
-            // Typeahead belongs after the reader's prompt, including a
-            // partial line typed while the preceding command was running.
-            if self.waiting.is_some() && !self.line.is_empty() {
+        // Kept until a line comes for it, after the readers that asked
+        // before. A reader whose caller has gone (a shell restarted under
+        // its call) is nobody's and gives way; the same holder asking again
+        // while its read still waits gets busy, so a holder keeps one place.
+        if self.wants_wait {
+            self.waiting.retain(|(_, p)| p.waiting());
+            if !self.waiting.iter().any(|(b, _)| *b == badge)
+                && let Some(p) = parked.take()
+            {
+                self.waiting.push_back((badge, p));
+            }
+            // Typeahead belongs after the first reader's prompt, including
+            // a partial line typed while the preceding command was running.
+            if self.waiting.len() == 1 && !self.line.is_empty() {
                 let typed = core::mem::take(&mut self.line);
                 self.show(&typed);
                 self.line = typed;
@@ -402,7 +424,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         modifiers: keys::Modifiers::default(),
         line: String::new(),
         lines: VecDeque::new(),
-        waiting: None,
+        waiting: VecDeque::new(),
         wants_wait: false,
         line_out: String::new(),
     };
