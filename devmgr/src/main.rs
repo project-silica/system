@@ -696,15 +696,6 @@ impl Manager {
                 Grant::badged(granted(GRANT_IRQS), Rights::ALL, first_line as u64 | (first_line as u64 + lines as u64) << 32);
         }
         grants[silica_driver::grant::CONFIG as usize] = Grant::lend(f.config_frame, Rights::READ);
-        // What the driver may not change itself: the device answers memory
-        // accesses, may do DMA and send message interrupts, and raises
-        // those through MSI-X, never the legacy wire.
-        let registers = config.registers();
-        registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
-        if let Some(msix) = config.msix() {
-            registers.write16(msix.cap + 2, (registers.read16(msix.cap + 2) | 1 << 15) & !(1 << 14));
-        }
-        self.next_id += 1;
         // A display: the framebuffer the firmware set up, if it is this
         // device's (its mode, and the BAR it starts at the first byte of).
         let mut display = [0u64; 3];
@@ -716,6 +707,15 @@ impl Manager {
                 None => return Err("the firmware's framebuffer does not start a BAR of this display"),
             }
         }
+        // What the driver may not change itself: the device answers memory
+        // accesses, may do DMA and send message interrupts, and raises
+        // those through MSI-X, never the legacy wire.
+        let registers = config.registers();
+        registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
+        if let Some(msix) = config.msix() {
+            registers.write16(msix.cap + 2, (registers.read16(msix.cap + 2) | 1 << 15) & !(1 << 14));
+        }
+        self.next_id += 1;
         // A fault to commit on purpose, in the driver's first run only.
         let inject = if f.starts == 0 { inject_plan(self.cmdline, driver) } else { 0 };
         let starts = f.starts;
@@ -737,7 +737,14 @@ impl Manager {
             ..Program::new(image, self.next_id)
         };
         let child = spawn(&self.parent, &program).map_err(|e| {
-            println!("devmgr: cannot start {driver}: {e:?}");
+            // Nothing drives it: it does no DMA and raises nothing.
+            silence(&config);
+            let command = config.registers().read16(4);
+            println!(
+                "devmgr: cannot start {driver}: {e:?}; {} left with bus mastering {} (command {command:#06x})",
+                PciAddress(id),
+                if command & pci::COMMAND_MASTER != 0 { "on" } else { "off" }
+            );
             "its driver could not be started"
         })?;
         let f = &mut self.functions[index];
@@ -788,11 +795,7 @@ impl Manager {
     /// off from memory as the driver's device address space goes.
     fn stop(&mut self, r: Running<'static>) -> bool {
         let config = self.functions[r.function].config;
-        let registers = config.registers();
-        registers.write16(4, registers.read16(4) & !pci::COMMAND_MASTER);
-        if let Some(msix) = config.msix() {
-            registers.write16(msix.cap + 2, registers.read16(msix.cap + 2) & !(1 << 15));
-        }
+        silence(&config);
         let ok = r.child.destroy().is_ok();
         // Its clients hear of it now, not on their next call.
         for (_, g) in r.gone {
@@ -1042,5 +1045,20 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
             continue;
         }
         m.start_again(function, driver);
+    }
+}
+
+/// The device of `config` may no longer do DMA or send message interrupts:
+/// a device without a running driver (stopped, or never started because
+/// starting it failed) is silenced, so that without an IOMMU it cannot
+/// reach memory at all. Says so if the device does not take it.
+fn silence(config: &Config) {
+    let registers = config.registers();
+    registers.write16(4, registers.read16(4) & !pci::COMMAND_MASTER);
+    if let Some(msix) = config.msix() {
+        registers.write16(msix.cap + 2, registers.read16(msix.cap + 2) & !(1 << 15));
+    }
+    if registers.read16(4) & pci::COMMAND_MASTER != 0 {
+        println!("ERROR: devmgr: a device kept bus mastering after it was switched off");
     }
 }
