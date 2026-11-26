@@ -219,7 +219,10 @@ impl Device {
                 // as the program runs.
                 #[allow(unsafe_code)]
                 let m = unsafe { Mmio::new(at, 1 << bits) };
-                *bar = Some(m);
+                // Registers smaller than a page come as their page: they
+                // start where the BAR's address says within it.
+                let offset = pci::Config::new(config).bar_address(i).map_or(0, |(a, _)| (a & ((1 << bits) - 1)) as usize);
+                *bar = Some(if offset == 0 { m } else { m.part(offset, (1 << bits) - offset).ok_or(DeviceError::NotADriver)? });
             }
         }
         let first = info.args[1] as u32;

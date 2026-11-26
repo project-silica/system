@@ -461,3 +461,13 @@ dependencies = [
  "silica-driver",
  "silica-rt",
 ]
+
+[[package]]
+name = "watchdog-esb"
+version = "0.0.0"
+dependencies = [
+ "silica-driver",
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
