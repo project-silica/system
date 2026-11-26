@@ -89,6 +89,7 @@ pub fn start(info: &'static RootInfo, secret: [u64; 4]) -> Result<Root, &'static
         cpus: info.cpus,
         clock: info.clock,
         time: Cap::NONE,
+        sched: Cap(libsys::root::SLOT_CONTEXT),
     };
     Ok(Root { archive, parent, ports, ramdisk, secret })
 }

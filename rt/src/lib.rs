@@ -166,11 +166,18 @@ pub mod slots {
     /// service manager or a service starts; writable only by a service
     /// that sets the time (`sets_time`).
     pub const TIME: Cap = Cap(12);
+    /// The scheduling context the program runs on (readable): processor
+    /// time is a capability, and this is the program's. A thread runs only
+    /// once it is bound to a context (`sys::thread_bind`), so a thread the
+    /// program makes is bound to this one, and a program it starts runs on
+    /// it too unless it is given another (`silica_proc::Program::sched`):
+    /// together they take the one share their parent gave.
+    pub const SCHED: Cap = Cap(13);
     /// The first capability the parent granted beyond these. Slots from
     /// here to 64 that the parent did not fill are left empty, for
     /// capabilities the program is given later; the program's own
     /// allocations start above them.
-    pub const FIRST_GRANT: u64 = 13;
+    pub const FIRST_GRANT: u64 = 14;
 }
 
 /// `ProcessInfo::magic`.

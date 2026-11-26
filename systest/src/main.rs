@@ -10,6 +10,7 @@ use libsys::{self as sys, Cap, Error, MsgInfo, ObjectType, Rights, Wait};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
 use silica_proc::{Child, FAULT_BADGE, Grant, Program, report, spawn};
+use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{free_slot, release_slot};
 use silica_rt::mem::Object;
 use silica_rt::{EXIT_LABEL, print, println};
@@ -42,6 +43,10 @@ struct Tests {
     /// processor (0 until that test has run): its pace, which the limits
     /// on the tests after it follow ([`Tests::patience`]).
     pace: u64,
+    /// Time on each processor for the programs the tests start there:
+    /// one fair context each, made on first use (processor 0's is this
+    /// root task's own; it holds every processor's time).
+    time: Vec<Option<Object>>,
 }
 
 /// The pace the limits are sized for: a million round trips on one
@@ -59,6 +64,21 @@ const SAY_NS: u64 = 10 * SECOND;
 type Outcome = Result<(), &'static str>;
 
 impl Tests {
+    /// A scheduling context on processor `cpu`: a program runs where its
+    /// time is, and is moved by binding it to time elsewhere.
+    fn time_on(&mut self, cpu: usize) -> Result<Cap, &'static str> {
+        if cpu == 0 {
+            return Ok(Cap(libsys::root::SLOT_CONTEXT));
+        }
+        if self.time[cpu].is_none() {
+            let sc = Object::new(ObjectType::SchedContext, 0).map_err(|_| "no memory for a scheduling context")?;
+            sys::sched_fair(sc.cap(), sys::SCHED_DEFAULT_WEIGHT, cpu, Cap(libsys::root::SLOT_SCHED))
+                .map_err(|_| "cannot take a share of a processor")?;
+            self.time[cpu] = Some(sc);
+        }
+        self.time[cpu].as_ref().map(Object::cap).ok_or("no scheduling context")
+    }
+
     /// Start `stress` in `role` on processor `cpu` (modulo how many there
     /// are). Returns the program and the badge its exit report will carry.
     fn start(&mut self, role: u64, args: [u64; 2], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
@@ -68,12 +88,13 @@ impl Tests {
     /// [`Tests::start`] with a third argument (a client's: where its
     /// progress notification is among its grants).
     fn start_with(&mut self, role: u64, args: [u64; 3], cpu: u64, grants: &[Grant]) -> Result<(&Child, u64), &'static str> {
+        let sched = self.time_on((cpu % self.root.parent.cpus) as usize)?;
         self.next_id += 1;
         let place = self.children.iter_mut().find(|c| c.is_none()).ok_or("a test starts too many programs")?;
         let prog = Program {
             grants,
             args: [role, args[0], args[1], args[2], 0, 0, 0, 0],
-            cpu: (cpu % self.root.parent.cpus) as usize,
+            sched: Some(sched),
             ..Program::new(self.stress, self.next_id)
         };
         let child = spawn(&self.root.parent, &prog).map_err(|e| {
@@ -267,7 +288,8 @@ impl Tests {
             }
             moves += 1;
             for (thread, k) in [(client, 0), (server, 3)] {
-                sys::thread_set_cpu(thread, ((moves + k) % cpus) as usize).map_err(|_| "cannot move a running program")?;
+                let time = self.time_on(((moves + k) % cpus) as usize)?;
+                sys::thread_bind(thread, time).map_err(|_| "cannot move a running program")?;
             }
         }
         println!("systest: the pair was moved {moves} times during its round trips");
@@ -562,7 +584,16 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         finish(false)
     };
     let cpus = root.parent.cpus;
-    let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
+    let mut t = Tests {
+        root,
+        stress,
+        next_id: 0,
+        children: [const { None }; 16],
+        caps: [None; 16],
+        objects: [const { None }; 8],
+        pace: 0,
+        time: (0..cpus).map(|_| None).collect(),
+    };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
     let tests: [(&str, Test); 15] = [
