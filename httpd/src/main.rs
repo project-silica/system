@@ -5,8 +5,11 @@
 //! `i % 251`, so a client checks a body without being sent its hash;
 //! `GET /quit` answers, and the server ends (status 0) once the client
 //! has closed that connection, so the answer is never lost with the
-//! server's memory. Connections are kept alive between requests (HTTP/1.1)
-//! unless the request says `Connection: close` or is HTTP/1.0.
+//! server's memory, where the command line allows it (`httpd.quit=allowed`,
+//! for a test that ends the server so); elsewhere it is answered 404, as
+//! any other path, and said once. Connections are kept alive between
+//! requests (HTTP/1.1) unless the request says `Connection: close` or is
+//! HTTP/1.0, and let go of after a minute with nothing to read or send.
 #![no_std]
 #![no_main]
 
@@ -46,6 +49,9 @@ struct Conn {
 
 /// How long a connection may be idle.
 const IDLE: u64 = 60_000_000_000;
+
+/// Whether a refused `GET /quit` has been said.
+static QUIT_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn main(_info: &'static ProcessInfo) -> i64 {
     // On its events: the stack is its need 0 (bit 0), so a restart of the
@@ -266,6 +272,10 @@ fn answer(c: &mut Conn, request: &[u8], quit_allowed: bool) {
     if path == "/quit" && quit_allowed {
         c.quit = true;
         return respond(c, 200, 0, true);
+    }
+    if path == "/quit" && !QUIT_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        // Said once: a peer asking again and again writes nothing more.
+        println!("httpd: GET /quit refused: httpd.quit is not allowed on this machine");
     }
     match path.strip_prefix('/').and_then(|n| n.parse::<u64>().ok()) {
         Some(n) if n <= MOST => respond(c, 200, n, close),
