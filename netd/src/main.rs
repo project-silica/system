@@ -1304,9 +1304,14 @@ impl proto::Server<Handle> for Stack {
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.add_memory(badge, memory)
     }
 
-    fn listen(&mut self, port: u16, backlog: u32, ready: Handle) -> Result<proto::ListenReply, proto::Error> {
+    /// Retired: naming a port is never the authority to listen on it.
+    fn listen(&mut self, _port: u16, _backlog: u32, _ready: Handle) -> Result<proto::ListenReply, proto::Error> {
+        Err(proto::Error::NotGranted)
+    }
+
+    fn listen_given(&mut self, backlog: u32, ready: Handle) -> Result<proto::ListenGivenReply, proto::Error> {
         let badge = self.caller;
-        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, port, backlog, ready)
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, backlog, ready)
     }
 
     fn accept(&mut self, listener: u32, offset: u64, bits: u8, wake: Handle) -> Result<proto::AcceptReply<Handle>, proto::Error> {

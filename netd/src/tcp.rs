@@ -848,16 +848,16 @@ impl Tcp {
         self.clients.retain(|c| c.badge != badge);
     }
 
-    pub fn listen(&mut self, badge: u64, port: u16, backlog: u32, ready: Handle) -> Result<proto::ListenReply, Error> {
-        if port == 0 || backlog == 0 {
+    pub fn listen(&mut self, badge: u64, backlog: u32, ready: Handle) -> Result<proto::ListenGivenReply, Error> {
+        if backlog == 0 {
             return Err(Error::BadArgument);
         }
         // The port is the one the caller's capability carries, never one it
-        // claims first (before: any holder could take any port, the remote
-        // service's included, while that service started again).
-        if scope::tcp_listen(badge) != Some(port) {
-            return Err(Error::NotGranted);
-        }
+        // names or claims first (before: any holder could take any port, the
+        // remote service's included, while that service started again). The
+        // service manager gives a port to one declaration only, so `in_use`
+        // is this caller listening on it already.
+        let port = scope::tcp_listen(badge).ok_or(Error::NotGranted)?;
         if self.listeners.iter().any(|l| l.port == port) {
             return Err(Error::InUse);
         }
@@ -867,7 +867,7 @@ impl Tcp {
         let id = self.number();
         let ready = Watched::new(ready, self.note)?;
         self.listeners.push(Listener { id, owner: badge, port, backlog: backlog.min(CONNECTIONS as u32), ready });
-        Ok(proto::ListenReply { listener: id })
+        Ok(proto::ListenGivenReply { listener: id, port })
     }
 
     pub fn accept(&mut self, badge: u64, listener: u32, offset: u64, bits: u8, wake: Handle) -> Result<proto::AcceptReply<Handle>, Error> {

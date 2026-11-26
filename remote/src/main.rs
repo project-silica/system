@@ -48,7 +48,7 @@ use silica_net::tcp::{Read, Stream, Tcp};
 use silica_protocols::remote::session;
 use silica_protocols::scope;
 use silica_protocols::system::manager;
-use silica_remote::{Frames, MAX_FRAME, MAX_MESSAGE, PORT, PROLOGUE, Status, TAG};
+use silica_remote::{Frames, MAX_FRAME, MAX_MESSAGE, PROLOGUE, Status, TAG};
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle};
@@ -223,15 +223,16 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             return 1;
         }
     };
-    let listener = match tcp.listen(PORT, 8) {
+    // On the port its declaration was given (`listen=<port>`).
+    let (listener, port) = match tcp.listen(8) {
         Ok(l) => l,
         Err(e) => {
-            println!("ERROR: remote: cannot listen on port {PORT}: {e:?}");
+            println!("ERROR: remote: cannot listen on the port it was given: {e:?}");
             return 1;
         }
     };
     println!(
-        "remote: listening on port {PORT} for {} owner{}; this machine's key is {}",
+        "remote: listening on port {port} for {} owner{}; this machine's key is {}",
         owners.len(),
         if owners.len() == 1 { "" } else { "s" },
         core::str::from_utf8(&silica_remote::key_text(&key.public)).unwrap_or("?")

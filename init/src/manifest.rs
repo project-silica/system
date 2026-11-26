@@ -196,6 +196,23 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             return Err("two services provide one protocol");
         }
     }
+    // A TCP port is given to one service: the second declaration that names
+    // it is the owner's mistake, said here, not a race the first to listen
+    // wins at run time.
+    let port = |s: &Service| {
+        s.needs
+            .iter()
+            .zip(&s.scopes)
+            .filter(|(n, _)| **n == "silica.net.Tcp")
+            .find_map(|(_, b)| silica_protocols::scope::tcp_listen(b << silica_protocols::scope::SHIFT))
+    };
+    for (i, s) in out.iter().enumerate() {
+        if let Some(p) = port(s)
+            && out[..i].iter().any(|o| port(o) == Some(p))
+        {
+            return Err("two services are given one TCP port to listen on");
+        }
+    }
     Ok(out)
 }
 

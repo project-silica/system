@@ -16,7 +16,8 @@
 //!     // 1 MiB: 16 connections of 64 KiB. On the program's own events, so
 //!     // that a restart of the stack is seen (bit 0: the stack is need 0).
 //!     let mut tcp = Tcp::on(stack, 20, silica_rt::slots::EVENTS, 32, 1)?;
-//!     let listener = tcp.listen(7, 16)?;
+//!     // On the port its capability carries (`listen=7` in its declaration).
+//!     let (listener, _port) = tcp.listen(16)?;
 //!     let mut streams = Vec::new();
 //!     let mut buf = [0u8; 4096];
 //!     loop {
@@ -105,7 +106,6 @@ impl Note {
 /// A port listened on: what to listen with again after the stack's
 /// restart, and the stack's number for it now.
 struct Listening {
-    port: u16,
     backlog: u32,
     id: u32,
 }
@@ -215,13 +215,15 @@ impl Tcp {
         1 << (self.first + 1 + (block as u32) % span)
     }
 
-    /// Listen on `port`, keeping up to `backlog` connections waiting to be
-    /// accepted. The listener's number.
-    pub fn listen(&mut self, port: u16, backlog: u32) -> Result<u32, Failure> {
+    /// Listen on the port this program's capability carries (`listen=<port>`
+    /// in its declaration: the owner's to give, so not named here), keeping
+    /// up to `backlog` connections waiting to be accepted. The listener's
+    /// number and the port.
+    pub fn listen(&mut self, backlog: u32) -> Result<(u32, u16), Failure> {
         let ready = lend(self.note.cap(), Rights::WRITE, self.ready_bit())?;
-        let id = self.stack.listen(port, backlog, ready)?.listener;
-        self.listening.push(Listening { port, backlog, id });
-        Ok(self.listening.len() as u32 - 1)
+        let r = self.stack.listen_given(backlog, ready)?;
+        self.listening.push(Listening { backlog, id: r.listener });
+        Ok((self.listening.len() as u32 - 1, r.port))
     }
 
     /// The next connection waiting on `listener`, if one is.
@@ -371,9 +373,9 @@ impl Tcp {
             }
         }
         for i in 0..self.listening.len() {
-            let (port, backlog) = (self.listening[i].port, self.listening[i].backlog);
+            let backlog = self.listening[i].backlog;
             if let Ok(ready) = lend(self.note.cap(), Rights::WRITE, self.ready_bit())
-                && let Ok(r) = self.stack.listen(port, backlog, ready)
+                && let Ok(r) = self.stack.listen_given(backlog, ready)
             {
                 self.listening[i].id = r.listener;
             }

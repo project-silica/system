@@ -20,7 +20,6 @@ use silica_rt::{ProcessInfo, println, slots};
 
 silica_rt::main!(main);
 
-const PORT: u16 = 80;
 /// The largest body asked for.
 const MOST: u64 = 16 << 20;
 /// The longest request head kept (method, path, version, headers).
@@ -65,14 +64,15 @@ fn main(_info: &'static ProcessInfo) -> i64 {
             return 1;
         }
     };
-    let listener = match tcp.listen(PORT, 64) {
+    // On the port its declaration was given (`listen=<port>`).
+    let (listener, port) = match tcp.listen(64) {
         Ok(l) => l,
         Err(e) => {
-            println!("ERROR: httpd: cannot listen on port {PORT}: {e:?}");
+            println!("ERROR: httpd: cannot listen on the port it was given: {e:?}");
             return 1;
         }
     };
-    println!("httpd: listening on port {PORT}");
+    println!("httpd: listening on port {port}");
     let quit_allowed = silica_rt::option("quit") == Some("allowed");
     let mut conns: Vec<Conn> = Vec::new();
     let mut buf = [0u8; 16384];
