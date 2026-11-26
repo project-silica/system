@@ -102,6 +102,41 @@ pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> Option<(i64, i64)> {
     Some((i64::try_from(offset).ok()?, i64::try_from(delay).ok()?))
 }
 
+/// The longest round trip an answer may take to be believed: a longer one
+/// leaves too much room for its times to be wrong (half of it is the
+/// offset's uncertainty).
+pub const DELAY_MOST: i64 = 1_000_000_000;
+/// The most a clock the network already set is moved by one answer: past
+/// it, the answer is not believed (ntpd's panic threshold). A clock not set
+/// from the network yet (the firmware's may be years out) is moved any
+/// amount.
+pub const STEP_MOST: u64 = 1000 * NS;
+
+/// Why an answer is not believed ([`judge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// Its times cannot be ([`offset`]).
+    Impossible,
+    /// The round trip took this many nanoseconds, past [`DELAY_MOST`].
+    Slow(i64),
+    /// It would move a set clock by this many nanoseconds, past [`STEP_MOST`].
+    Step(i64),
+}
+
+/// Whether to believe an answer with the four times of [`offset`], to a
+/// client whose clock the network has (`set`) or has not set yet: the
+/// offset to add to its clock and the round trip, or why not.
+pub fn judge(t1: u64, t2: u64, t3: u64, t4: u64, set: bool) -> Result<(i64, i64), Refused> {
+    let (shift, delay) = offset(t1, t2, t3, t4).ok_or(Refused::Impossible)?;
+    if delay > DELAY_MOST {
+        return Err(Refused::Slow(delay));
+    }
+    if set && shift.unsigned_abs() > STEP_MOST {
+        return Err(Refused::Step(shift));
+    }
+    Ok((shift, delay))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +211,27 @@ mod tests {
         assert_eq!(offset(100 * s, 50 * s, 60 * s, 101 * s), None, "the server held it longer than the round trip");
         assert_eq!(offset(0, u64::MAX, u64::MAX, 1), None, "an offset past 64 bits");
         assert!(offset(0, 1 << 62, 1 << 62, 1).is_some());
+    }
+
+    /// A slow answer is not believed, nor one that would move a clock the
+    /// network set by more than [`STEP_MOST`] either way; the first set
+    /// moves it any amount.
+    #[test]
+    fn slow_answers_and_large_steps_are_not_believed() {
+        let s = NS;
+        let t1 = 1_000_000 * s;
+        // Ten years ahead, a 4 ms round trip.
+        let far = 10 * 365 * 86_400 * s;
+        let (t2, t3, t4) = (t1 + far + 2_000_000, t1 + far + 2_000_000, t1 + 4_000_000);
+        assert_eq!(judge(t1, t2, t3, t4, false).map(|(_, d)| d), Ok(4_000_000), "the first set moves any amount");
+        assert!(matches!(judge(t1, t2, t3, t4, true), Err(Refused::Step(x)) if x > 0));
+        // Back 2,000 s on a set clock.
+        assert!(matches!(judge(t1, t1 - 2000 * s, t1 - 2000 * s, t1 + 1_000_000, true), Err(Refused::Step(x)) if x < 0));
+        // 999 s on a set clock is believed.
+        assert!(judge(t1, t1 + 999 * s, t1 + 999 * s, t1 + 1_000_000, true).is_ok());
+        // A round trip of 1.5 s.
+        assert_eq!(judge(t1, t1 + s, t1 + s, t1 + 1_500_000_000, false), Err(Refused::Slow(1_500_000_000)));
+        assert_eq!(judge(t1, t1 + s, t1 + s - 1, t1 + 1000, false), Err(Refused::Impossible));
     }
 
     #[test]

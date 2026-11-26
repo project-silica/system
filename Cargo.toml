@@ -28,6 +28,7 @@ members = [
     "netd",
     "netload",
     "netfault",
+    "tcphog",
     "partcheck",
     "logd",
     "httpd",

@@ -1,0 +1,27 @@
+[package]
+name = "tcphog"
+description = "A program that tries to take the network stack's connections from every other program, and to name memory past its own: what netd must refuse."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# How the service manager runs it (init documents the fields).
+[package.metadata.silica.service]
+needs = ["silica.net.Tcp"]
+memory = 22
+start = "check:tcphog"
+
+[[bin]]
+name = "tcphog"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+
+[lints]
+workspace = true
