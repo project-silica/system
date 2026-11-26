@@ -83,9 +83,15 @@ fn run() -> Result<(), silica_rt::alloc::string::String> {
         }
     }
     let ready = lend(note.cap(), Rights::WRITE, 2).ok_or("no slot")?;
-    match stack.listen_given(1, ready) {
+    match stack.listen_granted(ready) {
         Err(CallError::Error(Error::NotGranted)) => {}
         r => return Err(format!("listening with a capability that carries no port: {r:?}, not not_granted")),
+    }
+    // The retired backlog-taking listen is refused as well.
+    let ready = lend(note.cap(), Rights::WRITE, 2).ok_or("no slot")?;
+    match stack.listen_given(1, ready) {
+        Err(CallError::Error(Error::NotGranted)) => {}
+        r => return Err(format!("the retired listen_given: {r:?}, not not_granted")),
     }
     let connect = |stack: &mut proto::Client<Channel, Handle>, offset: u64, bits: u8| {
         let wake = lend(note.cap(), Rights::WRITE, 1).ok_or(CallError::Error(Error::NoRoom))?;

@@ -222,7 +222,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         }
     };
     // On the port its declaration was given (`listen=<port>`).
-    let (listener, port) = match tcp.listen(8) {
+    let (listener, port) = match tcp.listen() {
         Ok(l) => l,
         Err(e) => {
             println!("ERROR: remote: cannot listen on the port it was given: {e:?}");

@@ -1345,9 +1345,14 @@ impl proto::Server<Handle> for Stack {
         Err(proto::Error::NotGranted)
     }
 
-    fn listen_given(&mut self, backlog: u32, ready: Handle) -> Result<proto::ListenGivenReply, proto::Error> {
+    /// Retired: a backlog is a second bound beside the memory the caller lent.
+    fn listen_given(&mut self, _backlog: u32, _ready: Handle) -> Result<proto::ListenGivenReply, proto::Error> {
+        Err(proto::Error::NotGranted)
+    }
+
+    fn listen_granted(&mut self, ready: Handle) -> Result<proto::ListenGrantedReply, proto::Error> {
         let badge = self.caller;
-        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, backlog, ready)
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, ready)
     }
 
     fn accept(&mut self, listener: u32, offset: u64, bits: u8, wake: Handle) -> Result<proto::AcceptReply<Handle>, proto::Error> {

@@ -167,7 +167,6 @@ struct Listener {
     id: u32,
     owner: u64,
     port: u16,
-    backlog: u32,
     /// The program's notification for the listener, watched as `wake` is.
     ready: Watched,
 }
@@ -466,25 +465,25 @@ impl Tcp {
             && !s.has(RST)
             && let Some(l) = self.listeners.iter().find(|l| l.port == h.dst_port)
         {
-            let (lid, owner, backlog) = (l.id, l.owner, l.backlog);
-            // A handshake that never finishes (a SYN from an address that
-            // never answers: spoofed) holds its place and 64 KiB until its
-            // SYN-ACKs give up, minutes later; a real one finishes within a
-            // round trip. So a listener whose backlog is full, or whose
-            // program has every connection it may, gives the place of its
-            // own oldest unfinished handshake to this one: a flood of
-            // spoofed SYNs does not shut it to the peers that answer, and
-            // costs no other listener anything (before, the machine kept
-            // 64 unfinished handshakes between all listeners, and a flood
-            // on one evicted another's). The one evicted is told, by a
-            // reset: dropped without a word, its peer (a real one, in a
-            // burst of connections larger than the backlog) waited for
-            // SYN-ACKs that would never come, retrying for seconds, as two
-            // of the `remote` test's silent connections did on a hosted
-            // runner until the host gave up (2026-11-26).
+            let (lid, owner) = (l.id, l.owner);
+            // What waits to be accepted is its program's, paid for by the
+            // memory it lent, as its connections are: no number of its own
+            // (before, a backlog the program named, which the remote
+            // service set to eight, and a burst of ten handshakes, nine
+            // strangers' and an owner's, lost two places to it, on a hosted
+            // runner, 2026-11-26). A handshake that never finishes (a SYN
+            // from an address that never answers: spoofed) holds its place
+            // and 64 KiB until its SYN-ACKs give up, minutes later; a real
+            // one finishes within a round trip. So a listener whose program
+            // has every connection it pays for gives the place of its own
+            // oldest unfinished handshake to this one: a flood of spoofed
+            // SYNs does not shut it to the peers that answer, and costs no
+            // other listener anything (before, the machine kept 64
+            // unfinished handshakes between all listeners, and a flood on
+            // one evicted another's). The one evicted is told, by a reset,
+            // rather than left to wait for SYN-ACKs that never come.
             let unfinished = |c: &Conn| c.listener == Some(lid) && c.tcp.state() == State::SynReceived;
-            let full = self.conns.iter().filter(|c| c.listener == Some(lid)).count() >= backlog as usize;
-            if (full || self.held(owner) >= self.most(owner))
+            if self.held(owner) >= self.most(owner)
                 && let Some(c) = self.conns.iter_mut().filter(|c| unfinished(c)).min_by_key(|c| c.id)
             {
                 c.tcp.abort();
@@ -492,9 +491,7 @@ impl Tcp {
                 c.released = true;
                 c.due = true;
             }
-            let waiting = self.conns.iter().filter(|c| c.listener == Some(lid)).count();
-            if waiting < backlog as usize
-                && self.make_room(owner)
+            if self.make_room(owner)
                 && let Some(buffers) = buffers()
             {
                 let r = silica_rt::random::u64();
@@ -856,10 +853,7 @@ impl Tcp {
         self.clients.retain(|c| c.badge != badge);
     }
 
-    pub fn listen(&mut self, badge: u64, backlog: u32, ready: Handle) -> Result<proto::ListenGivenReply, Error> {
-        if backlog == 0 {
-            return Err(Error::BadArgument);
-        }
+    pub fn listen(&mut self, badge: u64, ready: Handle) -> Result<proto::ListenGrantedReply, Error> {
         // The port is the one the caller's capability carries, never one it
         // names or claims first (before: any holder could take any port, the
         // remote service's included, while that service started again). The
@@ -874,8 +868,8 @@ impl Tcp {
         }
         let id = self.number();
         let ready = Watched::new(ready, self.note)?;
-        self.listeners.push(Listener { id, owner: badge, port, backlog: backlog.min(CONNECTIONS as u32), ready });
-        Ok(proto::ListenGivenReply { listener: id, port })
+        self.listeners.push(Listener { id, owner: badge, port, ready });
+        Ok(proto::ListenGrantedReply { listener: id, port })
     }
 
     pub fn accept(&mut self, badge: u64, listener: u32, offset: u64, bits: u8, wake: Handle) -> Result<proto::AcceptReply<Handle>, Error> {
