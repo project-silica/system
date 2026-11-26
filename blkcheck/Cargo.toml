@@ -8,8 +8,8 @@ publish.workspace = true
 
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
-needs = ["silica.device.Manager:block"]
-memory = 23
+needs = ["silica.device.Manager:block+input+port+display"]
+memory = 24
 start = "check:block"
 
 [[bin]]
@@ -23,6 +23,7 @@ silica-rt = { workspace = true }
 silica-idl-rt = { workspace = true }
 silica-protocols = { workspace = true }
 silica-block = { workspace = true }
+silica-queue = { workspace = true }
 
 
 [lints]
