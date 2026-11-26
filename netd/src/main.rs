@@ -277,11 +277,15 @@ struct TimeClient {
     /// the port it was asked from.
     asked: Option<(u64, u64, u16)>,
     /// When to ask next, questions sent since the last answer, seconds
-    /// between answers, and whether the clock was ever set.
+    /// between answers, and whether the clock was set: by the firmware, by
+    /// this instance, or by one before it (the time page says which), so
+    /// that the step limit holds from the first answer after a restart.
     next: u64,
     tries: u32,
     poll: u64,
     set: bool,
+    /// Steps past the limit, taken only when answers agree.
+    steps: ntp::Steps,
 }
 
 impl TimeClient {
@@ -293,7 +297,8 @@ impl TimeClient {
         if silica_rt::option("ntp").is_some() && configured.is_none() {
             println!("ERROR: netd: the ntp option is not <address>[:<port>]");
         }
-        TimeClient { page, configured, asked: None, next: now, tries: 0, poll: 64, set: false }
+        let set = page.as_ref().is_some_and(|p| silica_rt::time::read(p).1 != silica_rt::time::Source::None);
+        TimeClient { page, configured, asked: None, next: now, tries: 0, poll: 64, set, steps: ntp::Steps::new() }
     }
 
     /// The server to ask: the configured one, else the lease's.
@@ -735,7 +740,7 @@ impl Stack {
         self.time.asked = None;
         let (offset, _) = silica_rt::time::read(&page);
         let t4 = offset.wrapping_add(now);
-        let (shift, delay) = match ntp::judge(t1, t2, t3, t4, self.time.set) {
+        let (shift, delay) = match self.time.steps.judge(t1, t2, t3, t4, self.time.set, now) {
             Ok(j) => j,
             Err(ntp::Refused::Impossible) => {
                 println!("netd: a time server's answer gives times that cannot be; not believed");
@@ -747,6 +752,13 @@ impl Stack {
             }
             Err(ntp::Refused::Step(shift)) => {
                 println!("netd: a time server would move the clock by {} s; not believed", shift / SECOND as i64);
+                return;
+            }
+            Err(ntp::Refused::Unconfirmed(shift)) => {
+                // Asked again soon, from another port with another number:
+                // a second answer that agrees takes the step.
+                println!("netd: a time server would move the clock by {} s; not believed until another answer agrees", shift / SECOND as i64);
+                self.time.next = now + 2 * SECOND;
                 return;
             }
         };
