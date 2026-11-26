@@ -492,7 +492,8 @@ impl Manager {
         }
         // A service whose time-limited call to a provider it needs went
         // unanswered: ask the provider ourselves.
-        if m.badge & FAULT_BADGE == 0 && m.info.label() == UNANSWERED_LABEL
+        if m.badge & FAULT_BADGE == 0
+            && m.info.label() == UNANSWERED_LABEL
             && let Some(i) = m.badge.checked_sub(SERVICE_IDS).map(|i| i as usize).filter(|i| *i < self.services.len())
         {
             self.unanswered(i, m.words[0]);
@@ -820,7 +821,10 @@ impl manager::Server<Handle> for Manager {
         self.running[i].hash = None;
         self.fresh_keep(i);
         let hash = self.hash(i);
-        println!("init: {name} has a new program, {length} bytes, BLAKE2s {}", Hex(&hash[..8]));
+        println!(
+            "init: {name} has a new program, {length} bytes, BLAKE2s {}, until the next reboot (an update is not kept on disk yet)",
+            Hex(&hash[..8])
+        );
         let Some(child) = self.running[i].child.take() else { return Ok(manager::UpdateReply {}) };
         self.end(i, child);
         if let Err(e) = Manager::start(self, i) {
