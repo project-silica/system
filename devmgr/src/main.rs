@@ -188,6 +188,9 @@ struct Manager {
     longest_turn: u64,
     /// The archive's drivers, by what they drive.
     table: Vec<(Match, &'static str)>,
+    /// The configuration writes each driver's declaration asks for, made
+    /// before it starts (`drivers`).
+    writes: Vec<(&'static str, Vec<ConfigWrite>)>,
     /// Every configuration space mapped, by function identity.
     configs: BTreeMap<u32, (Config, Cap)>,
     /// What clients asked to have signalled when a device of a class gains
@@ -207,6 +210,7 @@ fn scope_of(class: manager::Class) -> u64 {
         manager::Class::Port => scope::DEVICE_PORT,
         manager::Class::Input => scope::DEVICE_INPUT,
         manager::Class::Entropy => scope::DEVICE_ENTROPY,
+        manager::Class::Watchdog => scope::DEVICE_WATCHDOG,
         _ => 0,
     }
 }
@@ -248,6 +252,8 @@ fn class_of(f: &Function) -> Option<manager::Class> {
         (0x07, ..) => Some(manager::Class::Port),
         (0x09, ..) => Some(manager::Class::Input),
         (_, 0x1AF4, 0x1044) => Some(manager::Class::Entropy),
+        // Intel's 6300ESB watchdog (class "other system peripheral").
+        (_, 0x8086, 0x25AB) => Some(manager::Class::Watchdog),
         _ => None,
     }
 }
@@ -400,12 +406,72 @@ fn drivers(archive: &'static [u8]) -> Vec<(Match, &'static str)> {
             }
             _ => None,
         };
-        match (m, w.next(), w.next()) {
-            (Some(m), Some(program), None) => table.push((m, program)),
+        match (m, w.next(), w.next(), w.next()) {
+            (Some(m), Some(program), None, None) => table.push((m, program)),
+            (Some(m), Some(program), Some(c), None) if c.starts_with("config=") => table.push((m, program)),
             _ => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
         }
     }
     table
+}
+
+/// A write to a device's configuration space that its driver's declaration
+/// asks for (`config = ["<offset>:<bytes>:<value>", ...]`, hexadecimal):
+/// a device that is set up through registers of its own configuration
+/// space, which drivers may only read (the watchdog's enable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConfigWrite {
+    offset: u16,
+    bytes: u8,
+    value: u32,
+}
+
+/// The writes the archive's driver list declares, by driver program (the
+/// list's `config=<offset>:<bytes>:<value>,...` word).
+fn config_writes(archive: &'static [u8]) -> Vec<(&'static str, Vec<ConfigWrite>)> {
+    let mut all = Vec::new();
+    let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return all };
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let mut w = line.split_ascii_whitespace().skip(2);
+        let (Some(program), Some(spec)) = (w.next(), w.next().and_then(|c| c.strip_prefix("config="))) else { continue };
+        let writes: Option<Vec<ConfigWrite>> = spec
+            .split(',')
+            .map(|one| {
+                let mut p = one.split(':');
+                let offset = u16::from_str_radix(p.next()?, 16).ok()?;
+                let bytes = u8::from_str_radix(p.next()?, 16).ok()?;
+                let value = u32::from_str_radix(p.next()?, 16).ok()?;
+                p.next().is_none().then_some(ConfigWrite { offset, bytes, value })
+            })
+            .collect();
+        match writes {
+            Some(writes) => all.push((program, writes)),
+            None => println!("devmgr: the archive's driver list declares writes it cannot read: {line}"),
+        }
+    }
+    all
+}
+
+/// Whether `w` may be made to a device whose capabilities are `caps`
+/// (offset and identifier): only the device's own registers, after the
+/// standard header and outside every capability structure, at a width the
+/// bus has and aligned to it. A declaration can never move a BAR, turn on
+/// bus mastering or change a message interrupt: those stay the device
+/// manager's.
+fn write_allowed(w: ConfigWrite, caps: &[(u8, usize)]) -> bool {
+    let (at, n) = (w.offset as usize, w.bytes as usize);
+    let length = |id: u8| match id {
+        0x01 => 8,  // power management
+        0x05 => 24, // MSI
+        0x10 => 60, // PCI Express
+        0x11 => 12, // MSI-X
+        _ => 16,
+    };
+    matches!(n, 1 | 2 | 4)
+        && at.is_multiple_of(n)
+        && at >= 0x40
+        && at + n <= 0x100
+        && caps.iter().all(|&(id, cap)| at + n <= cap || at >= cap + length(id))
 }
 
 /// The driver for a function: the owner's choice on the command line
@@ -839,12 +905,23 @@ impl Manager {
         let mut frames = [None; 6];
         for (i, bar) in f.bars.iter().enumerate() {
             let Some(bar) = bar else { continue };
-            if bar.bits < 12 {
-                // Registers smaller than a page share their page with
-                // whatever else the firmware put there.
-                return Err("it has registers smaller than a page, which cannot be handed out on their own yet");
-            }
-            let frame = self.memory.frame(bar.base, bar.bits).map_err(|_| "its registers are not in the machine's device memory")?;
+            // Registers smaller than a page are handed out as their page
+            // when nothing else in the machine is there (another device's
+            // registers would be reachable through it): the driver finds
+            // where in the page they start from the BAR's address.
+            let (base, bits) = if bar.bits < 12 {
+                let page = bar.base & !0xFFF;
+                let shares = self.functions.iter().flat_map(|g| g.bars.iter().flatten()).any(|b| {
+                    (b.base, b.bits) != (bar.base, bar.bits) && b.base < page + 0x1000 && b.base.saturating_add(1 << b.bits) > page
+                });
+                if shares {
+                    return Err("its registers share a page with another device's, which cannot be handed out on their own");
+                }
+                (page, 12)
+            } else {
+                (bar.base, bar.bits)
+            };
+            let frame = self.memory.frame(base, bits).map_err(|_| "its registers are not in the machine's device memory")?;
             grants[silica_driver::grant::BAR0 as usize + i] = Grant::lend(frame, RW);
             if let Some(slot) = frames.get_mut(i) {
                 *slot = Some((frame, bar.bits));
@@ -879,6 +956,21 @@ impl Manager {
         // accesses, may do DMA and send message interrupts, and raises
         // those through MSI-X, never the legacy wire.
         let registers = config.registers();
+        // What the driver's declaration asks to have set in the device's
+        // own configuration registers, which the driver may only read.
+        if let Some((_, writes)) = self.writes.iter().find(|(p, _)| *p == driver) {
+            let caps: Vec<(u8, usize)> = config.capabilities().collect();
+            if !writes.iter().all(|w| write_allowed(*w, &caps)) {
+                return Err("its declaration asks to write configuration registers that are not its device's own");
+            }
+            for w in writes {
+                match w.bytes {
+                    1 => registers.write8(w.offset as usize, w.value as u8),
+                    2 => registers.write16(w.offset as usize, w.value as u16),
+                    _ => registers.write32(w.offset as usize, w.value),
+                }
+            }
+        }
         registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
         if let Some(msix) = config.msix() {
             // Every entry masked and emptied before any can fire: the table
@@ -1155,6 +1247,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         departures: 0,
         longest_turn: 0,
         table: drivers(archive),
+        writes: config_writes(archive),
         configs: BTreeMap::new(),
         watchers: Vec::new(),
         caller: 0,

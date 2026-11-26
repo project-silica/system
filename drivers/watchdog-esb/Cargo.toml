@@ -1,0 +1,29 @@
+[package]
+name = "watchdog-esb"
+description = "Intel's 6300ESB watchdog: resets the machine unless the service manager pets it, as silica.watchdog.Device."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# What the device manager starts this driver for, and the configuration it
+# sets before (silica_driver documents the forms): 0x60 = 0x0003 (a reset on
+# the second timeout, the 1 kHz clock, no interrupt), 0x68 = 0x02 (enabled).
+[package.metadata.silica]
+drivers = ["pci 8086:25ab"]
+config = ["60:2:0003", "68:1:02"]
+
+[[bin]]
+name = "watchdog-esb"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+silica-rt = { workspace = true }
+silica-driver = { workspace = true }
+silica-idl-rt = { workspace = true }
+silica-protocols = { workspace = true }
+
+[lints]
+workspace = true

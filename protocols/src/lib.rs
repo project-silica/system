@@ -63,6 +63,11 @@ pub mod entropy {
     include!(concat!(env!("OUT_DIR"), "/silica_entropy_source.rs"));
 }
 
+/// The machine's hardware watchdog, petted by the service manager.
+pub mod watchdog {
+    include!(concat!(env!("OUT_DIR"), "/silica_watchdog_device.rs"));
+}
+
 /// `silica.net.Tcp`.
 pub mod net {
     include!(concat!(env!("OUT_DIR"), "/silica_net_tcp.rs"));
@@ -118,6 +123,10 @@ pub mod scope {
     pub const DEVICE_ENTROPY: u64 = 1 << 5;
     /// `silica.device.Manager`: `restart` and `describe` of any device.
     pub const DEVICE_CONTROL: u64 = 1 << 6;
+    /// `silica.device.Manager`: `list`, `open` and `watch` of the watchdog.
+    /// No declaration can name it: the service manager alone holds it, so
+    /// nothing else can pet the watchdog of a hung machine.
+    pub const DEVICE_WATCHDOG: u64 = 1 << 7;
 
     /// `silica.block.Partitions`: `list`.
     pub const PARTITIONS_LIST: u64 = 1 << 0;
