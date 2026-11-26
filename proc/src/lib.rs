@@ -340,6 +340,11 @@ pub struct Program<'a> {
     /// Its options (`silica_rt::options`), at most
     /// `silica_rt::OPTIONS_MAX` bytes: longer is refused.
     pub options: &'a [u8],
+    /// The group its threads share a processor as (`libsys::sched_group`):
+    /// its first thread joins it, and every thread it makes is in it, so
+    /// its threads together take one share however many it makes.
+    /// `None`: the parent's own group.
+    pub group: Option<Cap>,
 }
 
 impl<'a> Program<'a> {
@@ -359,6 +364,7 @@ impl<'a> Program<'a> {
             keep: None,
             time: None,
             options: &[],
+            group: None,
         }
     }
 }
@@ -574,6 +580,9 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     }
     if let Some(events) = prog.events {
         sys::cap_derive(c.space, slots::EVENTS.0, events, Rights::ALL, 0)?;
+    }
+    if let Some(group) = prog.group {
+        sys::thread_bind(c.thread, group)?;
     }
     sys::thread_set_cpu(c.thread, cpu)?;
     let mut installed = 0;

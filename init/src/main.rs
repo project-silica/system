@@ -155,6 +155,10 @@ struct Manager {
     events: Vec<(Object, Vec<Handle>)>,
     /// The page each service that `keeps` is given at every start.
     kept: Vec<Option<Object>>,
+    /// Each service's group (`libsys::sched_group`), the same for every
+    /// start of it: its threads share one share of its processor however
+    /// many it makes, and the programs it starts are in it too.
+    groups: Vec<Object>,
     /// The time page (`silica_rt::time`), set from the firmware's clock.
     time: silica_rt::mem::Memory,
     /// Each service's options: the boot command line's
@@ -312,6 +316,7 @@ impl Manager {
             log,
             events: Some(events),
             keep: self.kept[i].as_ref().map(|p| p.cap()),
+            group: Some(self.groups[i].cap()),
             time: Some((self.time.frame(), self.services[i].sets_time)),
             options: &self.options[i],
             mem_bits: s.memory,
@@ -941,6 +946,19 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         .iter()
         .map(|s| s.keeps.then(|| Object::new(ObjectType::Frame, 12).unwrap_or_else(|_| fail!("no memory for {}'s page", s.name))))
         .collect();
+    // A group for each service, on the processor it runs on (0): a program
+    // that makes many threads takes one share, not one a thread (the
+    // remediation of the 2026-11-24 audit).
+    let groups = services
+        .iter()
+        .map(|s| {
+            let g = Object::new(ObjectType::SchedContext, 0).unwrap_or_else(|_| fail!("no memory for {}'s group", s.name));
+            if let Err(e) = sys::sched_group(g.cap(), libsys::SCHED_DEFAULT_WEIGHT, 0, sys::Cap(libsys::root::SLOT_SCHED)) {
+                fail!("cannot make {}'s group: {e:?}", s.name);
+            }
+            g
+        })
+        .collect();
     // The log, when a service provides it: a ring for every other service,
     // made before anything starts; the log starts first.
     let mut order = order;
@@ -987,6 +1005,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         running,
         events,
         kept,
+        groups,
         time,
         options,
         order: order.clone(),
