@@ -370,6 +370,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tcphog"
+version = "0.0.0"
+dependencies = [
+ "silica-idl-rt",
+ "silica-protocols",
+ "silica-rt",
+]
+
+[[package]]
 name = "trial-client"
 version = "0.0.0"
 dependencies = [

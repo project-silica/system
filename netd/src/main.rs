@@ -29,6 +29,7 @@
 
 use silica_idl_rt::CapList;
 use silica_inet::dhcp_client::{self, Client, Event, Lease, To};
+use silica_inet::neighbours::Neighbours;
 use silica_inet::{Ipv4, Mac, Malformed, arp, dhcp, ether, icmp, ipv4, ntp, udp};
 use silica_net::client::Interface;
 use silica_net::{Completion, LINK, Op, Request};
@@ -63,9 +64,8 @@ const SENT: u64 = 1 << 32;
 /// interface that cuts. A frame of 64 KiB holds 45 segments of 1448 bytes.
 const BURSTS: usize = 4;
 const BURST: usize = 1 << 16;
-/// Neighbours remembered, and for how long.
+/// Neighbours remembered (`silica_inet::neighbours`).
 const NEIGHBOURS: usize = 16;
-const NEIGHBOUR_LIFE: u64 = 300 * SECOND;
 /// How long an address is asked for before what waits for it is dropped.
 const RESOLVE_WAIT: u64 = 3 * SECOND;
 
@@ -219,8 +219,7 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         dhcp,
         lease,
         keep,
-        neighbours: [Neighbour::EMPTY; NEIGHBOURS],
-        asking: [Ipv4::UNSPECIFIED; 4],
+        neighbours: Neighbours::new(),
         defended: 0,
         held: None,
         ip_id: (silica_rt::random::u64() & 0xFFFF) as u16,
@@ -265,14 +264,6 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
 /// The ports the time-server client asks from: a random one of these for
 /// each question, so that an answer must reach the one it was asked from.
 const TIME_PORTS: core::ops::Range<u16> = 50_000..60_000;
-/// The longest a time server's answer may take to be believed: a longer
-/// round trip leaves too much room for its times to be wrong.
-const TIME_DELAY_MOST: i64 = 1_000_000_000;
-/// The most the clock is moved at once after the network first set it:
-/// past this, an answer is not believed (ntpd's panic threshold). The
-/// first answer of a boot may move it any amount (the firmware's clock
-/// may be years out).
-const TIME_STEP_MOST: u64 = 1000 * SECOND;
 
 /// The time-server client's state (SNTP to one server).
 struct TimeClient {
@@ -383,17 +374,6 @@ fn kept_lease(k: &Mmio, mac: Mac) -> Option<Lease> {
     })
 }
 
-#[derive(Clone, Copy)]
-struct Neighbour {
-    ip: Ipv4,
-    mac: Mac,
-    expires: u64,
-}
-
-impl Neighbour {
-    const EMPTY: Neighbour = Neighbour { ip: Ipv4::UNSPECIFIED, mac: Mac::ZERO, expires: 0 };
-}
-
 /// A packet waiting for its next hop's Ethernet address.
 struct Held {
     hop: Ipv4,
@@ -439,10 +419,8 @@ struct Stack {
     lease: Option<Lease>,
     /// The page kept across restarts (`slots::KEEP`), the lease in it.
     keep: Option<Mmio>,
-    neighbours: [Neighbour; NEIGHBOURS],
-    /// Addresses asked for and not yet answered: only an answer to one of
-    /// these changes what is known of a neighbour.
-    asking: [Ipv4; 4],
+    /// Who is where on the link, and the questions in flight.
+    neighbours: Neighbours<NEIGHBOURS>,
     /// When another host was last told this address is ours (a conflict).
     defended: u64,
     held: Option<Held>,
@@ -690,7 +668,7 @@ impl Stack {
                 continue;
             };
             if self.neighbour(h, now).is_none() {
-                if !self.asking.contains(&h) {
+                if !self.neighbours.asking(h) {
                     self.ask(h);
                 }
                 continue;
@@ -719,7 +697,9 @@ impl Stack {
     fn ask_time(&mut self, now: u64) {
         let Some((server, port)) = self.time.server(self.lease.as_ref()) else { return };
         let Some(page) = self.time.page else { return };
-        if now < self.time.next {
+        // Not before the address: a question sent without one goes nowhere
+        // and used up one of the quick tries.
+        if now < self.time.next || self.lease.is_none() {
             return;
         }
         // The question's time, by this clock (the firmware's, or none yet:
@@ -755,18 +735,21 @@ impl Stack {
         self.time.asked = None;
         let (offset, _) = silica_rt::time::read(&page);
         let t4 = offset.wrapping_add(now);
-        let Some((shift, delay)) = ntp::offset(t1, t2, t3, t4) else {
-            println!("netd: a time server's answer gives times that cannot be; not believed");
-            return;
+        let (shift, delay) = match ntp::judge(t1, t2, t3, t4, self.time.set) {
+            Ok(j) => j,
+            Err(ntp::Refused::Impossible) => {
+                println!("netd: a time server's answer gives times that cannot be; not believed");
+                return;
+            }
+            Err(ntp::Refused::Slow(delay)) => {
+                println!("netd: a time server's answer took {} ms; not believed", delay / 1_000_000);
+                return;
+            }
+            Err(ntp::Refused::Step(shift)) => {
+                println!("netd: a time server would move the clock by {} s; not believed", shift / SECOND as i64);
+                return;
+            }
         };
-        if delay > TIME_DELAY_MOST {
-            println!("netd: a time server's answer took {} ms; not believed", delay / 1_000_000);
-            return;
-        }
-        if self.time.set && shift.unsigned_abs() > TIME_STEP_MOST {
-            println!("netd: a time server would move the clock by {} s; not believed", shift / SECOND as i64);
-            return;
-        }
         let Some(wall) = t4.checked_add_signed(shift) else { return };
         silica_rt::time::set(&page, wall, now, silica_rt::time::Source::Network);
         if !self.time.set || shift.unsigned_abs() > SECOND {
@@ -968,30 +951,11 @@ impl Stack {
     }
 
     fn neighbour(&self, ip: Ipv4, now: u64) -> Option<Mac> {
-        self.neighbours.iter().find(|n| n.ip == ip && n.expires > now).map(|n| n.mac)
+        self.neighbours.lookup(ip, now)
     }
 
-    /// Remember that `ip` is at `mac`: in its old place, else the oldest,
-    /// never the router's (a stranger who asks for us does not push the
-    /// way out of the table).
-    fn learn(&mut self, ip: Ipv4, mac: Mac, now: u64) {
-        if ip == Ipv4::UNSPECIFIED || mac.is_group() {
-            return;
-        }
-        let router = self.lease.and_then(|l| l.router);
-        let at = self.neighbours.iter().position(|n| n.ip == ip).unwrap_or_else(|| {
-            let mut oldest = None;
-            for (i, n) in self.neighbours.iter().enumerate() {
-                if Some(n.ip) == router && n.expires > now {
-                    continue;
-                }
-                if oldest.is_none_or(|o: usize| n.expires < self.neighbours[o].expires) {
-                    oldest = Some(i);
-                }
-            }
-            oldest.unwrap_or(0)
-        });
-        self.neighbours[at] = Neighbour { ip, mac, expires: now + NEIGHBOUR_LIFE };
+    /// `ip` was learned to be at `mac`: what waited for it goes.
+    fn learned(&mut self, ip: Ipv4, mac: Mac) {
         if let Some(h) = self.held.take() {
             if h.hop == ip {
                 self.frame_out(mac, &h.packet[..h.len]);
@@ -1001,13 +965,16 @@ impl Stack {
         }
     }
 
-    /// Ask who has `ip`.
+    /// Ask who has `ip`: its answer is believed (`Neighbours`).
     fn ask(&mut self, ip: Ipv4) {
+        self.neighbours.asked(ip);
+        self.arp_request(ip);
+    }
+
+    /// Send an ARP request for `ip` from the leased address (for our own
+    /// address: an announcement that it is ours).
+    fn arp_request(&mut self, ip: Ipv4) {
         let Some(l) = self.lease else { return };
-        if !self.asking.contains(&ip) {
-            self.asking.rotate_right(1);
-            self.asking[0] = ip;
-        }
         let a = arp::Arp { op: arp::REQUEST, sender_mac: self.mac, sender_ip: l.address, target_mac: Mac::ZERO, target_ip: ip };
         let mac = self.mac;
         let Some(p) = ether::header(&mut self.out, Mac::BROADCAST, mac, ether::ARP) else { return };
@@ -1051,37 +1018,27 @@ impl Stack {
 
     fn arp(&mut self, now: u64, a: &arp::Arp) {
         let Some(l) = self.lease else { return };
-        if a.sender_ip == l.address && a.sender_mac != self.mac {
+        // What the packet teaches is the table's to say: only answers to
+        // our questions and strangers asking for us (one unsolicited packet
+        // redirected all our traffic for a host, the router's included).
+        let h = self.neighbours.heard(a, (l.address, self.mac), l.router, now);
+        if let Some(other) = h.conflict {
             // Another host says our address is its: a conflict. Said, and
             // our claim announced, no more than every ten seconds.
             if now >= self.defended + 10 * SECOND {
                 self.defended = now;
-                println!("netd: {} says {} is its address too", a.sender_mac, l.address);
-                self.ask(l.address);
+                println!("netd: {other} says {} is its address too", l.address);
+                self.arp_request(l.address);
             }
             return;
         }
-        // An answer to our own question teaches, whatever was known before.
-        if a.op == arp::REPLY && a.sender_ip != Ipv4::UNSPECIFIED && self.asking.contains(&a.sender_ip) {
-            for x in self.asking.iter_mut().filter(|x| **x == a.sender_ip) {
-                *x = Ipv4::UNSPECIFIED;
-            }
-            self.learn(a.sender_ip, a.sender_mac, now);
-            return;
+        if let Some((ip, mac)) = h.learned {
+            self.learned(ip, mac);
         }
-        if a.target_ip != l.address {
-            return;
+        if let Some(ip) = h.ask {
+            self.ask(ip);
         }
-        // Someone who asks for us is a neighbour: one new to us is
-        // learned; one known at another hardware address is asked again
-        // rather than believed (one unsolicited packet redirected all our
-        // traffic for a host, the router's included).
-        match self.neighbours.iter().position(|n| n.ip == a.sender_ip && n.expires > now) {
-            Some(k) if self.neighbours[k].mac != a.sender_mac => self.ask(a.sender_ip),
-            Some(k) => self.neighbours[k].expires = now + NEIGHBOUR_LIFE,
-            None => self.learn(a.sender_ip, a.sender_mac, now),
-        }
-        if a.op == arp::REQUEST {
+        if h.answer {
             let r =
                 arp::Arp { op: arp::REPLY, sender_mac: self.mac, sender_ip: l.address, target_mac: a.sender_mac, target_ip: a.sender_ip };
             let mac = self.mac;
@@ -1197,10 +1154,12 @@ impl Events for Stack {
 
     fn signals(&mut self, signals: u64) {
         self.nic.signalled(signals);
-        if signals & tcp::GONE != 0
-            && let Some(t) = self.tcp.as_mut()
-        {
-            t.forget_ended();
+        if let Some(t) = self.tcp.as_mut() {
+            if signals & tcp::GONE != 0 {
+                t.forget_ended();
+            }
+            // The connections whose programs signalled.
+            t.signalled(signals);
         }
         self.work();
     }

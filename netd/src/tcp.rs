@@ -15,8 +15,12 @@
 //!
 //! Programs signal the stack's notification for their connections on bits
 //! from [`FIRST_BIT`] up, one per connection number modulo the bits there
-//! are; every connection is looked at after any signal (a few hundred
-//! connections are a few microseconds of looking).
+//! are. A pass looks only at the connections something reached since the
+//! last (a segment, found through an index of their addresses and ports;
+//! one of their bits signalled; a call on them; their timer; work the last
+//! pass could not finish): a program that calls or signals in a loop, or a
+//! table full of TIME-WAIT, no longer costs every call a walk over every
+//! connection.
 //!
 //! Each connection has a record in the page the service manager keeps
 //! across the stack's restarts (`slots::KEEP`, after the lease): its peer,
@@ -41,6 +45,7 @@ use silica_inet::Ipv4;
 use silica_inet::tcp::{ACK, Header, Options, RST, SYN, Segment};
 use silica_inet::tcp_conn::{Buffers, Connection, Endpoints, Error as Failure, State};
 use silica_protocols::net::tcp::{self as proto, Endpoint, Error, Reason};
+use silica_rt::alloc::collections::BTreeMap;
 use silica_rt::alloc::vec;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Handle, free_slot, release_slot};
@@ -136,6 +141,12 @@ struct Conn {
     announced: bool,
     /// The program let go of it: it goes once TCP is done with it.
     released: bool,
+    /// Something reached it since the last pass looked (a segment, its
+    /// program's signal, a call, its timer) or that pass left it work:
+    /// `pump` looks at it. The rest are passed over, so a pass costs what
+    /// changed, not the table (a program calling in a loop made the stack
+    /// look at every connection on every call).
+    due: bool,
 }
 
 struct Listener {
@@ -188,6 +199,10 @@ pub struct Tcp {
     clients: Vec<Client>,
     listeners: Vec<Listener>,
     conns: Vec<Conn>,
+    /// Where each connection is in `conns`, by its four addresses and
+    /// ports: a segment finds its connection in a lookup, not a walk over
+    /// the table (TIME-WAIT included, over a thousand).
+    index: BTreeMap<Key, usize>,
     /// Where the next pass starts (`pump`).
     rotor: usize,
     next: u32,
@@ -266,6 +281,13 @@ fn streams_in(memory: &Mmio, offset: u64, bits: u8) -> Option<(StreamProducer, S
     Some((rx, tx))
 }
 
+/// A connection's place in the index: its local and remote address and port.
+type Key = (u32, u16, u32, u16);
+
+fn key(e: &Endpoints) -> Key {
+    (e.local.to_u32(), e.local_port, e.remote.to_u32(), e.remote_port)
+}
+
 /// A connection's two buffers, or `None` when the stack has no memory for
 /// them: a peer that opens connections can make the stack refuse more,
 /// never fail.
@@ -314,6 +336,7 @@ impl Tcp {
             clients: Vec::new(),
             listeners: Vec::new(),
             conns: Vec::new(),
+            index: BTreeMap::new(),
             rotor: 0,
             next: 1,
             note,
@@ -344,7 +367,18 @@ impl Tcp {
             records.write32(r * RECORD, 0);
             self.recorded[r] = false;
         }
+        self.index.remove(&key(&self.conns[i].tcp.endpoints()));
         self.conns.swap_remove(i);
+        // The last one took its place.
+        if let Some(moved) = self.conns.get(i) {
+            self.index.insert(key(&moved.tcp.endpoints()), i);
+        }
+    }
+
+    /// Add connection `c` to the table and its index.
+    fn add_conn(&mut self, c: Conn) {
+        self.index.insert(key(&c.tcp.endpoints()), self.conns.len());
+        self.conns.push(c);
     }
 
     /// A record for a new connection `c`, if one is free.
@@ -380,8 +414,10 @@ impl Tcp {
     pub fn segment(&mut self, now: u64, local: Ipv4, remote: Ipv4, s: &Segment<'_>) -> Option<Header> {
         let h = &s.header;
         let ends = Endpoints { local, local_port: h.dst_port, remote, remote_port: h.src_port };
-        if let Some(c) = self.conns.iter_mut().find(|c| c.tcp.endpoints() == ends) {
+        if let Some(&i) = self.index.get(&key(&ends)) {
+            let c = &mut self.conns[i];
             c.tcp.on_segment(now, s);
+            c.due = true;
             return None;
         }
         if s.has(SYN)
@@ -390,14 +426,34 @@ impl Tcp {
             && let Some(l) = self.listeners.iter().find(|l| l.port == h.dst_port)
         {
             let (lid, owner, backlog) = (l.id, l.owner, l.backlog);
-            let waiting = self.conns.iter().filter(|c| c.listener == Some(lid)).count();
-            // The oldest half-open handshake gives way to this one.
+            // A handshake that never finishes (a SYN from an address that
+            // never answers: spoofed) holds its place and 64 KiB until its
+            // SYN-ACKs give up, minutes later; a real one finishes within a
+            // round trip. So a full backlog gives the place of the
+            // listener's oldest unfinished handshake to this one, and so
+            // does the machine past `HALF_OPEN` of them: a flood of spoofed
+            // SYNs no longer shuts a listener, or every listener, to the
+            // peers that answer.
             let half_open = |c: &Conn| c.tcp.state() == State::SynReceived;
-            if self.conns.iter().filter(|c| half_open(c)).count() >= HALF_OPEN
-                && let Some(oldest) = self.conns.iter().enumerate().filter(|(_, c)| half_open(c)).min_by_key(|(_, c)| c.id).map(|(i, _)| i)
+            let oldest = |conns: &[Conn], of: Option<u32>| {
+                conns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| half_open(c) && of.is_none_or(|l| c.listener == Some(l)))
+                    .min_by_key(|(_, c)| c.id)
+                    .map(|(i, _)| i)
+            };
+            if self.conns.iter().filter(|c| c.listener == Some(lid)).count() >= backlog as usize
+                && let Some(i) = oldest(&self.conns, Some(lid))
             {
-                self.drop_conn(oldest);
+                self.drop_conn(i);
             }
+            if self.conns.iter().filter(|c| half_open(c)).count() >= HALF_OPEN
+                && let Some(i) = oldest(&self.conns, None)
+            {
+                self.drop_conn(i);
+            }
+            let waiting = self.conns.iter().filter(|c| c.listener == Some(lid)).count();
             if waiting < backlog as usize
                 && self.room_for(owner)
                 && let Some(buffers) = buffers()
@@ -407,7 +463,17 @@ impl Tcp {
                 tcp.set_offloads(self.checksum_offload, self.most_payload);
                 let id = self.number();
                 let record = self.record(&tcp);
-                self.conns.push(Conn { id, record, owner, tcp, streams: None, listener: Some(lid), announced: false, released: false });
+                self.add_conn(Conn {
+                    id,
+                    record,
+                    owner,
+                    tcp,
+                    streams: None,
+                    listener: Some(lid),
+                    announced: false,
+                    released: false,
+                    due: true,
+                });
                 return None;
             }
         }
@@ -423,12 +489,28 @@ impl Tcp {
         for c in &mut self.conns {
             if c.tcp.deadline().is_some_and(|d| d <= now) {
                 c.tcp.on_time(now);
+                c.due = true;
             }
         }
     }
 
-    /// Move bytes between every connection and its program, send what
-    /// the connections have to send while `out` has room, tell programs
+    /// Programs signalled `bits` of the stack's notification: the
+    /// connections those bits stand for ([`FIRST_BIT`] and up, one per
+    /// connection number modulo the bits there are) are due.
+    pub fn signalled(&mut self, bits: u64) {
+        let ours = bits >> FIRST_BIT;
+        if ours == 0 {
+            return;
+        }
+        for c in self.conns.iter_mut() {
+            if ours & (1 << (c.id % BITS)) != 0 {
+                c.due = true;
+            }
+        }
+    }
+
+    /// Move bytes between every connection that is due and its program,
+    /// send what they have to send while `out` has room, tell programs
     /// and listeners what changed, and forget connections that are done.
     /// Returns whether a connection still has something to send (`out`
     /// had no room).
@@ -444,6 +526,10 @@ impl Tcp {
         self.rotor = self.rotor.wrapping_add(1);
         for k in 0..n {
             let c = &mut self.conns[(first + k) % n];
+            if !c.due {
+                continue;
+            }
+            c.due = false;
             if let Some(s) = c.streams.as_mut() {
                 // The program's bytes to TCP.
                 let mut took = false;
@@ -533,18 +619,20 @@ impl Tcp {
                 }
             }
             if !out.room() {
+                // What it could not send waits for the next pass.
                 more = true;
+                c.due = true;
             }
             // How far each side has sent, for a reset of it by the next stack.
             if let (Some(i), Some(r)) = (c.record, self.records.as_ref()) {
                 r.write32(i * RECORD + 8, c.tcp.sent_to());
                 r.write32(i * RECORD + 12, c.tcp.received_to());
             }
-        }
-        // In TIME-WAIT nothing more is sent or read: a connection's buffers
-        // go now, not a minute later when it ends (`Connection::shed`),
-        // unless its program has still to read what arrived.
-        for c in self.conns.iter_mut() {
+            // In TIME-WAIT nothing more is sent or read: a connection's
+            // buffers go now, not a minute later when it ends
+            // (`Connection::shed`), unless its program has still to read
+            // what arrived. (A connection gets there, and its program
+            // reads the rest, only by what makes it due.)
             if c.released || c.tcp.readable() == 0 {
                 let _ = c.tcp.shed();
             }
@@ -560,8 +648,9 @@ impl Tcp {
             }
         }
         // Too many in TIME-WAIT (and let go of): the nearest its end goes.
+        // (Counted only when the table holds more than that many at all.)
         let waiting = |c: &Conn| c.released && c.tcp.state() == State::TimeWait;
-        while self.conns.iter().filter(|c| waiting(c)).count() > TIME_WAITING {
+        while self.conns.len() > TIME_WAITING && self.conns.iter().filter(|c| waiting(c)).count() > TIME_WAITING {
             let Some(i) = self.conns.iter().enumerate().filter(|(_, c)| waiting(c)).min_by_key(|(_, c)| c.tcp.deadline()).map(|(i, _)| i)
             else {
                 break;
@@ -682,6 +771,7 @@ impl Tcp {
             if (c.owner == badge || waiting) && !c.released {
                 c.tcp.abort();
                 c.released = true;
+                c.due = true;
                 c.streams = None;
             }
         }
@@ -716,6 +806,7 @@ impl Tcp {
         let wake = Watched::new(wake, self.note)?;
         let c = &mut self.conns[i];
         c.listener = None;
+        c.due = true;
         c.owner = badge;
         c.streams = Some(Streams { rx, tx, wake, offset, bits, rx_closed: false, tx_closed: false });
         let remote = c.tcp.endpoints();
@@ -757,7 +848,17 @@ impl Tcp {
         let wake = Watched::new(wake, self.note)?;
         let streams = Streams { rx, tx, wake, offset, bits, rx_closed: false, tx_closed: false };
         let record = self.record(&tcp);
-        self.conns.push(Conn { id, record, owner: badge, tcp, streams: Some(streams), listener: None, announced: true, released: false });
+        self.add_conn(Conn {
+            id,
+            record,
+            owner: badge,
+            tcp,
+            streams: Some(streams),
+            listener: None,
+            announced: true,
+            released: false,
+            due: true,
+        });
         Ok(proto::ConnectReply { connection: id, requests })
     }
 
@@ -811,6 +912,7 @@ impl Tcp {
         }
         c.tcp.release(silica_rt::clock().now());
         c.released = true;
+        c.due = true;
         c.streams = None;
         Ok(proto::CloseReply {})
     }
@@ -822,6 +924,7 @@ impl Tcp {
     pub fn address_gone(&mut self) {
         for c in self.conns.iter_mut().filter(|c| !c.tcp.is_closed()) {
             c.tcp.abort();
+            c.due = true;
         }
     }
 
@@ -830,6 +933,7 @@ impl Tcp {
         self.listeners.remove(at);
         for c in self.conns.iter_mut().filter(|c| c.listener == Some(listener)) {
             c.tcp.abort();
+            c.due = true;
         }
         Ok(proto::UnlistenReply {})
     }
