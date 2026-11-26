@@ -97,11 +97,15 @@
 //! fatal error) ends with a nonzero status from `main`, or with
 //! `silica_rt::exit` from anywhere, `signals` included: the device manager
 //! silences the device and starts the driver again, which resets it, and
-//! each client sends again what was in flight. After three such failures
-//! the device is left alone and its owner told. A driver for a device it
-//! will never support (a namespace format it does not know) should end
-//! with status 0 after saying why: ending well is not a failure, and the
-//! device is left alone at once.
+//! each client sends again what was in flight. A driver that keeps failing
+//! is started again later each time (up to a minute apart), never left for
+//! good. A driver for a device it will never support (a namespace format it
+//! does not know) should end with status 0 after saying why: ending well is
+//! not a failure, and the device is left alone at once.
+//!
+//! A driver asked to end by its parent ([`silica_rt::END`], as the machine
+//! turns off) is ended here: the service flushes the device's write cache
+//! with a request of its own, then calls [`Device::shutdown`] and exits 0.
 
 use crate::device::{self, AddMemoryReply, ConnectReply, Error, Info, InfoReply, NarrowReply, RemoveMemoryReply, TraceReply};
 use crate::{Op, Request, Status};
@@ -346,6 +350,19 @@ pub struct Service<D: Device> {
     caller: u64,
     /// A client to wake as the driver next waits (`Session::flush`).
     wake: Option<Cap>,
+    /// The driver is ending in order (`Service::begin_end`).
+    ending: Option<Ending>,
+}
+
+/// A driver ending in order: its last flush, heard of through the same wait
+/// as everything else the device says.
+struct Ending {
+    /// The flush reached the device (it may have been full when asked).
+    started: bool,
+    /// How the flush ended, once the device said.
+    result: Option<Result<(), Status>>,
+    /// When the device is given up on (monotonic ns).
+    deadline: u64,
 }
 
 /// A flush request, as the device is given one.
@@ -369,6 +386,7 @@ impl<D: Device> Service<D> {
             next_trace: 0,
             caller: 0,
             wake: None,
+            ending: None,
         }
     }
 
@@ -490,9 +508,16 @@ impl<D: Device> Service<D> {
     /// The device's signals (`Some`), or its deadline passing (`None`):
     /// what it reports finished goes to the client.
     fn device_event(&mut self, bits: Option<u64>) {
-        let (session, traces, flushes) = (&mut self.session, &mut self.traces, &mut self.flushes);
+        let (session, traces, flushes, ending) = (&mut self.session, &mut self.traces, &mut self.flushes, &mut self.ending);
         let clock = silica_rt::clock();
         let mut done = |ticket: Ticket, s: Result<(), Status>| {
+            if ticket == provider::Ticket::own(END_FLUSH_TAG) {
+                // The flush the driver made as it ends: no client's.
+                if let Some(e) = ending.as_mut() {
+                    e.result = Some(s);
+                }
+                return;
+            }
             if ticket.tag() & TRACED != 0
                 && let Some(t) = traces.iter_mut().find(|t| t.tag == ticket.tag() && t.done == 0 && t.taken != 0)
             {
@@ -553,45 +578,50 @@ impl<D: Device> Service<D> {
     /// cut for the device's cache. What clients still have on the device is
     /// theirs to lose: the service manager ends clients before the device
     /// manager, and the flush covers every write the device had finished.
-    fn end(&mut self) -> ! {
-        let info = self.device.info();
-        let said = if info.write_cache {
+    ///
+    /// The flush is one more request on the device: its completion arrives
+    /// as every completion does, on the driver's one wait (the device's
+    /// interrupt, [`Events::signals`]), and the device's bound on it is that
+    /// wait's deadline ([`Events::deadline`]). Nothing is looked at between
+    /// the two (before, the driver woke every 100 us for up to 5 s to ask).
+    fn begin_end(&mut self) {
+        if self.ending.is_some() {
+            return;
+        }
+        if !self.device.info().write_cache {
+            self.finish_end("no write cache");
+        }
+        self.ending = Some(Ending { started: false, result: None, deadline: silica_rt::clock().now() + END_FLUSH_NS });
+        self.end_step();
+    }
+
+    /// The ending driver's next step, after anything the device said: the
+    /// flush offered (again, if the device was full), or the end itself
+    /// once the flush is answered or the device's time for it is up.
+    fn end_step(&mut self) {
+        let (device, Some(e)) = (&mut self.device, self.ending.as_mut()) else { return };
+        if !e.started && e.result.is_none() {
             let ticket = provider::Ticket::own(END_FLUSH_TAG);
-            let clock = silica_rt::clock();
-            let deadline = clock.now() + END_FLUSH_NS;
-            // What the wait between looks sleeps on: signalled by nobody.
-            let nap = silica_rt::mem::OwnedObject::new(sys::ObjectType::Notification, 0).ok();
-            let (mut started, mut result) = (false, None);
-            while result.is_none() && clock.now() < deadline {
-                if !started {
-                    match self.device.start(&flush_request(ticket), 0, ticket) {
-                        Ok(()) => {
-                            started = true;
-                            self.device.kick();
-                        }
-                        Err(Refusal::Busy) => {}
-                        Err(Refusal::Fail(_)) => result = Some(Err(Status::Io)),
-                    }
+            match device.start(&flush_request(ticket), 0, ticket) {
+                Ok(()) => {
+                    e.started = true;
+                    device.kick();
                 }
-                self.device.timeout(&mut |t, s| {
-                    if t == ticket {
-                        result = Some(s);
-                    }
-                });
-                if result.is_none()
-                    && let Some(n) = &nap
-                {
-                    let _ = sys::recv(n.cap(), sys::Wait::Until(clock.now() + 100_000));
-                }
+                // Offered again after the device's next completion.
+                Err(Refusal::Busy) => {}
+                Err(Refusal::Fail(_)) => e.result = Some(Err(Status::Io)),
             }
-            match result {
-                Some(Ok(())) => "its write cache flushed",
-                Some(Err(_)) => "its write cache's flush failed",
-                None => "its write cache's flush did not finish in time",
-            }
-        } else {
-            "no write cache"
-        };
+        }
+        let (result, late) = (e.result, silica_rt::clock().now() >= e.deadline);
+        match result {
+            Some(Ok(())) => self.finish_end("its write cache flushed"),
+            Some(Err(_)) => self.finish_end("its write cache's flush failed"),
+            None if late => self.finish_end("its write cache's flush did not finish in time"),
+            None => {}
+        }
+    }
+
+    fn finish_end(&mut self, said: &str) -> ! {
         self.device.shutdown();
         silica_rt::println!("block: the driver ended in order, {said}");
         silica_rt::exit(0)
@@ -708,18 +738,24 @@ impl<D: Device> Events for Service<D> {
     }
 
     fn signals(&mut self, bits: u64) {
+        // The device's bits: not the clients', not the parent's.
+        let device = bits & !(CLIENT | silica_rt::END);
+        if device != 0 {
+            self.device_event(Some(device));
+        }
         if bits & silica_rt::END != 0 {
-            self.end();
+            self.begin_end();
         }
-        if bits & !CLIENT != 0 {
-            self.device_event(Some(bits & !CLIENT));
-        }
-        self.pump();
-        self.wake = self.session.flush();
+        self.after_event();
     }
 
     fn deadline(&self) -> Option<u64> {
-        self.device.deadline()
+        // The device's deadline for its requests; and, ending, its time for
+        // the last flush.
+        match (self.device.deadline(), self.ending.as_ref().map(|e| e.deadline)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn take_wake(&mut self) -> Option<Cap> {
@@ -728,7 +764,20 @@ impl<D: Device> Events for Service<D> {
 
     fn timer(&mut self) {
         self.device_event(None);
-        self.pump();
+        self.after_event();
+    }
+}
+
+impl<D: Device> Service<D> {
+    /// After the device spoke or a deadline passed: an ending driver takes
+    /// its next step and no new request; any other takes what its clients
+    /// have ready.
+    fn after_event(&mut self) {
+        if self.ending.is_some() {
+            self.end_step();
+        } else {
+            self.pump();
+        }
         self.wake = self.session.flush();
     }
 }
