@@ -715,6 +715,38 @@ impl Manager {
         }
     }
 
+    /// As the machine turns off, the services' last lines on the console
+    /// before the log service goes ([`flush_log`]), answering meanwhile what
+    /// the log service needs answered to get there: reading a ring whose
+    /// memory went with its writer (the device manager's drivers', ended
+    /// before it) faults, and that fault is the service manager's to answer
+    /// ([`Manager::ended`]). Before, each waited on the other for the whole
+    /// [`FLUSH_WAIT`], at every shutdown. For shutdown only, as
+    /// [`Manager::end_in_order`].
+    fn flush_log_answering(&mut self) {
+        let (to, done) = (FLUSH_TO.load(Ordering::Relaxed), FLUSHED.load(Ordering::Relaxed));
+        if to == 0 {
+            return;
+        }
+        let _ = sys::recv(sys::Cap(done), Wait::Poll);
+        if sys::signal(sys::Cap(to)).is_err() {
+            return;
+        }
+        let deadline = silica_rt::clock().now() + FLUSH_WAIT;
+        while let Ok(m) = sys::recv_listening(self.root.parent.exit, sys::Cap(done), Wait::Until(deadline)) {
+            if m.signals().is_some() {
+                return;
+            }
+            // The log service itself gone: nothing more is coming.
+            if let Some((j, _)) = self.ended(&m)
+                && self.log.as_ref().is_some_and(|l| l.service == j)
+            {
+                break;
+            }
+        }
+        println!("init: the log service did not put its text on the console within 2 s: services' last lines may be missing");
+    }
+
     /// Ask service `i` to end ([`silica_rt::END`] on its events notification)
     /// and wait up to [`END_WAIT`] for it to exit; the caller then stops it
     /// (what is left of it, or all of it if it did not exit). For shutdown
@@ -984,7 +1016,7 @@ impl manager::Server<Handle> for Manager {
             // What the services said as they ended reaches the console
             // before the log goes.
             if self.log.as_ref().is_some_and(|l| l.service == i) {
-                flush_log();
+                self.flush_log_answering();
             }
             if self.stop(i) {
                 println!("init: {} stopped", self.services[i].name);
