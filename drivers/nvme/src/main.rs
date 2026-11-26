@@ -212,7 +212,11 @@ impl Controller {
         // interrupt costs milliseconds, not the whole timeout, and a
         // controller that has died is seen as soon (CSTS).
         let mut poll = POLL_NS;
-        let mut woken = true;
+        // A lost interrupt is lost from the moment the command is rung,
+        // whether the completion comes before the first look or after: the
+        // fault is committed here, not when (or if) the interrupt arrives.
+        let lost = lose_interrupt && inject::pending(Fault::AdminMissed);
+        let mut woken = !lost;
         loop {
             if let Some(c) = self.admin.pop()? {
                 if !woken {
@@ -239,12 +243,8 @@ impl Controller {
                 return Err(DeviceError::Timeout(what));
             }
             let until = (t + poll).min(deadline);
-            woken = sys::recv(self.listen, Wait::Until(until)).is_ok();
-            if woken && lose_interrupt && inject::pending(Fault::AdminMissed) {
-                // Lost: the driver does not know it came, and waits on.
-                woken = false;
-                let _ = sys::recv(self.listen, Wait::Until(until));
-            }
+            // Lost: the driver does not know it came, and waits on.
+            woken = sys::recv(self.listen, Wait::Until(until)).is_ok() && !lost;
             poll = (poll * 2).min(ADMIN_POLL_MAX_NS);
         }
     }
