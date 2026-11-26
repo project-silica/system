@@ -117,6 +117,7 @@
 #![deny(unsafe_code)]
 
 pub mod dma;
+pub mod framebuffer;
 pub mod inject;
 pub mod irq;
 pub mod pci;

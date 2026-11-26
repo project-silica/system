@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use silica_driver::{Device, DeviceError, grant, granted};
+use silica_driver::{Device, DeviceError, framebuffer, grant, granted};
 use silica_idl_rt::CapList;
 use silica_protocols::display::device::{self, AttachReply, Error, Format, Mode, ModeReply, PresentReply, Rect};
 use silica_rt::ipc::{Handle, serve};
@@ -60,34 +60,23 @@ impl device::Server<Handle> for Display {
         let Some((_, lent)) = &self.attached else { return Err(Error::NotAttached) };
         let from = lent.region();
         let Rect { x, y, width, height } = rect;
-        let (x, y, w, h, stride) = (x as u64, y as u64, width as u64, height as u64, stride as u64);
+        let (x, y, w, h) = (x as u64, y as u64, width as u64, height as u64);
         if w == 0 || h == 0 {
             return Ok(PresentReply {});
         }
         let on_screen = x + w <= self.mode.width as u64 && y + h <= self.mode.height as u64;
-        let last = offset.checked_add(((h - 1) * stride + w) * 4);
-        // Pixels start at multiples of 4: an offset between them is refused
-        // (read as words, it would stop the driver).
-        if !on_screen || stride < w || !offset.is_multiple_of(4) || last.is_none_or(|l| l > from.len() as u64) {
+        // Every byte of the rectangle, row padding included, in the frame:
+        // checked arithmetic, as a maximum-size rectangle overflowed it.
+        let last = framebuffer::byte_end(offset, width, height, stride);
+        if !on_screen || last.is_none_or(|l| l > from.len() as u64) {
             return Err(Error::Outside);
         }
         let to = &self.framebuffer;
         for row in 0..h {
-            let src = (offset + row * stride * 4) as usize;
+            let src = (offset + row * u64::from(stride) * 4) as usize;
             let dst = (((y + row) * self.stride as u64 + x) * 4) as usize;
-            let bytes = (w * 4) as usize;
-            if src.is_multiple_of(8) && dst.is_multiple_of(8) {
-                for i in (0..bytes & !7).step_by(8) {
-                    to.write64(dst + i, from.read64(src + i));
-                }
-                if !bytes.is_multiple_of(8) {
-                    to.write32(dst + bytes - 4, from.read32(src + bytes - 4));
-                }
-            } else {
-                for i in (0..bytes).step_by(4) {
-                    to.write32(dst + i, from.read32(src + i));
-                }
-            }
+            // Pixels may start at any byte: a client's offset is its own.
+            framebuffer::copy_row(to, dst, &from, src, width);
         }
         Ok(PresentReply {})
     }
@@ -116,7 +105,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         return Err(DeviceError::Protocol("the framebuffer's description makes no sense"));
     }
     let framebuffer = device.bar(bar).ok_or(DeviceError::Missing("the BAR holding the framebuffer"))?;
-    if (framebuffer.len() as u64) < stride as u64 * height as u64 * 4 {
+    if framebuffer::byte_end(0, stride, height, stride).is_none_or(|end| end > framebuffer.len() as u64) {
         return Err(DeviceError::Protocol("the framebuffer does not fit its BAR"));
     }
     println!("fbdisplay: {width}x{height}, {stride} pixels a row");
