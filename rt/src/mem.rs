@@ -6,9 +6,9 @@
 //! comes and goes is managed here, in blocks: a block is an Untyped of its
 //! own, made from one of the program's sources; whoever is done with a block
 //! revokes it, which destroys everything made from it, and the empty block
-//! is kept for the next request of its size. Nothing is merged or split:
-//! a program that uses a few sizes over and over, as a parent starting and
-//! ending children does, never runs out by fragmentation.
+//! goes back to a buddy tree over the sources (`blocks`): split to serve
+//! a smaller request, merged with its buddy when both are free, so memory
+//! given back at one size serves any other.
 //!
 //! A program's source is its own Untyped ([`crate::slots::UNTYPED`]); the
 //! root task's are all the memory of the machine.
@@ -17,130 +17,94 @@ use crate::ipc::{free_slot, release_slot};
 use crate::mmio::Mmio;
 use crate::slots;
 use crate::sys::{self, Cap, Error, ObjectType};
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Untyped capabilities blocks are made from, as `slot | bits << 56`,
-/// smallest first (0: none, at the end).
-static SOURCES: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-/// Flag in a source's entry: blocks have been made from it.
-const USED: u64 = 1 << 63;
-/// A source that was handed out whole as a block: skipped from then on (it
-/// comes back through the list of empty blocks when it is freed).
-const SPENT: u64 = 1 << 62;
-/// Empty blocks: `slot | bits << 56` (0: none).
-static FREE: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
-/// Bytes of all the sources, bytes made into blocks from them, and bytes
-/// of the empty blocks kept: what [`available`] counts.
-static TOTAL: AtomicU64 = AtomicU64::new(0);
-static MADE: AtomicU64 = AtomicU64::new(0);
-static KEPT: AtomicU64 = AtomicU64::new(0);
+mod blocks;
 
-/// Bytes [`alloc()`] can still give out: the sources not yet made into
-/// blocks, and the empty blocks kept. A block given back with [`free`] is
-/// counted again; one lost (more empty blocks than this module keeps) is
-/// not, so a program that starts and ends children sees memory go only
-/// where it went.
+/// The program's blocks (`blocks`), under a lock: a program's threads
+/// allocate at once, and the heap asks for chunks holding its own lock.
+struct Tree {
+    lock: AtomicBool,
+    blocks: UnsafeCell<blocks::Blocks>,
+}
+
+// SAFETY: `blocks` is only touched holding `lock`.
+#[allow(unsafe_code)]
+unsafe impl Sync for Tree {}
+
+static TREE: Tree = Tree { lock: AtomicBool::new(false), blocks: UnsafeCell::new(blocks::Blocks::new()) };
+
+fn with<R>(f: impl FnOnce(&mut blocks::Blocks) -> R) -> R {
+    while TREE.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    // SAFETY: the lock is held, so this is the only reference.
+    #[allow(unsafe_code)]
+    let r = f(unsafe { &mut *TREE.blocks.get() });
+    TREE.lock.store(false, Ordering::Release);
+    r
+}
+
+/// The kernel's side of the tree: the program's own CapSpace.
+struct Kernel;
+
+impl blocks::Ops for Kernel {
+    fn carve(&mut self, parent: u64, bits: u8) -> Result<u64, Error> {
+        let slot = free_slot().ok_or(Error::NoMemory)?;
+        sys::retype(Cap(parent), ObjectType::Untyped, bits, slots::SPACE, slot, 1).inspect_err(|_| release_slot(slot))?;
+        Ok(slot)
+    }
+
+    fn delete(&mut self, slot: u64) {
+        // SAFETY: an empty block of the tree's, which nothing names.
+        #[allow(unsafe_code)]
+        let _ = unsafe { sys::cap_delete(Cap(slot)) };
+        release_slot(slot);
+    }
+}
+
+/// Bytes [`alloc()`] can still give out: the free blocks, which a block
+/// given back with [`free`] joins at once.
 pub fn available() -> u64 {
-    (TOTAL.load(Ordering::Relaxed) + KEPT.load(Ordering::Relaxed)).saturating_sub(MADE.load(Ordering::Relaxed))
+    with(|b| b.available())
 }
 
 /// Add `untyped`, of `2^bits` bytes, to what [`alloc()`] makes blocks from.
-/// A request is served from the smallest source that has room, so the
-/// large ones stay whole for large requests. When there are more sources
-/// than this module keeps, the smallest are left out. Call it while the
-/// program has one thread.
+/// A request is served from the smallest free block that holds it, so
+/// large ones stay whole for large requests. A source the table has no
+/// room for is not used. Call it while the program has one thread.
 pub fn add_source(untyped: Cap, bits: u8) {
-    TOTAL.fetch_add(1 << bits, Ordering::Relaxed);
-    let mut entry = untyped.0 | (bits as u64) << 56;
-    // Insert in order of size; what falls off the end is the largest so
-    // far, so swap it against the smallest instead.
-    for s in &SOURCES {
-        let have = s.load(Ordering::Relaxed);
-        if have == 0 {
-            s.store(entry, Ordering::Relaxed);
-            return;
-        }
-        if have >> 56 > entry >> 56 {
-            s.store(entry, Ordering::Relaxed);
-            entry = have;
-        }
-    }
-    // Full: `entry` is now the largest of all. Drop the smallest for it.
-    TOTAL.fetch_sub(1 << (SOURCES[0].load(Ordering::Relaxed) >> 56 & 0x3F), Ordering::Relaxed);
-    for i in 0..SOURCES.len() - 1 {
-        SOURCES[i].store(SOURCES[i + 1].load(Ordering::Relaxed), Ordering::Relaxed);
-    }
-    SOURCES[SOURCES.len() - 1].store(entry, Ordering::Relaxed);
+    with(|b| b.add_source(untyped.0, bits));
 }
 
 /// An empty Untyped of `2^bits` bytes, or `NoMemory`.
 pub fn alloc(bits: u8) -> Result<Cap, Error> {
-    for f in &FREE {
-        let v = f.load(Ordering::Relaxed);
-        if v != 0 && (v >> 56) as u8 == bits && f.compare_exchange(v, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            KEPT.fetch_sub(1 << bits, Ordering::Relaxed);
-            return Ok(Cap(v & ((1 << 56) - 1)));
-        }
-    }
-    let slot = free_slot().ok_or(Error::NoMemory)?;
-    for s in &SOURCES {
-        let entry = s.load(Ordering::Relaxed);
-        if entry == 0 {
-            break;
-        }
-        let entry_bits = ((entry & !USED) >> 56) as u8;
-        if entry == SPENT || entry_bits < bits {
-            continue;
-        }
-        let source = entry & ((1 << 56) - 1);
-        match sys::retype(Cap(source), ObjectType::Untyped, bits, slots::SPACE, slot, 1) {
-            Ok(()) => {
-                s.store(entry | USED, Ordering::Relaxed);
-                MADE.fetch_add(1 << bits, Ordering::Relaxed);
-                return Ok(Cap(slot));
-            }
-            // A source of exactly this size cannot be made into a smaller
-            // one: while nothing has been made from it, it is the block.
-            Err(Error::NoMemory) if entry_bits == bits && entry & USED == 0 => {
-                if s.compare_exchange(entry, SPENT, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                    MADE.fetch_add(1 << bits, Ordering::Relaxed);
-                    release_slot(slot);
-                    return Ok(Cap(source));
-                }
-            }
-            Err(Error::NoMemory) => {}
-            Err(e) => {
-                release_slot(slot);
-                return Err(e);
-            }
-        }
-    }
-    release_slot(slot);
-    Err(Error::NoMemory)
+    with(|b| b.alloc(&mut Kernel, bits)).map(Cap)
 }
 
 /// Give back the block `block` of `2^bits` bytes from [`alloc()`]: everything
-/// made from it is destroyed, in whatever CapSpace its capabilities are.
+/// made from it is destroyed, in whatever CapSpace its capabilities are,
+/// and its memory serves the next request of any size.
 ///
 /// # Safety
 /// Nothing the program still uses may be made from the block: no memory it
 /// has mapped and references, no object it will name again.
 #[allow(unsafe_code)]
 pub unsafe fn free(block: Cap, bits: u8) {
+    let _ = bits;
+    // Emptied before the lock is taken: destroying what was made from it
+    // can take long (a CapSpace's slots, a large frame's mappings).
     // SAFETY: the caller's promise is this function's.
     if unsafe { sys::cap_revoke(block) }.is_err() {
         return; // not a block: nothing to keep
     }
-    let v = block.0 | (bits as u64) << 56;
-    if FREE.iter().any(|f| f.compare_exchange(0, v, Ordering::Relaxed, Ordering::Relaxed).is_ok()) {
-        KEPT.fetch_add(1 << bits, Ordering::Relaxed);
-        return;
+    if !with(|b| b.free(&mut Kernel, block.0)) {
+        // Not one the tree handed out: let it go.
+        // SAFETY: the block is empty and is the caller's to give up.
+        let _ = unsafe { sys::cap_delete(block) };
+        release_slot(block.0);
     }
-    // No room to remember it: its memory stays out of use until the source
-    // it came from is revoked as a whole.
-    // SAFETY: the block is empty and is the caller's to give up.
-    let _ = unsafe { sys::cap_delete(block) };
-    release_slot(block.0);
 }
 
 /// A kernel object with a block of memory to itself, so that freeing it

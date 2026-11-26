@@ -24,6 +24,7 @@ const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
 const BORROWER: u64 = 7;
 const CHURN: u64 = 8;
+const BLOCKS: u64 = 9;
 
 const SECOND: u64 = 1_000_000_000;
 const SEND: Rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
@@ -361,6 +362,20 @@ impl Tests {
     /// first round. Before, the heap kept what was freed at each size for
     /// that size alone, and the first round's 32 KiB blocks were refused
     /// (block 24, with 256 KiB of the program's memory left).
+    /// A program takes its memory in 64 KiB blocks until it is refused,
+    /// gives them all back, and takes 1 MiB blocks: they must hold what the
+    /// small ones did. Before, a block given back was kept for a request of
+    /// its own size alone, and the 1 MiB requests were refused with all the
+    /// program's memory free.
+    fn blocks_given_back_serve_any_size(&mut self) -> Outcome {
+        let (_, id) = self.start_with(BLOCKS, [16, 20, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, 0) if who == id => Ok(()),
+            (who, _) if who == id => Err("memory given back in small blocks did not serve large ones (the program's line says how many)"),
+            _ => Err("something other than the block program ended"),
+        }
+    }
+
     fn heap_churn(&mut self) -> Outcome {
         let (_, id) = self.start_with(CHURN, [4, 0, 0], 0, &[])?;
         match self.next_exit(60 * SECOND)? {
@@ -521,9 +536,10 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 13] = [
+    let tests: [(&str, Test); 14] = [
         ("lent_memory_taken_back_any_number_of_times", Tests::lent_memory_taken_back_any_number_of_times),
         ("memory_freed_at_one_size_serves_another", Tests::heap_churn),
+        ("blocks_given_back_serve_any_size", Tests::blocks_given_back_serve_any_size),
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("time_reader_survives_its_writer", Tests::abandoned_time_page),
         ("failed_spawn_returns_grants", Tests::failed_spawn_returns_grants),

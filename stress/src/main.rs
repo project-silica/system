@@ -25,6 +25,9 @@
 //!   mapped, every page then touched (its supervisor answers with zeros),
 //!   and let go of; exits 0 if every page read zeros and every frame after
 //!   the first was mapped where the first was.
+//! - `BLOCKS`: takes blocks of `2^args[1]` bytes from its memory (`silica_rt::mem`) until
+//!   refused, gives them all back, then takes blocks of `2^args[2]` bytes until refused; exits 0
+//!   if the large blocks hold what the small ones did (memory given back at one size serves another).
 //! - `CHURN`: `args[1]` rounds of `args[2]` bytes (0: 45% of its free memory) of the heap at a time,
 //!   as 2 KiB pieces, then 32 KiB blocks, then 256 KiB blocks, each
 //!   written and checked and given back; exits 0 if every request was
@@ -46,6 +49,7 @@ const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
 const BORROWER: u64 = 7;
 const CHURN: u64 = 8;
+const BLOCKS: u64 = 9;
 
 const PING: u64 = 1;
 const COUNT: u64 = 2;
@@ -73,6 +77,7 @@ fn main(info: &'static ProcessInfo) -> i64 {
         }
         BORROWER => borrower(info.args[1], info.args[2] as u8),
         CHURN => churn(info.args[1], info.args[2] as usize),
+        BLOCKS => blocks(info.args[1] as u8, info.args[2] as u8),
         ONE_CALL => match sys::call(grant, MsgInfo::new(PING, 1), [41, 0, 0, 0]) {
             Ok(_) => 0,
             Err(e) => e as i64,
@@ -269,4 +274,63 @@ fn churn(rounds: u64, bytes: usize) -> i64 {
     }
     println!("stress churn: {rounds} rounds of {bytes} bytes at three sizes; the heap kept what it freed for the next size");
     0
+}
+
+/// See `BLOCKS` in the module's documentation.
+fn blocks(small: u8, large: u8) -> i64 {
+    use silica_rt::mem;
+    let mut held: [Option<sys::Cap>; 512] = [None; 512];
+    let take = |bits: u8, held: &mut [Option<sys::Cap>; 512]| {
+        let mut n = 0;
+        while n < held.len() {
+            match mem::alloc(bits) {
+                Ok(b) => {
+                    held[n] = Some(b);
+                    n += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        n
+    };
+    let give_back = |bits: u8, held: &mut [Option<sys::Cap>; 512]| {
+        for b in held.iter_mut().filter_map(Option::take) {
+            // SAFETY: nothing was made from these blocks.
+            #[allow(unsafe_code)]
+            unsafe {
+                mem::free(b, bits)
+            };
+        }
+    };
+    // The heap first: 45% of the program's memory in 256 KiB blocks, then
+    // dropped. Its chunks go back to the program's memory but for one
+    // spare chunk and its records (512 KiB, here): before, the heap kept
+    // every chunk it made.
+    let start = mem::available();
+    {
+        use silica_rt::alloc::vec::Vec;
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..(start as usize / 100 * 45) / (256 << 10) {
+            let mut b = Vec::new();
+            if b.try_reserve_exact(256 << 10).is_err() {
+                return 2;
+            }
+            b.resize(256 << 10, 1);
+            v.push(b);
+        }
+    }
+    let after = mem::available();
+    println!("stress blocks: {start} bytes free, {after} after 45% of them were the heap's and given back");
+    if after + (512 << 10) < start {
+        return 3;
+    }
+    let n = take(small, &mut held);
+    give_back(small, &mut held);
+    let m = take(large, &mut held);
+    give_back(large, &mut held);
+    let (small_bytes, large_bytes) = ((n as u64) << small, (m as u64) << large);
+    println!("stress blocks: {n} of 2^{small} bytes taken and given back, then {m} of 2^{large}");
+    // The large blocks hold what the small did, but for what the program's
+    // own heap and the alignment of the large ones take.
+    if n == 0 || m == 0 || large_bytes + (1u64 << large) < small_bytes { 1 } else { 0 }
 }
