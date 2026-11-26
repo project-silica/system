@@ -311,18 +311,25 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         return Err(DeviceError::Protocol("the network device's configuration is too short"));
     }
     // Fields that belong together are read under one configuration generation.
-    let (address, mtu) = loop {
-        let before = transport.config_generation();
-        let address = if features & F_MAC != 0 {
-            (0..6).fold(0u64, |a, i| a | (config.read8(i) as u64) << (8 * i))
-        } else {
-            // Locally administered, unicast, from the device's identity.
-            0x02 | 0x5E << 8 | (device.id as u64) << 16
-        };
+    let (reported, mtu) = transport.read_config(|| {
+        let reported = (features & F_MAC != 0).then(|| (0..6).fold(0u64, |a, i| a | (config.read8(i) as u64) << (8 * i)));
         let mtu = if features & F_MTU != 0 { config.read16(10) as u32 } else { 1500 };
-        if transport.config_generation() == before {
-            break (address, mtu);
+        (reported, mtu)
+    })?;
+    // An address the device reports that no interface may have
+    // (multicast, zeros) is not used (`silica_driver::mac`).
+    let address = match reported {
+        Some(a) if silica_driver::mac::usable(a) => a,
+        Some(a) => {
+            let local = silica_driver::mac::local(device.id);
+            println!(
+                "virtio-net: the device's address {} is multicast or zero; the interface uses {}",
+                silica_driver::mac::Shown(a),
+                silica_driver::mac::Shown(local)
+            );
+            local
         }
+        None => silica_driver::mac::local(device.id),
     };
     if !(68..=65535).contains(&mtu) {
         return Err(DeviceError::Protocol("an MTU below 68 or above 65535"));
@@ -335,7 +342,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         tx_headers: dma.memory(12, false)?,
         rx_slots: (0..rx_count).map(|_| None).collect(),
         tx_slots: (0..tx_count).map(|_| None).collect(),
-        tx_oldest: Oldest::new(),
+        tx_oldest: Oldest::for_slots(tx_count)?,
         rx_free: (0..rx_count as u16).rev().collect(),
         tx_free: (0..tx_count as u16).rev().collect(),
         // (Each receive descriptor bounds what the device writes: a buffer

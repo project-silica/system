@@ -154,4 +154,21 @@ impl<T: Copy> Ring<T> {
         self.next = (self.next + 1) % RING;
         Some(Done { ticket, length, status, errors })
     }
+
+    /// Take back every request the device holds, oldest first, whether or
+    /// not it wrote them back, and start the ring again from its first
+    /// descriptor: for a ring whose queue the driver has stopped, after
+    /// which the device's head and tail are set to 0 as well.
+    pub fn drain(&mut self, mut each: impl FnMut(T)) {
+        while self.next != self.tail {
+            if let Some((ticket, _)) = self.slots[self.next].take() {
+                each(ticket);
+            }
+            self.words.write32(self.next * DESC + 12, 0);
+            self.next = (self.next + 1) % RING;
+        }
+        self.next = 0;
+        self.tail = 0;
+        self.added = false;
+    }
 }

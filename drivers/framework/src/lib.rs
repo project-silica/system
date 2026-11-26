@@ -120,6 +120,7 @@ pub mod dma;
 pub mod framebuffer;
 pub mod inject;
 pub mod irq;
+pub mod mac;
 pub mod oldest;
 pub mod pci;
 pub mod virtio;
