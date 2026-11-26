@@ -5,7 +5,7 @@
 //! ```text
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
-//!        [restart=always|never] [seed] [keeps] [sets_time] [files=<name>,...]
+//!        [restart=always|never] [seed] [keeps] [sets_time] [secrets] [files=<name>,...]
 //! ```
 //!
 //! - `provides`: the protocol it serves; the service manager makes its
@@ -46,6 +46,9 @@
 //! - `sets_time`: its time page (`slots::TIME`, which every service can
 //!   read) is writable: it may set the wall clock (the network stack's
 //!   time-server client).
+//! - `secrets`: it holds keys or other secrets: its address space is
+//!   isolated against speculative execution (`libsys::ASPACE_ISOLATED`), so
+//!   no other program can train predictors against it or read through them.
 //! - `files=<name>,<name>...`: files of the boot archive it is given, each
 //!   read-only in a frame of its own (the smallest power of two that holds
 //!   it, at least a page, zeros after it), as grants after its needs, in
@@ -87,6 +90,8 @@ pub struct Service {
     pub seed: bool,
     pub keeps: bool,
     pub sets_time: bool,
+    /// It holds secrets: its address space is isolated against speculation.
+    pub secrets: bool,
     pub files: Vec<&'static str>,
     pub start: Start,
     pub restart: bool,
@@ -111,6 +116,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             seed: false,
             keeps: false,
             sets_time: false,
+            secrets: false,
             files: Vec::new(),
             start: Start::Boot,
             restart: false,
@@ -144,6 +150,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("seed", "") => s.seed = true,
                 ("keeps", "") => s.keeps = true,
                 ("sets_time", "") => s.sets_time = true,
+                ("secrets", "") => s.secrets = true,
                 ("files", f) => s.files = f.split(',').filter(|n| !n.is_empty()).collect(),
                 ("start", "boot") => s.start = Start::Boot,
                 ("start", c) if c.starts_with("check:") => s.start = Start::Check(&c[6..]),

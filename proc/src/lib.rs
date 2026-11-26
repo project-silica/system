@@ -345,6 +345,10 @@ pub struct Program<'a> {
     /// its threads together take one share however many it makes.
     /// `None`: the parent's own group.
     pub group: Option<Cap>,
+    /// Its address space isolated against speculative execution
+    /// (`libsys::ASPACE_ISOLATED`): for a program that holds secrets. Every
+    /// switch into or out of it flushes the processor's predictors.
+    pub isolated: bool,
 }
 
 impl<'a> Program<'a> {
@@ -365,6 +369,7 @@ impl<'a> Program<'a> {
             time: None,
             options: &[],
             group: None,
+            isolated: false,
         }
     }
 }
@@ -449,7 +454,7 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
 }
 
 fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Program) -> Result<(), SpawnError> {
-    let Program { mem_bits, id, grants, args, cpu, space_bits, aspace_bits, .. } = *prog;
+    let Program { mem_bits, id, grants, args, cpu, space_bits, aspace_bits, isolated, .. } = *prog;
     let pages = check_image(image)?;
     let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
     // The image's slots follow the grants, from slot 64 at the lowest: the
@@ -463,7 +468,11 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     // The child's own allocatable memory comes first: half the budget.
     sys::retype(c.untyped, ObjectType::Untyped, mem_bits - 1, p.space, own.0, 1)?;
     sys::retype(c.untyped, ObjectType::CapSpace, space_bits, p.space, c.space.0, 1)?;
-    sys::retype(c.untyped, ObjectType::AddressSpace, aspace_bits, p.space, c.aspace.0, 1)?;
+    if isolated {
+        sys::retype_isolated_space(c.untyped, aspace_bits, p.space, c.aspace.0)?;
+    } else {
+        sys::retype(c.untyped, ObjectType::AddressSpace, aspace_bits, p.space, c.aspace.0, 1)?;
+    }
     sys::retype(c.untyped, ObjectType::Thread, 0, p.space, c.thread.0, 1)?;
 
     // A frame of `bits` filled by `fill` (given the address it is mapped at
@@ -706,8 +715,17 @@ pub fn report(out: &mut dyn core::fmt::Write, name: &str, space: Cap) -> Result<
         let rights = [(1, 'r'), (2, 'w'), (4, 'x'), (8, 'g')].map(|(b, c)| if r & b != 0 { c } else { '-' });
         let _ = writeln!(
             out,
-            "  slot {i}: {:?} rights {}{}{}{} bits {} object {:#x} badge {:#x} depth {}",
-            info.ty, rights[0], rights[1], rights[2], rights[3], info.bits, info.object, info.badge, info.depth
+            "  slot {i}: {:?} rights {}{}{}{} bits {} object {:#x} badge {:#x} depth {}{}",
+            info.ty,
+            rights[0],
+            rights[1],
+            rights[2],
+            rights[3],
+            info.bits,
+            info.object,
+            info.badge,
+            info.depth,
+            if info.isolated { " isolated against speculation" } else { "" }
         );
         if info.ty == ObjectType::Thread && !listed[..n].contains(&info.object) {
             if n < listed.len() {

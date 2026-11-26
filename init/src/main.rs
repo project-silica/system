@@ -325,6 +325,7 @@ impl Manager {
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
             cpu: self.placed[i],
+            isolated: s.secrets,
             ..Program::new(image, SERVICE_IDS + i as u64)
         };
         let child = spawn(&self.root.parent, &program).map_err(|e| {
