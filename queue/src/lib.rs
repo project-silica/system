@@ -5,7 +5,7 @@
 //! # The rings
 //!
 //! After a class's `connect`, requests and completions travel through two
-//! rings (`silica_ring`) in the 16 KiB frame the client shared:
+//! rings (`silica_rt::ring`) in the 16 KiB frame the client shared:
 //!
 //! | bytes | what |
 //! | --- | --- |
@@ -24,7 +24,7 @@
 //! keeps at most [`QUEUE`] requests in progress, so the completion ring
 //! cannot overflow. Either side signals the other's notification after
 //! adding records only when the other said it was going to sleep
-//! (`silica_ring`'s wake-up rule).
+//! (`silica_rt::ring`'s wake-up rule).
 //!
 //! Data is never copied: the device reads and writes the client's
 //! registered frames in place. The client leaves the bytes of a request

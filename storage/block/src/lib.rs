@@ -168,7 +168,7 @@ mod tests {
         raw[8] = 200;
         assert_eq!(Completion::decode(&raw).status, Err(Status::Aborted));
         // The rings fit the frame, one after the other.
-        assert!(silica_ring::size(QUEUE, REQUEST_BYTES) <= COMPLETIONS_AT);
-        assert!(COMPLETIONS_AT + silica_ring::size(QUEUE, COMPLETION_BYTES) <= 1 << RINGS_BITS);
+        assert!(silica_rt::ring::size(QUEUE, REQUEST_BYTES) <= COMPLETIONS_AT);
+        assert!(COMPLETIONS_AT + silica_rt::ring::size(QUEUE, COMPLETION_BYTES) <= 1 << RINGS_BITS);
     }
 }

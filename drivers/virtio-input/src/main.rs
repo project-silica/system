@@ -16,8 +16,8 @@ use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
 use silica_idl_rt::CapList;
 use silica_protocols::input::device::{self, ConnectReply, DescribeReply, Error, Kind};
-use silica_ring::Producer;
 use silica_rt::ipc::{Events, Handle, serve_events};
+use silica_rt::ring::Producer;
 use silica_rt::sys::{self, ObjectType, Rights};
 use silica_rt::{ProcessInfo, mem, println, slots};
 

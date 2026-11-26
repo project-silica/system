@@ -26,11 +26,11 @@ use silica_protocols::console::port;
 use silica_protocols::console::terminal::{self, ReadLineReply, SizeReply, WriteReply};
 use silica_protocols::device::manager;
 use silica_protocols::input::device as input;
-use silica_ring::Consumer;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::string::String;
 use silica_rt::ipc::{Channel, Handle, Parked, Waiting, serve_parked};
 use silica_rt::mem::{Memory, Object};
+use silica_rt::ring::Consumer;
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{ProcessInfo, print, println, slots};
 

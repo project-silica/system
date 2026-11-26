@@ -23,12 +23,12 @@ use crate::{
 };
 use silica_idl_rt::{CallError, TransportError};
 use silica_protocols::device::manager;
-use silica_ring::{Consumer, Producer};
 use silica_rt::alloc::boxed::Box;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, free_slot, release_slot};
 use silica_rt::mem::{Memory, OwnedObject, SharedMemory};
+use silica_rt::ring::{Consumer, Producer};
 use silica_rt::slots;
 use silica_rt::sys::{self, Cap, ObjectType, Rights, Wait};
 

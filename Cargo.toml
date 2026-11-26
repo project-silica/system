@@ -11,7 +11,6 @@ members = [
     "trial-client",
     "stress",
     "systest",
-    "ring",
     "queue",
     "protocols",
     "storage/block",
@@ -51,7 +50,7 @@ members = [
     "shell",
 ]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
-default-members = ["rt", "proc", "ring", "queue", "protocols", "storage/block", "net", "inet", "crypto", "remote/proto", "drivers/framework", "console/grid"]
+default-members = ["rt", "proc", "queue", "protocols", "storage/block", "net", "inet", "crypto", "remote/proto", "drivers/framework", "console/grid"]
 
 [workspace.package]
 version = "0.0.0"
@@ -76,7 +75,6 @@ silica-idlc = { path = "../idl/idlc" }
 silica-rt = { path = "rt" }
 silica-proc = { path = "proc" }
 silica-driver = { path = "drivers/framework" }
-silica-ring = { path = "ring" }
 silica-queue = { path = "queue" }
 silica-net = { path = "net" }
 silica-inet = { path = "inet" }

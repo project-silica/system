@@ -20,7 +20,6 @@ bench = false
 silica-rt = { workspace = true }
 silica-driver = { workspace = true }
 silica-idl-rt = { workspace = true }
-silica-ring = { workspace = true }
 silica-protocols = { workspace = true }
 
 [lints]

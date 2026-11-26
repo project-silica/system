@@ -30,7 +30,6 @@ dependencies = [
  "silica-formats",
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -256,7 +255,6 @@ dependencies = [
  "silica-idlc",
  "silica-protocols",
  "silica-queue",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -324,7 +322,6 @@ version = "0.0.0"
 dependencies = [
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -333,13 +330,6 @@ name = "silica-remote"
 version = "0.0.0"
 dependencies = [
  "silica-crypto",
-]
-
-[[package]]
-name = "silica-ring"
-version = "0.0.0"
-dependencies = [
- "silica-rt",
 ]
 
 [[package]]
@@ -420,7 +410,6 @@ dependencies = [
  "silica-driver",
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
 
@@ -431,7 +420,6 @@ dependencies = [
  "silica-driver",
  "silica-idl-rt",
  "silica-protocols",
- "silica-ring",
  "silica-rt",
 ]
 

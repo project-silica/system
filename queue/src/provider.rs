@@ -15,10 +15,10 @@ use crate::{
     COMPLETION_BYTES, COMPLETIONS_AT, Completion, EVENT_BYTES, EVENT_SLOTS, EVENTS_AT, MEMORIES, NO_MEMORY, QUEUE, REQUEST_BYTES,
     RINGS_BITS, Raw, Refused, memory_of, tag_of,
 };
-use silica_ring::{Consumer, Producer};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::Handle;
 use silica_rt::mmio::Mmio;
+use silica_rt::ring::{Consumer, Producer};
 use silica_rt::sys::{self, Cap, ObjectType, Rights};
 use silica_rt::{mem, slots};
 
