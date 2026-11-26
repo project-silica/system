@@ -203,8 +203,10 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
     }
     let memory = Memory::new(16).map_err(|e| why(e, "no memory"))?;
     nic.add_memory(0, &memory, true).map_err(|e| why(e, "cannot register memory with the driver"))?;
+    // In the same boot as the checks below (they need the same image): a
+    // full queue while the link changes, then the interface goes on as ever.
     if silica_rt::option("crowd").is_some() {
-        return crowd(nic, memory.shared(), mac);
+        crowd(&mut nic, memory.shared(), mac)?;
     }
     let mut c = Check { nic, m: memory.shared(), mac, sent: 0 };
     for tag in 1..=BUFFERS {
@@ -461,7 +463,7 @@ fn bench(c: &mut Check, driver: &str) -> Result<(), &'static str> {
 /// which holds as many records as requests can be in flight: it took the
 /// place of the last transmit's completion, which was dropped, and the
 /// client waited for it for ever.
-fn crowd(mut nic: Interface, m: Mmio, mac: [u8; 6]) -> Result<(), &'static str> {
+fn crowd(nic: &mut Interface, m: Mmio, mac: [u8; 6]) -> Result<(), &'static str> {
     // A broadcast frame of a type nobody answers.
     let o = OUT as usize;
     for (i, b) in [[0xFF; 6], mac].concat().iter().chain(SINK.iter()).enumerate() {
