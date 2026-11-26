@@ -375,7 +375,7 @@ impl Manager {
             ..Program::new(image, SERVICE_IDS + i as u64)
         };
         let child = spawn(&self.root.parent, &program).map_err(|e| {
-            println!("init: cannot start {}: {e:?}", s.name);
+            println!("init: cannot start {}: {e:?} (2^{} bytes asked, {} bytes free)", s.name, s.memory, silica_rt::mem::available());
             "it could not be started"
         })?;
         self.running[i].starts += 1;
