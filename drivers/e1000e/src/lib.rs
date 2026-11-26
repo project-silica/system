@@ -104,6 +104,12 @@ impl<T: Copy> Ring<T> {
         (self.tail + RING - self.next) % RING
     }
 
+    /// When the oldest request the device holds was given: the one at
+    /// `next` (the device takes them in order), without a walk.
+    pub fn oldest(&self) -> Option<u64> {
+        (self.holding() != 0).then(|| self.slots[self.next].map(|(_, at)| at)).flatten()
+    }
+
     /// When each request the device holds was given.
     pub fn given(&self) -> impl Iterator<Item = u64> + '_ {
         self.slots.iter().flatten().map(|(_, at)| *at)

@@ -45,6 +45,7 @@ use silica_block::service::{CLIENT, Completions, Device as BlockDevice, Refusal,
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject::{self, Fault};
+use silica_driver::oldest::Oldest;
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::{Device, DeviceError};
 use silica_rt::alloc::vec::Vec;
@@ -298,6 +299,8 @@ struct Disk {
     /// The request each command identifier carries, while the device has
     /// it, and when it was started.
     tickets: Vec<Option<(Ticket, u64)>>,
+    /// The oldest of them, found without a walk.
+    oldest: Oldest,
     free: Vec<u16>,
     /// Commands pushed since the doorbell was last rung.
     unrung: bool,
@@ -387,7 +390,10 @@ impl BlockDevice for Disk {
             c[11] = (request.block >> 32) as u32;
             c[12] = request.blocks - 1;
         }
-        self.tickets[cid as usize] = Some((ticket, now()));
+        let at = now();
+        self.tickets[cid as usize] = Some((ticket, at));
+        let tickets = &self.tickets;
+        self.oldest.started(cid as u32, at, tickets.len(), |s, t| tickets[s as usize].is_some_and(|(_, x)| x == t));
         // An injected fault (`silica_driver::inject`): the controller never
         // sees this command.
         if inject::due() == Some(Fault::Stuck) && inject::pending(Fault::Stuck) {
@@ -447,7 +453,8 @@ impl BlockDevice for Disk {
 
     fn deadline(&self) -> Option<u64> {
         let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { IO_TIMEOUT_NS };
-        self.tickets.iter().flatten().map(|(_, t)| t + limit).min()
+        let tickets = &self.tickets;
+        self.oldest.oldest(|s, t| tickets[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + limit)
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -601,6 +608,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         prp_mem: prp.shared(),
         prp,
         tickets: (0..io_entries).map(|_| None).collect(),
+        oldest: Oldest::new(),
         free: (0..io_entries).rev().collect(),
         unrung: false,
         io_bit,

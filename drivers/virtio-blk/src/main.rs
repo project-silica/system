@@ -29,6 +29,7 @@ use silica_block::service::{CLIENT, Completions, Refusal, Service, Ticket};
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject;
+use silica_driver::oldest::Oldest;
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
@@ -72,6 +73,8 @@ struct Disk {
     /// The request in each slot while the device has it, and when it was
     /// started.
     slots: Vec<Option<(Ticket, u64)>>,
+    /// The oldest of them, found without a walk.
+    oldest: Oldest,
     free: Vec<u16>,
     info: Info,
     /// 512-byte sectors in a block.
@@ -136,7 +139,10 @@ impl silica_block::service::Device for Disk {
             self.free.push(slot);
             return Err(Refusal::Busy);
         }
-        self.slots[at] = Some((ticket, silica_rt::clock().now()));
+        let now = silica_rt::clock().now();
+        self.slots[at] = Some((ticket, now));
+        let slots = &self.slots;
+        self.oldest.started(slot as u32, now, slots.len(), |s, t| slots[s as usize].is_some_and(|(_, x)| x == t));
         Ok(())
     }
 
@@ -145,7 +151,8 @@ impl silica_block::service::Device for Disk {
     }
 
     fn deadline(&self) -> Option<u64> {
-        self.slots.iter().flatten().map(|(_, t)| t + Disk::timeout_ns()).min()
+        let slots = &self.slots;
+        self.oldest.oldest(|s, t| slots[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + Disk::timeout_ns())
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -241,6 +248,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         headers: dma.memory(12, false)?,
         status: dma.memory(12, true)?,
         slots: (0..slots).map(|_| None).collect(),
+        oldest: Oldest::new(),
         free: (0..slots as u16).rev().collect(),
         info: Info {
             block_size,

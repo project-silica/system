@@ -298,7 +298,7 @@ impl silica_net::service::Device for Nic {
 
     fn deadline(&self) -> Option<u64> {
         let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { TX_TIMEOUT_NS };
-        self.tx.given().map(|t| t + limit).min()
+        self.tx.oldest().map(|t| t + limit)
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {

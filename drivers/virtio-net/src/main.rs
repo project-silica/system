@@ -28,6 +28,7 @@
 
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject;
+use silica_driver::oldest::Oldest;
 use silica_driver::irq::{Interrupt, Signals};
 use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
@@ -84,6 +85,8 @@ struct Nic {
     /// when they were started).
     rx_slots: Vec<Option<Ticket>>,
     tx_slots: Vec<Option<(Ticket, u64)>>,
+    /// The oldest frame being sent, found without a walk.
+    tx_oldest: Oldest,
     rx_free: Vec<u16>,
     tx_free: Vec<u16>,
     info: Info,
@@ -163,7 +166,10 @@ impl silica_net::service::Device for Nic {
                     self.tx_free.push(slot);
                     return Err(Refusal::Busy);
                 }
-                self.tx_slots[slot as usize] = Some((ticket, silica_rt::clock().now()));
+                let now = silica_rt::clock().now();
+                self.tx_slots[slot as usize] = Some((ticket, now));
+                let slots = &self.tx_slots;
+                self.tx_oldest.started(slot as u32, now, slots.len(), |s, t| slots[s as usize].is_some_and(|(_, x)| x == t));
             }
         }
         Ok(())
@@ -228,7 +234,8 @@ impl silica_net::service::Device for Nic {
 
     fn deadline(&self) -> Option<u64> {
         let limit = if inject::armed() { inject::ARMED_TIMEOUT_NS } else { TX_TIMEOUT_NS };
-        self.tx_slots.iter().flatten().map(|(_, t)| t + limit).min()
+        let slots = &self.tx_slots;
+        self.tx_oldest.oldest(|s, t| slots[s as usize].is_some_and(|(_, x)| x == t)).map(|t| t + limit)
     }
 
     fn timeout(&mut self, done: &mut Completions<'_>) {
@@ -328,6 +335,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         tx_headers: dma.memory(12, false)?,
         rx_slots: (0..rx_count).map(|_| None).collect(),
         tx_slots: (0..tx_count).map(|_| None).collect(),
+        tx_oldest: Oldest::new(),
         rx_free: (0..rx_count as u16).rev().collect(),
         tx_free: (0..tx_count as u16).rev().collect(),
         // (Each receive descriptor bounds what the device writes: a buffer
