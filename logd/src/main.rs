@@ -239,7 +239,9 @@ impl Log {
         // In pieces of whole lines where it can, each written whole.
         for piece in out.split_inclusive(|b| *b == b'\n') {
             for part in piece.chunks(LINE) {
-                print!("{}", String::from_utf8_lossy(part));
+                // Another program's text: shown, not obeyed
+                // (`silica_rt::text`).
+                print!("{}", silica_rt::text::printable(&String::from_utf8_lossy(part)));
             }
         }
         if let Some(s) = self.sources.get_mut(from) {
@@ -269,7 +271,7 @@ impl Log {
         if s.partial.len() > LINE {
             return false;
         }
-        print!("{}", String::from_utf8_lossy(&s.partial));
+        print!("{}", silica_rt::text::printable(&String::from_utf8_lossy(&s.partial)));
         true
     }
 

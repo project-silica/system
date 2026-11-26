@@ -5,7 +5,8 @@
 //! A TCP connection carries messages, each its length (2 bytes,
 //! big-endian) and that many bytes ([`Frames`] finds them in what arrived).
 //! The first two are the Noise IK handshake ([`silica_crypto::noise`],
-//! [`PROLOGUE`], no payloads); every later one is sealed, and its plaintext
+//! [`PROLOGUE`]; the owner's first message carries the time it was made,
+//! [`stamp`], and the machine's answer nothing); every later one is sealed, and its plaintext
 //! is a call ([`call`]: channel, IDL request) or an answer ([`answer`]:
 //! channel, status, IDL reply).
 //!
@@ -23,7 +24,30 @@ pub use silica_crypto::noise;
 pub const PORT: u16 = 22;
 /// Hashed into every handshake: a client of another protocol, or another
 /// version of this one, fails the handshake instead of being misread.
-pub const PROLOGUE: &[u8] = b"silica.remote 1";
+pub const PROLOGUE: &[u8] = b"silica.remote 2";
+/// The length of the payload of an owner's first handshake message: when
+/// it was made ([`stamp`]).
+pub const STAMP: usize = 8;
+
+/// The payload of an owner's first handshake message: the owner's clock
+/// in nanoseconds since 1970, big-endian. Sealed with the handshake, so
+/// nobody but the owner makes one; a machine takes a first message from
+/// an owner only with a time later than every one it took from that owner
+/// before, so a first message recorded and sent again (by anyone who saw
+/// it pass) is refused at once instead of being answered (version 2 of the
+/// wire; version 1 carried none, and its replays were answered). An owner
+/// whose clock goes back is refused until it is past its last time again,
+/// as WireGuard does.
+pub fn stamp(unix_ns: u64) -> [u8; STAMP] {
+    unix_ns.to_be_bytes()
+}
+
+/// The time a first message's payload carries ([`stamp`]), or `None` for
+/// a payload that is not one.
+pub fn stamp_of(payload: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(payload.try_into().ok()?))
+}
+
 /// The largest IDL message (`silica_idl_rt::MAX_MESSAGE`).
 pub const MAX_MESSAGE: usize = 4000;
 /// The largest plaintext: an answer's channel and status, then a message.
@@ -160,6 +184,15 @@ pub fn owners(text: &str) -> impl Iterator<Item = Result<([u8; 32], &str, Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stamp_is_eight_bytes_of_time_and_nothing_else_is_one() {
+        assert_eq!(stamp_of(&stamp(0x0102_0304_0506_0708)), Some(0x0102_0304_0506_0708));
+        assert_eq!(stamp(1), [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(stamp_of(&[]), None);
+        assert_eq!(stamp_of(&[0; 7]), None);
+        assert_eq!(stamp_of(&[0; 9]), None);
+    }
 
     #[test]
     fn frames_are_found_whole() {

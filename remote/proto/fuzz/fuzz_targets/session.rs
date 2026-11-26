@@ -51,15 +51,21 @@ fuzz_target!(|data: &[u8]| {
                 // fuzzer holds neither secret.
                 assert!(n <= m.len());
                 let _ = r.peer();
+                let _ = silica_remote::stamp_of(&m[..n]);
+            }
+            // The time a payload carries, on anything.
+            if let Some(t) = silica_remote::stamp_of(f) {
+                assert_eq!(silica_remote::stamp(t)[..], f[..]);
             }
         }),
         // An open session, then frames: an even first byte is sealed by the
         // honest owner around the rest, an odd one is sent as it is.
         1 => {
-            let mut first = [0u8; noise::FIRST];
-            let (init, n) = Initiator::start(PROLOGUE, &owner, &machine.public, [3; 32], &[], &mut first).unwrap();
+            let mut first = [0u8; noise::FIRST + silica_remote::STAMP];
+            let made = silica_remote::stamp(u64::from(mode));
+            let (init, n) = Initiator::start(PROLOGUE, &owner, &machine.public, [3; 32], &made, &mut first).unwrap();
             let (resp, p) = Responder::read(PROLOGUE, &machine, &mut first[..n]).unwrap();
-            assert_eq!((p, resp.peer()), (0, &owner.public));
+            assert_eq!((silica_remote::stamp_of(&first[..p]), resp.peer()), (Some(u64::from(mode)), &owner.public));
             let mut second = [0u8; noise::SECOND];
             let (mut machine_side, n) = resp.answer([4; 32], &[], &mut second).unwrap();
             let (mut owner_side, _) = init.finish(&mut second[..n]).unwrap();

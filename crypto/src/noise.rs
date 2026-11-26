@@ -133,13 +133,21 @@ struct Symmetric {
 
 impl Drop for Symmetric {
     /// The chaining key, with the ephemeral keys a party saw, gives the
-    /// session's keys: wiped however the handshake ends.
+    /// session's keys: wiped however the handshake ends (its cipher's key
+    /// is wiped by the cipher's own drop).
     fn drop(&mut self) {
-        crate::wipe(&mut self.ck);
+        self.forget();
     }
 }
 
 impl Symmetric {
+    /// Zero the chaining key and drop the cipher (whose key its drop
+    /// wipes), as dropping the state does.
+    fn forget(&mut self) {
+        crate::wipe(&mut self.ck);
+        self.k = None;
+    }
+
     fn new(prologue: &[u8]) -> Self {
         // NAME is longer than HASHLEN: hashed.
         let h = blake2s::hash(&[NAME]);
@@ -449,6 +457,18 @@ mod tests {
         for short in 0..FIRST {
             assert!(matches!(Responder::read(PROLOGUE, &rs, &mut { m1 }[..short]), Err(Error::Length)));
         }
+    }
+
+    /// The chaining key, which with the ephemerals seen gives every key of
+    /// the session, and the handshake's cipher are gone once the state is
+    /// (`forget`, which its drop runs).
+    #[test]
+    fn the_chaining_key_is_zeroed_when_the_handshake_state_goes() {
+        let mut s = Symmetric::new(PROLOGUE);
+        s.mix_key([7; 32]);
+        assert!(s.ck.iter().any(|b| *b != 0) && s.k.is_some());
+        s.forget();
+        assert!(s.ck.iter().all(|b| *b == 0) && s.k.is_none());
     }
 
     #[test]

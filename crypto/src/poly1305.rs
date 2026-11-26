@@ -161,9 +161,10 @@ pub fn tag(key: &[u8; 32], message: &[u8]) -> [u8; 16] {
     p.finish()
 }
 
-impl Drop for Poly1305 {
-    /// Its key (`r`, `s`, `pad`) and what it computed are secret: wiped.
-    fn drop(&mut self) {
+impl Poly1305 {
+    /// Its key (`r`, `s`, `pad`) and what it computed are secret: zeroed,
+    /// as dropping it does.
+    fn forget(&mut self) {
         crate::wipe_words(&mut self.r);
         crate::wipe_words(&mut self.s);
         crate::wipe_words(&mut self.h);
@@ -172,10 +173,27 @@ impl Drop for Poly1305 {
     }
 }
 
+impl Drop for Poly1305 {
+    fn drop(&mut self) {
+        self.forget();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hex;
+
+    /// What it holds of its one-time key and of the message is gone once it
+    /// is done with (`forget`, which its drop runs; `finish` drops it).
+    #[test]
+    fn its_key_and_state_are_zeroed_when_done_with() {
+        let mut p = Poly1305::new(&[0x5a; 32]);
+        p.update(b"a message whose tag is secret until sent");
+        assert!(p.r.iter().chain(&p.s).chain(&p.pad).any(|w| *w != 0) && p.h.iter().any(|w| *w != 0));
+        p.forget();
+        assert!(p.r.iter().chain(&p.s).chain(&p.h).chain(&p.pad).all(|w| *w == 0) && p.buf.iter().all(|b| *b == 0));
+    }
 
     #[test]
     fn rfc8439_tag() {
