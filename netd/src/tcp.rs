@@ -46,7 +46,7 @@
 //! program's next when the program has no other, and is given up on when
 //! its peer keeps its window shut (`silica_inet`'s `release`). A listener's
 //! unfinished handshakes are its own too: a flood of them evicts only
-//! that listener's.
+//! that listener's, and the peer of each one evicted is told by a reset.
 //!
 //! What it does not do yet: IPv6, more than one address, and sending from
 //! the program's memory in place (G14).
@@ -476,13 +476,21 @@ impl Tcp {
             // spoofed SYNs does not shut it to the peers that answer, and
             // costs no other listener anything (before, the machine kept
             // 64 unfinished handshakes between all listeners, and a flood
-            // on one evicted another's).
+            // on one evicted another's). The one evicted is told, by a
+            // reset: dropped without a word, its peer (a real one, in a
+            // burst of connections larger than the backlog) waited for
+            // SYN-ACKs that would never come, retrying for seconds, as two
+            // of the `remote` test's silent connections did on a hosted
+            // runner until the host gave up (2026-11-26).
             let unfinished = |c: &Conn| c.listener == Some(lid) && c.tcp.state() == State::SynReceived;
             let full = self.conns.iter().filter(|c| c.listener == Some(lid)).count() >= backlog as usize;
             if (full || self.held(owner) >= self.most(owner))
-                && let Some(i) = self.conns.iter().enumerate().filter(|(_, c)| unfinished(c)).min_by_key(|(_, c)| c.id).map(|(i, _)| i)
+                && let Some(c) = self.conns.iter_mut().filter(|c| unfinished(c)).min_by_key(|c| c.id)
             {
-                self.drop_conn(i);
+                c.tcp.abort();
+                c.listener = None;
+                c.released = true;
+                c.due = true;
             }
             let waiting = self.conns.iter().filter(|c| c.listener == Some(lid)).count();
             if waiting < backlog as usize
