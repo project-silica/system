@@ -126,10 +126,8 @@ const TRIAL: u64 = 10 * SECOND;
 /// (`Manager::end_in_order`): longer than the device manager gives its
 /// drivers.
 const END_WAIT: u64 = 10 * SECOND;
-/// The largest program `update` takes, and the most all callers may have
-/// staged at once.
+/// The largest program `update` takes.
 const MAX_PROGRAM: u64 = 16 << 20;
-const MAX_STAGED: usize = 32 << 20;
 
 /// A service and what it is now.
 struct Running {
@@ -218,8 +216,11 @@ struct Manager {
     described: String,
     /// The badge of the call being answered.
     caller: u64,
-    /// The program each caller is sending (`stage`), by its badge.
-    staged: Vec<(u64, Vec<u8>)>,
+    /// The memory each calling service was lent to write a program into
+    /// (`program`), with its size in bits: one a service, the service
+    /// manager's own frame, taken back by `update`, by the next `program`
+    /// and when the service ends.
+    lent: Vec<(u64, u8, Object)>,
     /// Every program hash `list` has shown, each kept once: what a
     /// service's `hash` points at (a reply borrows it). One per distinct
     /// program the system ran, 32 bytes each.
@@ -397,6 +398,7 @@ impl Manager {
     /// device registers in the device manager and its drivers), for the
     /// next instance; then its memory comes back.
     fn end(&mut self, i: usize, child: Child) {
+        self.take_lent(i as u64);
         let name = self.services[i].name;
         let given = core::mem::take(&mut self.running[i].given);
         for &(at, slot) in &given {
@@ -412,6 +414,25 @@ impl Manager {
             // frames made from it were the service's and its children's.
             #[allow(unsafe_code)]
             let _ = unsafe { sys::cap_revoke(sys::Cap(slot)) };
+        }
+    }
+
+    /// The service whose call this is, as what `program` lends to: a
+    /// declared service (`refused` for any other caller).
+    fn borrower(&self) -> Result<u64, manager::Error> {
+        (self.caller & CONSUMERS != 0).then_some(self.caller & 0xFFFF_FFFF).ok_or(manager::Error::Refused)
+    }
+
+    /// Take back the memory service `caller` was lent for a program
+    /// (`program`), if any: its borrower's capability goes with the frame.
+    fn take_lent(&mut self, caller: u64) {
+        while let Some(k) = self.lent.iter().position(|(c, _, _)| *c == caller) {
+            let (_, _, frame) = self.lent.swap_remove(k);
+            // SAFETY: never mapped here outside `copy_out`.
+            #[allow(unsafe_code)]
+            unsafe {
+                frame.destroy()
+            };
         }
     }
 
@@ -1028,46 +1049,64 @@ impl manager::Server<Handle> for Manager {
         Err(manager::Error::Refused)
     }
 
-    fn stage(&mut self, at: u64, data: &[u8]) -> Result<manager::StageReply, manager::Error> {
+    fn stage(&mut self, _at: u64, _data: &[u8]) -> Result<manager::StageReply, manager::Error> {
+        // Retired: nothing a caller sends is kept here before `update`.
         self.may(scope::SYSTEM_UPDATE)?;
-        let end = at.checked_add(data.len() as u64).filter(|e| *e <= MAX_PROGRAM).ok_or(manager::Error::TooLarge)?;
-        let caller = self.caller;
-        let k = match self.staged.iter().position(|(c, _)| *c == caller) {
-            Some(k) => k,
-            None => {
-                self.staged.push((caller, Vec::new()));
-                self.staged.len() - 1
-            }
-        };
-        if at == 0 {
-            self.staged[k].1.clear();
-        }
-        let others: usize = self.staged.iter().filter(|(c, _)| *c != caller).map(|(_, p)| p.len()).sum();
-        let program = &mut self.staged[k].1;
-        // In order: a piece starts where the last one ended, or earlier.
-        if at > program.len() as u64 || others + end as usize > MAX_STAGED {
+        Err(manager::Error::Refused)
+    }
+
+    fn program(&mut self, bytes: u64) -> Result<manager::ProgramReply<Handle>, manager::Error> {
+        self.may(scope::SYSTEM_UPDATE)?;
+        if bytes > MAX_PROGRAM {
             return Err(manager::Error::TooLarge);
         }
-        let (at, end) = (at as usize, end as usize);
-        if end > program.len() {
-            program.try_reserve(end - program.len()).map_err(|_| manager::Error::Refused)?;
-            program.resize(end, 0);
+        let caller = self.borrower()?;
+        self.take_lent(caller);
+        let bits = (bytes.max(1 << 12).next_power_of_two().trailing_zeros()) as u8;
+        // The service manager's own frame, never mapped here while its
+        // borrower holds it: `update` reads it once the bytes are asked for.
+        let frame = Object::new(ObjectType::Frame, bits).map_err(|_| manager::Error::Refused)?;
+        let lend = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused).and_then(|slot| {
+            sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), slot, frame.cap(), Rights(Rights::READ.0 | Rights::WRITE.0), 0)
+                .map(|()| Handle::new(sys::Cap(slot)))
+                .map_err(|_| {
+                    silica_rt::ipc::release_slot(slot);
+                    manager::Error::Refused
+                })
+        });
+        match lend {
+            Ok(memory) => {
+                self.lent.push((caller, bits, frame));
+                Ok(manager::ProgramReply { memory })
+            }
+            Err(e) => {
+                // SAFETY: just made, never mapped, lent to nobody.
+                #[allow(unsafe_code)]
+                unsafe {
+                    frame.destroy()
+                };
+                Err(e)
+            }
         }
-        program[at..end].copy_from_slice(data);
-        Ok(manager::StageReply {})
     }
 
     fn update(&mut self, name: &str, length: u64) -> Result<manager::UpdateReply, manager::Error> {
         self.may(scope::SYSTEM_UPDATE)?;
+        // The memory the caller was lent, the service manager's own again:
+        // destroyed with the capability its borrower holds once its first
+        // `length` bytes are copied, so what is checked and run is what was
+        // read, whatever the borrower writes meanwhile.
+        let caller = self.borrower()?;
+        let k = self.lent.iter().position(|(c, _, _)| *c == caller).ok_or(manager::Error::TooLarge)?;
+        let (_, bits, frame) = self.lent.swap_remove(k);
+        let program = copy_out(&frame, bits, length);
+        // SAFETY: mapped only inside `copy_out`, which unmapped it.
+        #[allow(unsafe_code)]
+        unsafe {
+            frame.destroy()
+        };
         let i = self.find(name)?;
-        let caller = self.caller;
-        let k = self.staged.iter().position(|(c, _)| *c == caller).ok_or(manager::Error::TooLarge)?;
-        let (_, mut program) = self.staged.swap_remove(k);
-        if length > program.len() as u64 {
-            return Err(manager::Error::TooLarge);
-        }
-        program.truncate(length as usize);
-        program.shrink_to_fit();
+        let program = program?;
         if let Err(e) = silica_proc::check_image(&program) {
             println!("init: the program sent to update {name} is not one this machine runs: {e:?}");
             return Err(manager::Error::NotAProgram);
@@ -1345,7 +1384,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         listed: Vec::new(),
         described: String::new(),
         caller: 0,
-        staged: Vec::new(),
+        lent: Vec::new(),
         hashes: Vec::new(),
         log,
         dog: Watchdog::default(),
@@ -1623,4 +1662,20 @@ fn place(services: &[Service], cpus: usize) -> Vec<usize> {
         }
     }
     placed.into_iter().map(|(c, _)| c).collect()
+}
+
+/// The first `length` bytes of `frame` (the service manager's own, of
+/// `2^bits` bytes), copied once: `too_large` past its end, `refused` with
+/// no memory for the copy. Mapped for the copy alone, at addresses the next
+/// copy of that size takes again.
+fn copy_out(frame: &Object, bits: u8, length: u64) -> Result<Vec<u8>, manager::Error> {
+    if length > 1 << bits {
+        return Err(manager::Error::TooLarge);
+    }
+    let map = silica_rt::mem::Lent::map(frame.cap(), bits, Rights::READ).map_err(|_| manager::Error::Refused)?;
+    let mut program = Vec::new();
+    program.try_reserve_exact(length as usize).map_err(|_| manager::Error::Refused)?;
+    program.resize(length as usize, 0);
+    map.region().read_bytes(0, &mut program);
+    Ok(program)
 }

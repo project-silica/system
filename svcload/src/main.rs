@@ -122,6 +122,7 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
         other => Err(format!("{what} with observe+control+logs only: {other:?}, not refused")),
     };
     refused("stage", system.stage(0, b"\x7fELF").map(|_| ()).map_err(err))?;
+    refused("program", system.program(1 << 24).map(|_| ()).map_err(err))?;
     refused("update", system.update("httpd", 4).map(|_| ()).map_err(err))?;
     refused("revert", system.revert("httpd").map(|_| ()).map_err(err))?;
     refused("shutdown", system.shutdown(false).map(|_| ()).map_err(err))?;
@@ -139,7 +140,7 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
     if listed.services.iter().next().is_none() {
         return Err(String::from("list, which observe allows, answered no service"));
     }
-    println!("svcload: the service manager refuses stage, update, revert and shutdown to a holder of observe+control+logs");
+    println!("svcload: the service manager refuses stage, program, update, revert and shutdown to a holder of observe+control+logs");
     Ok(())
 }
 
