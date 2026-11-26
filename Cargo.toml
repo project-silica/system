@@ -45,10 +45,11 @@ members = [
     "drivers/virtio-console",
     "drivers/fbdisplay",
     "console",
+    "console/grid",
     "shell",
 ]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
-default-members = ["rt", "proc", "ring", "queue", "protocols", "storage/block", "net", "inet", "crypto", "remote/proto", "drivers/framework"]
+default-members = ["rt", "proc", "ring", "queue", "protocols", "storage/block", "net", "inet", "crypto", "remote/proto", "drivers/framework", "console/grid"]
 
 [workspace.package]
 version = "0.0.0"

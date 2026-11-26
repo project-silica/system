@@ -19,7 +19,8 @@
 mod keys;
 mod screen;
 
-use screen::{Display, Grid};
+use console_grid::Grid;
+use screen::Display;
 use silica_idl_rt::CapList;
 use silica_protocols::console::port;
 use silica_protocols::console::terminal::{self, ReadLineReply, SizeReply, WriteReply};
@@ -196,8 +197,15 @@ impl terminal::Server<Handle> for Console {
     fn write(&mut self, text: &str) -> WriteReply {
         // Printable text only: an escape sequence or a carriage return
         // from a program would move the cursor, rewrite what another
-        // wrote, or reach a terminal beyond the console.
-        self.show(&silica_rt::text::printable(text));
+        // wrote, or reach a terminal beyond the console. A line ended for a
+        // serial terminal (`\r\n`, as `println!` writes) is ended once: the
+        // console ends lines for its port itself.
+        let shown = silica_rt::text::printable(text);
+        if shown.contains("\r\n") {
+            self.show(&shown.replace("\r\n", "\n"));
+        } else {
+            self.show(&shown);
+        }
         WriteReply {}
     }
 

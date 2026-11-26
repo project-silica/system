@@ -25,12 +25,17 @@ dependencies = [
 name = "console"
 version = "0.0.0"
 dependencies = [
+ "console-grid",
  "silica-formats",
  "silica-idl-rt",
  "silica-protocols",
  "silica-ring",
  "silica-rt",
 ]
+
+[[package]]
+name = "console-grid"
+version = "0.0.0"
 
 [[package]]
 name = "devmgr"

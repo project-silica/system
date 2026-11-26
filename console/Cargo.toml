@@ -21,6 +21,7 @@ test = false
 bench = false
 
 [dependencies]
+console-grid = { path = "grid" }
 silica-rt = { workspace = true }
 silica-formats = { workspace = true }
 silica-ring = { workspace = true }
