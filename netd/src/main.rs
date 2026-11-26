@@ -29,7 +29,7 @@
 
 use silica_idl_rt::CapList;
 use silica_inet::dhcp_client::{self, Client, Event, Lease, To};
-use silica_inet::neighbours::Neighbours;
+use silica_inet::neighbours::{NEIGHBOURS, Neighbours};
 use silica_inet::{Ipv4, Mac, Malformed, arp, dhcp, ether, icmp, ipv4, ntp, udp};
 use silica_net::client::Interface;
 use silica_net::{Completion, LINK, Op, Request};
@@ -64,8 +64,9 @@ const SENT: u64 = 1 << 32;
 /// interface that cuts. A frame of 64 KiB holds 45 segments of 1448 bytes.
 const BURSTS: usize = 4;
 const BURST: usize = 1 << 16;
-/// Neighbours remembered (`silica_inet::neighbours`).
-const NEIGHBOURS: usize = 16;
+/// Packets waiting for their next hop's address: one for each hop asked
+/// about at once (a newer one for the same hop replaces it).
+const HELD: usize = 4;
 /// How long an address is asked for before what waits for it is dropped.
 const RESOLVE_WAIT: u64 = 3 * SECOND;
 
@@ -221,7 +222,7 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         keep,
         neighbours: Neighbours::new(),
         defended: 0,
-        held: None,
+        held: [const { None }; HELD],
         ip_id: (silica_rt::random::u64() & 0xFFFF) as u16,
         frame: [0; BUFFER],
         out: [0; BUFFER],
@@ -428,7 +429,7 @@ struct Stack {
     neighbours: Neighbours<NEIGHBOURS>,
     /// When another host was last told this address is ours (a conflict).
     defended: u64,
-    held: Option<Held>,
+    held: [Option<Held>; HELD],
     ip_id: u16,
     /// The frame being read (copied out of its buffer) and the one being built.
     frame: [u8; BUFFER],
@@ -561,9 +562,11 @@ impl Stack {
         if let Some(t) = self.tcp.as_ref().and_then(|t| t.deadline()) {
             d = d.min(t);
         }
-        if let Some(h) = &self.held {
+        for h in self.held.iter().flatten() {
             d = d.min(h.asked + SECOND).min(h.since + RESOLVE_WAIT);
         }
+        // A neighbour in use, asked again before its entry ends.
+        d = d.min(self.neighbours.refresh_at());
         if let Some(p) = &self.probe {
             d = d.min(p.until);
         }
@@ -578,18 +581,24 @@ impl Stack {
     }
 
     fn timers(&mut self, now: u64) {
-        if let Some(h) = &self.held {
+        for k in 0..HELD {
+            let Some(h) = &self.held[k] else { continue };
             if now >= h.since + RESOLVE_WAIT {
                 println!("netd: {} does not answer ARP; what was for it is dropped", h.hop);
-                self.held = None;
+                self.held[k] = None;
                 self.dropped.unresolved += 1;
             } else if now >= h.asked + SECOND {
                 let hop = h.hop;
                 self.ask(hop);
-                if let Some(h) = self.held.as_mut() {
+                if let Some(h) = self.held[k].as_mut() {
                     h.asked = now;
                 }
             }
+        }
+        // Neighbours in use whose entries end soon: asked again, so what
+        // is sent to them never waits for an answer.
+        while let Some(ip) = self.neighbours.refresh(now) {
+            self.arp_request(ip);
         }
         if let Some(p) = &self.probe
             && now >= p.until
@@ -757,7 +766,10 @@ impl Stack {
             Err(ntp::Refused::Unconfirmed(shift)) => {
                 // Asked again soon, from another port with another number:
                 // a second answer that agrees takes the step.
-                println!("netd: a time server would move the clock by {} s; not believed until another answer agrees", shift / SECOND as i64);
+                println!(
+                    "netd: a time server would move the clock by {} s; not believed until another answer agrees",
+                    shift / SECOND as i64
+                );
                 self.time.next = now + 2 * SECOND;
                 return;
             }
@@ -861,13 +873,19 @@ impl Stack {
         match self.neighbour(hop, now) {
             Some(mac) => self.frame_out(mac, &packet[..len]),
             None => {
-                // One packet waits for an address at a time: a newer one
-                // replaces it (what is sent before the router answers is
-                // DHCP's and a ping's, each sent again if lost).
-                if self.held.is_some() {
+                // One packet waits for each hop asked about: a newer one
+                // for the same hop replaces it, and with every place taken
+                // the oldest goes (each is sent again if lost).
+                let k = self
+                    .held
+                    .iter()
+                    .position(|h| h.as_ref().is_some_and(|h| h.hop == hop))
+                    .or_else(|| self.held.iter().position(Option::is_none))
+                    .unwrap_or_else(|| (0..HELD).min_by_key(|&k| self.held[k].as_ref().map_or(0, |h| h.since)).unwrap_or(0));
+                if self.held[k].is_some() {
                     self.dropped.unresolved += 1;
                 }
-                self.held = Some(Held { hop, since: now, asked: now, len, packet });
+                self.held[k] = Some(Held { hop, since: now, asked: now, len, packet });
                 self.ask(hop);
             }
         }
@@ -962,17 +980,17 @@ impl Stack {
         self.transmit(ether::HEADER + packet.len());
     }
 
-    fn neighbour(&self, ip: Ipv4, now: u64) -> Option<Mac> {
+    fn neighbour(&mut self, ip: Ipv4, now: u64) -> Option<Mac> {
         self.neighbours.lookup(ip, now)
     }
 
     /// `ip` was learned to be at `mac`: what waited for it goes.
     fn learned(&mut self, ip: Ipv4, mac: Mac) {
-        if let Some(h) = self.held.take() {
-            if h.hop == ip {
+        for k in 0..HELD {
+            if self.held[k].as_ref().is_some_and(|h| h.hop == ip)
+                && let Some(h) = self.held[k].take()
+            {
                 self.frame_out(mac, &h.packet[..h.len]);
-            } else {
-                self.held = Some(h);
             }
         }
     }
