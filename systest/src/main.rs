@@ -23,6 +23,7 @@ const ONE_CALL: u64 = 4;
 const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
 const BORROWER: u64 = 7;
+const CHURN: u64 = 8;
 
 const SECOND: u64 = 1_000_000_000;
 const SEND: Rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
@@ -354,6 +355,24 @@ impl Tests {
         }
     }
 
+    /// A program uses 45% of its free memory in its heap at a time, as
+    /// 2 KiB pieces, then 32 KiB blocks, then 256 KiB blocks, four rounds:
+    /// every request is served and its free memory stops falling after the
+    /// first round. Before, the heap kept what was freed at each size for
+    /// that size alone, and the first round's 32 KiB blocks were refused
+    /// (block 24, with 256 KiB of the program's memory left).
+    fn heap_churn(&mut self) -> Outcome {
+        let (_, id) = self.start_with(CHURN, [4, 0, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, 0) if who == id => Ok(()),
+            (who, s) if who == id => {
+                println!("systest:   the churning program ended with status {s} (10 x round + size: 0 small, 1 32 KiB, 2 256 KiB)");
+                Err("a program's heap did not reuse what it freed at one size for another")
+            }
+            _ => Err("something other than the churning program ended"),
+        }
+    }
+
     fn failed_spawn_returns_grants(&mut self) -> Outcome {
         let endpoint = self.endpoint()?;
         let memory = self.object(ObjectType::Untyped, 12)?;
@@ -502,8 +521,9 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 12] = [
+    let tests: [(&str, Test); 13] = [
         ("lent_memory_taken_back_any_number_of_times", Tests::lent_memory_taken_back_any_number_of_times),
+        ("memory_freed_at_one_size_serves_another", Tests::heap_churn),
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("time_reader_survives_its_writer", Tests::abandoned_time_page),
         ("failed_spawn_returns_grants", Tests::failed_spawn_returns_grants),
