@@ -295,7 +295,7 @@ impl silica_net::service::Device for Nic {
         // Buffers given to the receive ring are taken back by resetting the
         // device, which the next start of the driver does.
         println!("e1000e: its last client ended with {} requests in the device; starting again to take them back", self.holding());
-        silica_rt::exit(silica_rt::EXIT_AGAIN)
+        silica_rt::exit_again()
     }
 
     fn kick(&mut self) {

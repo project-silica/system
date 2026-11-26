@@ -6,6 +6,7 @@
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
 //!        [restart=always|never] [seed] [keeps] [ends] [sets_time] [secrets] [files=<name>,...]
+//!        [logs=<n>]
 //! ```
 //!
 //! - `provides`: the protocol it serves; the service manager makes its
@@ -25,9 +26,9 @@
 //!   count the last two. The device manager alone; when it ends, the
 //!   service manager takes the memory given outright back first, emptied,
 //!   for its next start.
-//! - `start=boot` runs at every boot; `start=check:<c>` only when the
-//!   command line's `checks=` names `c`, and the boot waits for it to end
-//!   with status 0.
+//! - `start=boot` runs at every boot; `start=check:<c>` only in a test
+//!   image, when its command line's `checks=` names `c`, and the boot
+//!   waits for it to end with status 0.
 //! - `cpu=<n>`: it runs on processor `n` (a machine without one runs it on
 //!   processor 0, and says so); `cpu=any`: the service manager chooses, spreading
 //!   such services over the processors after the first. Without the word it runs
@@ -49,10 +50,14 @@
 //!   instance: another program's bytes (the network stack takes from it the
 //!   connections to reset, and nothing else).
 //! - `ends`: it has something to finish before it is let go of (the device
-//!   manager: its disks' caches). When the machine is turned off it is
-//!   asked to end (`silica_rt::END` on its events notification) and given a
-//!   while to exit before it is ended where it stands; every other service
-//!   is ended at once, last started first, as it always was.
+//!   manager: its disks' caches; the log service: the text still in the
+//!   rings). When the machine is turned off it is asked to end
+//!   (`silica_rt::END` on its events notification) and its exit, which the
+//!   kernel delivers, is waited for; one that never exits is ended where
+//!   it stands after a while, and said to have failed to end. Every other
+//!   service is ended at once, last started first. A service stopped,
+//!   restarted, updated or reverted while the machine runs is ended at
+//!   once, whatever it declares.
 //! - `sets_time`: its time page (`slots::TIME`, which every service can
 //!   read) is writable: it may set the wall clock (the network stack's
 //!   time-server client).
@@ -65,6 +70,11 @@
 //!   that order; a file the archive lacks is an empty slot, and the log
 //!   says so. How an image gives a service what was provisioned for that
 //!   machine: the remote management service's key and its owners.
+//! - `logs=<n>`: it may give `n` programs of its own a log each
+//!   (`silica.system.Manager`'s `add_log`, with the `logs` scope): the
+//!   device manager, one per device it starts a driver for. Those places
+//!   are its own; without the word it has none, and past `n` it is
+//!   refused.
 
 use silica_rt::alloc::vec::Vec;
 
@@ -104,6 +114,8 @@ pub struct Service {
     /// It holds secrets: its address space is isolated against speculation.
     pub secrets: bool,
     pub files: Vec<&'static str>,
+    /// How many logs it may give its programs (`logs=`).
+    pub logs: u32,
     pub start: Start,
     pub restart: bool,
     /// Where it runs.
@@ -130,6 +142,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             sets_time: false,
             secrets: false,
             files: Vec::new(),
+            logs: 0,
             start: Start::Boot,
             restart: false,
             cpu: Cpu::Fixed(0),
@@ -170,6 +183,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("sets_time", "") => s.sets_time = true,
                 ("secrets", "") => s.secrets = true,
                 ("files", f) => s.files = f.split(',').filter(|n| !n.is_empty()).collect(),
+                ("logs", n) => s.logs = n.parse().ok().filter(|n| *n <= 64).ok_or("a service's logs is not a number up to 64")?,
                 ("start", "boot") => s.start = Start::Boot,
                 ("start", c) if c.starts_with("check:") => s.start = Start::Check(&c[6..]),
                 ("restart", "always") => s.restart = true,
@@ -181,6 +195,11 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
         }
         if out.iter().any(|o: &Service| o.name == s.name) {
             return Err("two services have one name");
+        }
+        // Each has a bit of the service manager's notification to say it
+        // serves after an update (bit 0 is the watchdog's).
+        if out.len() == 63 {
+            return Err("more than 63 services");
         }
         out.push(s);
     }

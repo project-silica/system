@@ -284,6 +284,8 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         out: String::new(),
     };
     let _ = shell.term.write("Silica. Type help for the commands.\n");
+    // No request loop of the runtime's: it serves from here.
+    silica_rt::serving();
     'prompt: loop {
         // The console restarted under a call (`peer_gone`): its endpoint is
         // the service manager's, so calling again reaches the new one, and

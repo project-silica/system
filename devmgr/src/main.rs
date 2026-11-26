@@ -148,6 +148,10 @@ struct Running<'a> {
     events: OwnedObject,
     /// What clients asked to have signalled when this driver ends.
     gone: Vec<(u64, Handle)>,
+    /// A client was given it (`open`) since it started: one that then ends
+    /// asking to be started again (`silica_rt::AGAIN_LABEL`) is, at once; one
+    /// nobody opened is not (it could keep the device manager starting it).
+    opened: bool,
 }
 
 struct Manager {
@@ -314,6 +318,7 @@ impl manager::Server<Handle> for Manager {
             r.gone.retain(|(c, _)| *c != caller);
             r.gone.push((caller, g));
         }
+        r.opened = true;
         if class == Some(manager::Class::Watchdog) {
             // The service manager takes the watchdog's driver: it knows
             // (`tell_watchdog`).
@@ -1060,7 +1065,16 @@ impl Manager {
         f.starts += 1;
         f.restarts.started(silica_rt::clock().now());
         f.waiting = None;
-        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, events, gone: Vec::new() });
+        self.running.push(Running {
+            name: driver,
+            id: self.next_id,
+            function: index,
+            child,
+            service,
+            events,
+            gone: Vec::new(),
+            opened: false,
+        });
         self.changed(index);
         Ok(())
     }
@@ -1428,8 +1442,13 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         let ended_well = if label == EXIT_LABEL && !fault {
             let status = msg.words[0] as i64;
             println!("devmgr: {driver} for {device} ended with status {status}");
-            again = status == silica_rt::EXIT_AGAIN && m.functions[function].restarts.may_start_again(silica_rt::clock().now());
-            status == 0 || again
+            status == 0
+        } else if label == silica_rt::AGAIN_LABEL && !fault {
+            // To reset its device for its next client: a start, not a
+            // failure, of a driver a client was given since it started.
+            println!("devmgr: {driver} for {device} ended to be started again");
+            again = r.opened;
+            again
         } else if fault {
             // The kernel's fault message: instruction, address, detail.
             let kind = match label - sys::FAULT_LABEL {

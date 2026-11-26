@@ -184,7 +184,7 @@ impl silica_net::service::Device for Nic {
         // Virtio takes back buffers it was given only by resetting the
         // queue (RING_RESET, not taken) or the device.
         println!("virtio-net: its last client ended with {} requests in the device; starting again to take them back", self.holding());
-        silica_rt::exit(silica_rt::EXIT_AGAIN)
+        silica_rt::exit_again()
     }
 
     fn kick(&mut self) {

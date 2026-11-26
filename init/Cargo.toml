@@ -12,6 +12,12 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# A test image's init: it obeys `checks=`, `bench` and `halt=reboot` on the
+# command line, runs the check programs and turns the machine off with a
+# status for the harness. No image a machine runs is built with it.
+harness = []
+
 [dependencies]
 silica-protocols = { workspace = true }
 silica-idl-rt = { workspace = true }

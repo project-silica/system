@@ -17,30 +17,35 @@
 //! one per program a service asks for (`add_log`), which the log service
 //! finds in its directory (`silica_rt::log::directory`).
 //!
-//! The kernel command line chooses what is checked at boot (`checks=`, a
-//! comma list; default `programs,block`): `programs` runs the round trips
-//! everything rests on (a program's memory comes back, two programs talk
-//! through a protocol), `spawn` measures starting a program, and every
-//! other name runs the services declared
-//! `start=check:<name>`, which must end with status 0. When checks ran, the
-//! machine is turned off when they are done (`halt=reboot`: reset);
-//! without them the system stays up. `off=` (a comma list of service
-//! names) keeps those boot services from starting, as if stopped: what an
-//! owner does to boot without a service (and what a driver's own check
-//! does to have its device to itself); `start <name>` starts one later.
-//! `bench` on the command line prints
-//! `BENCH DONE` when the checks are done (`tools/bench.sh` reads up to it).
+//! `off=` on the kernel command line (a comma list of service names) keeps
+//! those boot services from starting, as if stopped: what an owner does to
+//! boot without a service; `start <name>` starts one later. The system then
+//! stays up, and the machine is turned off only when a holder of the
+//! `power` scope asks (`shutdown`).
+//!
+//! A test image's init (the `harness` feature, which no image a machine
+//! runs is built with) also obeys `checks=` (a comma list; default
+//! `programs,block`): `programs` runs the round trips everything rests on
+//! (a program's memory comes back, two programs talk through a protocol),
+//! `spawn` measures starting a program, `watchdog` stops petting, and every
+//! other name runs the services declared `start=check:<name>`, which must
+//! end with status 0. When checks ran, the machine is turned off when they
+//! are done (`halt=reboot`: reset), and `bench` prints `BENCH DONE` first
+//! (`tools/bench.sh` reads up to it). A failure there turns the machine off
+//! with a status the harness reads; without the feature, an init that
+//! cannot start the system says why and stands still.
 #![no_std]
 #![no_main]
 
 mod manifest;
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, RootInfo, SLOT_DEVICES, SLOT_FIRST_UNTYPED, SLOT_INFO, SLOT_IRQS};
 use libsys::{self as sys, ObjectType, Rights, Wait};
 use manifest::{Cpu, Service, Start};
 use silica_formats::ramdisk;
-use silica_proc::root::{self, Root, finish};
+#[cfg(feature = "harness")]
+use silica_proc::root::finish;
+use silica_proc::root::{self, Root};
 use silica_proc::{Child, FAULT_BADGE, Grant, Program, Restarts, spawn};
 use silica_protocols::device::manager as devices;
 use silica_protocols::scope;
@@ -51,28 +56,48 @@ use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, Listener};
 use silica_rt::log::directory;
 use silica_rt::mem::Object;
-use silica_rt::{EXIT_LABEL, PROBE_LABEL, UNANSWERED_LABEL, println};
+use silica_rt::{AGAIN_LABEL, EXIT_LABEL, println};
 
+/// Init cannot go on: say why and stop ([`halt`]). For what fails before
+/// any service runs; later, [`Manager::fail`] puts the services' last
+/// lines on the console first.
 macro_rules! fail {
     ($($a:tt)*) => {{
-        flush_log();
         silica_rt::print!("ERROR: init: ");
         println!($($a)*);
-        finish(false)
+        halt(false)
     }};
 }
 
-/// The log service's notification, badged [`FLUSH`], and the notification it
-/// answers a flush on (0: no log service).
-static FLUSH_TO: AtomicU64 = AtomicU64::new(0);
-static FLUSHED: AtomicU64 = AtomicU64::new(0);
-/// The bit of the log's notification that asks it to flush (`logd`).
-const FLUSH: u64 = 2;
+/// As [`fail!`], once services run: `$m` is the [`Manager`].
+macro_rules! fail_with {
+    ($m:expr, $($a:tt)*) => {{
+        $m.last_words();
+        silica_rt::print!("ERROR: init: ");
+        println!($($a)*);
+        halt(false)
+    }};
+}
+
+/// The end of this boot. A test image's init turns the machine off, telling
+/// the harness whether everything passed. On a machine, init never turns
+/// the power off by itself: one that cannot start the system has said why
+/// and stands still (nothing pets the watchdog, where there is one).
+fn halt(ok: bool) -> ! {
+    #[cfg(feature = "harness")]
+    finish(ok);
+    #[cfg(not(feature = "harness"))]
+    {
+        let _ = ok;
+        println!("init: the system cannot start; this machine stands still until it is reset");
+        loop {
+            let _ = sys::thread_suspend(sys::Cap(libsys::root::SLOT_THREAD));
+        }
+    }
+}
+
 /// The bit of the log's notification that says logs were added (`add_log`).
 const ADDED: u64 = 4;
-/// The most logs services give their programs (`add_log`), half of them at
-/// most to any one service.
-const MAX_LOGS: usize = 64;
 
 /// Whether the ring `h` names is still there: one whose maker ended is gone,
 /// and every capability derived from it with it.
@@ -80,54 +105,37 @@ fn alive(h: &Handle) -> bool {
     matches!(sys::inspect_slot(sys::Cap(libsys::root::SLOT_CAPSPACE), h.cap().0), Ok(Some(_)))
 }
 
-/// The longest init waits for the log service to answer a flush.
-const FLUSH_WAIT: u64 = 2_000_000_000;
-
-/// Have the log service put everything its rings hold on the console before
-/// what init says next: a failure, a check's verdict, `BOOT OK`, and the
-/// machine turning off, after which nothing in a ring would reach the
-/// console. Init waits for the answer, which normally comes at once, at
-/// most [`FLUSH_WAIT`] so that a log service that hangs cannot hang
-/// shutdown; if it does not come, init says so, so that missing lines are
-/// never missing silently. (200 ms was too short: on a loaded host half of
-/// 48 boots of the entropy check lost a service's last lines at power-off,
-/// 2026-11-23.)
-fn flush_log() {
-    let (to, done) = (FLUSH_TO.load(Ordering::Relaxed), FLUSHED.load(Ordering::Relaxed));
-    if to == 0 {
-        return;
-    }
-    // A late answer to an earlier flush is not this one's.
-    let _ = sys::recv(sys::Cap(done), Wait::Poll);
-    if sys::signal(sys::Cap(to)).is_ok() && sys::recv(sys::Cap(done), Wait::Until(silica_rt::clock().now() + FLUSH_WAIT)).is_err() {
-        println!("init: the log service did not put its text on the console within 2 s: services' last lines may be missing");
-    }
-}
-
 const SECOND: u64 = 1_000_000_000;
 /// Badges of consumers' capabilities to a provider start here.
 const CONSUMERS: u64 = 1 << 32;
 /// Service `i` runs with the program identifier `SERVICE_IDS + i`.
 const SERVICE_IDS: u64 = 1000;
-/// How long a provider has to answer the service manager's probe after a
-/// client reported it unanswered (`Manager::unanswered`): its runtime
-/// answers from its request loop, so only a provider that takes no calls
-/// at all, for longer than a driver is given (`DRIVER_CALL_LIMIT`), misses it.
-const PROBE_LIMIT: u64 = 2 * SECOND;
-/// How long after it answered a probe a provider is not asked again.
-const PROBE_QUIET: u64 = 5 * SECOND;
-/// The status `after` is given for a provider ended because it stopped
-/// answering (no program exits with it).
-const HUNG: i64 = i64::MIN + 1;
-/// How long an updated service's new program is on trial: failing within
-/// it puts the program before it back (`update`).
-const TRIAL: u64 = 10 * SECOND;
+
+/// The bit of the watchdog's notification service `i`'s program under an
+/// update's trial signals when it serves (`silica_rt::serving`): 1 + `i`,
+/// bit 0 being the device manager's word on the watchdog. The services list
+/// holds at most 63 services (`manifest::parse`), so every one has a bit.
+fn serving_bit(i: usize) -> u64 {
+    1u64.checked_shl(1 + i as u32).unwrap_or(0)
+}
 /// How long a service asked to end as the machine turns off has to exit
 /// (`Manager::end_in_order`): longer than the device manager gives its
-/// drivers.
+/// drivers. Its exit is what is waited for; this is how long a service that
+/// never exits is waited for before it is ended where it stands.
 const END_WAIT: u64 = 10 * SECOND;
 /// The largest program `update` takes.
 const MAX_PROGRAM: u64 = 16 << 20;
+
+/// How a service's program ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// It exited with this status (0: it finished).
+    Status(i64),
+    /// It faulted.
+    Fault,
+    /// It ended asking to be started again (`silica_rt::AGAIN_LABEL`).
+    Again,
+}
 
 /// A service and what it is now.
 struct Running {
@@ -140,17 +148,17 @@ struct Running {
     starts: u64,
     /// When it failed and when it is started again (`restart=always`).
     restarts: Restarts,
-    /// When it last answered the service manager's probe (`unanswered`).
-    answered_at: u64,
     /// Stopped by the owner: not started again until asked.
     stopped: bool,
     /// The program it runs, when an `update` gave it one; `None`: the boot
     /// archive's.
     program: Option<Vec<u8>>,
-    /// An update on trial: the program to go back to if the new one fails
-    /// (`None` inside: the archive's), and when the trial ends (0: the new
-    /// program has not started yet; the trial starts when it does).
-    trial: Option<(Option<Vec<u8>>, u64)>,
+    /// An update on trial: the program to go back to (`None` inside: the
+    /// archive's) if the new one ends badly before it has served. The new
+    /// program says when it serves (`silica_rt::serving`, a signal on its
+    /// bit of the watchdog's notification: `serving_bit`), which ends
+    /// the trial.
+    trial: Option<Option<Vec<u8>>>,
     /// The BLAKE2s-256 of its program, once asked for (`list`).
     hash: Option<&'static [u8; 32]>,
     /// The boot archive's files it is given (`files=`), each in a frame of
@@ -232,8 +240,9 @@ struct Manager {
     /// service's `hash` points at (a reply borrows it). One per distinct
     /// program the system ran, 32 bytes each.
     hashes: Vec<&'static [u8; 32]>,
-    /// The log: the service that provides it, its notification, what it
-    /// answers flushes on, and a ring per service (`silica_rt::log`).
+    /// The log: the service that provides it (whose events notification
+    /// its writers signal), a ring per service (`silica_rt::log`), and the
+    /// places for the logs services give their programs.
     log: Option<LogSetup>,
     /// The machine's hardware watchdog, once the device manager has it.
     dog: Watchdog,
@@ -241,16 +250,17 @@ struct Manager {
 
 struct LogSetup {
     service: usize,
-    note: Object,
-    flushed: Object,
     rings: Vec<Option<Object>>,
-    /// The note, badged [`ADDED`].
+    /// The log service's notification, badged [`ADDED`].
     added: sys::Cap,
     /// The logs services gave their programs (`add_log`): the source's
-    /// name and the ring.
-    given: Vec<(String, Handle)>,
+    /// name and the ring. Each service has the places its declaration
+    /// gives it (`logs=`), from `first[service]` on: a service fills its
+    /// own and no other's.
+    given: Vec<Option<(String, Handle)>>,
+    first: Vec<usize>,
     /// The ring directory (`silica_rt::log::directory`): entry `i` names
-    /// service `i`'s ring, entry `services + k` the `k`th given one.
+    /// service `i`'s ring, entry `services + k` the given one in place `k`.
     directory: silica_rt::mem::Memory,
 }
 
@@ -290,12 +300,12 @@ impl Manager {
             });
         }
         if let Some(log) = self.log.as_ref().filter(|l| l.service == i) {
-            // The notification, the flush's answer, the directory, then a
-            // slot for each ring the directory can name (`log_slot`): the
-            // services' and those given so far; `add_log` fills the rest.
+            // The notification its writers signal (its own events, where it
+            // is also asked to end), the directory, then a slot for each
+            // ring the directory can name (`log_slot`): the services' and
+            // those given so far; `add_log` fills the rest.
             debug_assert_eq!(grants.len() as u64, self.log_grants());
-            grants.push(Grant::lend(log.note.cap(), Rights::ALL));
-            grants.push(Grant::lend(log.flushed.cap(), Rights::WRITE));
+            grants.push(Grant::lend(self.events[i].0.cap(), Rights::ALL));
             grants.push(Grant::lend(log.directory.frame(), Rights::READ));
             let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
             for r in &log.rings {
@@ -304,13 +314,13 @@ impl Manager {
                     None => Grant::none(),
                 });
             }
-            for k in 0..MAX_LOGS {
-                grants.push(match log.given.get(k) {
+            for place in &log.given {
+                grants.push(match place {
                     Some((_, ring)) if alive(ring) => Grant::lend(ring.cap(), rw),
                     _ => Grant::none(),
                 });
             }
-            args[0] = (log.rings.len() + MAX_LOGS) as u64;
+            args[0] = (log.rings.len() + log.given.len()) as u64;
         }
         if s.machine {
             let info = self.info;
@@ -362,7 +372,7 @@ impl Manager {
     /// directory entry `entry` (`grants`: grant `n` lands in
     /// `FIRST_GRANT + n`).
     fn log_slot(&self, entry: usize) -> u64 {
-        silica_rt::slots::FIRST_GRANT + self.log_grants() + 3 + entry as u64
+        silica_rt::slots::FIRST_GRANT + self.log_grants() + 2 + entry as u64
     }
 
     /// Create and record the running instance of service `i`.
@@ -383,7 +393,7 @@ impl Manager {
             };
         }
         let (grants, args) = self.grants(i)?;
-        let log = self.log.as_ref().and_then(|l| Some((l.rings.get(i)?.as_ref()?.cap(), l.note.cap())));
+        let log = self.log.as_ref().and_then(|l| Some((l.rings.get(i)?.as_ref()?.cap(), self.events[l.service].0.cap())));
         // Nothing a last instance was told is news to this one.
         let events = self.events[i].0.cap();
         let _ = sys::recv(events, Wait::Poll);
@@ -400,6 +410,11 @@ impl Manager {
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
             isolated: s.secrets,
+            // A program an update installed says when it serves, by a signal
+            // on bit 1 + i of the notification this program listens on beside
+            // its endpoint (bit 0 is the device manager's watchdog news): its
+            // trial's end.
+            says_serving: self.running[i].trial.as_ref().and(self.dog.note.as_ref()).map(|n| (n.cap(), serving_bit(i))),
             ..Program::new(image, SERVICE_IDS + i as u64)
         };
         let child = spawn(&self.root.parent, &program).map_err(|e| {
@@ -411,10 +426,6 @@ impl Manager {
             *given = true;
         }
         self.running[i].restarts.started(silica_rt::clock().now());
-        // An update's trial runs from its program's first start.
-        if let Some((_, until @ 0)) = &mut self.running[i].trial {
-            *until = silica_rt::clock().now() + TRIAL;
-        }
         // What was given outright, by the slot it lands in (`silica_proc`
         // puts grant `n` at `FIRST_GRANT + n`).
         self.running[i].given =
@@ -466,23 +477,40 @@ impl Manager {
         }
     }
 
-    /// A message on the exit endpoint about a service: it ended (`EXIT_LABEL`)
-    /// or faulted (`FAULT_BADGE`). Returns the service and its status
-    /// (`None`: a fault), or `None` for a message about nothing of ours or
-    /// a fault on memory a peer took back, which is answered.
-    fn ended(&mut self, m: &sys::Message) -> Option<(usize, Option<i64>)> {
+    /// A message on the exit endpoint about a service: it ended (`EXIT_LABEL`,
+    /// or `AGAIN_LABEL`) or faulted (`FAULT_BADGE`). Returns the service and
+    /// how it ended, or `None` for a message about nothing of ours, one that
+    /// says nothing this program acts on, or a fault on memory a peer took
+    /// back, which is answered.
+    fn ended(&mut self, m: &sys::Message) -> Option<(usize, End)> {
         let fault = m.badge & FAULT_BADGE != 0;
         let i = (m.badge & !FAULT_BADGE).checked_sub(SERVICE_IDS)? as usize;
-        if i >= self.services.len() || self.running[i].child.is_none() || (!fault && m.info.label() != EXIT_LABEL) {
+        if i >= self.services.len() || self.running[i].child.is_none() {
             return None;
         }
+        let how = match m.info.label() {
+            _ if fault => End::Fault,
+            EXIT_LABEL => End::Status(m.words[0] as i64),
+            AGAIN_LABEL => End::Again,
+            // Whatever else a program tells its parent changes nothing.
+            _ => return None,
+        };
         // Memory a peer lent it and took back: it carries on, on zeros.
         if fault && self.running[i].child.as_mut().is_some_and(|c| c.answer_peer_fault(m)) {
             return None;
         }
         let child = self.running[i].child.take()?;
         self.end(i, child);
-        Some((i, if fault { None } else { Some(m.words[0] as i64) }))
+        Some((i, how))
+    }
+
+    /// Service `i`'s program says it serves (its bit, `serving_bit`): if an update
+    /// installed it, the update's trial is over and the program before it
+    /// is let go.
+    fn serves(&mut self, i: usize) {
+        if self.running[i].child.is_some() && self.running[i].trial.take().is_some() {
+            println!("init: {}'s new program serves; it is kept", self.services[i].name);
+        }
     }
 
     /// Publish a new instance to its running consumers once spawn succeeds.
@@ -502,31 +530,29 @@ impl Manager {
         Ok(())
     }
 
-    /// Service `i` ended with `status` (`None`: it faulted): say so, and
-    /// start it again if it asks to be.
-    fn after(&mut self, i: usize, status: Option<i64>) {
+    /// Say how service `i` ended.
+    fn say_end(&self, i: usize, how: End) {
         let name = self.services[i].name;
-        match status {
-            Some(0) => println!("init: {name} ended"),
-            Some(HUNG) => println!("init: {name} was ended: it stopped answering"),
-            Some(s) => println!("init: {name} ended with status {s}"),
-            None => println!("init: {name} faulted"),
+        match how {
+            End::Status(0) => println!("init: {name} ended"),
+            End::Status(s) => println!("init: {name} ended with status {s}"),
+            End::Fault => println!("init: {name} faulted"),
+            End::Again => println!("init: {name} ended asking to be started again, which only a driver's device needs: a failure"),
         }
-        if status != Some(0) && self.on_trial(i) && !self.running[i].stopped {
-            println!("init: {name}'s new program failed within {} s of its update; it is started on the program before it", TRIAL / SECOND);
+    }
+
+    /// Service `i` ended (`how`): say so, and start it again if it asks to be.
+    fn after(&mut self, i: usize, how: End) {
+        let name = self.services[i].name;
+        self.say_end(i, how);
+        let failed = how != End::Status(0);
+        if failed && self.running[i].trial.is_some() && !self.running[i].stopped {
+            println!("init: {name}'s new program failed before it served; it is started on the program before it");
             self.undo_update(i);
             self.start_again(i, " on the program before its update");
             return;
         }
-        if status == Some(silica_rt::EXIT_AGAIN)
-            && !self.running[i].stopped
-            && self.running[i].restarts.may_start_again(silica_rt::clock().now())
-        {
-            // It asked to be started again: a start, not a failure.
-            self.start_again(i, "");
-            return;
-        }
-        if status == Some(0) || !self.services[i].restart || self.running[i].stopped {
+        if !failed || !self.services[i].restart || self.running[i].stopped {
             return;
         }
         let now = silica_rt::clock().now();
@@ -678,7 +704,7 @@ impl Manager {
         self.pet_watchdog()
     }
 
-    fn step(&mut self, listener: &mut Listener, wait: Wait, watch: Option<usize>) -> Result<Option<(usize, Option<i64>)>, ()> {
+    fn step(&mut self, listener: &mut Listener, wait: Wait, watch: Option<usize>) -> Result<Option<(usize, End)>, ()> {
         // The wait ends for the watchdog's pet too, and hears the device
         // manager say a watchdog came.
         let pet = self.tend_watchdog();
@@ -701,7 +727,16 @@ impl Manager {
             Err(_) => return Err(()),
         };
         if m.info == sys::MsgInfo::NOTIFIED {
-            self.find_watchdog();
+            // Programs on trial that serve now (their bits), then the
+            // device manager's word on the watchdog (bit 0).
+            for i in 0..self.services.len().min(63) {
+                if m.badge & serving_bit(i) != 0 {
+                    self.serves(i);
+                }
+            }
+            if m.badge & 1 != 0 {
+                self.find_watchdog();
+            }
             return Ok(None);
         }
         if m.badge >= CONSUMERS && m.badge & FAULT_BADGE == 0 {
@@ -709,91 +744,26 @@ impl Manager {
             listener.answer(&m, |request, caps, reply, reply_caps| manager::dispatch(self, request, caps, reply, reply_caps));
             return Ok(None);
         }
-        // A service whose time-limited call to a provider it needs went
-        // unanswered: ask the provider ourselves.
-        if m.badge & FAULT_BADGE == 0
-            && m.info.label() == UNANSWERED_LABEL
-            && let Some(i) = m.badge.checked_sub(SERVICE_IDS).map(|i| i as usize).filter(|i| *i < self.services.len())
-        {
-            self.unanswered(i, m.words[0]);
-            return Ok(None);
-        }
         match self.ended(&m) {
-            Some((j, status)) if Some(j) == watch => Ok(Some((j, status))),
-            Some((j, status)) => {
-                self.after(j, status);
+            Some((j, how)) if Some(j) == watch => Ok(Some((j, how))),
+            Some((j, how)) => {
+                self.after(j, how);
                 Ok(None)
             }
             None => Ok(None),
         }
     }
 
-    /// Service `i` waited past its limit for need `need`'s provider: ask the
-    /// provider itself, once, within [`PROBE_LIMIT`] (its runtime answers
-    /// from its request loop, whatever its protocol); one that does not
-    /// answer either has hung without ending, and is ended and started
-    /// again as a failure (the restart backoff applies). A provider that
-    /// answered is not asked again for [`PROBE_QUIET`], so reports cannot
-    /// keep the service manager busy. Nothing happens without a report.
-    fn unanswered(&mut self, i: usize, need: u64) {
-        let Some(protocol) = usize::try_from(need).ok().and_then(|n| self.services[i].needs.get(n)).copied() else { return };
-        let Some(p) = self.services.iter().position(|s| s.provides == Some(protocol)) else { return };
-        let Some(endpoint) = self.endpoints[p].as_ref().map(Object::cap) else { return };
-        let now = silica_rt::clock().now();
-        if self.running[p].child.is_none() || now < self.running[p].answered_at.saturating_add(PROBE_QUIET) {
-            return;
-        }
-        match sys::call_within(endpoint, sys::MsgInfo::new(PROBE_LABEL, 0), [0; 4], PROBE_LIMIT) {
-            Ok(_) => self.running[p].answered_at = silica_rt::clock().now(),
-            Err(sys::Error::Timeout) => {
-                let (name, by) = (self.services[p].name, self.services[i].name);
-                println!("init: {name} did not answer within {} ms after {by} waited for it", PROBE_LIMIT / 1_000_000);
-                if let Some(child) = self.running[p].child.take() {
-                    self.end(p, child);
-                    self.after(p, Some(HUNG));
-                }
-            }
-            Err(_) => {}
-        }
-    }
-
-    /// As the machine turns off, the services' last lines on the console
-    /// before the log service goes ([`flush_log`]), answering meanwhile what
-    /// the log service needs answered to get there: reading a ring whose
-    /// memory went with its writer (the device manager's drivers', ended
-    /// before it) faults, and that fault is the service manager's to answer
-    /// ([`Manager::ended`]). Before, each waited on the other for the whole
-    /// [`FLUSH_WAIT`], at every shutdown. For shutdown only, as
-    /// [`Manager::end_in_order`].
-    fn flush_log_answering(&mut self) {
-        let (to, done) = (FLUSH_TO.load(Ordering::Relaxed), FLUSHED.load(Ordering::Relaxed));
-        if to == 0 {
-            return;
-        }
-        let _ = sys::recv(sys::Cap(done), Wait::Poll);
-        if sys::signal(sys::Cap(to)).is_err() {
-            return;
-        }
-        let deadline = silica_rt::clock().now() + FLUSH_WAIT;
-        while let Ok(m) = sys::recv_listening(self.root.parent.exit, sys::Cap(done), Wait::Until(deadline)) {
-            if m.signals().is_some() {
-                return;
-            }
-            // The log service itself gone: nothing more is coming.
-            if let Some((j, _)) = self.ended(&m)
-                && self.log.as_ref().is_some_and(|l| l.service == j)
-            {
-                break;
-            }
-        }
-        println!("init: the log service did not put its text on the console within 2 s: services' last lines may be missing");
-    }
-
     /// Ask service `i` to end ([`silica_rt::END`] on its events notification)
-    /// and wait up to [`END_WAIT`] for it to exit; the caller then stops it
-    /// (what is left of it, or all of it if it did not exit). For shutdown
-    /// only: a call that arrives meanwhile is not answered (the machine is
-    /// going down), and another service's exit is left for its own stop.
+    /// and wait for its exit, which the kernel delivers; the caller then
+    /// stops it (what is left of it). For the machine going down only.
+    /// What the wait hears meanwhile is looked after as ever, but for
+    /// starting anything again: a fault of this service or another on memory
+    /// a peer took back is answered (the log service reads rings whose
+    /// writers have ended), another service that ends is taken back and
+    /// said. A call that arrives is not answered (the machine is going
+    /// down). A service that never exits is waited for [`END_WAIT`], said to
+    /// have failed to end, and ended where it stands.
     fn end_in_order(&mut self, i: usize) {
         let name = self.services[i].name;
         let slot = silica_rt::ipc::free_slot();
@@ -814,9 +784,19 @@ impl Manager {
         let deadline = silica_rt::clock().now() + END_WAIT;
         while let Ok(m) = sys::recv(self.root.parent.exit, Wait::Until(deadline)) {
             if m.badge & !FAULT_BADGE != id {
+                if let Some((j, how)) = self.ended(&m) {
+                    self.say_end(j, how);
+                }
                 continue;
             }
-            if m.badge & FAULT_BADGE == 0 && m.info.label() == EXIT_LABEL && m.words[0] == 0 {
+            let fault = m.badge & FAULT_BADGE != 0;
+            if fault && self.running[i].child.as_mut().is_some_and(|c| c.answer_peer_fault(&m)) {
+                continue;
+            }
+            if !fault && m.info.label() != EXIT_LABEL {
+                continue;
+            }
+            if !fault && m.words[0] == 0 {
                 println!("init: {name} ended in order");
             } else {
                 println!("init: {name} did not end in order");
@@ -824,6 +804,26 @@ impl Manager {
             return;
         }
         println!("init: {name} did not end within {} s; it is ended where it stands", END_WAIT / SECOND);
+    }
+
+    /// Before init says its last words on this boot (a failure, the checks'
+    /// verdict): the log service, if it runs, is asked to end, so every
+    /// service's text is on the console first; then it is taken back.
+    fn last_words(&mut self) {
+        if let Some(l) = self.log.as_ref().map(|l| l.service)
+            && self.running[l].child.is_some()
+        {
+            self.end_in_order(l);
+            self.stop(l);
+        }
+    }
+
+    /// Whether service `i` gave a program of its own a log whose ring is
+    /// still there (`add_log`).
+    fn gave_logs(&self, i: usize) -> bool {
+        self.log
+            .as_ref()
+            .is_some_and(|l| l.given[l.first[i]..l.first[i] + self.services[i].logs as usize].iter().flatten().any(|(_, ring)| alive(ring)))
     }
 
     /// Stop service `i` at once, as if it had failed, but for good.
@@ -839,22 +839,9 @@ impl Manager {
         }
     }
 
-    /// Whether service `i` runs an update still on trial. A trial that is
-    /// over is ended here, and the program it kept to go back to let go.
-    fn on_trial(&mut self, i: usize) -> bool {
-        match self.running[i].trial {
-            Some((_, until)) if until == 0 || silica_rt::clock().now() < until => true,
-            Some(_) => {
-                self.running[i].trial = None;
-                false
-            }
-            None => false,
-        }
-    }
-
     /// Put back the program service `i` ran before its update on trial.
     fn undo_update(&mut self, i: usize) {
-        if let Some((before, _)) = self.running[i].trial.take() {
+        if let Some(before) = self.running[i].trial.take() {
             self.running[i].program = before;
             self.running[i].hash = None;
             self.fresh_keep(i);
@@ -925,12 +912,17 @@ impl Manager {
         self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)
     }
 
-    /// Wait for service `i` to end, looking after the others meanwhile.
+    /// Wait for service `i` (a check) to end, looking after the others
+    /// meanwhile: its exit is what is waited for, `within` how long a check
+    /// that never ends is given before the boot is failed.
+    #[cfg(feature = "harness")]
     fn wait_for(&mut self, listener: &mut Listener, i: usize, within: u64) -> Result<i64, &'static str> {
         let deadline = silica_rt::clock().now() + within;
         loop {
             match self.step(listener, Wait::Until(deadline), Some(i)) {
-                Ok(Some((_, status))) => return status.ok_or("it faulted"),
+                Ok(Some((_, End::Status(status)))) => return Ok(status),
+                Ok(Some((_, End::Fault))) => return Err("it faulted"),
+                Ok(Some((_, End::Again))) => return Err("it ended asking to be started again"),
                 Ok(None) => {}
                 Err(()) => return Err("it did not finish in time"),
             }
@@ -961,7 +953,6 @@ impl manager::Server<Handle> for Manager {
         }
         for i in 0..self.services.len() {
             let program = self.hash(i);
-            let _ = self.on_trial(i);
             let (s, r) = (&self.services[i], &self.running[i]);
             let state = if r.child.is_some() {
                 manager::State::Running
@@ -1057,22 +1048,45 @@ impl manager::Server<Handle> for Manager {
 
     fn shutdown(&mut self, reboot: bool) -> Result<manager::ShutdownReply, manager::Error> {
         self.may(scope::SYSTEM_POWER)?;
-        flush_log();
         println!("init: shutting down{}", if reboot { " to reset" } else { "" });
         let caller = (self.caller & CONSUMERS != 0).then_some(self.caller & 0xFFFF_FFFF);
+        let log = self.log.as_ref().map(|l| l.service);
+        // Taken back only once the log service has ended.
+        let mut later = Vec::new();
         for &i in self.order.clone().iter().rev() {
+            if Some(i) == log {
+                continue;
+            }
             // A service with something to finish (`ends`: the device
-            // manager, its disks' caches) is asked to end and given a while;
-            // not the one whose call this is, which cannot answer while it
-            // waits for it (it ends what it must before it calls).
+            // manager, its disks' caches) is asked to end and its exit
+            // waited for; not the one whose call this is, which cannot
+            // answer while it waits for it (it ends what it must before it
+            // calls).
             if self.services[i].ends && self.running[i].child.is_some() && caller != Some(i as u64) {
                 self.end_in_order(i);
             }
-            // What the services said as they ended reaches the console
-            // before the log goes.
-            if self.log.as_ref().is_some_and(|l| l.service == i) {
-                self.flush_log_answering();
+            // The logs it gave its programs are rings in its own memory: it
+            // keeps that until the log service has read them (it runs no
+            // more: it has ended in order, or waits for this call's answer).
+            if self.gave_logs(i) {
+                later.push(i);
+                continue;
             }
+            if self.stop(i) {
+                println!("init: {} stopped", self.services[i].name);
+            }
+        }
+        // The log service, last: every ring is still whole, so what the
+        // services said as they ended reaches the console before it goes,
+        // and its exit says that it has.
+        if let Some(l) = log
+            && self.services[l].ends
+            && self.running[l].child.is_some()
+            && caller != Some(l as u64)
+        {
+            self.end_in_order(l);
+        }
+        for i in later.into_iter().chain(log) {
             if self.stop(i) {
                 println!("init: {} stopped", self.services[i].name);
             }
@@ -1149,7 +1163,7 @@ impl manager::Server<Handle> for Manager {
         // if one is still on, ends here: its program is the one now kept).
         let before = self.running[i].program.take();
         self.running[i].program = Some(program);
-        self.running[i].trial = Some((before, 0));
+        self.running[i].trial = Some(before);
         self.running[i].hash = None;
         self.fresh_keep(i);
         let hash = self.hash(i);
@@ -1191,15 +1205,20 @@ impl manager::Server<Handle> for Manager {
 
     fn add_log(&mut self, name: &str, ring: Handle) -> Result<manager::AddLogReply<Handle>, manager::Error> {
         self.may(scope::SYSTEM_LOGS)?;
-        let caller: &'static str = self.calling().ok_or(manager::Error::Refused)?.name;
+        let c = (self.caller & 0xFFFF_FFFF) as usize;
+        let (caller, allowed): (&'static str, usize) = self.calling().map(|s| (s.name, s.logs as usize)).ok_or(manager::Error::Refused)?;
         let source = silica_rt::alloc::format!("{caller}/{name}");
+        let notify = self.log.as_ref().map(|l| self.events[l.service].0.cap()).ok_or(manager::Error::Refused)?;
         let log = self.log.as_mut().ok_or(manager::Error::Refused)?;
+        // The caller's own places, as many as its declaration says (`logs=`):
+        // no service takes another's, whatever it asks for.
+        let mine = log.first[c]..log.first[c] + allowed;
         // A name given before keeps its place only while its ring lives: a
         // ring that is gone (the service that made it restarted, its
         // memory with it) is replaced by the new one, and the log service
         // reads on from it under the same source.
-        let again = log.given.iter().position(|(n, _)| *n == source);
-        if again.is_some_and(|k| alive(&log.given[k].1)) {
+        let again = mine.clone().find(|k| log.given[*k].as_ref().is_some_and(|(n, _)| *n == source));
+        if again.is_some_and(|k| log.given[k].as_ref().is_some_and(|(_, r)| alive(r))) {
             return Err(manager::Error::Exists);
         }
         // A ring of the size every log's writer and reader assume.
@@ -1208,35 +1227,20 @@ impl manager::Server<Handle> for Manager {
         if !fits || name.is_empty() || name.len() > 64 || source.len() > directory::NAME {
             return Err(manager::Error::Refused);
         }
-        // One service has at most half the logs, so no one service can take
-        // them all; and a log whose ring is gone (its maker ended for good)
-        // gives its place to the next new one, anyone's.
-        let mine = log.given.iter().filter(|(n, r)| n.strip_prefix(caller).is_some_and(|n| n.starts_with('/')) && alive(r)).count();
-        let reuse = match again {
-            Some(_) => None,
-            None if mine >= MAX_LOGS / 2 => return Err(manager::Error::Refused),
-            None if log.given.len() < MAX_LOGS => None,
-            None => Some(log.given.iter().position(|(_, r)| !alive(r)).ok_or(manager::Error::Refused)?),
+        // Its place again, else one of its own never used, else one whose
+        // ring is gone (its maker ended for good); with none, the service
+        // has every log its declaration gives it.
+        let free = |want_empty: bool| mine.clone().find(|k| log.given[*k].as_ref().map_or(want_empty, |(_, r)| !want_empty && !alive(r)));
+        let Some(k) = again.or_else(|| free(true)).or_else(|| free(false)) else {
+            println!("init: {caller} asked for another log; it has the {allowed} its declaration gives it (logs=)");
+            return Err(manager::Error::Refused);
         };
         let to = silica_rt::ipc::free_slot().ok_or(manager::Error::Refused)?;
-        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, log.note.cap(), Rights::WRITE, 0).is_err() {
+        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, notify, Rights::WRITE, 0).is_err() {
             silica_rt::ipc::release_slot(to);
             return Err(manager::Error::Refused);
         }
-        let k = match (again, reuse) {
-            (Some(k), _) => {
-                log.given[k].1 = ring;
-                k
-            }
-            (None, Some(k)) => {
-                log.given[k] = (source, ring);
-                k
-            }
-            (None, None) => {
-                log.given.push((source, ring));
-                log.given.len() - 1
-            }
-        };
+        log.given[k] = Some((source, ring));
         // Into the log service's own slot for it, if it runs (one started
         // later is given it with the others: `grants`), then named in the
         // directory: the log service never asks the service manager
@@ -1245,12 +1249,14 @@ impl manager::Server<Handle> for Manager {
         let entry = self.services.len() + k;
         let slot = self.log_slot(entry);
         let log = self.log.as_ref().ok_or(manager::Error::Refused)?;
-        if let Some(child) = &self.running[log.service].child
-            && let Err(e) = sys::cap_derive(child.space(), slot, log.given[k].1.cap(), Rights(Rights::READ.0 | Rights::WRITE.0), 0)
-        {
-            println!("init: cannot give the log service the ring of {}: {e:?}", log.given[k].0);
+        if let Some((source, ring)) = &log.given[k] {
+            if let Some(child) = &self.running[log.service].child
+                && let Err(e) = sys::cap_derive(child.space(), slot, ring.cap(), Rights(Rights::READ.0 | Rights::WRITE.0), 0)
+            {
+                println!("init: cannot give the log service the ring of {source}: {e:?}");
+            }
+            directory::publish(&log.directory.shared(), entry, source.as_bytes());
         }
-        directory::publish(&log.directory.shared(), entry, log.given[k].0.as_bytes());
         let _ = sys::signal(log.added);
         Ok(manager::AddLogReply { wake: Handle::new(sys::Cap(to)) })
     }
@@ -1278,15 +1284,19 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         println!("init: the firmware gave no wall clock; it is unknown until a time server sets it");
     }
     let root = Root { parent: silica_proc::Parent { fault: root.parent.exit, time: time.frame(), ..root.parent }, ..root };
+    say_last_panic(info);
     let cmdline: &'static [u8] = &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())];
+    #[cfg(feature = "harness")]
     let checks: Vec<&[u8]> =
         option(cmdline, "checks").unwrap_or(b"programs,block").split(|b| *b == b',').filter(|c| !c.is_empty()).collect();
-
-    if checks.contains(&&b"programs"[..]) {
-        program_checks(&root);
-    }
-    if checks.contains(&&b"spawn"[..]) {
-        spawn_bench(&root);
+    #[cfg(feature = "harness")]
+    {
+        if checks.contains(&&b"programs"[..]) {
+            program_checks(&root);
+        }
+        if checks.contains(&&b"spawn"[..]) {
+            spawn_bench(&root);
+        }
     }
 
     let Some(list) = ramdisk::find(root.archive, "services").and_then(|b| core::str::from_utf8(b).ok()) else {
@@ -1320,7 +1330,6 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             given: Vec::new(),
             starts: 0,
             restarts: Restarts::default(),
-            answered_at: 0,
             stopped: false,
             program: None,
             trial: None,
@@ -1366,19 +1375,28 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         })
         .collect();
     // The log, when a service provides it: a ring for every other service,
-    // made before anything starts; the log starts first.
+    // made before anything starts, and a place for every log the services'
+    // declarations let them give their programs (`logs=`); the log starts
+    // first. Its writers signal the log service's own events notification.
     let mut order = order;
     let log = match services.iter().position(|s| s.provides == Some("silica.log.Reader")) {
         None => None,
         Some(l) => {
             let object = |ty, bits| Object::new(ty, bits).unwrap_or_else(|_| fail!("no memory for the log"));
-            let note = object(ObjectType::Notification, 0);
-            let flushed = object(ObjectType::Notification, 0);
             let rings = (0..services.len()).map(|i| (i != l).then(|| object(ObjectType::Frame, silica_rt::log::BITS))).collect();
             order.retain(|&i| i != l);
             order.insert(0, l);
-            if services.len() + MAX_LOGS > directory::ENTRIES {
-                fail!("more services than the log's directory names");
+            let mut first = Vec::new();
+            let mut places = 0;
+            for s in &services {
+                first.push(places);
+                places += s.logs as usize;
+            }
+            if services.len() + places > directory::ENTRIES {
+                fail!(
+                    "the services and the {places} logs their declarations give them (logs=) are more than the {} the log's directory names",
+                    directory::ENTRIES
+                );
             }
             let directory = silica_rt::mem::Memory::new(directory::BITS).unwrap_or_else(|_| fail!("no memory for the log"));
             for (i, s) in services.iter().enumerate() {
@@ -1386,7 +1404,11 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
                     directory::publish(&directory.shared(), i, s.name.as_bytes());
                 }
             }
-            Some(LogSetup { service: l, note, flushed, rings, added: sys::Cap(0), given: Vec::new(), directory })
+            let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for the log"));
+            if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, events[l].0.cap(), Rights::WRITE, ADDED).is_err() {
+                fail!("cannot make the log's capability for added logs");
+            }
+            Some(LogSetup { service: l, rings, added: sys::Cap(to), given: (0..places).map(|_| None).collect(), first, directory })
         }
     };
     // Each service's options, from the boot command line.
@@ -1426,21 +1448,6 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         // started: it is among that program's grants.
         dog: Watchdog { note: Object::new(ObjectType::Notification, 0).ok(), ..Watchdog::default() },
     };
-    if let Some(l) = &m.log {
-        let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for the log"));
-        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, l.note.cap(), Rights::WRITE, FLUSH).is_err() {
-            fail!("cannot make the log's flush capability");
-        }
-        FLUSH_TO.store(to, Ordering::Relaxed);
-        FLUSHED.store(l.flushed.cap().0, Ordering::Relaxed);
-    }
-    if let Some(l) = m.log.as_mut() {
-        let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for the log"));
-        if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, l.note.cap(), Rights::WRITE, ADDED).is_err() {
-            fail!("cannot make the log's capability for added logs");
-        }
-        l.added = sys::Cap(to);
-    }
     let mut listener = Listener::new(m.root.parent.exit);
 
     // The system, in order, but for what the command line keeps off.
@@ -1462,23 +1469,64 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         // Boot order puts providers before consumers, so none needs a
         // notification for this initial instance.
         if let Err(e) = m.spawn(i) {
-            fail!("{}: {e}", m.services[i].name);
+            fail_with!(m, "{}: {e}", m.services[i].name);
         }
     }
     // The machine's watchdog, petted from here on.
     m.watch_watchdog();
+    #[cfg(feature = "harness")]
+    run_checks(&mut m, &mut listener, &checks, &order, cmdline);
+    // The system stays up, and its services are looked after.
+    println!("BOOT OK");
+    let mut next = None;
+    loop {
+        let wait = next.map_or(Wait::Forever, Wait::Until);
+        let _ = m.step(&mut listener, wait, None);
+        next = m.restart_due();
+    }
+}
+
+/// The last boot's end, when the kernel kept its record across the reset
+/// (`RootInfo::last_panic`: the console's last lines, the panic and its
+/// backtrace): said here, so the owner reading this boot's log learns that
+/// the machine reset itself and why. The record is the last boot's bytes,
+/// whatever was on its console: shown as text, obeyed by no terminal.
+fn say_last_panic(info: &RootInfo) {
+    let record = &info.last_panic[..(info.last_panic_len as usize).min(info.last_panic.len())];
+    if record.is_empty() {
+        return;
+    }
+    println!("init: the last boot ended in a kernel panic and the machine reset itself; the kernel's record of it:");
+    for line in String::from_utf8_lossy(record).lines().filter(|l| !l.trim().is_empty()) {
+        // In pieces a line of the console holds whole.
+        let mut rest = line;
+        while !rest.is_empty() {
+            let cut = (0..=rest.len().min(160)).rev().find(|n| rest.is_char_boundary(*n)).unwrap_or(rest.len());
+            let (piece, more) = rest.split_at(cut.max(1).min(rest.len()));
+            println!("init: | {}", silica_rt::text::printable(piece));
+            rest = more;
+        }
+    }
+    println!("init: end of the last boot's panic record");
+}
+
+/// What a test image's command line asks for once the system is up
+/// (`checks=`). Returns when it asked for nothing that ends the boot: the
+/// system then stays up.
+#[cfg(feature = "harness")]
+fn run_checks(m: &mut Manager, listener: &mut Listener, checks: &[&[u8]], order: &[usize], cmdline: &'static [u8]) {
     // `checks=watchdog`: once the watchdog is petted, stop petting it and
     // answering anyone, as a hung service manager would: the watchdog must
     // reset the machine, and the next boot hears it did.
     if checks.contains(&&b"watchdog"[..]) {
         let until = silica_rt::clock().now() + 60 * SECOND;
         while m.dog.driver.is_none() && silica_rt::clock().now() < until {
-            let _ = m.step(&mut listener, Wait::Until(until), None);
+            let _ = m.step(listener, Wait::Until(until), None);
         }
         if m.dog.driver.is_none() {
-            fail!("checks=watchdog: no watchdog came within 60 s");
+            fail_with!(m, "checks=watchdog: no watchdog came within 60 s");
         }
-        flush_log();
+        m.last_words();
         println!("init: no more pets and no more answers, as checks=watchdog asks: the watchdog must reset the machine");
         let Ok(never) = Object::new(ObjectType::Notification, 0) else { fail!("no memory") };
         loop {
@@ -1489,30 +1537,29 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     let mut checked = false;
     for c in checks.iter().filter(|c| **c != b"programs" && **c != b"spawn" && **c != b"watchdog") {
         let mut any = false;
-        for &i in &order {
+        for &i in order {
             if !matches!(m.services[i].start, Start::Check(n) if n.as_bytes() == *c) {
                 continue;
             }
             any = true;
             let name = m.services[i].name;
             if let Err(e) = m.start(i) {
-                fail!("{name}: {e}");
+                fail_with!(m, "{name}: {e}");
             }
-            let ended = m.wait_for(&mut listener, i, 120 * SECOND);
-            flush_log();
-            match ended {
+            match m.wait_for(listener, i, 120 * SECOND) {
                 Ok(0) => println!("init: {name} passed"),
-                Ok(s) => fail!("{name} ended with status {s}"),
-                Err(e) => fail!("{name}: {e}"),
+                Ok(s) => fail_with!(m, "{name} ended with status {s}"),
+                Err(e) => fail_with!(m, "{name}: {e}"),
             }
         }
         if !any {
-            fail!("checks= names {}, which no service is declared for", core::str::from_utf8(c).unwrap_or("?"));
+            fail_with!(m, "checks= names {}, which no service is declared for", core::str::from_utf8(c).unwrap_or("?"));
         }
         checked = true;
     }
     if checked || checks.contains(&&b"programs"[..]) || checks.contains(&&b"spawn"[..]) {
-        flush_log();
+        // Every service's text on the console before the verdict.
+        m.last_words();
         if option(cmdline, "bench").is_some() || cmdline.split(|b| b.is_ascii_whitespace()).any(|w| w == b"bench") {
             println!("BENCH DONE");
         }
@@ -1521,22 +1568,10 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             let why = sys::reboot(sys::Cap(libsys::root::SLOT_POWER), 0);
             fail!("the machine cannot be reset: {why:?}");
         }
-        finish(true)
-    }
-    // No checks: the system stays up, and its services are looked after.
-    flush_log();
-    println!("BOOT OK");
-    let mut next = None;
-    loop {
-        let wait = next.map_or(Wait::Forever, Wait::Until);
-        let _ = m.step(&mut listener, wait, None);
-        next = m.restart_due();
+        halt(true)
     }
 }
 
-/// The round trips everything rests on: a program runs in its own address
-/// space and CapSpace, reports its exit, and its memory comes back; two
-/// programs call each other through a protocol.
 /// `checks=spawn`: how long a program takes from its parent's `spawn` to
 /// its own first line of code (`hello` asked to answer with the time it
 /// started), over [`SPAWNS`] programs started and taken down one after
@@ -1544,6 +1579,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
 /// `BENCH spawn_p99`, in nanoseconds; the Linux baseline measures fork or
 /// vfork and exec of a static program to its `main` the same way
 /// (os/bench/linux/init.c).
+#[cfg(feature = "harness")]
 fn spawn_bench(root: &Root) {
     const SPAWNS: usize = 2000;
     const WARMUP: usize = 200;
@@ -1576,6 +1612,10 @@ fn spawn_bench(root: &Root) {
     println!("BENCH spawn_p99 {} ns", took[SPAWNS - SPAWNS / 100 - 1]);
 }
 
+/// `checks=programs`: the round trips everything rests on: a program runs
+/// in its own address space and CapSpace, reports its exit, and its memory
+/// comes back; two programs call each other through a protocol.
+#[cfg(feature = "harness")]
 fn program_checks(root: &Root) {
     let (parent, archive) = (&root.parent, root.archive);
     let Some(image) = ramdisk::find(archive, "hello") else { fail!("the ramdisk has no program named hello") };

@@ -348,6 +348,11 @@ pub struct Program<'a> {
     /// (`libsys::ASPACE_ISOLATED`): for a program that holds secrets. Every
     /// switch into or out of it flushes the processor's predictors.
     pub isolated: bool,
+    /// The parent hears when it first waits for requests: a notification
+    /// and the badge the child signals it with, from `slots::SERVING`
+    /// (`silica_rt::serving`). What the service manager asks of a program
+    /// an update installed.
+    pub says_serving: Option<(Cap, u64)>,
 }
 
 impl<'a> Program<'a> {
@@ -369,6 +374,7 @@ impl<'a> Program<'a> {
             options: &[],
             sched: None,
             isolated: false,
+            says_serving: None,
         }
     }
 }
@@ -535,6 +541,7 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
         cpus: p.cpus,
         clock: p.clock,
         args,
+        says_serving: prog.says_serving.is_some() as u64,
     };
     // The program's own page, read-write: the runtime takes the seed of its
     // random number generator from it and overwrites it (`silica_rt::random`).
@@ -589,6 +596,9 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     }
     if let Some(events) = prog.events {
         sys::cap_derive(c.space, slots::EVENTS.0, events, Rights::ALL, 0)?;
+    }
+    if let Some((note, badge)) = prog.says_serving {
+        sys::cap_derive(c.space, slots::SERVING.0, note, Rights::WRITE, badge)?;
     }
     // Processor time: the context named, or the parent's own. The child
     // holds it readable, to bind what it makes and to pass on; its first
@@ -856,14 +866,6 @@ impl Restarts {
         self.started = now + wait;
         self.due = (now + wait).max(1);
         self.due
-    }
-
-    /// Whether a program that asks to be started again (`EXIT_AGAIN`) at
-    /// `now` may be at once: not if it ran less than a second, or a
-    /// program could keep its supervisor starting it (then it is a
-    /// failure, and backs off).
-    pub fn may_start_again(&self, now: u64) -> bool {
-        now.saturating_sub(self.started) >= 1_000_000_000
     }
 
     /// Not to be started again by itself (its owner stopped it).

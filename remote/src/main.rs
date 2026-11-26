@@ -235,6 +235,8 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         if owners.len() == 1 { "" } else { "s" },
         core::str::from_utf8(&silica_remote::key_text(&key.public)).unwrap_or("?")
     );
+    // No request loop of the runtime's: it serves from here.
+    silica_rt::serving();
     // A page of 4 KiB, read and written one access at a time.
     let keep = silica_rt::mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
     let newest = Machine::kept(keep.as_ref(), owners.len());

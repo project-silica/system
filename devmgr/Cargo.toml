@@ -15,6 +15,8 @@ memory = 26
 start = "boot"
 restart = "always"
 ends = true
+# A log for each device it starts a driver for.
+logs = 32
 
 [lib]
 path = "src/lib.rs"

@@ -144,15 +144,60 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
     Ok(())
 }
 
-/// One service asks for logs until it is refused: it gets at most half the
-/// machine's (32 of 64), so the device manager restarted afterwards (the
-/// `devmgr` round) still gets its drivers' logs. Before (the 2026-11-24
-/// audit), the 64 were first come first served and never given back: one
-/// holder could leave every later driver and service without a log.
+/// A program's word about another is not obeyed. This one tells the service
+/// manager, for each provider it needs, that the provider left a call
+/// unanswered (the message a service's runtime sent when a time-limited
+/// call expired: label 2, the need's number), and sends a label nothing has.
+/// Each send returns when the service manager has taken it, and the `list`
+/// after them is answered once it has dealt with them all: no provider was
+/// counted as failed, so none was ended. Before, each report made the
+/// service manager call the provider itself with a 2 s limit, standing
+/// still meanwhile, and end one that did not answer in time (a provider
+/// busy with other clients' calls, or still starting, as much as one that
+/// hung): any service could have a provider ended under its other clients.
+fn reports_are_not_obeyed(system: &mut system::Client<Channel, Handle>) -> Result<(), String> {
+    use silica_rt::sys::{self, MsgInfo};
+    for need in 0..5u64 {
+        for label in [2, 0xFFFF_FFFF, 77] {
+            sys::send(slots::PARENT, MsgInfo::new(label, 1), [need, 0, 0, 0]).map_err(|e| format!("telling the service manager: {e:?}"))?;
+        }
+    }
+    let mut from = 0;
+    loop {
+        let listed = system.list(from).map_err(|e| format!("list after the reports: {e:?}"))?;
+        for s in listed.services.iter() {
+            if s.failures != 0 {
+                return Err(format!(
+                    "{} was ended on this program's word that it left a call unanswered ({} failures)",
+                    s.name, s.failures
+                ));
+            }
+        }
+        if listed.next <= from {
+            break;
+        }
+        from = listed.next;
+    }
+    println!("svcload: the service manager ends no provider on a client's word");
+    Ok(())
+}
+
+/// The logs this service's declaration lets it register (`logs` in
+/// Cargo.toml): enough that the log's list of sources takes more than one
+/// message ([`log_sources_paged`]).
+const LOGS: u32 = 36;
+
+/// One service asks for logs until it is refused: it gets the number its
+/// declaration gives it, in places that are its own, so the device manager
+/// restarted afterwards (the `devmgr` round) still gets its drivers' logs.
+/// Before (the 2026-11-24 audit), 64 places were first come first served
+/// and never given back: one holder could leave every later driver and
+/// service without a log; then any holder was given half of them, whatever
+/// it was declared to need.
 fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<u32, String> {
     let mut rings = silica_rt::alloc::vec::Vec::new();
     let mut given = 0;
-    for n in 0..40 {
+    for n in 0..LOGS + 8 {
         let ring = Memory::new(silica_rt::log::BITS).map_err(|e| format!("no memory for a ring: {e:?}"))?;
         let lent = Handle::new(Cap(silica_rt::ipc::free_slot().ok_or("no slot")?));
         silica_rt::sys::cap_derive(slots::SPACE, lent.cap().0, ring.frame(), silica_rt::sys::Rights(3), 0)
@@ -164,15 +209,15 @@ fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<u32, Str
         }
         rings.push(ring);
     }
-    // Exactly the allowance, no more and no fewer: a manager that refused
+    // Exactly what it is declared, no more and no fewer: a manager that refused
     // every log would pass a test that only bounded it from above. This
     // service had asked for none before.
-    if given != 32 {
-        return Err(format!("one service was given {given} logs; its allowance is 32, half of the machine's 64"));
+    if given != LOGS {
+        return Err(format!("one service was given {given} logs; its declaration gives it {LOGS}"));
     }
     // And a call its scopes allow still answers once it holds them all.
     system.memory().map_err(|e| format!("memory, which observe allows, after the flood: {e:?}"))?;
-    println!("svcload: one service is given {given} logs and refused the next");
+    println!("svcload: one service is given the {given} logs it is declared and refused the next");
     // The rings stay this program's while it runs (their places stay taken).
     core::mem::forget(rings);
     Ok(given)
@@ -244,6 +289,7 @@ fn placed(info: &ProcessInfo) -> Result<(), String> {
 fn run() -> Result<(), String> {
     let mut load = Load { system: system::Client::from(Channel::new(grant(0))), slowest: 0 };
     scopes_hold(&mut load.system)?;
+    reports_are_not_obeyed(&mut load.system)?;
     // What the service manager can give out and what its running services
     // hold: a service that ends by itself meanwhile (the remote service on
     // a machine without its keys, at boot) moves memory from one to the

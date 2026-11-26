@@ -104,49 +104,5 @@ fn run() -> Result<(), String> {
         }
     }
     println!("TEST entropy.a_restarted_service_repeats_nothing PASS");
-    if let Some(n) = silica_rt::option("hang").and_then(|v| v.parse::<u32>().ok()) {
-        a_hung_provider_is_started_again(n)?;
-    }
-    Ok(())
-}
-
-/// The entropy service stops answering when asked for `n` bytes
-/// (`entropy.hang_on=<n>`), without ending. A call to it through a
-/// time-limited channel to the need (`Channel::to_need`) is given up and
-/// reported; the service manager asks the service itself, finds it does not
-/// answer, and starts it again, which this program hears as its need 0's
-/// provider starting again; then a call is answered. Before, the service
-/// manager heard only of services that ended or faulted: a hung one stayed
-/// "running" for good, with every client of it.
-fn a_hung_provider_is_started_again(n: u32) -> Result<(), String> {
-    const LIMIT: u64 = 1_000_000_000;
-    let channel = || Source::from(Channel::to_need(Cap(slots::FIRST_GRANT), 0, LIMIT));
-    let restarted = |within: u64| {
-        silica_rt::sys::recv(slots::EVENTS, silica_rt::sys::Wait::Until(silica_rt::clock().now() + within)).is_ok_and(|m| m.badge & 1 != 0)
-    };
-    let _ = silica_rt::sys::recv(slots::EVENTS, silica_rt::sys::Wait::Poll);
-    match channel().fill(n) {
-        Err(silica_idl_rt::CallError::Transport(silica_idl_rt::TransportError::Cancelled)) => {}
-        other => return Err(format!("the call meant to hang the entropy service was answered: {:?}", other.map(|r| r.data.len()))),
-    }
-    // A report the service manager was too busy to take is made again by
-    // the next call that goes unanswered.
-    let mut back = false;
-    for _ in 0..5 {
-        if restarted(5 * LIMIT) {
-            back = true;
-            break;
-        }
-        let _ = channel().fill(32);
-    }
-    if !back {
-        return Err(String::from("the entropy service stopped answering and was never started again"));
-    }
-    let mut s = channel();
-    let r = s.fill(32).map_err(|e| format!("after the hung service was started again, fill: {e:?}"))?;
-    if r.data.len() != 32 {
-        return Err(format!("after the restart, asked for 32 bytes, got {}", r.data.len()));
-    }
-    println!("TEST entropy.a_hung_provider_is_started_again PASS");
     Ok(())
 }

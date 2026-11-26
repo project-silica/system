@@ -202,11 +202,6 @@ fn dispatch(
     reply_caps: &mut CapList<Handle>,
     handle: impl FnOnce(&[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize,
 ) -> usize {
-    // The service manager asking whether this provider still takes calls:
-    // an empty answer, whatever the protocol (`crate::PROBE_LABEL`).
-    if m.info.label() == crate::PROBE_LABEL && m.info.caps() == 0 {
-        return 0;
-    }
     let mut caps = CapList::new();
     collect(buf, m.info.caps(), &mut caps);
     match unpack(buf, m, request) {
@@ -231,16 +226,13 @@ pub struct Channel {
     endpoint: Cap,
     /// The longest a call may take, in nanoseconds (0: no limit).
     limit: u64,
-    /// The need it reaches, by its index in the program's declaration: a
-    /// call past its limit is reported to the service manager.
-    need: Option<u64>,
 }
 
 impl Channel {
     /// A channel through the endpoint capability `endpoint`, which must
     /// allow sending (and passing capabilities, if the protocol does).
     pub fn new(endpoint: Cap) -> Channel {
-        Channel { endpoint, limit: 0, need: None }
+        Channel { endpoint, limit: 0 }
     }
 
     /// As [`Channel::new`], each call ending with `cancelled` if its answer
@@ -250,17 +242,7 @@ impl Channel {
     /// (a service calling a driver) this way, so a provider that hangs
     /// without ending holds it, and its own clients, for no longer.
     pub fn within(endpoint: Cap, limit_ns: u64) -> Channel {
-        Channel { endpoint, limit: limit_ns, need: None }
-    }
-
-    /// As [`Channel::within`], to need `need` of this service's declaration
-    /// (its `index` among the `needs`): a call that passes its limit is also
-    /// reported to the service manager (`crate::UNANSWERED_LABEL`), which
-    /// asks the provider itself and starts it again if it does not answer
-    /// either. How a service calls another it depends on without a hung
-    /// provider holding it, and without the hang lasting.
-    pub fn to_need(endpoint: Cap, need: u64, limit_ns: u64) -> Channel {
-        Channel { endpoint, limit: limit_ns, need: Some(need) }
+        Channel { endpoint, limit: limit_ns }
     }
 }
 
@@ -286,14 +268,7 @@ impl Transport<Handle> for Channel {
             // The endpoint, or the provider holding the call, went away.
             Error::Gone => TransportError::PeerGone,
             // Its time limit passed: the call is given up.
-            Error::Timeout => {
-                // Told without waiting: the service manager may be asking
-                // this very program whether it answers.
-                if let Some(need) = self.need {
-                    let _ = sys::try_send(crate::slots::PARENT, MsgInfo::new(crate::UNANSWERED_LABEL, 1), [need, 0, 0, 0]);
-                }
-                TransportError::Cancelled
-            }
+            Error::Timeout => TransportError::Cancelled,
             // BadCap, NoRights, WrongType: this capability does not reach a provider.
             _ => TransportError::Revoked,
         })?;
@@ -327,6 +302,7 @@ pub fn serve(endpoint: Cap, mut handle: impl FnMut(u64, &[u8], CapList<Handle>, 
     let buf = buffer();
     let mut request = [0u8; MAX_MESSAGE];
     let mut reply = [0u8; MAX_MESSAGE];
+    crate::serving();
     let mut next = sys::recv(endpoint, Wait::Forever);
     loop {
         let m = match next {
@@ -390,6 +366,7 @@ pub fn serve_events(endpoint: Cap, notification: Cap, handler: &mut impl Events)
     let mut request = [0u8; MAX_MESSAGE];
     let mut reply = [0u8; MAX_MESSAGE];
     let wait = |d: Option<u64>| d.map_or(Wait::Forever, Wait::Until);
+    crate::serving();
     // The wait, with the handler's wake-up of a peer given first. A peer
     // that is gone (its notification with it) is not this loop's failure:
     // the wait goes ahead without the wake-up.
@@ -459,12 +436,14 @@ impl Listener {
 
     /// The next message, whatever it is.
     pub fn recv(&mut self, wait: Wait) -> Result<sys::Message, Error> {
+        crate::serving();
         sys::recv(self.endpoint, wait)
     }
 
     /// The next message, or `notification`'s signals if they come first
     /// (`sys::Message::signals` says which).
     pub fn recv_listening(&mut self, notification: Cap, wait: Wait) -> Result<sys::Message, Error> {
+        crate::serving();
         sys::recv_listening(self.endpoint, notification, wait)
     }
 
@@ -590,6 +569,7 @@ pub fn serve_parked(endpoint: Cap, notification: Cap, handler: &mut impl Waiting
     let buf = buffer();
     let mut request = [0u8; MAX_MESSAGE];
     let mut reply = [0u8; MAX_MESSAGE];
+    crate::serving();
     loop {
         let park = take_park();
         let park_cap = park.map_or(Cap::NONE, |(_, c)| c);

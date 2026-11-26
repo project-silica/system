@@ -3,18 +3,20 @@
 //! The service manager gives every other service a ring to print into
 //! (`silica_rt::log`), creates the rings and the notification their writers
 //! signal before it starts anything, and gives them all to this service:
-//! grants 0 its endpoint, 1 the notification, 2 a notification of the
-//! service manager's to answer flushes on, 3 the ring directory
+//! grants 0 its endpoint, 1 the notification (its own events notification,
+//! which the writers signal too), 2 the ring directory
 //! (`silica_rt::log::directory`), then a slot per entry of the directory
 //! (`args[0]` of them), holding that entry's ring. A service that runs
 //! programs of its own gives each a ring through the service manager too
 //! (the device manager, one per device for its drivers: `add_log`), which
 //! puts it in the next slot, names it in the directory and signals
 //! [`ADDED`]: those are sources named `<service>/<name>`. This service
-//! never calls the service manager, which waits for its flushes. A signal
-//! with [`FLUSH`] asks for
-//! everything to be on the console now: the service manager's way to put a
-//! service's last lines before its own verdict, without calling the log. On every wake-up it takes the
+//! never calls the service manager. Asked to end (`silica_rt::END`, as the
+//! machine turns off, when every other service has ended), it puts
+//! everything the rings hold on the console and exits: the service
+//! manager hears of the exit from the kernel, so the services' last lines
+//! are out before the power goes and nothing waits out a time for them.
+//! On every wake-up it takes the
 //! text out of every ring, keeps the last [`KEPT`] bytes of each service's,
 //! and puts it on the console as it was written: another source's text
 //! starts on a fresh line, and a line it cut short (a prompt, and what was
@@ -53,8 +55,6 @@ const OWN: usize = usize::MAX;
 /// Rounds of taking text (a ring's worth of each source) between looking
 /// at calls.
 const ROUNDS: usize = 4;
-/// The bit of the notification that asks for a flush (the service manager's).
-const FLUSH: u64 = 2;
 /// The bit of the notification that says services gave their programs logs
 /// (`silica.system.Manager`'s `add_log`): this service asks for the rings.
 const ADDED: u64 = 4;
@@ -94,8 +94,6 @@ struct Log {
     /// The source whose unfinished line another's text cut short, until
     /// it is shown again.
     cut: Option<usize>,
-    /// Signalled when a flush asked for is done.
-    flushed: Cap,
     /// The page the service manager keeps across this service's restarts
     /// (`slots::KEEP`), with `open` and `cut` and their lines in it.
     keep: Option<silica_rt::mmio::Mmio>,
@@ -114,7 +112,7 @@ impl Log {
     fn drain(&mut self) {
         // A round takes at most a ring's worth from each source, so one
         // that writes without pause cannot keep the others waiting, and a
-        // few rounds at a time, so it cannot keep callers (a flush, the
+        // few rounds at a time, so it cannot keep callers (the
         // shell) waiting either: what is left is taken at once after them
         // (`deadline`).
         for _ in 0..ROUNDS {
@@ -380,8 +378,8 @@ impl Events for Log {
             self.take_rings();
         }
         self.drain();
-        if bits & FLUSH != 0 {
-            // Everything written so far on the console before the answer
+        if bits & silica_rt::END != 0 {
+            // Everything written so far on the console, then the end
             // (within reason: a writer that never pauses is not waited for).
             for _ in 0..16 {
                 if !self.more {
@@ -389,7 +387,8 @@ impl Events for Log {
                 }
                 self.drain();
             }
-            let _ = sys::signal(self.flushed);
+            self.save();
+            silica_rt::exit(0);
         }
     }
 }
@@ -408,12 +407,12 @@ fn ring_in(cap: Cap) -> Option<(Consumer<RECORD>, mem::Lent)> {
 
 /// The slot holding directory entry `entry`'s ring.
 fn ring_slot(entry: usize) -> Cap {
-    Cap(slots::FIRST_GRANT + 4 + entry as u64)
+    Cap(slots::FIRST_GRANT + 3 + entry as u64)
 }
 
 fn main(info: &'static ProcessInfo) -> i64 {
     let grant = |n: u64| Cap(slots::FIRST_GRANT + n);
-    let directory = match mem::peer(grant(3), directory::BITS, Rights::READ) {
+    let directory = match mem::peer(grant(2), directory::BITS, Rights::READ) {
         Ok(d) => d,
         Err(e) => {
             println!("ERROR: logd: no ring directory: {e:?}");
@@ -427,7 +426,6 @@ fn main(info: &'static ProcessInfo) -> i64 {
         more: false,
         open: None,
         cut: None,
-        flushed: grant(2),
         keep: mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok(),
         listed: Vec::new(),
         names: Vec::new(),

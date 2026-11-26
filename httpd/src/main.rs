@@ -73,6 +73,8 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         }
     };
     println!("httpd: listening on port {port}");
+    // No request loop of the runtime's: it serves from here.
+    silica_rt::serving();
     let quit_allowed = silica_rt::option("quit") == Some("allowed");
     let mut conns: Vec<Conn> = Vec::new();
     let mut buf = [0u8; 16384];

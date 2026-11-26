@@ -173,11 +173,16 @@ pub mod slots {
     /// it too unless it is given another (`silica_proc::Program::sched`):
     /// together they take the one share their parent gave.
     pub const SCHED: Cap = Cap(13);
+    /// When the parent asked to hear that the program serves
+    /// (`ProcessInfo::says_serving`): a capability to signal one bit of the
+    /// parent's notification, which [`crate::serving`] signals once. A
+    /// signal never waits, and the kernel keeps it until the parent looks.
+    pub const SERVING: Cap = Cap(14);
     /// The first capability the parent granted beyond these. Slots from
     /// here to 64 that the parent did not fill are left empty, for
     /// capabilities the program is given later; the program's own
     /// allocations start above them.
-    pub const FIRST_GRANT: u64 = 14;
+    pub const FIRST_GRANT: u64 = 15;
 }
 
 /// `ProcessInfo::magic`.
@@ -187,27 +192,13 @@ pub const PROCESS_MAGIC: u64 = 0x4F46_4E49_434F_5250; // "PROCINFO"
 /// is its exit status.
 pub const EXIT_LABEL: u64 = 1;
 
-/// Label of the message a program sends its parent when a time-limited call
-/// to a provider it needs went unanswered (`ipc::Channel::to_need`); word 0
-/// is the need's index in its declaration. The service manager then asks
-/// that provider itself ([`PROBE_LABEL`]) and starts it again if it does
-/// not answer either: a provider that hangs without ending is noticed only
-/// because a client waited for it, and nothing runs while nobody does.
-pub const UNANSWERED_LABEL: u64 = 2;
-
-/// Label of a call every provider's runtime answers at once, with an empty
-/// reply, from its request loop (`ipc::dispatch`), before any protocol sees
-/// it: whether the provider still takes calls. No protocol message has
-/// this label (theirs is their length, at most 4000 bytes).
-pub const PROBE_LABEL: u64 = 0xFFFF_FFFF;
-
-/// The exit status that asks the program's supervisor to start it again at
-/// once, as a fresh start and not a failure: a driver whose device can be
-/// put back to its first state only by a reset ends with it when its client
-/// changes, and the device manager resets the device by starting the
-/// driver again (`silica_proc::Restarts` does not count it). The service
-/// manager and the device manager both honour it.
-pub const EXIT_AGAIN: i64 = 75;
+/// Label of the message a program sends its parent in place of an exit
+/// status when it ends to be started again at once ([`exit_again`]): a
+/// driver whose device can be put back to its first state only by a reset
+/// ends so when its client changes, and the device manager resets the
+/// device by starting the driver again, as a fresh start and not a failure.
+/// Its own message, not a status: every status is the program's to mean.
+pub const AGAIN_LABEL: u64 = 4;
 
 /// The bit of [`slots::EVENTS`] a parent signals to ask the program to end:
 /// finish what must be finished (a block driver makes its device's write
@@ -237,6 +228,12 @@ pub struct ProcessInfo {
     pub clock: [u64; 3],
     /// Arguments from the parent; their meaning is between the two.
     pub args: [u64; 8],
+    /// Not 0: the parent wants to hear when the program first waits for
+    /// requests, on the capability in [`slots::SERVING`] ([`serving`]). The
+    /// service manager asks this of a program an update installed, and
+    /// keeps the program from then on (a new program that ends badly before
+    /// it has served is the update's failure).
+    pub says_serving: u64,
 }
 
 /// Where in the start-up page (after the [`ProcessInfo`] at its start) the
@@ -394,11 +391,39 @@ pub fn exit(status: i64) -> ! {
     }
 }
 
+/// End the program asking its parent to start it again at once
+/// ([`AGAIN_LABEL`]).
+pub fn exit_again() -> ! {
+    let _ = sys::send(slots::PARENT, MsgInfo::new(AGAIN_LABEL, 0), [0; 4]);
+    loop {
+        let _ = sys::thread_suspend(slots::THREAD);
+        sys::yield_now();
+    }
+}
+
+/// Whether the parent is still to be told that this program serves.
+static SAYS_SERVING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// This program now waits for requests: its parent is told, once, if it
+/// asked to be ([`ProcessInfo::says_serving`]), by a signal on
+/// [`slots::SERVING`]. A signal, not a message: the program never waits for
+/// its parent to listen (a message did, and a new network stack's first
+/// turn waited for the service manager, and every program's call to the
+/// stack with it). The runtime's request loops call this as they first
+/// wait (`ipc::serve`, `serve_events`, `serve_parked`, `Listener`); a
+/// program with a loop of its own calls it there.
+pub fn serving() {
+    if SAYS_SERVING.load(Ordering::Relaxed) && SAYS_SERVING.swap(false, Ordering::Relaxed) {
+        let _ = sys::signal(slots::SERVING);
+    }
+}
+
 /// Start-up of an ordinary program; called by the code [`main!`] generates.
 pub fn start(info: &'static ProcessInfo, main: fn(&'static ProcessInfo) -> i64) -> ! {
     if info.magic != PROCESS_MAGIC {
         exit(-1);
     }
+    SAYS_SERVING.store(info.says_serving != 0, Ordering::Relaxed);
     INFO_PAGE.store(core::ptr::from_ref(info).expose_provenance() as u64, Ordering::Relaxed);
     init(slots::DEBUG, info.clock);
     // The seed the parent put after the record (`random::SEED_OFFSET`), in
