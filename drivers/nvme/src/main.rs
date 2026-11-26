@@ -638,7 +638,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         prp_mem: prp.shared(),
         prp,
         tickets: (0..io_entries).map(|_| None).collect(),
-        oldest: Oldest::new(),
+        oldest: Oldest::for_slots(io_entries as usize)?,
         free: (0..io_entries).rev().collect(),
         unrung: false,
         io_bit,

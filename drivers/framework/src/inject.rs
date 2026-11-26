@@ -18,6 +18,9 @@
 //! | `broken` | gives up and asks to be reset (virtio's DEVICE_NEEDS_RESET), as it must when the driver breaks the protocol |
 //! | `admin_missed` | NVMe: completes the first admin command without an interrupt (the driver ignores the one it gets) |
 //! | `tiny` | virtio: offers a queue of two descriptors, fewer than one request takes |
+//! | `generation` | virtio: its configuration's generation changes on every read, from bring-up on |
+//! | `short` | virtio-blk: completes a read saying it wrote only the status byte, not the data |
+//! | `unplugged` | e1000e: holds every transmit while its link is down, as an 82574 does |
 //!
 //! The virtio queue ([`crate::virtio`]) commits all six (`broken` by
 //! offering the device a descriptor chain it must refuse, which a virtio
@@ -42,6 +45,9 @@ pub enum Fault {
     Broken = 6,
     AdminMissed = 7,
     Tiny = 8,
+    Generation = 9,
+    Short = 10,
+    Unplugged = 11,
 }
 
 impl Fault {
@@ -56,6 +62,9 @@ impl Fault {
             b"broken" => Fault::Broken,
             b"admin_missed" => Fault::AdminMissed,
             b"tiny" => Fault::Tiny,
+            b"generation" => Fault::Generation,
+            b"short" => Fault::Short,
+            b"unplugged" => Fault::Unplugged,
             _ => return None,
         })
     }
@@ -70,6 +79,9 @@ impl Fault {
             6 => Fault::Broken,
             7 => Fault::AdminMissed,
             8 => Fault::Tiny,
+            9 => Fault::Generation,
+            10 => Fault::Short,
+            11 => Fault::Unplugged,
             _ => return None,
         })
     }

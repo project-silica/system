@@ -155,6 +155,9 @@ struct Nic {
     _interrupts: Vec<Interrupt>,
     /// An injected `stuck`: the device no longer sees transmits.
     stuck: bool,
+    /// An injected `unplugged`: the device holds transmits while its link
+    /// is down, as an 82574 does (QEMU's model sends them nowhere at once).
+    unplugged: bool,
 }
 
 impl Nic {
@@ -183,6 +186,30 @@ impl Nic {
         silica_rt::exit(2)
     }
 
+    /// The link went down: an 82574 holds what it was given to send until
+    /// the link comes back, which a request's timeout would take for a
+    /// dead device (every cable pull restarted the driver). The transmit
+    /// unit is stopped, every frame it held is answered as dropped, and the
+    /// ring starts again empty (82574 datasheet: TDH and TDT written only
+    /// while TCTL.EN is clear).
+    fn drop_transmits(&mut self, done: &mut Completions<'_>) {
+        let tctl = self.regs.read32(TCTL);
+        self.regs.write32(TCTL, tctl & !TCTL_EN);
+        // The write reaches the device before the ring is taken back.
+        let _ = self.regs.read32(STATUS);
+        let mut dropped = 0;
+        self.tx.drain(|ticket| {
+            dropped += 1;
+            done(ticket, Err(Status::Io));
+        });
+        self.regs.write32(TDH, 0);
+        self.regs.write32(TDT, 0);
+        self.regs.write32(TCTL, tctl);
+        if dropped != 0 {
+            println!("e1000e: {dropped} frames dropped with the link");
+        }
+    }
+
     fn link_up(&self) -> bool {
         self.regs.read32(STATUS) & STATUS_LU != 0
     }
@@ -207,11 +234,22 @@ impl silica_net::service::Device for Nic {
     fn start(&mut self, r: &Request, address: u64, ticket: Ticket) -> Result<(), Refusal> {
         // An injected fault comes due with the nth request offered.
         inject::due();
+        // Injected: from here on the device holds transmits while its link
+        // is down (`kick`).
+        if inject::pending(Fault::Unplugged) {
+            self.unplugged = true;
+        }
         match r.op {
             // The device writes the length back; the buffer is RECEIVE_BYTES
             // (the service checked the request has that many).
             Op::Receive => self.rx.add(address, 0, 0, ticket, now()).then_some(()).ok_or(Refusal::Busy),
             Op::Transmit => {
+                // With the link down nothing is sent: the frame is dropped at
+                // once, as a cable pulled drops it, rather than held for a
+                // timeout that would take the device for dead.
+                if !self.info.link_up {
+                    return Err(Refusal::Fail(Status::Io));
+                }
                 let length = u16::try_from(r.length).map_err(|_| Refusal::Fail(Status::Invalid))?;
                 if !self.tx.add(address, length, TX_EOP | TX_IFCS | TX_RS, ticket, now()) {
                     return Err(Refusal::Busy);
@@ -272,7 +310,10 @@ impl silica_net::service::Device for Nic {
                 Err(broken) => self.give_up(DeviceError::Protocol(broken.why())),
             }
         }
-        while let Some(d) = if missed { None } else { self.tx.pop() } {
+        // Injected `unplugged`: while its link is down the device reports
+        // no transmit done, as an 82574 holding its queue does.
+        let holding = self.unplugged && !self.info.link_up;
+        while let Some(d) = if missed || holding { None } else { self.tx.pop() } {
             done(d.ticket, Ok(0));
         }
         // The queues whose interrupt came were masked when it was sent:
@@ -291,6 +332,9 @@ impl silica_net::service::Device for Nic {
             if up != self.info.link_up {
                 self.info.link_up = up;
                 println!("e1000e: link {}", if up { "up" } else { "down" });
+                if !up {
+                    self.drop_transmits(done);
+                }
                 link(up);
             }
         }
@@ -438,6 +482,7 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         rings: [rx_memory, tx_memory],
         _interrupts: interrupts,
         stuck: false,
+        unplugged: false,
     };
     nic.info.link_up = nic.link_up();
     let a = address.to_le_bytes();

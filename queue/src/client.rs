@@ -413,7 +413,16 @@ impl<C: Control> Queue<C> {
             backoff: 0,
             nap: OwnedObject::new(ObjectType::Notification, 0)?,
         };
-        q.connect()?;
+        match q.connect() {
+            Ok(()) => {}
+            // Its driver ended as this opened (it refused its device at
+            // bring-up, or was restarted): the next one is waited for as
+            // for a connection lost later, [`Queue::RECONNECT_NS`] at most.
+            // Before, the open failed at once, and whether a client got
+            // its disk depended on when it asked.
+            Err(Error::Gone) => q.recover()?,
+            Err(e) => return Err(e),
+        }
         Ok(q)
     }
 

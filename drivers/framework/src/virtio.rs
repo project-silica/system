@@ -48,6 +48,15 @@ const CONFIG_VECTOR: usize = 0x10;
 const NUM_QUEUES: usize = 0x12;
 const DEVICE_STATUS: usize = 0x14;
 const CONFIG_GENERATION: usize = 0x15;
+/// How often [`Transport::read_config`] reads a configuration that changes
+/// underneath before it gives the device up: a configuration changes when
+/// something happens to the device (a disk resized, a link changed), not
+/// sixty-four times in a row.
+pub const CONFIG_READS: u32 = 64;
+/// An injected `generation` was committed: every read after reports a new
+/// generation ([`Transport::config_generation`]).
+static CHURN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static TURNS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
 const QUEUE_SELECT: usize = 0x16;
 const QUEUE_SIZE: usize = 0x18;
 const QUEUE_VECTOR: usize = 0x1A;
@@ -118,10 +127,40 @@ impl Transport {
         self.device
     }
 
+    /// Fields of the device-specific configuration that belong together,
+    /// as `read` reads them, under one configuration generation (virtio 1.2,
+    /// 4.1.4.3.1): read again while the generation changes underneath, at
+    /// most [`CONFIG_READS`] times, then the device is refused. A device
+    /// whose configuration never settles spun its driver at bring-up for
+    /// ever, and never said so (the 2026-11-25 drivers review).
+    pub fn read_config<T>(&self, mut read: impl FnMut() -> T) -> Result<T, DeviceError> {
+        for _ in 0..CONFIG_READS {
+            let before = self.config_generation();
+            let fields = read();
+            if self.config_generation() == before {
+                return Ok(fields);
+            }
+        }
+        Err(DeviceError::Protocol("the configuration changes on every read"))
+    }
+
     /// Changes every time the device-specific configuration changes: read
-    /// it before and after reading several fields that belong together.
+    /// it before and after reading several fields that belong together
+    /// ([`Transport::read_config`]).
     pub fn config_generation(&self) -> u8 {
-        self.common.read8(CONFIG_GENERATION)
+        let generation = self.common.read8(CONFIG_GENERATION);
+        // Injected (`generation`): from here on the device reports a new
+        // generation at every read, as one whose configuration never
+        // settles would.
+        if CHURN.load(core::sync::atomic::Ordering::Relaxed)
+            || (inject::planned() == Some(Fault::Generation)
+                && inject::due() == Some(Fault::Generation)
+                && inject::pending(Fault::Generation))
+        {
+            CHURN.store(true, core::sync::atomic::Ordering::Relaxed);
+            return generation.wrapping_add(TURNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
+        }
+        generation
     }
 
     /// Whether the device has given up and asks to be reset (virtio 1.2,
@@ -548,13 +587,18 @@ impl Queue {
         if inject::pending(Fault::Garbage) {
             u.write32(o, 0xFFFF_FF00);
         }
-        let (id, written) = (u.read32(o), u.read32(o + 4));
+        let (id, mut written) = (u.read32(o), u.read32(o + 4));
         let Some(slot) = self.offered.get_mut(id as usize) else {
             return Err(DeviceError::Protocol("the device completed a request the driver never offered"));
         };
         let Some(Offered { token, count, writable }) = *slot else {
             return Err(DeviceError::Protocol("the device completed a request the driver never offered"));
         };
+        // Injected (`short`): a request with data for the driver completed
+        // as if the device wrote only its last byte.
+        if writable > 1 && inject::pending(Fault::Short) {
+            written = 1;
+        }
         // A length past the buffers would have a client read what the
         // device never wrote: the device is not believed.
         if written as u64 > writable {

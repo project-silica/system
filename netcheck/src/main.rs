@@ -279,9 +279,81 @@ fn check(mut nic: Interface, driver: &str) -> Result<(), &'static str> {
         times.push(clock.now() - t);
     }
     pass("ping");
+    if silica_rt::option("unplug").is_some() {
+        unplug(&mut c, gateway)?;
+        pass("unplug");
+    }
     times.sort_unstable();
     println!("BENCH {driver}_ping_user_mode {} ns", times[times.len() / 2]);
     bench(&mut c, driver)
+}
+
+/// `netcheck.unplug`: the cable pulled during traffic. It says it is ready
+/// (the harness takes the link down), sends eight frames while the link is
+/// down, and waits longer than the driver's transmit limit: every one must
+/// be answered (sent or dropped) and the driver must carry on, not end as a
+/// device that died (the 2026-11-25 drivers review: an 82574 holds
+/// transmits while its link is down, and its driver timed them out and gave
+/// the device up, so every cable pull restarted it). Then it says so (the
+/// harness brings the link back) and the gateway must answer an ARP again.
+fn unplug(c: &mut Check, gateway: [u8; 6]) -> Result<(), &'static str> {
+    let clock = silica_rt::clock();
+    let o = OUT as usize;
+    println!("netcheck: ready for unplug");
+    loop {
+        let e = c.nic.kick_wait(Some(clock.now() + 5 * SECOND)).map_err(|e| why(e, "the link never went down"))?;
+        if e.tag == LINK && e.result == Ok(0) {
+            break;
+        }
+    }
+    let first = c.sent + 1;
+    for _ in 0..8 {
+        c.put(o, &[0xFF; 6]);
+        c.put(o + 6, &c.mac);
+        c.put(o + 12, &[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+        c.put(o + 22, &c.mac);
+        c.put(o + 28, &ME);
+        c.put(o + 32, &[0; 6]);
+        c.put(o + 38, &GATEWAY);
+        c.put(o + 42, &[0; 18]);
+        c.send(42)?;
+    }
+    c.nic.kick();
+    // Longer than the driver's transmit limit (1 s while a fault is armed,
+    // 5 s otherwise).
+    let until = clock.now() + 6 * SECOND;
+    let mut answered = 0;
+    while clock.now() < until {
+        match c.nic.kick_wait(Some(until)) {
+            Ok(x) if x.tag >= SENT + first && x.tag < SENT + first + 8 => answered += 1,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    println!("netcheck: unplugged: {answered} of 8 transmits answered while the link was down");
+    if answered != 8 {
+        return Err("transmits while the link was down were never answered");
+    }
+    println!("netcheck: ready for link up");
+    loop {
+        let e = c.nic.kick_wait(Some(clock.now() + 5 * SECOND)).map_err(|e| why(e, "the link never came back"))?;
+        if e.tag == LINK && e.result == Ok(1) {
+            break;
+        }
+    }
+    c.put(o, &[0xFF; 6]);
+    c.put(o + 6, &c.mac);
+    c.put(o + 12, &[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+    c.put(o + 22, &c.mac);
+    c.put(o + 28, &ME);
+    c.put(o + 32, &[0; 6]);
+    c.put(o + 38, &GATEWAY);
+    c.put(o + 42, &[0; 18]);
+    c.send(42)?;
+    c.receive(clock.now() + 3 * SECOND, &mut |c, at, n| {
+        let f = c.get(at, n.min(42));
+        n >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2] && f[22..28] == gateway
+    })
 }
 
 /// The benchmarks, where the host's echo answers.
