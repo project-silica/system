@@ -50,6 +50,49 @@ impl Pool {
     }
 }
 
+
+/// Whether `read`, bytes a randomness device just gave, may be counted
+/// towards the pool being seeded: they pass the continuous health tests a
+/// noise source's output must (NIST SP 800-90B, 4.4), for the full entropy
+/// a device claims (8 bits a byte), and do not repeat the device's last
+/// read (`last`). Bytes that fail are still mixed in (they cannot weaken the
+/// pool) but are not counted: a broken device that gives constant bytes, or
+/// the same bytes every time, does not make the service say it is seeded.
+///
+/// - Repetition count: no value four times in a row (the cutoff for
+///   H = 8 at a false-positive rate of 2^-20: 1 + ceil(20 / 8)).
+/// - Proportion: no value more than 13 times among the 64 bytes asked for
+///   (the binomial's tail for p = 1/256 at 2^-20 is near 9; 13 leaves room).
+/// - At least 32 distinct values among 64 (about 56 are expected).
+pub fn healthy(read: &[u8], last: &[u8]) -> Result<(), &'static str> {
+    if read.len() < 16 {
+        return Err("too few bytes to judge");
+    }
+    if read == last {
+        return Err("the same bytes as the read before");
+    }
+    let mut run = 1;
+    for w in read.windows(2) {
+        run = if w[0] == w[1] { run + 1 } else { 1 };
+        if run >= 4 {
+            return Err("a byte repeated four times in a row");
+        }
+    }
+    let mut counts = [0u8; 256];
+    for b in read {
+        counts[*b as usize] = counts[*b as usize].saturating_add(1);
+    }
+    let limit = (read.len() * 13).div_ceil(64).max(4);
+    if counts.iter().any(|c| *c as usize > limit) {
+        return Err("one value far more often than chance");
+    }
+    let distinct = counts.iter().filter(|c| **c != 0).count();
+    if distinct * 2 < read.len().min(256) {
+        return Err("too few distinct values");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -105,5 +148,27 @@ mod tests {
         let n = buf.len() as u64 * 8;
         let sigma = ((n / 4) as f64).sqrt();
         assert!(((ones as f64) - (n / 2) as f64).abs() < 6.0 * sigma, "{ones} ones in {n} bits");
+    }
+
+    #[test]
+    fn a_device_that_is_stuck_or_constant_is_not_counted() {
+        let zeros = [0u8; 64];
+        assert!(healthy(&zeros, &[]).is_err(), "all zeros");
+        let mut run = [0u8; 64];
+        for (i, b) in run.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        run[10..14].fill(7);
+        assert!(healthy(&run, &[]).is_err(), "a byte four times in a row");
+        let two: [u8; 64] = core::array::from_fn(|i| if i % 2 == 0 { 0x55 } else { 0xAA });
+        assert!(healthy(&two, &[]).is_err(), "two values alternating");
+        // What a generator gives passes, but not twice the same.
+        let mut pool = Pool::new([9; 32]);
+        let mut good = [0u8; 64];
+        for _ in 0..1000 {
+            pool.fill(&mut good);
+            assert_eq!(healthy(&good, &[]), Ok(()));
+        }
+        assert!(healthy(&good, &good).is_err(), "the same read again");
     }
 }
