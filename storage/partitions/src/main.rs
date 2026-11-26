@@ -108,9 +108,28 @@ fn table(id: u32, names: &mut Vec<&'static str>) -> Result<Vec<Part>, &'static s
         }
         Ok(data)
     };
-    let Some(header) = gpt::header(&read(&mut disk, 1, bs)?, disk_blocks)? else { return Ok(Vec::new()) };
-    let entries = read(&mut disk, header.entries_at, header.entries_len())?;
-    let parts = gpt::entries(&header, &entries, |i, why| println!("partitions: disk {id:#x}: entry {i} left out: {why}"))?;
+    // The table from one copy of the header: `Ok(None)` when that copy is
+    // not there at all.
+    let mut copy = |disk: &mut Disk, at: u64| -> Result<Option<Vec<gpt::Entry>>, &'static str> {
+        let Some(header) = gpt::header_at(&read(disk, at, bs)?, disk_blocks, at)? else { return Ok(None) };
+        let entries = read(disk, header.entries_at, header.entries_len())?;
+        gpt::entries(&header, &entries, |i, why| println!("partitions: disk {id:#x}: entry {i} left out: {why}")).map(Some)
+    };
+    // The primary copy, else the backup at the disk's last block (a torn
+    // write or a damaged first block leaves the backup whole: the table is
+    // there twice for this).
+    let parts = match copy(&mut disk, 1) {
+        Ok(Some(p)) => p,
+        primary => match copy(&mut disk, disk_blocks.saturating_sub(1).max(1)) {
+            Ok(Some(p)) => {
+                let why = primary.err().unwrap_or("it has no primary GPT header");
+                println!("partitions: disk {id:#x}: {why}; its backup GPT is used");
+                p
+            }
+            Ok(None) => return primary.map(|_| Vec::new()),
+            Err(_) => return primary.map(|_| Vec::new()),
+        },
+    };
     // A partition is named by its disk and its index in a byte.
     for e in parts.iter().filter(|e| e.index > 0xFF) {
         println!("partitions: disk {id:#x}: entry {} left out: only the first 256 entries are numbered", e.index);

@@ -122,6 +122,18 @@ pub fn header(block: &[u8], disk_blocks: u64) -> Result<Option<Header>, &'static
     Ok(Some(Header { entries_at: le64(block, 72), count, entry_bytes, entries_crc: le32(block, 88), first_usable, last_usable }))
 }
 
+/// [`header`] for the copy read from block `at`: the primary (block 1) or
+/// the backup (the disk's last block), which says where it is itself (UEFI
+/// 2.10 5.3.2: a header found at one place that names another is not this
+/// one).
+pub fn header_at(block: &[u8], disk_blocks: u64, at: u64) -> Result<Option<Header>, &'static str> {
+    let h = header(block, disk_blocks)?;
+    if h.is_some() && le64(block, 24) != at {
+        return Err("its GPT header names another block as its own");
+    }
+    Ok(h)
+}
+
 /// The partitions in `bytes` (at least [`Header::entries_len`] of them, as
 /// read from [`Header::entries_at`]), in table order. An entry that lies
 /// outside the usable blocks, or overlaps one taken before it, is left
