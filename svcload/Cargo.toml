@@ -11,6 +11,9 @@ publish.workspace = true
 needs = ["silica.system.Manager:observe+control+logs", "silica.block.Partitions:list+open", "silica.log.Reader", "silica.console.Terminal", "silica.device.Manager:block+network+display+port+input+entropy+control"]
 memory = 22
 start = "check:services"
+# On a processor after the first (the service manager chooses): what it
+# loads is the services on processor 0.
+cpu = "any"
 
 [[bin]]
 name = "svcload"

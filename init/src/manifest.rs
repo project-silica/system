@@ -27,6 +27,10 @@
 //! - `start=boot` runs at every boot; `start=check:<c>` only when the
 //!   command line's `checks=` names `c`, and the boot waits for it to end
 //!   with status 0.
+//! - `cpu=<n>`: it runs on processor `n` (a machine without one runs it on
+//!   processor 0, and says so); `cpu=any`: the service manager chooses, spreading
+//!   such services over the processors after the first. Without the word it runs
+//!   on processor 0, where every service ran before declarations said where.
 //! - `restart=always`: started again when it fails (`silica_proc::Restarts`:
 //!   at once the first time, then backing off to a try a minute; never given
 //!   up on for good).
@@ -62,6 +66,13 @@ pub enum Start {
     Check(&'static str),
 }
 
+/// Where a service runs (`cpu=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cpu {
+    Fixed(u32),
+    Any,
+}
+
 /// One declared service.
 #[derive(Clone, Debug)]
 pub struct Service {
@@ -79,6 +90,8 @@ pub struct Service {
     pub files: Vec<&'static str>,
     pub start: Start,
     pub restart: bool,
+    /// Where it runs.
+    pub cpu: Cpu,
 }
 
 /// The services the list declares, or what is wrong with a line.
@@ -101,6 +114,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             files: Vec::new(),
             start: Start::Boot,
             restart: false,
+            cpu: Cpu::Fixed(0),
         };
         for w in words {
             let (key, value) = w.split_once('=').unwrap_or((w, ""));
@@ -135,6 +149,8 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("start", c) if c.starts_with("check:") => s.start = Start::Check(&c[6..]),
                 ("restart", "always") => s.restart = true,
                 ("restart", "never") => s.restart = false,
+                ("cpu", "any") => s.cpu = Cpu::Any,
+                ("cpu", n) => s.cpu = Cpu::Fixed(n.parse().map_err(|_| "a service's cpu is not a processor number or `any`")?),
                 _ => return Err("a service line has a word the service manager does not know"),
             }
         }

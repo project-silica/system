@@ -60,8 +60,8 @@ fn now() -> u64 {
     silica_rt::clock().now()
 }
 
-fn main(_info: &'static ProcessInfo) -> i64 {
-    match run() {
+fn main(info: &'static ProcessInfo) -> i64 {
+    match placed(info).and_then(|()| run()) {
         Ok(()) => {
             println!("SVCLOAD OK");
             0
@@ -172,6 +172,20 @@ fn err(e: silica_idl_rt::CallError<system::Error>) -> system::Error {
         silica_idl_rt::CallError::Error(e) => e,
         silica_idl_rt::CallError::Transport(_) => system::Error::Unknown(u32::MAX),
     }
+}
+
+/// This check is declared `cpu = "any"`: the service manager puts it on a
+/// processor after the first, where every other service runs, whenever the
+/// machine has one (the 2026-11-24 audit: declarations said nothing of
+/// processors, and everything ran on processor 0).
+fn placed(info: &ProcessInfo) -> Result<(), String> {
+    let me = silica_rt::sys::inspect_thread(slots::THREAD).map_err(|e| format!("inspecting this thread: {e:?}"))?;
+    let want = if info.cpus > 1 { 1 } else { 0 };
+    if me.cpu != want {
+        return Err(format!("declared cpu=any on a machine of {} processors, it runs on processor {}, not {want}", info.cpus, me.cpu));
+    }
+    println!("svcload: placed on processor {} of {}, as its declaration lets the service manager choose", me.cpu, info.cpus);
+    Ok(())
 }
 
 fn run() -> Result<(), String> {

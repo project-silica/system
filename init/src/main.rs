@@ -38,7 +38,7 @@ mod manifest;
 use core::sync::atomic::{AtomicU64, Ordering};
 use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, RootInfo, SLOT_DEVICES, SLOT_FIRST_UNTYPED, SLOT_INFO, SLOT_IRQS};
 use libsys::{self as sys, ObjectType, Rights, Wait};
-use manifest::{Service, Start};
+use manifest::{Cpu, Service, Start};
 use silica_formats::ramdisk;
 use silica_proc::root::{self, Root, finish};
 use silica_proc::{Child, FAULT_BADGE, Grant, Program, Restarts, spawn};
@@ -162,6 +162,8 @@ struct Manager {
     options: Vec<Vec<u8>>,
     /// The order services were started in, for stopping them in reverse.
     order: Vec<usize>,
+    /// The processor each service runs on (`place`).
+    placed: Vec<usize>,
     /// What `list` answers with, rebuilt for each call.
     listed: Vec<manager::Service<'static>>,
     /// What `describe` answers with.
@@ -317,6 +319,7 @@ impl Manager {
             mem_bits: s.memory,
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
+            cpu: self.placed[i],
             ..Program::new(image, SERVICE_IDS + i as u64)
         };
         let child = spawn(&self.root.parent, &program).map_err(|e| {
@@ -979,7 +982,9 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             o
         })
         .collect();
+    let placed = place(&services, root.parent.cpus as usize);
     let mut m = Manager {
+        placed,
         root,
         info,
         services,
@@ -1230,4 +1235,24 @@ impl core::fmt::Display for Hex<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
     }
+}
+
+/// The processor each of `services` runs on (`cpu=`, manifest.rs;
+/// `silica_proc::place`), saying so of one declared for a processor this
+/// machine does not have, which runs on processor 0.
+fn place(services: &[Service], cpus: usize) -> Vec<usize> {
+    let wanted: Vec<silica_proc::Placement> = services
+        .iter()
+        .map(|s| match s.cpu {
+            Cpu::Fixed(n) => silica_proc::Placement::Fixed(n),
+            Cpu::Any => silica_proc::Placement::Any,
+        })
+        .collect();
+    let placed = silica_proc::place(&wanted, cpus);
+    for (s, (_, missing)) in services.iter().zip(&placed) {
+        if *missing {
+            println!("init: {} is declared for a processor this machine does not have ({cpus}); it runs on processor 0", s.name);
+        }
+    }
+    placed.into_iter().map(|(c, _)| c).collect()
 }
