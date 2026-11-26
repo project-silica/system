@@ -70,8 +70,8 @@ const HELD: usize = 4;
 /// How long an address is asked for before what waits for it is dropped.
 const RESOLVE_WAIT: u64 = 3 * SECOND;
 
-fn main(_info: &'static ProcessInfo) -> i64 {
-    match run() {
+fn main(info: &'static ProcessInfo) -> i64 {
+    match run(info) {
         Ok(never) => match never {},
         Err(e) => {
             println!("ERROR: netd: {e}");
@@ -130,24 +130,28 @@ impl Devices {
     }
 }
 
-fn run() -> Result<core::convert::Infallible, &'static str> {
+fn run(start: &ProcessInfo) -> Result<core::convert::Infallible, &'static str> {
     // Options that do not parse stop the stack, rather than have it guess.
     let fixed = fixed_lease()?;
     let mut devices = Devices::new()?;
+    // The page the program before this one left, when this is the first
+    // instance of a new one: the service manager's last grant, beyond the
+    // two every instance has. Looked at once.
+    let mut left = (start.grants > 2).then(|| Cap(slots::FIRST_GRANT + start.grants - 1));
     loop {
         let id = devices.interface()?;
         // An interface whose driver cannot be talked to (failing, or not
         // keeping to its protocol) is not the stack's to give up on: the
         // device manager restarts a failing driver, and a change is waited
         // for before the interface is tried again.
-        let Err(why) = use_interface(id, fixed);
+        let Err(why) = use_interface(id, fixed, left.take());
         println!("netd: interface {id:#x}: {why}; waiting for its driver to change");
         devices.wait()?;
     }
 }
 
 /// Run the stack on the interface `id` until it cannot be used.
-fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infallible, &'static str> {
+fn use_interface(id: u32, fixed: Option<Lease>, left: Option<Cap>) -> Result<core::convert::Infallible, &'static str> {
     // One notification for everything: the interface's bits, then the
     // programs' (`tcp`).
     let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
@@ -210,6 +214,24 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         }
         _ => Vec::new(),
     };
+    // What the program before this one left, when this is the first
+    // instance of a new one (the service manager's last grant, read-only):
+    // another program's page, of which only its connections are taken, to
+    // reset them as a stack that was killed resets its own, and the
+    // address they were on, to compare with the one this stack comes to
+    // hold. Its lease is not taken: this program asks for its own.
+    let left = left.and_then(|c| mem::peer(c, 12, Rights::READ).ok());
+    let (left_resets, resets_from) = match left.as_ref().and_then(|k| Some((k, k.part(128, 4096 - 128)?))) {
+        Some((k, r)) if k.read64(120) == tcp::RECORDS_MARK => {
+            (tcp::left_connections(&r), (k.read64(0) == KEPT_LEASE).then(|| Ipv4::from_u32(k.read64(16) as u32)))
+        }
+        _ => (Vec::new(), None),
+    };
+    if !left_resets.is_empty() {
+        println!("netd: {} connections of the program before this one to reset", left_resets.len());
+    }
+    let resets_from = if resets.is_empty() { resets_from } else { None };
+    let resets = if resets.is_empty() { left_resets } else { resets };
     let mut s = Stack {
         nic,
         m: memory.shared(),
@@ -231,6 +253,7 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
         resets,
         resets_until: 0,
+        resets_from,
         time: TimeClient::new(clock, now),
         caller: 0,
         more: true,
@@ -446,6 +469,9 @@ struct Stack {
     /// When the resets not sent by then are given up (their peers' hops
     /// never answered ARP); set when the first one waits.
     resets_until: u64,
+    /// The address those connections were on, when another program's
+    /// page says so: they are reset only from that address.
+    resets_from: Option<Ipv4>,
     time: TimeClient,
     /// Work is left (a completion there, segments with no transmit slot):
     /// look again at once rather than wait.
@@ -658,6 +684,13 @@ impl Stack {
     fn send_resets(&mut self, now: u64) {
         let Some(l) = self.lease else { return };
         if self.resets.is_empty() {
+            return;
+        }
+        if let Some(from) = self.resets_from.take()
+            && from != l.address
+        {
+            println!("netd: {} connections of the program before this one were on {from}, not {}: not reset", self.resets.len(), l.address);
+            self.resets.clear();
             return;
         }
         let hop = |r: Ipv4| if l.address.same_subnet(r, l.prefix) { Some(r) } else { l.router };

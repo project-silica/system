@@ -243,22 +243,29 @@ pub struct Kept {
 /// The connections an earlier stack recorded in `records`, taken out (the
 /// records are cleared for this stack's own).
 pub fn kept_connections(records: &Mmio) -> Vec<Kept> {
+    let kept = left_connections(records);
+    clear_records(records);
+    kept
+}
+
+/// The connections `records` name, the records left as they are: those of
+/// the program before this one, in a page this one may only read (the
+/// service manager hands it over when a stack's program is replaced). Any
+/// bytes decode: each record is at most one reset, to an address a
+/// connection can be with (not none, a group's or the broadcast address)
+/// and from and to a port that is one, which is no more than the program
+/// that wrote them could have sent itself.
+pub fn left_connections(records: &Mmio) -> Vec<Kept> {
     let mut kept = Vec::new();
     for i in 0..records.len() / RECORD {
         let at = i * RECORD;
-        let remote = records.read32(at);
-        if remote == 0 {
+        let remote = Ipv4::from_u32(records.read32(at));
+        let ports = records.read32(at + 4);
+        let (remote_port, local_port) = (ports as u16, (ports >> 16) as u16);
+        if remote == Ipv4::UNSPECIFIED || remote == Ipv4::BROADCAST || remote.is_multicast() || remote_port == 0 || local_port == 0 {
             continue;
         }
-        let ports = records.read32(at + 4);
-        kept.push(Kept {
-            remote: Ipv4::from_u32(remote),
-            remote_port: ports as u16,
-            local_port: (ports >> 16) as u16,
-            sequence: records.read32(at + 8),
-            acknowledges: records.read32(at + 12),
-        });
-        records.write32(at, 0);
+        kept.push(Kept { remote, remote_port, local_port, sequence: records.read32(at + 8), acknowledges: records.read32(at + 12) });
     }
     kept
 }

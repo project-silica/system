@@ -42,7 +42,11 @@
 //! - `keeps`: it is given a page of 4 KiB (`slots::KEEP`), zeroed at boot,
 //!   that the service manager keeps across its restarts: what a service
 //!   started again needs to pick up where the last one was (the network
-//!   stack's lease, so that it answers on its address at once).
+//!   stack's lease, so that it answers on its address at once). When its
+//!   program is replaced (`update`, `revert`) the page starts empty, and
+//!   the old one is the new program's last grant, read-only, for its first
+//!   instance: another program's bytes (the network stack takes from it the
+//!   connections to reset, and nothing else).
 //! - `ends`: it has something to finish before it is let go of (the device
 //!   manager: its disks' caches). When the machine is turned off it is
 //!   asked to end (`silica_rt::END` on its events notification) and given a
