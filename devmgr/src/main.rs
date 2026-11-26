@@ -833,6 +833,7 @@ impl Manager {
         };
         // Its registers: one frame per memory BAR.
         let mut grants = [Grant::none(); silica_driver::grant::COUNT];
+        let mut frames = [None; 6];
         for (i, bar) in f.bars.iter().enumerate() {
             let Some(bar) = bar else { continue };
             if bar.bits < 12 {
@@ -842,6 +843,9 @@ impl Manager {
             }
             let frame = self.memory.frame(bar.base, bar.bits).map_err(|_| "its registers are not in the machine's device memory")?;
             grants[silica_driver::grant::BAR0 as usize + i] = Grant::lend(frame, RW);
+            if let Some(slot) = frames.get_mut(i) {
+                *slot = Some((frame, bar.bits));
+            }
         }
         let f = &self.functions[index];
         let service = Object::new(ObjectType::Endpoint, 0).map_err(|_| "no memory for its service endpoint")?;
@@ -874,6 +878,17 @@ impl Manager {
         let registers = config.registers();
         registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
         if let Some(msix) = config.msix() {
+            // Every entry masked and emptied before any can fire: the table
+            // still holds the last driver's messages, whose lines may since
+            // belong to another device. Enabled under the function mask,
+            // emptied, then the mask lifted; the new driver unmasks each
+            // entry only after writing it (`Interrupt::bind_to`).
+            let control = registers.read16(msix.cap + 2);
+            registers.write16(msix.cap + 2, control | 1 << 15 | 1 << 14);
+            match frames.get(msix.bar as usize).copied().flatten() {
+                Some((frame, bits)) => mask_msix_table(frame, bits, msix.offset as usize, msix.vectors as usize)?,
+                None => return Err("its MSI-X table is in no memory BAR"),
+            }
             registers.write16(msix.cap + 2, (registers.read16(msix.cap + 2) | 1 << 15) & !(1 << 14));
         }
         self.next_id += 1;
@@ -1235,6 +1250,33 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         }
         m.start_again(function, driver);
     }
+}
+
+/// Mask and empty each of the `vectors` entries of the MSI-X table at
+/// `offset` in the BAR whose frame is `frame` (`2^bits` bytes), before a
+/// driver is started: an entry left by the last driver names a line that
+/// may since be another device's (QEMU's VT-d model aborted re-routing one,
+/// and real units fault every message through it).
+fn mask_msix_table(frame: Cap, bits: u8, offset: usize, vectors: usize) -> Result<(), &'static str> {
+    let at = mem::map(frame, bits, RW).map_err(|_| "its MSI-X table cannot be mapped")?;
+    // SAFETY: the device's own BAR, mapped here and unmapped below before
+    // its driver (which gets a copy of the frame) is started.
+    #[allow(unsafe_code)]
+    let table = unsafe { Mmio::new(at, 1 << bits) };
+    let result = (|| {
+        for v in 0..vectors {
+            let entry = table.part(offset + v * 16, 16).ok_or("its MSI-X table lies outside its BAR")?;
+            entry.write32(12, 1);
+            entry.write32(0, 0);
+            entry.write32(4, 0);
+            entry.write32(8, 0);
+        }
+        Ok(())
+    })();
+    // SAFETY: nothing refers to the mapping after this.
+    #[allow(unsafe_code)]
+    let _ = unsafe { sys::unmap(frame) };
+    result
 }
 
 /// The device of `config` may no longer do DMA or send message interrupts:
