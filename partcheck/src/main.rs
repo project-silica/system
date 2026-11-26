@@ -35,11 +35,48 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     }
 }
 
+/// Wait until the block server lists partitions (as many as
+/// `partcheck.partitions=<n>` says, when it says), woken by the device
+/// manager each time a disk gains or loses its driver (`watch` first, then
+/// `list`, so no change between them is missed). The block server serves
+/// from its start with the disks it has; a disk still on its way is the
+/// client's to wait for, on the device manager's word. The bound is a
+/// backstop: past it no disk came, which is this test's failure.
+fn wait_for_partitions(devices: Cap, list: &mut partitions::Client<Channel, Handle>) -> Result<(), &'static str> {
+    use silica_rt::sys::{self, ObjectType, Rights, Wait};
+    let changed = silica_rt::mem::Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
+    let slot = silica_rt::ipc::free_slot().ok_or("no free slot")?;
+    sys::cap_derive(slots::SPACE, slot, changed.cap(), Rights::WRITE, 0).map_err(|_| "the notification cannot be lent")?;
+    let mut devices = manager::Client::<Channel, Handle>::from(Channel::new(devices));
+    devices.watch(manager::Class::Block, Handle::new(Cap(slot))).map_err(|_| "the device manager does not answer a watch")?;
+    let want = silica_rt::option("partitions").and_then(|n| n.parse::<u32>().ok());
+    let deadline = silica_rt::clock().now() + 30 * SECOND;
+    loop {
+        let (mut n, mut from) = (0u32, 0);
+        loop {
+            let part = list.list(from).map_err(|_| "the block server does not answer")?;
+            n += part.partitions.iter().count() as u32;
+            if part.next == 0 || part.next <= from {
+                break;
+            }
+            from = part.next;
+        }
+        if n > 0 && want.is_none_or(|w| n >= w) {
+            return Ok(());
+        }
+        if sys::recv(changed.cap(), Wait::Until(deadline)).is_err() {
+            println!("partcheck: {n} partitions listed after 30 s of the device manager's news");
+            return Err("no disk with the partitions expected arrived");
+        }
+    }
+}
+
 fn run() -> Result<(), &'static str> {
     let pass = |name: &str| println!("TEST partitions.{name} PASS");
     let devices = Cap(slots::FIRST_GRANT);
     let server = Cap(slots::FIRST_GRANT + 1);
     let mut list = partitions::Client::<Channel, Handle>::from(Channel::new(server));
+    wait_for_partitions(devices, &mut list)?;
     // Every partition of every disk, part after part: as many as the
     // machine's disks have (`partcheck.partitions=<n>` says how many to
     // expect: a disk with a full table of 128 is one before which the list

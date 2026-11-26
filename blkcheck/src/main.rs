@@ -59,10 +59,16 @@ fn main(info: &'static ProcessInfo) -> i64 {
 
 /// Every block device with a driver: its identity and its driver's name.
 fn disks(devices: &mut manager::Client<Channel, Handle>) -> Result<Vec<(u32, silica_rt::alloc::string::String)>, &'static str> {
-    // The device manager answers once it has started a driver for every
-    // device it found; a disk may still be on its way when the first
-    // answer comes, so an empty list is asked again for a while.
-    let deadline = silica_rt::clock().now() + 10 * SECOND;
+    // A disk may still be on its way when the first answer comes: the
+    // device manager says when one gains its driver (`watch` first, then
+    // `list`, so no change between them is missed). The bound is a
+    // backstop: past it no disk came, which is this test's failure.
+    use silica_rt::sys::{self, ObjectType, Rights, Wait};
+    let changed = silica_rt::mem::Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
+    let slot = silica_rt::ipc::free_slot().ok_or("no free slot")?;
+    sys::cap_derive(slots::SPACE, slot, changed.cap(), Rights::WRITE, 0).map_err(|_| "the notification cannot be lent")?;
+    devices.watch(manager::Class::Block, Handle::new(Cap(slot))).map_err(|e| why(e, "the device manager does not answer a watch"))?;
+    let deadline = silica_rt::clock().now() + 30 * SECOND;
     loop {
         let (mut found, mut from) = (Vec::new(), 0);
         loop {
@@ -76,10 +82,9 @@ fn disks(devices: &mut manager::Client<Channel, Handle>) -> Result<Vec<(u32, sil
         if !found.is_empty() {
             return Ok(found);
         }
-        if silica_rt::clock().now() > deadline {
-            return Err("no block device has a driver after 10 s");
+        if sys::recv(changed.cap(), Wait::Until(deadline)).is_err() {
+            return Err("no block device gained a driver in 30 s of the device manager's news");
         }
-        silica_rt::sys::yield_now();
     }
 }
 
