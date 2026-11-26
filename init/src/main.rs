@@ -949,14 +949,17 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         .iter()
         .map(|s| s.keeps.then(|| Object::new(ObjectType::Frame, 12).unwrap_or_else(|_| fail!("no memory for {}'s page", s.name))))
         .collect();
-    // A group for each service, on the processor it runs on (0): a program
+    // Where each service runs (its declaration's `cpu=`, or processor 0).
+    let placed = place(&services, root.parent.cpus as usize);
+    // A group for each service, on the processor it runs on: a program
     // that makes many threads takes one share, not one a thread (the
     // remediation of the 2026-11-24 audit).
     let groups = services
         .iter()
-        .map(|s| {
+        .zip(&placed)
+        .map(|(s, &cpu)| {
             let g = Object::new(ObjectType::SchedContext, 0).unwrap_or_else(|_| fail!("no memory for {}'s group", s.name));
-            if let Err(e) = sys::sched_group(g.cap(), libsys::SCHED_DEFAULT_WEIGHT, 0, sys::Cap(libsys::root::SLOT_SCHED)) {
+            if let Err(e) = sys::sched_group(g.cap(), libsys::SCHED_DEFAULT_WEIGHT, cpu, sys::Cap(libsys::root::SLOT_SCHED)) {
                 fail!("cannot make {}'s group: {e:?}", s.name);
             }
             g
@@ -1000,7 +1003,6 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             o
         })
         .collect();
-    let placed = place(&services, root.parent.cpus as usize);
     let mut m = Manager {
         placed,
         root,
