@@ -45,8 +45,8 @@ use silica_block::service::{CLIENT, Completions, Device as BlockDevice, Refusal,
 use silica_block::{Op, Request, Status};
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject::{self, Fault};
-use silica_driver::oldest::Oldest;
 use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::oldest::Oldest;
 use silica_driver::{Device, DeviceError};
 use silica_rt::alloc::vec::Vec;
 use silica_rt::mmio::Mmio;
@@ -214,7 +214,10 @@ impl Controller {
         loop {
             if let Some(c) = self.admin.pop()? {
                 if !woken {
-                    println!("nvme: {what}: its completion came without its interrupt; found by polling after {} us", (now() - start) / 1000);
+                    println!(
+                        "nvme: {what}: its completion came without its interrupt; found by polling after {} us",
+                        (now() - start) / 1000
+                    );
                 }
                 self.admin.release();
                 if c.cid != self.cid {

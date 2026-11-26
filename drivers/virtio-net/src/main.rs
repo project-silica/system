@@ -28,8 +28,8 @@
 
 use silica_driver::dma::{Dma, DmaMemory, Shared};
 use silica_driver::inject;
-use silica_driver::oldest::Oldest;
 use silica_driver::irq::{Interrupt, Signals};
+use silica_driver::oldest::Oldest;
 use silica_driver::virtio::{Buffer, Queue, Transport};
 use silica_driver::{Device, DeviceError, grant, granted};
 use silica_net::device::{Error, Info};

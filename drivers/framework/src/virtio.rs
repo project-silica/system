@@ -221,7 +221,11 @@ impl Transport {
         self.common.write16(QUEUE_SELECT, index);
         let offered = self.common.read16(QUEUE_SIZE);
         // An injected fault (`inject`): the device offers two descriptors.
-        let offered = if inject::planned() == Some(Fault::Tiny) && inject::due() == Some(Fault::Tiny) && inject::pending(Fault::Tiny) { 2 } else { offered };
+        let offered = if inject::planned() == Some(Fault::Tiny) && inject::due() == Some(Fault::Tiny) && inject::pending(Fault::Tiny) {
+            2
+        } else {
+            offered
+        };
         if offered == 0 {
             return Err(DeviceError::Missing("the queue"));
         }

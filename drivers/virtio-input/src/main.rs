@@ -201,21 +201,20 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         }
     }
     let events = dma.memory(12, true)?;
-    let mut keyboard =
-        Keyboard {
-            queue,
-            events,
-            name,
-            name_len,
-            client: None,
-            mapped: None,
-            early: [[0; 8]; EARLY],
-            early_len: 0,
-            _interrupt: interrupt,
-            _config: config_irq,
-            transport,
-            config_shared: config_vector == 0,
-        };
+    let mut keyboard = Keyboard {
+        queue,
+        events,
+        name,
+        name_len,
+        client: None,
+        mapped: None,
+        early: [[0; 8]; EARLY],
+        early_len: 0,
+        _interrupt: interrupt,
+        _config: config_irq,
+        transport,
+        config_shared: config_vector == 0,
+    };
     for slot in 0..BUFFERS.min(keyboard.queue.size()) {
         keyboard.offer(slot);
     }
