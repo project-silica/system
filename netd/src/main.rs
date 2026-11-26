@@ -18,7 +18,8 @@
 //! It provides TCP to programs (`silica.net.Tcp`, the `tcp` module), in the
 //! same thread and the same wait as its interface: one notification, the
 //! interface's bits below `tcp::GONE`, then the kernel's notice that a
-//! program using TCP ended, then the programs' bits.
+//! program using TCP ended, the device manager's word that an interface
+//! gained or lost its driver ([`DEVICES_CHANGED`]), then the programs' bits.
 //!
 //! What it does not do yet (spec/MILESTONES.md, M4): UDP for programs,
 //! IPv6, more than one interface, reassembly; a program's call made before
@@ -70,8 +71,8 @@ const HELD: usize = 4;
 /// How long an address is asked for before what waits for it is dropped.
 const RESOLVE_WAIT: u64 = 3 * SECOND;
 
-fn main(_info: &'static ProcessInfo) -> i64 {
-    match run() {
+fn main(info: &'static ProcessInfo) -> i64 {
+    match run(info) {
         Ok(never) => match never {},
         Err(e) => {
             println!("ERROR: netd: {e}");
@@ -80,30 +81,38 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     }
 }
 
-/// A copy of `cap` in a free slot of this program, with `rights`, to hand
-/// to another program in a call.
-fn lend(cap: Cap, rights: Rights) -> Result<Handle, &'static str> {
+/// A copy of `cap` in a free slot of this program, with `rights` and
+/// `badge`, to hand to another program in a call.
+fn lend(cap: Cap, rights: Rights, badge: u64) -> Result<Handle, &'static str> {
     let slot = free_slot().ok_or("no free capability slot")?;
-    if sys::cap_derive(slots::SPACE, slot, cap, rights, 0).is_err() {
+    if sys::cap_derive(slots::SPACE, slot, cap, rights, badge).is_err() {
         release_slot(slot);
         return Err("cannot lend a capability");
     }
     Ok(Handle::new(Cap(slot)))
 }
 
+/// The bit of the stack's notification the device manager signals when a
+/// network interface gains or loses its driver (its `watch`): how the stack
+/// hears that the driver of the interface it uses is back, and that there
+/// is an interface at all. Between `tcp::GONE` and the programs' bits.
+const DEVICES_CHANGED: u64 = 1 << 9;
+
 /// The device manager, watched for network interfaces gaining or losing
 /// their drivers.
 struct Devices {
     client: manager::Client<Channel, Handle>,
-    changed: Object,
+    changed: Cap,
 }
 
 impl Devices {
-    fn new() -> Result<Devices, &'static str> {
+    /// Watching on `note`, the stack's one notification, bit [`DEVICES_CHANGED`].
+    fn new(note: Cap) -> Result<Devices, &'static str> {
         let mut client = manager::Client::<Channel, Handle>::from(Channel::new(DEVICES));
-        let changed = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
-        client.watch(manager::Class::Network, lend(changed.cap(), Rights::WRITE)?).map_err(|_| "the device manager does not answer")?;
-        Ok(Devices { client, changed })
+        client
+            .watch(manager::Class::Network, lend(note, Rights::WRITE, DEVICES_CHANGED)?)
+            .map_err(|_| "the device manager does not answer")?;
+        Ok(Devices { client, changed: note })
     }
 
     /// The first network interface with a driver, waited for (no wake-ups
@@ -124,38 +133,51 @@ impl Devices {
         }
     }
 
-    /// Until an interface gains or loses a driver.
+    /// Until an interface gains or loses a driver (whatever else signals
+    /// the notification meanwhile is nothing to wait for here).
     fn wait(&mut self) -> Result<(), &'static str> {
-        sys::recv(self.changed.cap(), Wait::Forever).map(|_| ()).map_err(|_| "cannot wait for an interface")
+        loop {
+            let m = sys::recv(self.changed, Wait::Forever).map_err(|_| "cannot wait for an interface")?;
+            if m.badge & DEVICES_CHANGED != 0 {
+                return Ok(());
+            }
+        }
     }
 }
 
-fn run() -> Result<core::convert::Infallible, &'static str> {
+fn run(start: &ProcessInfo) -> Result<core::convert::Infallible, &'static str> {
     // Options that do not parse stop the stack, rather than have it guess.
     let fixed = fixed_lease()?;
-    let mut devices = Devices::new()?;
+    // One notification for everything, for as long as the stack runs: the
+    // interface's bits, the device manager's, then the programs' (`tcp`).
+    let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
+    let mut devices = Devices::new(note.cap())?;
+    // The page the program before this one left, when this is the first
+    // instance of a new one: the service manager's last grant, beyond the
+    // two every instance has. Looked at once.
+    let mut left = (start.grants > 2).then(|| Cap(slots::FIRST_GRANT + start.grants - 1));
     loop {
         let id = devices.interface()?;
         // An interface whose driver cannot be talked to (failing, or not
         // keeping to its protocol) is not the stack's to give up on: the
         // device manager restarts a failing driver, and a change is waited
         // for before the interface is tried again.
-        let Err(why) = use_interface(id, fixed);
+        let Err(why) = use_interface(id, fixed, left.take(), note.cap());
         println!("netd: interface {id:#x}: {why}; waiting for its driver to change");
         devices.wait()?;
     }
 }
 
 /// Run the stack on the interface `id` until it cannot be used.
-fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infallible, &'static str> {
-    // One notification for everything: the interface's bits, then the
-    // programs' (`tcp`).
-    let note = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for a notification")?;
-    let mut nic = Interface::open_on(DEVICES, id, note.cap(), 0).map_err(|e| match e {
+fn use_interface(id: u32, fixed: Option<Lease>, left: Option<Cap>, note: Cap) -> Result<core::convert::Infallible, &'static str> {
+    let mut nic = Interface::open_on(DEVICES, id, note, 0).map_err(|e| match e {
         silica_net::client::Error::Refused(silica_queue::Refused::Busy) => "another program has it",
         silica_net::client::Error::Gone => "its driver ended",
         _ => "it cannot be opened (its driver does not keep to the protocol)",
     })?;
+    // The device manager says when the interface's driver changes: its next
+    // driver is tried then, not by the clock.
+    nic.provider_changed();
     let info = nic.info().map_err(|_| "the interface says nothing about itself")?;
     let a = info.address.to_le_bytes();
     let mac = Mac([a[0], a[1], a[2], a[3], a[4], a[5]]);
@@ -210,8 +232,28 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         }
         _ => Vec::new(),
     };
+    // What the program before this one left, when this is the first
+    // instance of a new one (the service manager's last grant, read-only):
+    // another program's page, of which only its connections are taken, to
+    // reset them as a stack that was killed resets its own, and the
+    // address they were on, to compare with the one this stack comes to
+    // hold. Its lease is not taken: this program asks for its own.
+    let left = left.and_then(|c| mem::peer(c, 12, Rights::READ).ok());
+    let (left_resets, resets_from) = match left.as_ref().and_then(|k| Some((k, k.part(128, 4096 - 128)?))) {
+        Some((k, r)) if k.read64(120) == tcp::RECORDS_MARK => {
+            (tcp::left_connections(&r), (k.read64(0) == KEPT_LEASE).then(|| Ipv4::from_u32(k.read64(16) as u32)))
+        }
+        _ => (Vec::new(), None),
+    };
+    if !left_resets.is_empty() {
+        println!("netd: {} connections of the program before this one to reset", left_resets.len());
+    }
+    let resets_from = if resets.is_empty() { resets_from } else { None };
+    let resets = if resets.is_empty() { left_resets } else { resets };
     let mut s = Stack {
         nic,
+        id,
+        devices: manager::Client::<Channel, Handle>::from(Channel::new(DEVICES)),
         m: memory.shared(),
         mac,
         free: (1 << SLOTS) - 1,
@@ -228,9 +270,10 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
         out: [0; BUFFER],
         probe: None,
         dropped: Dropped::default(),
-        tcp: Some(tcp::Tcp::new(note.cap(), info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
+        tcp: Some(tcp::Tcp::new(note, info.mtu.min(1500) as u16, records, checksum_offload, most_payload as u32)),
         resets,
         resets_until: 0,
+        resets_from,
         time: TimeClient::new(clock, now),
         caller: 0,
         more: true,
@@ -259,7 +302,7 @@ fn use_interface(id: u32, fixed: Option<Lease>) -> Result<core::convert::Infalli
             s.ping(now, r);
         }
     }
-    silica_rt::ipc::serve_events(ENDPOINT, note.cap(), &mut s)
+    silica_rt::ipc::serve_events(ENDPOINT, note, &mut s)
 }
 
 /// The ports the time-server client asks from: a random one of these for
@@ -413,6 +456,9 @@ struct Probe {
 
 struct Stack {
     nic: Interface,
+    /// The interface's identity, and the device manager to ask about it.
+    id: u32,
+    devices: manager::Client<Channel, Handle>,
     m: Mmio,
     mac: Mac,
     /// Free transmit slots, a bit each.
@@ -446,6 +492,9 @@ struct Stack {
     /// When the resets not sent by then are given up (their peers' hops
     /// never answered ARP); set when the first one waits.
     resets_until: u64,
+    /// The address those connections were on, when another program's
+    /// page says so: they are reset only from that address.
+    resets_from: Option<Ipv4>,
     time: TimeClient,
     /// Work is left (a completion there, segments with no transmit slot):
     /// look again at once rather than wait.
@@ -653,11 +702,37 @@ impl Stack {
         }
     }
 
+    /// The interface's driver is away and the device manager says the
+    /// machine's interfaces changed. A driver being started again is
+    /// waited for, for as long as the device manager takes: it signals
+    /// again when there is one, and the connections wait as they do for a
+    /// cable put back. If the device itself is gone and the machine has
+    /// another interface, the stack starts again on that one. (Before, the
+    /// stack looked every 50 us to 4 ms for 5 s and then ended, whatever
+    /// the device manager knew.)
+    fn interface_away(&mut self) {
+        let Ok(listed) = self.devices.list(manager::Class::Network, 0) else { return };
+        let mut others = listed.devices.iter().filter(|d| d.id != self.id);
+        if listed.devices.iter().all(|d| d.id != self.id)
+            && let Some(other) = others.next()
+        {
+            println!("netd: interface {:#x} is gone and {:#x} is there: starting again on it", self.id, other.id);
+            silica_rt::exit(1);
+        }
+    }
+
     /// Reset the connections the last stack had (`tcp::kept_connections`),
     /// once the lease is held and the first hop's Ethernet address known.
     fn send_resets(&mut self, now: u64) {
         let Some(l) = self.lease else { return };
         if self.resets.is_empty() {
+            return;
+        }
+        if let Some(from) = self.resets_from.take()
+            && from != l.address
+        {
+            println!("netd: {} connections of the program before this one were on {from}, not {}: not reset", self.resets.len(), l.address);
+            self.resets.clear();
             return;
         }
         let hop = |r: Ipv4| if l.address.same_subnet(r, l.prefix) { Some(r) } else { l.router };
@@ -1193,6 +1268,10 @@ impl Events for Stack {
 
     fn signals(&mut self, signals: u64) {
         self.nic.signalled(signals);
+        let changed = signals & DEVICES_CHANGED != 0;
+        if changed {
+            self.nic.provider_changed();
+        }
         if let Some(t) = self.tcp.as_mut() {
             if signals & tcp::GONE != 0 {
                 t.forget_ended();
@@ -1201,6 +1280,9 @@ impl Events for Stack {
             t.signalled(signals);
         }
         self.work();
+        if changed && self.nic.away() {
+            self.interface_away();
+        }
     }
 
     fn deadline(&self) -> Option<u64> {
@@ -1222,9 +1304,14 @@ impl proto::Server<Handle> for Stack {
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.add_memory(badge, memory)
     }
 
-    fn listen(&mut self, port: u16, backlog: u32, ready: Handle) -> Result<proto::ListenReply, proto::Error> {
+    /// Retired: naming a port is never the authority to listen on it.
+    fn listen(&mut self, _port: u16, _backlog: u32, _ready: Handle) -> Result<proto::ListenReply, proto::Error> {
+        Err(proto::Error::NotGranted)
+    }
+
+    fn listen_given(&mut self, backlog: u32, ready: Handle) -> Result<proto::ListenGivenReply, proto::Error> {
         let badge = self.caller;
-        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, port, backlog, ready)
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.listen(badge, backlog, ready)
     }
 
     fn accept(&mut self, listener: u32, offset: u64, bits: u8, wake: Handle) -> Result<proto::AcceptReply<Handle>, proto::Error> {
@@ -1240,6 +1327,11 @@ impl proto::Server<Handle> for Stack {
     fn close(&mut self, connection: u32) -> Result<proto::CloseReply, proto::Error> {
         let badge = self.caller;
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.close(badge, connection)
+    }
+
+    fn reset(&mut self, connection: u32) -> Result<proto::ResetReply, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.reset_conn(badge, connection)
     }
 
     fn unlisten(&mut self, listener: u32) -> Result<proto::UnlistenReply, proto::Error> {

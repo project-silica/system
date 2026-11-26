@@ -20,7 +20,6 @@ use silica_rt::{ProcessInfo, println, slots};
 
 silica_rt::main!(main);
 
-const PORT: u16 = 80;
 /// The largest body asked for.
 const MOST: u64 = 16 << 20;
 /// The longest request head kept (method, path, version, headers).
@@ -56,21 +55,24 @@ static QUIT_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 fn main(_info: &'static ProcessInfo) -> i64 {
     // On its events: the stack is its need 0 (bit 0), so a restart of the
     // stack is seen and its listener set up again; its own bits from 32.
-    let mut tcp = match Tcp::on(silica_rt::sys::Cap(slots::FIRST_GRANT), 22, slots::EVENTS, 32, 1) {
+    // 8 MiB lent: 128 connections (one for every 64 KiB, the stack's rule),
+    // accepted, waiting to be, and let go of but not yet ended.
+    let mut tcp = match Tcp::on(silica_rt::sys::Cap(slots::FIRST_GRANT), 23, slots::EVENTS, 32, 1) {
         Ok(t) => t,
         Err(e) => {
             println!("ERROR: httpd: no TCP: {e:?}");
             return 1;
         }
     };
-    let listener = match tcp.listen(PORT, 64) {
+    // On the port its declaration was given (`listen=<port>`).
+    let (listener, port) = match tcp.listen(64) {
         Ok(l) => l,
         Err(e) => {
-            println!("ERROR: httpd: cannot listen on port {PORT}: {e:?}");
+            println!("ERROR: httpd: cannot listen on the port it was given: {e:?}");
             return 1;
         }
     };
-    println!("httpd: listening on port {PORT}");
+    println!("httpd: listening on port {port}");
     let quit_allowed = silica_rt::option("quit") == Some("allowed");
     let mut conns: Vec<Conn> = Vec::new();
     let mut buf = [0u8; 16384];
@@ -121,11 +123,18 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                 progress |= failed(c);
             }
         }
-        // Done with: the answer sent and finished, and the peer done too.
+        // Done with: the answer sent and finished. The stack sends the rest
+        // and ends the connection, which stays this program's to pay for
+        // until then and gives its place when this program needs it: a
+        // peer that never reads its answer, or never finishes, holds
+        // nothing here (before, each such connection kept its block for
+        // good, and 64 of them shut the server). The one that asked the
+        // server to end is kept until its peer has finished, so that the
+        // answer is not lost with the server.
         let mut i = 0;
         while i < conns.len() {
             let c = &conns[i];
-            if c.finished && c.peer_done {
+            if c.finished && (c.peer_done || !c.quit) {
                 let c = conns.swap_remove(i);
                 let quit = c.quit;
                 let _ = tcp.close(c.s);

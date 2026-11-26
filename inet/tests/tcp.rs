@@ -1039,6 +1039,28 @@ fn a_live_peer_may_keep_its_window_shut_for_as_long_as_it_answers() {
     assert!(probes >= 20, "the window was probed all along ({probes})");
 }
 
+/// Once its program has let go of the connection (closed in order, the
+/// rest left to the stack), nobody but the peer waits for those bytes: a
+/// peer that answers every probe with its window still shut is given up
+/// on after as many probes as a segment is sent again (RFC 6429: a sender
+/// may end such a connection to keep its resources). Before, it held the
+/// connection, its buffers and its program's place for as long as it
+/// liked: 128 of them shut a server for good.
+#[test]
+fn a_peer_that_keeps_its_window_shut_on_a_connection_nobody_holds_is_given_up_on() {
+    let mut net = Net::new((64 << 10, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    net.a.send(&pattern(40_000));
+    net.a.close();
+    net.run_until(30 * SECOND, |_| false);
+    assert!(!net.a.is_closed());
+    net.a.release(net.now);
+    let let_go = net.now;
+    net.run_until(45 * 60 * SECOND, |n| n.a.is_closed());
+    assert_eq!(net.a.error(), Some(Error::TimedOut), "a peer with its window shut held a connection nobody holds");
+    assert!(net.now <= let_go + 16 * 60 * SECOND, "given up on after {} s", (net.now - let_go) / SECOND);
+}
+
 /// A peer that stops answering the probes is given up on, as before.
 #[test]
 fn a_peer_that_stops_answering_a_shut_window_is_given_up_on() {

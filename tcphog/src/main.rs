@@ -3,10 +3,12 @@
 //!
 //! - It opens connections, to an address on the link that never answers
 //!   (each stays a handshake that is retried), until the stack refuses.
-//!   The stack is one table for the machine: before 2026-11-25 one program
-//!   took every place in it, and no other program could connect or accept
-//!   until its handshakes gave up minutes later. It must be refused with
-//!   `no_room` after a fair share and before half the table.
+//!   A program has as many connections as the memory it lent pays for,
+//!   one for every 64 KiB (what a connection costs the stack in buffers
+//!   of its own), however small it cuts its blocks: before 2026-11-25
+//!   one program took every place in the stack's table, then half of
+//!   it whatever it lent. It lends 1 MiB and must be refused its 17th
+//!   with `no_room`.
 //! - It names blocks of the memory it lent that are not in it: at the top
 //!   of the 64-bit range (where the end wraps past zero), past its end, and
 //!   larger than all of it. Each must be refused as `bad_memory`, and the
@@ -30,9 +32,10 @@ use silica_rt::{ProcessInfo, println, slots};
 
 silica_rt::main!(main);
 
-/// The stack's table (netd's `CONNECTIONS`) and what one program may hold.
-const TABLE: usize = 256;
-const SHARE: usize = TABLE / 2;
+/// What a connection costs the stack (netd's two buffers of 32 KiB), and
+/// so how many this program's memory pays for.
+const COST: usize = 64 << 10;
+const SHARE: usize = (1 << MEMORY_BITS) / COST;
 /// 10.0.2.99: on QEMU's user-mode link, nobody.
 const NOBODY: Endpoint = Endpoint { address: 0x0A00_0263, port: 9 };
 /// The memory lent, in blocks of 4 KiB.
@@ -68,15 +71,21 @@ fn run() -> Result<(), silica_rt::alloc::string::String> {
     let note = Object::new(ObjectType::Notification, 0).map_err(|e| format!("no notification: {e:?}"))?;
     let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
     stack.add_memory(lend(memory.frame(), rw, 0).ok_or("no slot")?).map_err(|e| format!("add_memory: {e:?}"))?;
-    // Ports it was not given: the remote service's, the web server's and
-    // one nobody listens on. Before, any holder took any port first come,
-    // first served (the remote service's, while it started again).
+    // Its capability carries no port (`connect` alone). Before, any holder
+    // took any port first come, first served (the remote service's, while it
+    // started again). Naming one (the retired `listen`) is refused whatever
+    // the port, and so is listening on the port its capability carries.
     for (port, whose) in [(22, "the remote service's"), (80, "the web server's"), (8080, "nobody's")] {
         let ready = lend(note.cap(), Rights::WRITE, 2).ok_or("no slot")?;
         match stack.listen(port, 1, ready) {
             Err(CallError::Error(Error::NotGranted)) => {}
-            r => return Err(format!("listening on port {port}, {whose}, with a capability that carries no port: {r:?}, not not_granted")),
+            r => return Err(format!("naming port {port}, {whose}, to listen on: {r:?}, not not_granted")),
         }
+    }
+    let ready = lend(note.cap(), Rights::WRITE, 2).ok_or("no slot")?;
+    match stack.listen_given(1, ready) {
+        Err(CallError::Error(Error::NotGranted)) => {}
+        r => return Err(format!("listening with a capability that carries no port: {r:?}, not not_granted")),
     }
     let connect = |stack: &mut proto::Client<Channel, Handle>, offset: u64, bits: u8| {
         let wake = lend(note.cap(), Rights::WRITE, 1).ok_or(CallError::Error(Error::NoRoom))?;
@@ -106,9 +115,10 @@ fn run() -> Result<(), silica_rt::alloc::string::String> {
         }
     };
     println!("tcphog: {} connections held, then {refusal:?}", held.len());
-    if refusal != Some(CallError::Error(Error::NoRoom)) || held.len() > SHARE || held.len() < SHARE * 3 / 4 {
+    if refusal != Some(CallError::Error(Error::NoRoom)) || held.len() != SHARE {
         return Err(format!(
-            "one program held {} of the stack's {TABLE} connections before it was refused ({refusal:?}); its share is at most {SHARE}",
+            "a program that lent {} KiB held {} connections before it was refused ({refusal:?}); its memory pays for {SHARE}",
+            (1 << MEMORY_BITS) >> 10,
             held.len()
         ));
     }

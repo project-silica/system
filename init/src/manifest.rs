@@ -42,7 +42,11 @@
 //! - `keeps`: it is given a page of 4 KiB (`slots::KEEP`), zeroed at boot,
 //!   that the service manager keeps across its restarts: what a service
 //!   started again needs to pick up where the last one was (the network
-//!   stack's lease, so that it answers on its address at once).
+//!   stack's lease, so that it answers on its address at once). When its
+//!   program is replaced (`update`, `revert`) the page starts empty, and
+//!   the old one is the new program's last grant, read-only, for its first
+//!   instance: another program's bytes (the network stack takes from it the
+//!   connections to reset, and nothing else).
 //! - `ends`: it has something to finish before it is let go of (the device
 //!   manager: its disks' caches). When the machine is turned off it is
 //!   asked to end (`silica_rt::END` on its events notification) and given a
@@ -190,6 +194,23 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             && out.iter().filter(|o| o.provides == Some(p)).count() > 1
         {
             return Err("two services provide one protocol");
+        }
+    }
+    // A TCP port is given to one service: the second declaration that names
+    // it is the owner's mistake, said here, not a race the first to listen
+    // wins at run time.
+    let port = |s: &Service| {
+        s.needs
+            .iter()
+            .zip(&s.scopes)
+            .filter(|(n, _)| **n == "silica.net.Tcp")
+            .find_map(|(_, b)| silica_protocols::scope::tcp_listen(b << silica_protocols::scope::SHIFT))
+    };
+    for (i, s) in out.iter().enumerate() {
+        if let Some(p) = port(s)
+            && out[..i].iter().any(|o| port(o) == Some(p))
+        {
+            return Err("two services are given one TCP port to listen on");
         }
     }
     Ok(out)

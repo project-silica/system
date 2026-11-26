@@ -333,6 +333,11 @@ pub struct Queue<C: Control> {
     /// before that (doubling from [`FIRST_TRY_NS`] to [`LAST_TRY_NS`]).
     next_try: u64,
     backoff: u64,
+    /// The queue's owner hears from the device manager when a device of
+    /// the class gains or loses its driver, and says so
+    /// ([`Queue::provider_changed`]): the next driver is then tried when
+    /// that is said, never by the clock.
+    told: bool,
     /// What a call that cannot go on without a driver sleeps on between
     /// tries: signalled by nobody.
     nap: OwnedObject,
@@ -411,6 +416,7 @@ impl<C: Control> Queue<C> {
             recovered_in: None,
             next_try: 0,
             backoff: 0,
+            told: false,
             nap: OwnedObject::new(ObjectType::Notification, 0)?,
         };
         match q.connect() {
@@ -520,6 +526,14 @@ impl<C: Control> Queue<C> {
                 }
                 Ok(true)
             }
+            // Not back yet, and the owner is told when it is: tried again
+            // then, however long that takes (a driver the device manager
+            // keeps starting, a device taken out: the owner knows which
+            // from the device manager, not from a time gone by).
+            Err(Error::Gone) if self.told => {
+                self.next_try = u64::MAX;
+                Ok(false)
+            }
             // Not back yet: the device manager is starting it again.
             Err(Error::Gone) if now < self.lost_at + Self::RECONNECT_NS => {
                 self.backoff = (self.backoff * 2).clamp(FIRST_TRY_NS, LAST_TRY_NS);
@@ -531,9 +545,15 @@ impl<C: Control> Queue<C> {
     }
 
     /// Wait for the next driver: for what cannot go on without one (a
-    /// control call, registering memory). Sleeps between tries.
+    /// control call, registering memory). Sleeps between tries; a queue
+    /// whose owner is told of the next driver does not wait here, where
+    /// nothing would wake it: the call fails `Gone`, and the owner makes
+    /// it again when it was told.
     fn recover(&mut self) -> Result<(), Error> {
         while !self.try_recover()? {
+            if self.told {
+                return Err(Error::Gone);
+            }
             let _ = sys::recv(self.nap.cap(), Wait::Until(self.next_try));
         }
         Ok(())
@@ -554,7 +574,22 @@ impl<C: Control> Queue<C> {
     /// to look again ([`Queue::poll`] tries then). A client on its own
     /// notification ([`Queue::open_on`]) waits no later than this.
     pub fn retry_at(&self) -> Option<u64> {
-        self.link.is_none().then_some(self.next_try)
+        self.link.is_none().then_some(self.next_try).filter(|t| *t != u64::MAX)
+    }
+
+    /// The device manager signalled that a device of this queue's class
+    /// gained or lost its driver (its `watch`, which the queue's owner
+    /// asked for and waits on): if the queue's driver is away, the next
+    /// one is tried at the next [`Queue::poll`]. From the first call the
+    /// queue no longer tries by the clock (50 us to 4 ms apart, for 5 s,
+    /// then `Gone`): it hears when there is a driver to try, and its
+    /// owner is never woken to look for one that is not there. Call it
+    /// once when the watch is set, and at every signal after.
+    pub fn provider_changed(&mut self) {
+        self.told = true;
+        if self.link.is_none() {
+            self.next_try = 0;
+        }
     }
 
     /// A recovery in progress ended at `now`: keep how it went.
@@ -628,6 +663,12 @@ impl<C: Control> Queue<C> {
             *m = None;
         }
         Ok(())
+    }
+
+    /// Whether the driver is away: it ended, and the next has not taken
+    /// the connection yet.
+    pub fn away(&self) -> bool {
+        self.link.is_none()
     }
 
     /// How many requests are in progress.

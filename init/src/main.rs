@@ -202,6 +202,11 @@ struct Manager {
     /// it: its threads take that one share however many it makes, and
     /// the programs it starts run on it too.
     sched: Vec<Object>,
+    /// The page the program before a service's new one kept (`fresh_keep`),
+    /// and whether an instance was started with it: the new program's
+    /// first instance is given it read-only, as its last grant, and it goes
+    /// when that instance has.
+    left: Vec<Option<(Object, bool)>>,
     /// The time page (`silica_rt::time`), set from the firmware's clock.
     time: silica_rt::mem::Memory,
     /// Each service's options: the boot command line's
@@ -329,6 +334,14 @@ impl Manager {
             }
             args[3] = self.info.entropy_sources;
         }
+        if s.keeps {
+            // Last: the page the program before this one left (`fresh_keep`),
+            // for its first instance, read-only.
+            grants.push(match &self.left[i] {
+                Some((page, false)) => Grant::lend(page.cap(), Rights::READ),
+                _ => Grant::none(),
+            });
+        }
         Ok((grants, args))
     }
 
@@ -353,6 +366,16 @@ impl Manager {
             Some(p) => p.as_slice(),
             None => ramdisk::find(self.root.archive, s.program).ok_or("its program is not in the boot archive")?,
         };
+        // The page of the program before this one was the last instance's
+        // to read: that instance has ended, and the page goes.
+        if let Some((page, true)) = self.left[i].take_if(|(_, given)| *given) {
+            // SAFETY: init never maps it, and the one instance that had
+            // it has ended.
+            #[allow(unsafe_code)]
+            unsafe {
+                page.destroy()
+            };
+        }
         let (grants, args) = self.grants(i)?;
         let log = self.log.as_ref().and_then(|l| Some((l.rings.get(i)?.as_ref()?.cap(), l.note.cap())));
         // Nothing a last instance was told is news to this one.
@@ -378,6 +401,9 @@ impl Manager {
             "it could not be started"
         })?;
         self.running[i].starts += 1;
+        if let Some((_, given)) = &mut self.left[i] {
+            *given = true;
+        }
         self.running[i].restarts.started(silica_rt::clock().now());
         // An update's trial runs from its program's first start.
         if let Some((_, until @ 0)) = &mut self.running[i].trial {
@@ -840,22 +866,35 @@ impl Manager {
 
     /// Service `i` runs another program from its next start: the page it
     /// keeps across restarts starts empty, so nothing a program wrote there
-    /// is read by one installed in its place (a compromised instance's
-    /// data trusted by its replacement). The old page goes at once: each
-    /// caller ends the running instance next.
+    /// is taken for its own by one installed in its place (a compromised
+    /// instance's data trusted by its replacement). The old page is handed
+    /// to the new program's first instance read-only, as its last grant:
+    /// another program's bytes, from which it takes what it would believe
+    /// of a stranger (the network stack: which peers to tell that their
+    /// connections are gone, as after it was killed, and nothing else).
+    /// A page left by the program before and never handed over (the new
+    /// program never started) stays the one handed over: what replaces it
+    /// here was nobody's yet.
     fn fresh_keep(&mut self, i: usize) {
         if self.kept[i].is_some() {
             match Object::new(ObjectType::Frame, 12) {
                 Ok(page) => {
                     println!("init: {}'s kept page starts empty for its new program", self.services[i].name);
                     if let Some(old) = self.kept[i].replace(page) {
-                        // SAFETY: init never maps it; the instance that has
-                        // it is ended before the next starts (each caller ends
-                        // it next), and reads zeros meanwhile.
-                        #[allow(unsafe_code)]
-                        unsafe {
-                            old.destroy()
+                        let stale = match &self.left[i] {
+                            Some((_, false)) => Some(old),
+                            _ => self.left[i].replace((old, false)).map(|(page, _)| page),
                         };
+                        if let Some(stale) = stale {
+                            // SAFETY: init never maps it, and no instance
+                            // has it: one never started on it, or the one
+                            // that read it is ended by each caller next,
+                            // and reads zeros meanwhile.
+                            #[allow(unsafe_code)]
+                            unsafe {
+                                stale.destroy()
+                            };
+                        }
                     }
                 }
                 Err(_) => println!("ERROR: init: no memory to give {} an empty page; it keeps the old one", self.services[i].name),
@@ -1308,7 +1347,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     }
     // The pages services keep across their restarts: zero at boot (a new
     // frame is).
-    let kept = services
+    let kept: Vec<Option<Object>> = services
         .iter()
         .map(|s| s.keeps.then(|| Object::new(ObjectType::Frame, 12).unwrap_or_else(|_| fail!("no memory for {}'s page", s.name))))
         .collect();
@@ -1374,6 +1413,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         endpoints,
         running,
         events,
+        left: kept.iter().map(|_| None).collect(),
         kept,
         sched,
         time,
