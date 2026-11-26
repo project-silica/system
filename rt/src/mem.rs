@@ -438,3 +438,80 @@ impl Memory {
         unsafe { self.frame.destroy() }
     }
 }
+
+/// Memory of the program's own that is only ever read and written through
+/// [`SharedMemory::shared`] (one access at a time), given back when it is
+/// dropped: rings a program shares with a driver or a service. Safe where
+/// [`Memory::free`] is not because nothing can refer into it but an
+/// [`Mmio`], and an `Mmio` access after the memory is gone faults instead of
+/// reaching anything (its addresses are never mapped again: [`reserve`]).
+#[derive(Debug)]
+pub struct SharedMemory(Option<Memory>);
+
+impl SharedMemory {
+    /// New memory of `2^bits` bytes (at least a page), zeroed.
+    pub fn new(bits: u8) -> Result<SharedMemory, Error> {
+        Memory::new(bits).map(|m| SharedMemory(Some(m)))
+    }
+
+    /// The memory, read and written one access at a time.
+    pub fn shared(&self) -> Mmio {
+        self.0.as_ref().map(Memory::shared).unwrap_or_else(|| unreachable!("SharedMemory is never empty before it drops"))
+    }
+
+    /// The frame capability, to derive what others are given from.
+    pub fn frame(&self) -> Cap {
+        self.0.as_ref().map(Memory::frame).unwrap_or(Cap::NONE)
+    }
+}
+
+impl Drop for SharedMemory {
+    fn drop(&mut self) {
+        if let Some(m) = self.0.take() {
+            // SAFETY: nothing refers into it but `Mmio`s, which fault once
+            // it is gone (the type's documentation); a peer or a device that
+            // was lent it loses it with every capability derived from it.
+            #[allow(unsafe_code)]
+            unsafe {
+                m.free()
+            };
+        }
+    }
+}
+
+/// A kernel object that is never mapped (a notification, an endpoint, a
+/// scheduling context), destroyed with every capability to it when it is
+/// dropped. Safe where [`Object::destroy`] is not: nothing in the program
+/// can refer into an object that is not memory, and a capability to one
+/// that is gone is simply empty.
+#[derive(Debug)]
+pub struct OwnedObject(Option<Object>);
+
+impl OwnedObject {
+    /// A new object of type `ty` (not a frame or an Untyped: memory is
+    /// [`Memory`] or [`SharedMemory`]) and size `2^bits` bytes.
+    pub fn new(ty: ObjectType, bits: u8) -> Result<OwnedObject, Error> {
+        if matches!(ty, ObjectType::Frame | ObjectType::Untyped | ObjectType::AddressSpace) {
+            return Err(Error::BadArg);
+        }
+        Object::new(ty, bits).map(|o| OwnedObject(Some(o)))
+    }
+
+    /// The capability to the object.
+    pub fn cap(&self) -> Cap {
+        self.0.as_ref().map_or(Cap::NONE, Object::cap)
+    }
+}
+
+impl Drop for OwnedObject {
+    fn drop(&mut self) {
+        if let Some(o) = self.0.take() {
+            // SAFETY: not memory (`new` refuses the types that are), so
+            // nothing of the program refers into it.
+            #[allow(unsafe_code)]
+            unsafe {
+                o.destroy()
+            };
+        }
+    }
+}

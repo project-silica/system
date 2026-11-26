@@ -25,7 +25,7 @@ use silica_rt::alloc::boxed::Box;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, free_slot, release_slot};
-use silica_rt::mem::{Memory, Object};
+use silica_rt::mem::{Memory, Object, OwnedObject, SharedMemory};
 use silica_rt::slots;
 use silica_rt::sys::{self, Cap, ObjectType, Rights, Wait};
 
@@ -257,14 +257,14 @@ pub struct Queue<C: Control> {
     devices: Box<dyn Opener>,
     id: u32,
     /// The frame of the two rings, reused (cleared) for each driver.
-    rings: Memory,
+    rings: SharedMemory,
     link: Option<Box<Link<C>>>,
     /// What the driver signals (`bits.completed()`) and the device manager
     /// signals when the driver ends (`bits.gone(generation)`): the queue's
     /// own, or its client's (`open_on`), which then owns it.
     note: Cap,
     /// The queue's own notification, kept while the queue lives.
-    _own_note: Option<Object>,
+    _own_note: Option<OwnedObject>,
     bits: Bits,
     /// Counts connections.
     generation: u32,
@@ -287,7 +287,7 @@ pub struct Queue<C: Control> {
     backoff: u64,
     /// What a call that cannot go on without a driver sleeps on between
     /// tries: signalled by nobody.
-    nap: Object,
+    nap: OwnedObject,
 }
 
 /// How long after a failed try to connect again, at first and at most: a
@@ -321,7 +321,7 @@ impl<C: Control> Queue<C> {
     /// Open device `id` through `opener` (which the queue keeps, to find
     /// the next provider when this one ends).
     pub fn open_with(devices: Box<dyn Opener>, id: u32) -> Result<Queue<C>, Error> {
-        let note = Object::new(ObjectType::Notification, 0)?;
+        let note = OwnedObject::new(ObjectType::Notification, 0)?;
         Queue::open_noting(devices, id, note.cap(), Some(note), Bits::OWN)
     }
 
@@ -341,14 +341,14 @@ impl<C: Control> Queue<C> {
         Queue::open_noting(opener, id, note, None, Bits { first, count: SHARED_BITS })
     }
 
-    fn open_noting(devices: Box<dyn Opener>, id: u32, note: Cap, own_note: Option<Object>, bits: Bits) -> Result<Queue<C>, Error> {
+    fn open_noting(devices: Box<dyn Opener>, id: u32, note: Cap, own_note: Option<OwnedObject>, bits: Bits) -> Result<Queue<C>, Error> {
         let mut memories = Vec::new();
         memories.try_reserve_exact(MEMORIES as usize).map_err(|_| Error::NoMemory)?;
         memories.resize(MEMORIES as usize, None);
         let mut q = Queue {
             devices,
             id,
-            rings: Memory::new(RINGS_BITS)?,
+            rings: SharedMemory::new(RINGS_BITS)?,
             link: None,
             note,
             _own_note: own_note,
@@ -363,7 +363,7 @@ impl<C: Control> Queue<C> {
             recovered_in: None,
             next_try: 0,
             backoff: 0,
-            nap: Object::new(ObjectType::Notification, 0)?,
+            nap: OwnedObject::new(ObjectType::Notification, 0)?,
         };
         q.connect()?;
         Ok(q)
@@ -743,6 +743,20 @@ impl<C: Control> Queue<C> {
                 Err(_) => return Err(Error::Timeout),
             }
         }
+    }
+}
+
+/// A queue let go of ends its connection: its rings are freed, which the
+/// driver sees as the client gone (`provider::Connection::alive`), and its
+/// own notifications with them. Before, the rings stayed, so the driver
+/// kept the connection for good: a program that opened a disk again after
+/// dropping it was refused (`Busy`: one connection a client), and every
+/// open left two frames behind.
+impl<C: Control> Drop for Queue<C> {
+    fn drop(&mut self) {
+        // The link reads and writes the rings: it goes before them (the
+        // fields go after this, the rings and the notifications with them).
+        drop(self.link.take());
     }
 }
 
