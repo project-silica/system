@@ -79,6 +79,10 @@ pub struct Parent {
     /// The time page children are given read-only when their `Program`
     /// names none ([`Cap::NONE`]: none).
     pub time: Cap,
+    /// The parent's own scheduling context (`slots::SCHED`; the root
+    /// task's `libsys::root::SLOT_CONTEXT`): what a child runs on when its
+    /// `Program` names none.
+    pub sched: Cap,
 }
 
 /// One capability to give the child.
@@ -159,6 +163,7 @@ impl Parent {
             cpus: info.cpus,
             clock: info.clock,
             time: if matches!(sys::inspect_slot(slots::SPACE, slots::TIME.0), Ok(Some(_))) { slots::TIME } else { Cap::NONE },
+            sched: slots::SCHED,
         }
     }
 }
@@ -187,12 +192,6 @@ impl Child {
     /// The child's address space.
     pub fn aspace(&self) -> Cap {
         self.aspace
-    }
-
-    /// Move the child's first thread to processor `cpu`. It carries on
-    /// with what it was doing (a call in progress included) there.
-    pub fn place(&self, cpu: usize) -> Result<(), Error> {
-        sys::thread_set_cpu(self.thread, cpu)
     }
 
     /// Answer the kernel's report of the child's fault `m` (on
@@ -314,8 +313,6 @@ pub struct Program<'a> {
     pub grants: &'a [Grant],
     /// Words the child reads from `ProcessInfo::args`.
     pub args: [u64; 8],
-    /// The processor its first thread runs on (an index below `Parent::cpus`).
-    pub cpu: usize,
     /// Slots in its CapSpace, in bits (at least 8; room is needed for the
     /// grants, one slot per megabyte of image, and what it makes itself).
     pub space_bits: u8,
@@ -340,11 +337,13 @@ pub struct Program<'a> {
     /// Its options (`silica_rt::options`), at most
     /// `silica_rt::OPTIONS_MAX` bytes: longer is refused.
     pub options: &'a [u8],
-    /// The group its threads share a processor as (`libsys::sched_group`):
-    /// its first thread joins it, and every thread it makes is in it, so
-    /// its threads together take one share however many it makes.
-    /// `None`: the parent's own group.
-    pub group: Option<Cap>,
+    /// The scheduling context it runs on (`libsys::sched_fair`: one share
+    /// of one processor): its first thread is bound to it and runs on its
+    /// processor, and the child holds it readable (`slots::SCHED`), which
+    /// is all it can bind the threads it makes to, so its threads together
+    /// take that one share however many it makes. `None`: the parent's own
+    /// (`Parent::sched`), which the child then shares with its parent.
+    pub sched: Option<Cap>,
     /// Its address space isolated against speculative execution
     /// (`libsys::ASPACE_ISOLATED`): for a program that holds secrets. Every
     /// switch into or out of it flushes the processor's predictors.
@@ -352,7 +351,8 @@ pub struct Program<'a> {
 }
 
 impl<'a> Program<'a> {
-    /// `image` with 4 MiB, no grants, no arguments, on processor 0.
+    /// `image` with 4 MiB, no grants, no arguments, on its parent's
+    /// scheduling context.
     pub fn new(image: &'a [u8], id: u64) -> Self {
         Program {
             image,
@@ -360,7 +360,6 @@ impl<'a> Program<'a> {
             id,
             grants: &[],
             args: [0; 8],
-            cpu: 0,
             space_bits: SPACE_BITS,
             aspace_bits: ASPACE_BITS,
             log: None,
@@ -368,7 +367,7 @@ impl<'a> Program<'a> {
             keep: None,
             time: None,
             options: &[],
-            group: None,
+            sched: None,
             isolated: false,
         }
     }
@@ -408,12 +407,13 @@ pub fn check_image(image: &[u8]) -> Result<Vec<(u64, u64)>, SpawnError> {
     Ok(pages)
 }
 
-/// Start `prog`: its first thread runs on `prog.cpu` from its first
-/// instruction. A given grant leaves the parent only on success. Keep
-/// its source slot reserved for the duration of this call.
+/// Start `prog`: its first thread runs from its first instruction, on
+/// the processor of the scheduling context it is given. A given grant
+/// leaves the parent only on success. Keep its source slot reserved for
+/// the duration of this call.
 pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
-    let Program { image, mem_bits, cpu, .. } = *prog;
-    if cpu as u64 >= p.cpus || !(8..=20).contains(&prog.space_bits) || prog.options.len() > silica_rt::OPTIONS_MAX {
+    let Program { image, mem_bits, .. } = *prog;
+    if !(8..=20).contains(&prog.space_bits) || prog.options.len() > silica_rt::OPTIONS_MAX {
         return Err(SpawnError::Kernel(Error::BadArg));
     }
     // Three slots for the child's objects and two to work with.
@@ -454,7 +454,7 @@ pub fn spawn(p: &Parent, prog: &Program) -> Result<Child, SpawnError> {
 }
 
 fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Program) -> Result<(), SpawnError> {
-    let Program { mem_bits, id, grants, args, cpu, space_bits, aspace_bits, isolated, .. } = *prog;
+    let Program { mem_bits, id, grants, args, space_bits, aspace_bits, isolated, .. } = *prog;
     let pages = check_image(image)?;
     let elf = Elf::parse(image, EM_NATIVE).map_err(SpawnError::Image)?;
     // The image's slots follow the grants, from slot 64 at the lowest: the
@@ -590,10 +590,13 @@ fn build(p: &Parent, c: &Child, [tmp, own]: [Cap; 2], image: &[u8], prog: &Progr
     if let Some(events) = prog.events {
         sys::cap_derive(c.space, slots::EVENTS.0, events, Rights::ALL, 0)?;
     }
-    if let Some(group) = prog.group {
-        sys::thread_bind(c.thread, group)?;
-    }
-    sys::thread_set_cpu(c.thread, cpu)?;
+    // Processor time: the context named, or the parent's own. The child
+    // holds it readable, to bind what it makes and to pass on; its first
+    // thread has no time until it is bound, and runs on the context's
+    // processor.
+    let sched = prog.sched.unwrap_or(p.sched);
+    sys::cap_derive(c.space, slots::SCHED.0, sched, Rights::READ, 0)?;
+    sys::thread_bind(c.thread, sched)?;
     let mut installed = 0;
     let result = (|| {
         for (i, g) in grants.iter().enumerate() {

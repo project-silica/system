@@ -199,10 +199,11 @@ struct Manager {
     events: Vec<(Object, Vec<Handle>)>,
     /// The page each service that `keeps` is given at every start.
     kept: Vec<Option<Object>>,
-    /// Each service's group (`libsys::sched_group`), the same for every
-    /// start of it: its threads share one share of its processor however
-    /// many it makes, and the programs it starts are in it too.
-    groups: Vec<Object>,
+    /// Each service's scheduling context (`libsys::sched_fair`: one share
+    /// of the processor it is placed on), the same for every start of
+    /// it: its threads take that one share however many it makes, and
+    /// the programs it starts run on it too.
+    sched: Vec<Object>,
     /// The time page (`silica_rt::time`), set from the firmware's clock.
     time: silica_rt::mem::Memory,
     /// Each service's options: the boot command line's
@@ -210,8 +211,6 @@ struct Manager {
     options: Vec<Vec<u8>>,
     /// The order services were started in, for stopping them in reverse.
     order: Vec<usize>,
-    /// The processor each service runs on (`place`).
-    placed: Vec<usize>,
     /// What `list` answers with, rebuilt for each call.
     listed: Vec<manager::Service<'static>>,
     /// What `describe` answers with.
@@ -364,13 +363,12 @@ impl Manager {
             log,
             events: Some(events),
             keep: self.kept[i].as_ref().map(|p| p.cap()),
-            group: Some(self.groups[i].cap()),
+            sched: Some(self.sched[i].cap()),
             time: Some((self.time.frame(), self.services[i].sets_time)),
             options: &self.options[i],
             mem_bits: s.memory,
             space_bits: if s.machine { 13 } else { 10 },
             aspace_bits: 18,
-            cpu: self.placed[i],
             isolated: s.secrets,
             ..Program::new(image, SERVICE_IDS + i as u64)
         };
@@ -1277,16 +1275,17 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         .collect();
     // Where each service runs (its declaration's `cpu=`, or processor 0).
     let placed = place(&services, root.parent.cpus as usize);
-    // A group for each service, on the processor it runs on: a program
-    // that makes many threads takes one share, not one a thread (the
-    // remediation of the 2026-11-24 audit).
-    let groups = services
+    // Time for each service: one share of the processor it runs on
+    // (processor time is a capability, and the service manager holds
+    // every processor's). A program that makes many threads takes that
+    // one share, not one a thread (the 2026-11-24 audit).
+    let sched = services
         .iter()
         .zip(&placed)
         .map(|(s, &cpu)| {
-            let g = Object::new(ObjectType::SchedContext, 0).unwrap_or_else(|_| fail!("no memory for {}'s group", s.name));
-            if let Err(e) = sys::sched_group(g.cap(), libsys::SCHED_DEFAULT_WEIGHT, cpu, sys::Cap(libsys::root::SLOT_SCHED)) {
-                fail!("cannot make {}'s group: {e:?}", s.name);
+            let g = Object::new(ObjectType::SchedContext, 0).unwrap_or_else(|_| fail!("no memory for {}'s scheduling context", s.name));
+            if let Err(e) = sys::sched_fair(g.cap(), libsys::SCHED_DEFAULT_WEIGHT, cpu, sys::Cap(libsys::root::SLOT_SCHED)) {
+                fail!("cannot give {} a share of processor {cpu}: {e:?}", s.name);
             }
             g
         })
@@ -1330,7 +1329,6 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         })
         .collect();
     let mut m = Manager {
-        placed,
         root,
         info,
         services,
@@ -1338,7 +1336,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         running,
         events,
         kept,
-        groups,
+        sched,
         time,
         options,
         order: order.clone(),
