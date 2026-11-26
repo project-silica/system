@@ -50,7 +50,6 @@ impl Pool {
     }
 }
 
-
 /// Whether `read`, bytes a randomness device just gave, may be counted
 /// towards the pool being seeded: they pass the continuous health tests a
 /// noise source's output must (NIST SP 800-90B, 4.4), for the full entropy

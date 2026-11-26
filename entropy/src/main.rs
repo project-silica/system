@@ -61,7 +61,12 @@ impl Service {
                 // broken device's constant or repeated bytes made the
                 // service say it was seeded after any 32 of them.
                 self.pool.mix(r.data);
-                let k = self.last.iter().position(|(d, _)| *d == id).or_else(|| self.last.iter().position(|(d, _)| *d == u32::MAX)).unwrap_or(0);
+                let k = self
+                    .last
+                    .iter()
+                    .position(|(d, _)| *d == id)
+                    .or_else(|| self.last.iter().position(|(d, _)| *d == u32::MAX))
+                    .unwrap_or(0);
                 let verdict = entropy::healthy(r.data, &self.last[k].1[..]);
                 self.last[k].0 = id;
                 let n = r.data.len().min(FROM_DEVICE as usize);
