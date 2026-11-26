@@ -110,6 +110,10 @@ const SERVICE_IDS: u64 = 1000;
 /// How long an updated service's new program is on trial: failing within
 /// it puts the program before it back (`update`).
 const TRIAL: u64 = 10 * SECOND;
+/// How long a service asked to end as the machine turns off has to exit
+/// (`Manager::end_in_order`): longer than the device manager gives its
+/// drivers.
+const END_WAIT: u64 = 10 * SECOND;
 /// The largest program `update` takes, and the most all callers may have
 /// staged at once.
 const MAX_PROGRAM: u64 = 16 << 20;
@@ -487,6 +491,43 @@ impl Manager {
         }
     }
 
+    /// Ask service `i` to end ([`silica_rt::END`] on its events notification)
+    /// and wait up to [`END_WAIT`] for it to exit; the caller then stops it
+    /// (what is left of it, or all of it if it did not exit). For shutdown
+    /// only: a call that arrives meanwhile is not answered (the machine is
+    /// going down), and another service's exit is left for its own stop.
+    fn end_in_order(&mut self, i: usize) {
+        let name = self.services[i].name;
+        let slot = silica_rt::ipc::free_slot();
+        let asked = slot.is_some_and(|s| {
+            let made = sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), s, self.events[i].0.cap(), Rights::WRITE, silica_rt::END);
+            let ok = made.and_then(|()| sys::signal(sys::Cap(s))).is_ok();
+            // SAFETY: made here for this one signal.
+            #[allow(unsafe_code)]
+            let _ = unsafe { sys::cap_delete(sys::Cap(s)) };
+            silica_rt::ipc::release_slot(s);
+            ok
+        });
+        if !asked {
+            println!("init: cannot ask {name} to end; it is ended where it stands");
+            return;
+        }
+        let id = SERVICE_IDS + i as u64;
+        let deadline = silica_rt::clock().now() + END_WAIT;
+        while let Ok(m) = sys::recv(self.root.parent.exit, Wait::Until(deadline)) {
+            if m.badge & !FAULT_BADGE != id {
+                continue;
+            }
+            if m.badge & FAULT_BADGE == 0 && m.info.label() == EXIT_LABEL && m.words[0] == 0 {
+                println!("init: {name} ended in order");
+            } else {
+                println!("init: {name} did not end in order");
+            }
+            return;
+        }
+        println!("init: {name} did not end within {} s; it is ended where it stands", END_WAIT / SECOND);
+    }
+
     /// Stop service `i` at once, as if it had failed, but for good.
     fn stop(&mut self, i: usize) -> bool {
         self.running[i].stopped = true;
@@ -707,7 +748,20 @@ impl manager::Server<Handle> for Manager {
         self.may(scope::SYSTEM_POWER)?;
         flush_log();
         println!("init: shutting down{}", if reboot { " to reset" } else { "" });
+        let caller = (self.caller & CONSUMERS != 0).then_some(self.caller & 0xFFFF_FFFF);
         for &i in self.order.clone().iter().rev() {
+            // A service with something to finish (`ends`: the device
+            // manager, its disks' caches) is asked to end and given a while;
+            // not the one whose call this is, which cannot answer while it
+            // waits for it (it ends what it must before it calls).
+            if self.services[i].ends && self.running[i].child.is_some() && caller != Some(i as u64) {
+                self.end_in_order(i);
+            }
+            // What the services said as they ended reaches the console
+            // before the log goes.
+            if self.log.as_ref().is_some_and(|l| l.service == i) {
+                flush_log();
+            }
             if self.stop(i) {
                 println!("init: {} stopped", self.services[i].name);
             }
@@ -946,7 +1000,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     for s in &services {
         let note = Object::new(ObjectType::Notification, 0).unwrap_or_else(|_| fail!("no memory for {}'s events", s.name));
         let mut needs = Vec::new();
-        for n in 0..s.needs.len().min(32) {
+        for n in 0..s.needs.len().min(31) {
             let to = silica_rt::ipc::free_slot().unwrap_or_else(|| fail!("no slot for {}'s events", s.name));
             if sys::cap_derive(sys::Cap(libsys::root::SLOT_CAPSPACE), to, note.cap(), Rights::WRITE, 1 << n).is_err() {
                 fail!("cannot make {}'s events", s.name);

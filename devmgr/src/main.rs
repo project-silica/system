@@ -72,7 +72,7 @@ use silica_proc::{Child, FAULT_BADGE, Grant, Parent, Program, Restarts, spawn};
 use silica_rt::alloc::collections::BTreeMap;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, Listener, free_slot, release_slot};
-use silica_rt::mem::{self, Object};
+use silica_rt::mem::{self, Object, OwnedObject};
 use silica_rt::mmio::Mmio;
 use silica_rt::{EXIT_LABEL, ProcessInfo, println, slots};
 
@@ -135,6 +135,9 @@ struct Running<'a> {
     child: Child,
     /// The endpoint its clients call it on.
     service: Object,
+    /// The driver's events notification (`slots::EVENTS` in it): what
+    /// the device manager asks it to end on ([`silica_rt::END`]).
+    events: OwnedObject,
     /// What clients asked to have signalled when this driver ends.
     gone: Vec<(u64, Handle)>,
 }
@@ -881,6 +884,10 @@ impl Manager {
         let inject = if f.starts == 0 { inject_plan(self.cmdline, driver) } else { 0 };
         let starts = f.starts;
         let log = self.log_of(index, driver);
+        let events = OwnedObject::new(ObjectType::Notification, 0).map_err(|_| {
+            silence(&config);
+            "no memory for its driver's notification"
+        })?;
         let program = Program {
             grants: &grants,
             args: [
@@ -894,6 +901,7 @@ impl Manager {
                 display[2],
             ],
             aspace_bits: 18,
+            events: Some(events.cap()),
             log,
             ..Program::new(image, self.next_id)
         };
@@ -927,7 +935,7 @@ impl Manager {
         f.starts += 1;
         f.restarts.started(silica_rt::clock().now());
         f.waiting = None;
-        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, gone: Vec::new() });
+        self.running.push(Running { name: driver, id: self.next_id, function: index, child, service, events, gone: Vec::new() });
         self.changed(index);
         Ok(())
     }
@@ -981,6 +989,65 @@ impl Manager {
         };
         ok
     }
+
+    /// End every driver, block devices' in order: each is asked
+    /// ([`silica_rt::END`] on its events notification) and has until
+    /// [`END_NS`] to make its device's cache durable, shut the device down
+    /// and exit; one that has not is ended where it stands, as is every
+    /// other driver (nothing they hold outlives them). Before, every driver
+    /// was destroyed where it stood: a power cut for the disks' caches.
+    /// Exits arrive on the endpoint clients call: a call taken meanwhile is
+    /// not answered (the machine is going down).
+    fn end_drivers(&mut self, listener: &mut Listener) {
+        let mut asked = Vec::new();
+        for r in &self.running {
+            if class_of(&self.functions[r.function]) != Some(manager::Class::Block) {
+                continue;
+            }
+            match signal_bits(r.events.cap(), silica_rt::END) {
+                Ok(()) => asked.push(r.id),
+                Err(e) => println!("devmgr: cannot ask {} to end: {e:?}", r.name),
+            }
+        }
+        println!("devmgr: {} disk drivers asked to end, {} drivers in all", asked.len(), self.running.len());
+        let deadline = silica_rt::clock().now() + END_NS;
+        while !asked.is_empty() {
+            let Ok(msg) = listener.recv(Wait::Until(deadline)) else { break };
+            let Some(k) = asked.iter().position(|id| *id == msg.badge & !FAULT_BADGE) else { continue };
+            asked.swap_remove(k);
+            let Some(at) = self.running.iter().position(|r| r.id == msg.badge & !FAULT_BADGE) else { continue };
+            let r = self.running.remove(at);
+            let device = PciAddress(self.functions[r.function].id);
+            if msg.badge & FAULT_BADGE == 0 && msg.info.label() == EXIT_LABEL && msg.words[0] == 0 {
+                println!("devmgr: {} for {device} ended in order", r.name);
+            } else {
+                println!("devmgr: {} for {device} did not end in order (status {})", r.name, msg.words[0] as i64);
+            }
+            self.stop(r);
+        }
+        while let Some(r) = self.running.pop() {
+            if asked.contains(&r.id) {
+                println!("devmgr: {} did not end within {} ms; ended where it stood", r.name, END_NS / 1_000_000);
+            }
+            self.stop(r);
+        }
+    }
+}
+
+/// How long a driver asked to end has to do so (`Manager::end_drivers`):
+/// a flush and an NVMe controller's shutdown, each bounded by the driver.
+const END_NS: u64 = 8_000_000_000;
+
+/// Signal `bits` on the notification `cap` (an unbadged capability signals
+/// bit 0 alone).
+fn signal_bits(cap: Cap, bits: u64) -> Result<(), sys::Error> {
+    let slot = free_slot().ok_or(sys::Error::NoMemory)?;
+    let made = sys::cap_derive(slots::SPACE, slot, cap, Rights::WRITE, bits).and_then(|()| sys::signal(Cap(slot)));
+    // SAFETY: the capability was made here, for this signal alone.
+    #[allow(unsafe_code)]
+    let _ = unsafe { sys::cap_delete(Cap(slot)) };
+    release_slot(slot);
+    made
 }
 
 /// Map the boot archive: the ramdisk frames, laid out as they are in memory.
@@ -1114,11 +1181,12 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         println!("ERROR: devmgr: not every device has its driver");
     }
     // What happens to the machine: the power button and the hot-plug slots,
-    // each a bit of one notification.
-    let happened = Object::new(ObjectType::Notification, 0).map_err(|_| "no memory for its notification")?;
+    // each a bit (from 32 up) of its events notification, where the service
+    // manager asks it to end (`silica_rt::END`).
+    let happened = slots::EVENTS;
     let sender = |bits: u64| -> Result<Cap, &'static str> {
         let slot = free_slot().ok_or("no capability slots left")?;
-        sys::cap_derive(slots::SPACE, slot, happened.cap(), Rights::WRITE, bits).map_err(|_| "cannot make a notification sender")?;
+        sys::cap_derive(slots::SPACE, slot, happened, Rights::WRITE, bits).map_err(|_| "cannot make a notification sender")?;
         Ok(Cap(slot))
     };
     let button = match power::Button::new(&mut m, granted(GRANT_PORTS), granted(GRANT_IRQS), sender(power::BUTTON)?) {
@@ -1151,13 +1219,20 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let got = listener.recv_listening(happened.cap(), next.map_or(Wait::Forever, Wait::Until));
+        let got = listener.recv_listening(happened, next.map_or(Wait::Forever, Wait::Until));
         took = silica_rt::clock().now();
         if matches!(got, Err(sys::Error::Timeout)) {
             continue;
         }
         let Ok(msg) = got else { return Err("its endpoint was taken away") };
         if let Some(bits) = msg.signals() {
+            if bits & silica_rt::END != 0 {
+                // The service manager is turning the machine off: the disks'
+                // caches are made durable before anything is let go of.
+                println!("devmgr: asked to end: its drivers end in order");
+                m.end_drivers(&mut listener);
+                silica_rt::exit(0);
+            }
             if bits & hotplug::HOTPLUG != 0 {
                 m.slots_changed();
             }
@@ -1166,6 +1241,9 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
                 && b.pressed()
             {
                 println!("devmgr: the power button was pressed: shutting down");
+                // The service manager cannot ask this program to end while it
+                // waits in the call below: its drivers end in order first.
+                m.end_drivers(&mut listener);
                 let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
                 if let Err(e) = system.shutdown(false) {
                     println!("ERROR: devmgr: the service manager would not shut down: {e:?}");

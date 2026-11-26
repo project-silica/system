@@ -38,18 +38,26 @@ pub struct Interrupt {
 /// which of them happened.
 #[derive(Debug)]
 pub struct Signals {
-    notification: Object,
+    /// The driver's events notification (`slots::EVENTS`, which the device
+    /// manager gives it, so its parent's `silica_rt::END` arrives on the same
+    /// wait), or one of its own when it was given none.
+    notification: Cap,
 }
 
 impl Signals {
-    /// A new notification.
+    /// The driver's events notification when its parent gave one, else a
+    /// new notification.
     pub fn new() -> Result<Signals, DeviceError> {
-        Ok(Signals { notification: Object::new(ObjectType::Notification, 0)? })
+        if matches!(sys::inspect_slot(slots::SPACE, slots::EVENTS.0), Ok(Some(_))) {
+            return Ok(Signals { notification: slots::EVENTS });
+        }
+        // It lives as long as the driver: no need to keep the object.
+        Ok(Signals { notification: Object::new(ObjectType::Notification, 0)?.cap() })
     }
 
     /// The notification itself: what the driver listens on.
     pub fn listen(&self) -> Cap {
-        self.notification.cap()
+        self.notification
     }
 
     /// Wait until it is signalled (it may have been before the call), or
@@ -64,7 +72,7 @@ impl Signals {
     /// else: what an interrupt is bound to, or a client is given.
     pub fn sender(&self, bits: u64) -> Result<Cap, DeviceError> {
         let slot = free_slot().ok_or(sys::Error::NoMemory)?;
-        sys::cap_derive(slots::SPACE, slot, self.notification.cap(), Rights::WRITE, bits).inspect_err(|_| release_slot(slot))?;
+        sys::cap_derive(slots::SPACE, slot, self.notification, Rights::WRITE, bits).inspect_err(|_| release_slot(slot))?;
         Ok(Cap(slot))
     }
 }

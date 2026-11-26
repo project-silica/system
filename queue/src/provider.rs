@@ -72,6 +72,13 @@ impl Ticket {
     pub fn is_marked(&self) -> bool {
         self.marked
     }
+
+    /// A ticket for a request the service makes itself, no client's (a
+    /// block service's flush as it ends): completing it reaches no
+    /// connection.
+    pub fn own(tag: u64) -> Ticket {
+        Ticket { tag, memory: NO_MEMORY, slot: u16::MAX, connection: u32::MAX, marked: false }
+    }
 }
 
 /// Why a service did not start a request.

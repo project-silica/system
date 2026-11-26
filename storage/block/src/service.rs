@@ -176,6 +176,12 @@ pub trait Device {
     /// The deadline passed: report what the device has finished, and deal
     /// with what it has not (see the module's "Timeouts").
     fn timeout(&mut self, _done: &mut Completions<'_>) {}
+
+    /// The driver is ending in order ([`silica_rt::END`]), after its cache was
+    /// flushed: leave the device as its specification asks of a host that
+    /// turns it off (an NVMe controller's normal shutdown), so it never
+    /// records an unsafe shutdown. The default: nothing.
+    fn shutdown(&mut self) {}
 }
 
 /// Where a driver reports a finished request: the ticket it was started
@@ -232,6 +238,12 @@ const INNER_PER_FIRST: u32 = 4;
 /// A request's tag with this bit set asks for its way through the provider
 /// to be kept (`trace`).
 pub const TRACED: u64 = 1 << 62;
+
+/// The tag of the flush a driver makes as it ends (`Service::end`): no
+/// client's ([`provider::Ticket::own`]).
+const END_FLUSH_TAG: u64 = u64::MAX;
+/// How long a driver that is ending waits for its flush.
+const END_FLUSH_NS: u64 = 5_000_000_000;
 /// Traced requests kept.
 const TRACES: usize = 16;
 
@@ -534,6 +546,57 @@ impl<D: Device> Service<D> {
         }
     }
 
+    /// Its parent asked it to end ([`silica_rt::END`]): what was written is
+    /// made durable (one flush, when the device has a write cache), the
+    /// device is left as its specification asks ([`Device::shutdown`]), and
+    /// the driver exits. Before, it was destroyed where it stood, a power
+    /// cut for the device's cache. What clients still have on the device is
+    /// theirs to lose: the service manager ends clients before the device
+    /// manager, and the flush covers every write the device had finished.
+    fn end(&mut self) -> ! {
+        let info = self.device.info();
+        let said = if info.write_cache {
+            let ticket = provider::Ticket::own(END_FLUSH_TAG);
+            let clock = silica_rt::clock();
+            let deadline = clock.now() + END_FLUSH_NS;
+            // What the wait between looks sleeps on: signalled by nobody.
+            let nap = silica_rt::mem::OwnedObject::new(sys::ObjectType::Notification, 0).ok();
+            let (mut started, mut result) = (false, None);
+            while result.is_none() && clock.now() < deadline {
+                if !started {
+                    match self.device.start(&flush_request(ticket), 0, ticket) {
+                        Ok(()) => {
+                            started = true;
+                            self.device.kick();
+                        }
+                        Err(Refusal::Busy) => {}
+                        Err(Refusal::Fail(_)) => result = Some(Err(Status::Io)),
+                    }
+                }
+                self.device.timeout(&mut |t, s| {
+                    if t == ticket {
+                        result = Some(s);
+                    }
+                });
+                if result.is_none()
+                    && let Some(n) = &nap
+                {
+                    let _ = sys::recv(n.cap(), sys::Wait::Until(clock.now() + 100_000));
+                }
+            }
+            match result {
+                Some(Ok(())) => "its write cache flushed",
+                Some(Err(_)) => "its write cache's flush failed",
+                None => "its write cache's flush did not finish in time",
+            }
+        } else {
+            "no write cache"
+        };
+        self.device.shutdown();
+        silica_rt::println!("block: the driver ended in order, {said}");
+        silica_rt::exit(0)
+    }
+
     /// A capability derived from window `k`'s, for its next holder.
     fn give_window(&self, k: usize) -> Result<NarrowReply<Handle>, Error> {
         let keep = self.windows.all[k].as_ref().ok_or(Error::NoRoom)?.keep.cap();
@@ -645,6 +708,9 @@ impl<D: Device> Events for Service<D> {
     }
 
     fn signals(&mut self, bits: u64) {
+        if bits & silica_rt::END != 0 {
+            self.end();
+        }
         if bits & !CLIENT != 0 {
             self.device_event(Some(bits & !CLIENT));
         }
