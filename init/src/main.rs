@@ -601,11 +601,11 @@ impl Manager {
 }
 
 impl manager::Server<Handle> for Manager {
-    fn list<'a>(&'a mut self) -> manager::ListReply<'a, Handle> {
+    fn list<'a>(&'a mut self, from: u32) -> manager::ListReply<'a, Handle> {
         self.listed.clear();
         // Nothing to a caller not given `observe`.
         if self.may(scope::SYSTEM_OBSERVE).is_err() {
-            return manager::ListReply { services: silica_idl_rt::Array::new(&self.listed) };
+            return manager::ListReply { services: silica_idl_rt::Array::new(&self.listed), next: 0 };
         }
         for i in 0..self.services.len() {
             let program = self.hash(i);
@@ -628,7 +628,19 @@ impl manager::Server<Handle> for Manager {
                 updated: r.program.is_some(),
             });
         }
-        manager::ListReply { services: silica_idl_rt::Array::new(&self.listed) }
+        // The part asked for, of every service made above.
+        let all = core::mem::take(&mut self.listed);
+        let listed = &mut self.listed;
+        let next = silica_protocols::paging::part(
+            all,
+            from,
+            |s| {
+                use silica_protocols::paging::{record, text};
+                record(text(s.name.len()) + 4 + 4 + text(s.provides.len()) + text(s.program.len()) + 1)
+            },
+            |s| listed.push(s),
+        );
+        manager::ListReply { services: silica_idl_rt::Array::new(&self.listed), next }
     }
 
     fn stop(&mut self, name: &str) -> Result<manager::StopReply, manager::Error> {

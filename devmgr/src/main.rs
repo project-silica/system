@@ -77,7 +77,7 @@ use silica_rt::mmio::Mmio;
 use silica_rt::{EXIT_LABEL, ProcessInfo, println, slots};
 
 use silica_protocols::device::{PciAddress, manager};
-use silica_protocols::scope;
+use silica_protocols::{paging, scope};
 
 silica_rt::main!(main);
 
@@ -230,18 +230,21 @@ fn class_of(f: &Function) -> Option<manager::Class> {
 }
 
 impl manager::Server<Handle> for Manager {
-    fn list<'a>(&'a mut self, class: manager::Class) -> manager::ListReply<'a, Handle> {
+    fn list<'a>(&'a mut self, class: manager::Class, from: u32) -> manager::ListReply<'a, Handle> {
         self.listing.clear();
         if scope_of(class) == 0 || !scope::has(self.caller, scope_of(class)) {
-            return manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing) };
+            return manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing), next: 0 };
         }
-        for r in &self.running {
-            let f = &self.functions[r.function];
-            if class_of(f) == Some(class) {
-                self.listing.push(manager::Device { id: f.id, class, driver: r.name });
-            }
-        }
-        manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing) }
+        let functions = &self.functions;
+        let of_class = self.running.iter().map(|r| (&functions[r.function], r.name)).filter(|(f, _)| class_of(f) == Some(class));
+        let listing = &mut self.listing;
+        let next = paging::part(
+            of_class,
+            from,
+            |(_, driver)| paging::record(4 + 4 + paging::text(driver.len())),
+            |(f, driver)| listing.push(manager::Device { id: f.id, class, driver }),
+        );
+        manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing), next }
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<manager::OpenReply<Handle>, manager::Error> {

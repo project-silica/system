@@ -331,7 +331,7 @@ pub(crate) fn lend(cap: Cap, rights: Rights, badge: u64) -> Option<Handle> {
 /// The first device of `class`, opened: its driver, which signals `gone`
 /// on `note` when it ends.
 fn open(devices: &mut manager::Client<Channel, Handle>, class: manager::Class, note: Cap, gone: u64) -> Option<Handle> {
-    let id = devices.list(class).ok()?.devices.iter().next()?.id;
+    let id = devices.list(class, 0).ok()?.devices.iter().next()?.id;
     Some(devices.open(id, Some(lend(note, Rights::WRITE, gone)?)).ok()?.driver)
 }
 

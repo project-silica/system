@@ -40,7 +40,40 @@ fn run() -> Result<(), &'static str> {
     let devices = Cap(slots::FIRST_GRANT);
     let server = Cap(slots::FIRST_GRANT + 1);
     let mut list = partitions::Client::<Channel, Handle>::from(Channel::new(server));
-    let listed = list.list().map_err(|_| "the block server does not answer")?;
+    // Every partition of every disk, part after part: as many as the
+    // machine's disks have (`partcheck.partitions=<n>` says how many to
+    // expect: a disk with a full table of 128 is one before which the list
+    // was refused to every caller, too long for one message).
+    let (mut all, mut ids, mut from, mut parts) = (0u32, silica_rt::alloc::vec::Vec::new(), 0, 0);
+    loop {
+        let part = list.list(from).map_err(|_| "the block server does not answer")?;
+        parts += 1;
+        for p in part.partitions.iter() {
+            all += 1;
+            ids.push(p.id);
+        }
+        if part.next == 0 {
+            break;
+        }
+        if part.next <= from {
+            return Err("the block server's next part does not move on");
+        }
+        from = part.next;
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() as u32 != all {
+        return Err("the block server listed a partition twice");
+    }
+    if let Some(n) = silica_rt::option("partitions").and_then(|n| n.parse::<u32>().ok())
+        && n != all
+    {
+        println!("partcheck: {all} partitions listed, {n} expected");
+        return Err("the block server did not list every partition");
+    }
+    println!("partcheck: {all} partitions listed, in {parts} parts");
+    pass("listed_whole");
+    let listed = list.list(0).map_err(|_| "the block server does not answer")?;
     let Some(p) = listed.partitions.iter().next() else { return Err("the block server lists no partition") };
     let (id, disk_id, first, blocks) = (p.id, p.disk, p.first, p.blocks);
     println!("partcheck: partition {id:#x} of disk {disk_id:#x}: blocks {first} to {}, {} {}", first + blocks - 1, p.kind, p.name);
@@ -105,7 +138,7 @@ fn run() -> Result<(), &'static str> {
             return Err("open through the list-only capability failed otherwise than refused");
         }
     }
-    if listing.list().map_or(true, |r| r.partitions.iter().next().is_none()) {
+    if listing.list(0).map_or(true, |r| r.partitions.iter().next().is_none()) {
         return Err("the list-only capability lists nothing");
     }
     pass("scopes");

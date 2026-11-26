@@ -110,7 +110,7 @@ impl Devices {
     fn interface(&mut self) -> Result<u32, &'static str> {
         let mut said = false;
         loop {
-            let listed = self.client.list(manager::Class::Network).map_err(|_| "the device manager does not answer")?;
+            let listed = self.client.list(manager::Class::Network, 0).map_err(|_| "the device manager does not answer")?;
             if let Some(d) = listed.devices.iter().next() {
                 println!("netd: interface {:#x}, driven by {}", d.id, d.driver);
                 return Ok(d.id);

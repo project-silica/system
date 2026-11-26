@@ -50,7 +50,7 @@ impl Service {
     /// Mix in what every randomness device gives now.
     fn mix_devices(&mut self) {
         self.mixed_at = silica_rt::clock().now().max(1);
-        let Ok(listed) = self.devices.list(manager::Class::Entropy) else { return };
+        let Ok(listed) = self.devices.list(manager::Class::Entropy, 0) else { return };
         let ids: [Option<u32>; 4] = core::array::from_fn(|i| listed.devices.iter().nth(i).map(|d| d.id));
         for id in ids.into_iter().flatten() {
             let Ok(opened) = self.devices.open(id, None) else { continue };

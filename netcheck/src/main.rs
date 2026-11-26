@@ -64,8 +64,15 @@ fn why<E: core::fmt::Debug>(e: E, what: &'static str) -> &'static str {
 fn interfaces(devices: &mut manager::Client<Channel, Handle>) -> Result<Vec<(u32, String)>, &'static str> {
     let deadline = silica_rt::clock().now() + 10 * SECOND;
     loop {
-        let listed = devices.list(manager::Class::Network).map_err(|e| why(e, "the device manager does not answer"))?;
-        let found: Vec<_> = listed.devices.iter().map(|d| (d.id, String::from(d.driver))).collect();
+        let (mut found, mut from) = (Vec::new(), 0);
+        loop {
+            let part = devices.list(manager::Class::Network, from).map_err(|e| why(e, "the device manager does not answer"))?;
+            found.extend(part.devices.iter().map(|d| (d.id, String::from(d.driver))));
+            if part.next <= from {
+                break;
+            }
+            from = part.next;
+        }
         if !found.is_empty() {
             return Ok(found);
         }

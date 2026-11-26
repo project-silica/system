@@ -142,7 +142,7 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
 /// `devmgr` round) still gets its drivers' logs. Before (the 2026-11-24
 /// audit), the 64 were first come first served and never given back: one
 /// holder could leave every later driver and service without a log.
-fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<(), String> {
+fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<u32, String> {
     let mut rings = silica_rt::alloc::vec::Vec::new();
     let mut given = 0;
     for n in 0..40 {
@@ -150,7 +150,7 @@ fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<(), Stri
         let lent = Handle::new(Cap(silica_rt::ipc::free_slot().ok_or("no slot")?));
         silica_rt::sys::cap_derive(slots::SPACE, lent.cap().0, ring.frame(), silica_rt::sys::Rights(3), 0)
             .map_err(|e| format!("deriving a ring: {e:?}"))?;
-        match system.add_log(&format!("flood{n}"), lent) {
+        match system.add_log(&flood_name(n), lent) {
             Ok(_) => given += 1,
             Err(silica_idl_rt::CallError::Error(system::Error::Refused)) => break,
             Err(e) => return Err(format!("add_log {n}: {e:?}")),
@@ -163,7 +163,48 @@ fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<(), Stri
     println!("svcload: one service is given {given} logs and refused the next");
     // The rings stay this program's while it runs (their places stay taken).
     core::mem::forget(rings);
-    Ok(())
+    Ok(given)
+}
+
+/// The name of flood log `n`: 64 bytes, the longest a log may have, so the
+/// log's list of sources holds more than one message does.
+fn flood_name(n: u32) -> String {
+    format!("flood{n:02}-{}", "x".repeat(56))
+}
+
+/// The log's sources, part after part, include every one of the `given`
+/// flood logs, and they take more than one part: a list longer than a
+/// message is answered whole, not refused (the 2026-11-24 audit: some 70
+/// sources, or fewer with long names, made `sources` fail for every reader).
+fn log_sources_paged(given: u32) -> Result<(), String> {
+    let mut reader = log::Client::<Channel, Handle>::from(Channel::new(grant(2)));
+    // Signalled by nobody: what the wait between tries sleeps on.
+    let nap =
+        silica_rt::mem::OwnedObject::new(silica_rt::sys::ObjectType::Notification, 0).map_err(|e| format!("no notification: {e:?}"))?;
+    let deadline = now() + 2_000_000_000;
+    loop {
+        let (mut found, mut parts, mut from, mut all) = (0, 0, 0, 0);
+        loop {
+            let part = reader.sources(from).map_err(|e| format!("sources from {from}: {e:?}"))?;
+            parts += 1;
+            for s in part.sources.iter() {
+                all += 1;
+                found += (0..given).any(|n| s.name.strip_prefix("svcload/") == Some(flood_name(n).as_str())) as u32;
+            }
+            if part.next <= from {
+                break;
+            }
+            from = part.next;
+        }
+        if found == given && parts > 1 {
+            println!("svcload: the log lists {all} sources in {parts} parts, all {given} flood logs among them");
+            return Ok(());
+        }
+        if now() > deadline {
+            return Err(format!("the log listed {found} of {given} flood logs among {all} sources in {parts} parts"));
+        }
+        let _ = silica_rt::sys::recv(nap.cap(), silica_rt::sys::Wait::Until(now() + 50_000_000));
+    }
 }
 
 /// A call's error, transport failures included, as the method's.
@@ -197,7 +238,8 @@ fn run() -> Result<(), String> {
     // other, and only a leak changes the sum.
     let total = |m: system::MemoryReply| m.free + m.held;
     let before = total(load.system.memory().map_err(|e| format!("memory: {e:?}"))?);
-    logs_bounded(&mut load.system)?;
+    let given = logs_bounded(&mut load.system)?;
+    log_sources_paged(given)?;
     partitions(&mut load)?;
     devmgr(&mut load)?;
     logd(&mut load)?;
@@ -208,13 +250,19 @@ fn run() -> Result<(), String> {
     if after != before {
         return Err(format!("the service manager could give out or had given {before} bytes before the restarts and {after} after"));
     }
-    let listed = load.system.list().map_err(|e| format!("list: {e:?}"))?;
-    for s in listed.services.iter() {
-        if s.failures != 0 {
-            return Err(format!("{} failed {} times while the services under it restarted", s.name, s.failures));
+    let mut from = 0;
+    loop {
+        let listed = load.system.list(from).map_err(|e| format!("list: {e:?}"))?;
+        for s in listed.services.iter() {
+            if s.failures != 0 {
+                return Err(format!("{} failed {} times while the services under it restarted", s.name, s.failures));
+            }
         }
+        if listed.next <= from {
+            return Ok(());
+        }
+        from = listed.next;
     }
-    Ok(())
 }
 
 /// Reads of the partition's first blocks, [`DEPTH`] at a time, each sent
@@ -228,7 +276,7 @@ struct Reads {
 impl Reads {
     fn new() -> Result<Reads, String> {
         let mut parts = silica_block::partitions::Client::<Channel, Handle>::from(Channel::new(grant(1)));
-        let id = parts.list().map_err(|e| format!("partitions: {e:?}"))?.partitions.iter().next().map(|p| p.id);
+        let id = parts.list(0).map_err(|e| format!("partitions: {e:?}"))?.partitions.iter().next().map(|p| p.id);
         let id = id.ok_or("the disk has no partition to read")?;
         let mut disk = Disk::open_partition(grant(1), id).map_err(|e| format!("opening partition {id:#x}: {e:?}"))?;
         let buffer = Memory::new(16).map_err(|_| "no memory for the reads")?;
@@ -295,7 +343,7 @@ fn partitions(load: &mut Load) -> Result<(), String> {
         let until = now() + EVERY_NS;
         while now() < until {
             reads.pump()?;
-            parts.list().map_err(|e| format!("partitions, between restarts: {e:?}"))?;
+            parts.list(0).map_err(|e| format!("partitions, between restarts: {e:?}"))?;
         }
         let mut failed = None;
         load.restart("partitions", || {
@@ -303,7 +351,7 @@ fn partitions(load: &mut Load) -> Result<(), String> {
                 failed = Some(e);
                 return true;
             }
-            parts.list().is_ok_and(|r| !r.partitions.is_empty())
+            parts.list(0).is_ok_and(|r| !r.partitions.is_empty())
         })?;
         if let Some(e) = failed {
             return Err(format!("{e} while the partitions service restarted"));
@@ -334,7 +382,7 @@ fn devmgr(load: &mut Load) -> Result<(), String> {
                 failed = Some(e);
                 return true;
             }
-            reads.done > before && manager.list(devices::Class::Block).is_ok_and(|r| !r.devices.is_empty())
+            reads.done > before && manager.list(devices::Class::Block, 0).is_ok_and(|r| !r.devices.is_empty())
         })?;
         if let Some(e) = failed {
             return Err(format!("{e} while the device manager restarted"));
@@ -404,7 +452,7 @@ fn shell(load: &mut Load) -> Result<(), String> {
         }
         let mut system = system::Client::<Channel, Handle>::from(Channel::new(grant(0)));
         load.restart("shell", || {
-            system.list().is_ok_and(|r| r.services.iter().any(|s| s.name == "shell" && s.state == system::State::Running))
+            system.list(0).is_ok_and(|r| r.services.iter().any(|s| s.name == "shell" && s.state == system::State::Running))
         })?;
     }
     load.said("shell");

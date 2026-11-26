@@ -54,8 +54,15 @@ fn main(_info: &'static ProcessInfo) -> i64 {
 
 /// The scratch disk: the block device whose block 1 is not a GPT header.
 fn scratch(devices: &mut manager::Client<Channel, Handle>, buffer: &Memory, m: Mmio) -> Result<(u32, Disk), &'static str> {
-    let listed: Vec<u32> =
-        devices.list(manager::Class::Block).map_err(|_| "the device manager does not answer")?.devices.iter().map(|d| d.id).collect();
+    let (mut listed, mut from) = (Vec::new(), 0);
+    loop {
+        let part = devices.list(manager::Class::Block, from).map_err(|_| "the device manager does not answer")?;
+        listed.extend(part.devices.iter().map(|d| d.id));
+        if part.next <= from {
+            break;
+        }
+        from = part.next;
+    }
     for id in listed {
         let mut disk = Disk::open(Cap(slots::FIRST_GRANT), id).map_err(|_| "cannot open a disk")?;
         disk.add_memory(0, buffer, true).map_err(|_| "cannot register memory")?;

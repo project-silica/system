@@ -27,6 +27,7 @@
 
 use silica_idl_rt::{Array, CapList};
 use silica_protocols::log::reader::{self as proto, Error, ReadReply, SourcesReply};
+use silica_protocols::paging;
 use silica_rt::alloc::collections::VecDeque;
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
@@ -333,13 +334,17 @@ impl Log {
 }
 
 impl proto::Server<Handle> for Log {
-    fn sources<'a>(&'a mut self) -> SourcesReply<'a, Handle> {
+    fn sources<'a>(&'a mut self, from: u32) -> SourcesReply<'a, Handle> {
         self.drain();
         self.listed.clear();
-        for s in &self.sources {
-            self.listed.push(proto::Source { name: s.name, written: s.written });
-        }
-        SourcesReply { sources: Array::new(&self.listed) }
+        let listed = &mut self.listed;
+        let next = paging::part(
+            &self.sources,
+            from,
+            |s| paging::record(paging::text(s.name.len()) + 8),
+            |s| listed.push(proto::Source { name: s.name, written: s.written }),
+        );
+        SourcesReply { sources: Array::new(&self.listed), next }
     }
 
     fn read<'a>(&'a mut self, name: &str, from: u64) -> Result<ReadReply<'a>, Error> {

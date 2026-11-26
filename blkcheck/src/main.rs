@@ -64,8 +64,15 @@ fn disks(devices: &mut manager::Client<Channel, Handle>) -> Result<Vec<(u32, sil
     // answer comes, so an empty list is asked again for a while.
     let deadline = silica_rt::clock().now() + 10 * SECOND;
     loop {
-        let listed = devices.list(manager::Class::Block).map_err(|e| why(e, "the device manager does not answer"))?;
-        let found: Vec<_> = listed.devices.iter().map(|d| (d.id, silica_rt::alloc::string::String::from(d.driver))).collect();
+        let (mut found, mut from) = (Vec::new(), 0);
+        loop {
+            let part = devices.list(manager::Class::Block, from).map_err(|e| why(e, "the device manager does not answer"))?;
+            found.extend(part.devices.iter().map(|d| (d.id, silica_rt::alloc::string::String::from(d.driver))));
+            if part.next <= from {
+                break;
+            }
+            from = part.next;
+        }
         if !found.is_empty() {
             return Ok(found);
         }
@@ -509,7 +516,7 @@ fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32, buffer: &M
     // console), which it once did unnoticed.
     let ring = Memory::new(12).map_err(|e| why(e, "no memory"))?;
     for (class, name) in [(manager::Class::Input, "input"), (manager::Class::Port, "port"), (manager::Class::Display, "display")] {
-        let Some(id) = devices.list(class).ok().and_then(|r| r.devices.iter().next().map(|d| d.id)) else {
+        let Some(id) = devices.list(class, 0).ok().and_then(|r| r.devices.iter().next().map(|d| d.id)) else {
             println!("blkcheck: no {name} device; its takeover is not tried");
             continue;
         };

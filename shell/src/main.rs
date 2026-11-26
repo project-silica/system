@@ -70,22 +70,33 @@ impl Shell {
             "echo" => {
                 let _ = writeln!(self.out, "{}", line.trim_start().strip_prefix("echo").unwrap_or("").trim());
             }
-            "services" => match self.system.list() {
-                Ok(r) => {
-                    for s in r.services.iter() {
-                        let state = match s.state {
-                            system::State::Running => "running",
-                            system::State::Stopped => "stopped",
-                            system::State::Failed => "failed",
-                            system::State::Unknown(_) => "?",
-                        };
-                        let _ = writeln!(self.out, "  {:<12} {:<8} failures {:<2} {}", s.name, state, s.failures, s.provides);
+            "services" => {
+                // Part after part, as the service manager gives them.
+                let mut from = 0;
+                loop {
+                    match self.system.list(from) {
+                        Ok(r) => {
+                            for s in r.services.iter() {
+                                let state = match s.state {
+                                    system::State::Running => "running",
+                                    system::State::Stopped => "stopped",
+                                    system::State::Failed => "failed",
+                                    system::State::Unknown(_) => "?",
+                                };
+                                let _ = writeln!(self.out, "  {:<12} {:<8} failures {:<2} {}", s.name, state, s.failures, s.provides);
+                            }
+                            if r.next <= from {
+                                break;
+                            }
+                            from = r.next;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(self.out, "services: {e:?}");
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    let _ = writeln!(self.out, "services: {e:?}");
-                }
-            },
+            }
             "stop" | "start" | "restart" if !arg.is_empty() => {
                 let r = match command {
                     "stop" => self.system.stop(arg).map(|_| ()),
@@ -133,11 +144,20 @@ impl Shell {
             "log" if !arg.is_empty() => {
                 // Stop at the writer's current position. In particular,
                 // displaying the console's own log writes more of that log.
-                let end = match self.log.sources() {
-                    Ok(r) => r.sources.iter().find(|s| s.name == arg).map(|s| s.written),
-                    Err(e) => {
-                        let _ = writeln!(self.out, "log: {arg}: {e:?}");
-                        return self.say();
+                let mut part = 0;
+                let end = loop {
+                    match self.log.sources(part) {
+                        Ok(r) => {
+                            let found = r.sources.iter().find(|s| s.name == arg).map(|s| s.written);
+                            if found.is_some() || r.next <= part {
+                                break found;
+                            }
+                            part = r.next;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(self.out, "log: {arg}: {e:?}");
+                            return self.say();
+                        }
                     }
                 };
                 let Some(end) = end else {
@@ -183,10 +203,15 @@ impl Shell {
                     (devices::Class::Entropy, "entropy"),
                     (devices::Class::Port, "port"),
                 ] {
-                    if let Ok(r) = self.devices.list(class) {
+                    let mut from = 0;
+                    while let Ok(r) = self.devices.list(class, from) {
                         for d in r.devices.iter() {
                             let _ = writeln!(self.out, "  {} {name:<8} {}", PciAddress(d.id), d.driver);
                         }
+                        if r.next <= from {
+                            break;
+                        }
+                        from = r.next;
                     }
                 }
             }
@@ -220,7 +245,7 @@ impl Shell {
     fn trace(&mut self) -> Result<(), &'static str> {
         let server = Cap(slots::FIRST_GRANT + 4);
         let mut parts = silica_block::partitions::Client::<Channel, Handle>::from(Channel::new(server));
-        let listed = parts.list().map_err(|_| "the block server does not answer")?;
+        let listed = parts.list(0).map_err(|_| "the block server does not answer")?;
         let p = listed.partitions.iter().next().ok_or("the block server lists no partition")?;
         let (id, name) = (p.id, String::from(p.name));
         let clock = silica_rt::clock();

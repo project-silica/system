@@ -163,3 +163,77 @@ pub mod scope {
         Ok(bits)
     }
 }
+
+/// Lists answered a part at a time (`from` in, `next` out), so a list
+/// longer than a message is never refused (`reply_too_large`) to every
+/// caller: the service manager's services, the device manager's devices,
+/// the block server's partitions and the log's sources (the 2026-11-24
+/// audit: one full GPT, some 40 services or 70 log sources were enough). A
+/// list that changes between parts may show an item twice or not at all;
+/// the next call from 0 sees it as it is.
+pub mod paging {
+    /// The bytes of items one part holds at most: a reply's 4000 bytes
+    /// less its header, the array's length and `next`, with room to spare
+    /// for an estimate that is a few bytes short.
+    pub const PART_BYTES: usize = 3200;
+
+    /// Give `push` the items from the `from`th on whose encoded sizes, as
+    /// `size` estimates them, total no more than [`PART_BYTES`] (always at
+    /// least one); returns `next`, the index of the first not given, or 0
+    /// when none is left.
+    pub fn part<T>(items: impl IntoIterator<Item = T>, from: u32, size: impl Fn(&T) -> usize, mut push: impl FnMut(T)) -> u32 {
+        let mut used = 0;
+        for (i, item) in items.into_iter().enumerate().skip(from as usize) {
+            let n = size(&item);
+            if used > 0 && used + n > PART_BYTES {
+                return i as u32;
+            }
+            used += n;
+            push(item);
+        }
+        0
+    }
+
+    /// The encoded size of a `string` or `bytes` field of `len` bytes.
+    pub const fn text(len: usize) -> usize {
+        4 + len
+    }
+
+    /// The encoded size of a struct whose fields take `fields` bytes.
+    pub const fn record(fields: usize) -> usize {
+        4 + fields
+    }
+
+    #[cfg(test)]
+    mod tests {
+        extern crate std;
+        use super::*;
+        use std::vec::Vec;
+
+        #[test]
+        fn parts_cover_a_long_list_once_in_order() {
+            let items: Vec<usize> = (0..1000).collect();
+            let (mut seen, mut from) = (Vec::new(), 0);
+            loop {
+                let mut this = Vec::new();
+                let next = part(items.iter().copied(), from, |_| 100, |i| this.push(i));
+                assert!(!this.is_empty() && this.len() * 100 <= PART_BYTES);
+                seen.extend(this);
+                if next == 0 {
+                    break;
+                }
+                assert_eq!(next as usize, seen.len());
+                from = next;
+            }
+            assert_eq!(seen, items);
+            // Past the end: nothing, and done. One item larger than a part
+            // is still given.
+            let mut none = Vec::new();
+            assert_eq!(part(items.iter().copied(), 5000, |_| 1, |i| none.push(i)), 0);
+            assert!(none.is_empty());
+            let mut big = Vec::new();
+            assert_eq!(part([1, 2], 0, |_| 5000, |i| big.push(i)), 1);
+            assert_eq!(big, [1]);
+        }
+    }
+}

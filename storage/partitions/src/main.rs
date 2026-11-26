@@ -27,7 +27,7 @@ use silica_block::partitions::{self, Error, ListReply, OpenReply, Partition};
 use silica_block::{Op, Request};
 use silica_idl_rt::{Array, CapList};
 use silica_protocols::device::manager;
-use silica_protocols::scope;
+use silica_protocols::{paging, scope};
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle, serve};
@@ -137,10 +137,23 @@ impl Server {
         if silica_rt::sys::recv(n.cap(), silica_rt::sys::Wait::Poll).is_err() {
             return;
         }
-        let disks: Vec<u32> =
-            self.devices.list(manager::Class::Block).map(|r| r.devices.iter().map(|d| d.id).collect()).unwrap_or_default();
+        let disks: Vec<u32> = block_disks(&mut self.devices);
         (self.parts, self.unread) = read_tables(&disks, &mut self.names);
     }
+}
+
+/// Every block device that has a driver, part after part (`from` and
+/// `next`); none when the device manager does not answer.
+fn block_disks(devices: &mut manager::Client<Channel, Handle>) -> Vec<u32> {
+    let (mut disks, mut from) = (Vec::new(), 0);
+    while let Ok(r) = devices.list(manager::Class::Block, from) {
+        disks.extend(r.devices.iter().map(|d| d.id));
+        if r.next == 0 || r.next <= from {
+            break;
+        }
+        from = r.next;
+    }
+    disks
 }
 
 /// The partitions of disks `disks`, each disk's table read now, and the
@@ -164,17 +177,21 @@ fn read_tables(disks: &[u32], names: &mut Vec<&'static str>) -> (Vec<Part>, Vec<
 }
 
 impl partitions::Server<Handle> for Server {
-    fn list<'a>(&'a mut self) -> ListReply<'a, Handle> {
+    fn list<'a>(&'a mut self, from: u32) -> ListReply<'a, Handle> {
         self.refresh();
         self.listed.clear();
         // Nothing to a caller not given `list`.
         if !scope::has(self.caller, scope::PARTITIONS_LIST) {
-            return ListReply { partitions: Array::new(&self.listed) };
+            return ListReply { partitions: Array::new(&self.listed), next: 0 };
         }
-        for p in &self.parts {
-            self.listed.push(Partition { id: p.id, disk: p.disk, first: p.first, blocks: p.blocks, kind: p.kind, name: p.name });
-        }
-        ListReply { partitions: Array::new(&self.listed) }
+        let listed = &mut self.listed;
+        let next = paging::part(
+            &self.parts,
+            from,
+            |p| paging::record(4 + 4 + 8 + 8 + paging::text(p.kind.len()) + paging::text(p.name.len())),
+            |p| listed.push(Partition { id: p.id, disk: p.disk, first: p.first, blocks: p.blocks, kind: p.kind, name: p.name }),
+        );
+        ListReply { partitions: Array::new(&self.listed), next }
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<OpenReply<Handle>, Error> {
@@ -218,7 +235,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
         }
     }
     let disks: Vec<u32> = loop {
-        let found: Vec<u32> = devices.list(manager::Class::Block).map(|r| r.devices.iter().map(|d| d.id).collect()).unwrap_or_default();
+        let found: Vec<u32> = block_disks(&mut devices);
         if !found.is_empty() || silica_rt::clock().now() > deadline {
             break found;
         }
