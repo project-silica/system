@@ -1218,3 +1218,75 @@ fn bogus_sack_blocks_change_nothing() {
     }
     assert!(got == data, "{} of {} bytes after bogus SACK blocks", got.len(), data.len());
 }
+
+/// A segment from B to A carrying timestamps `ts` (its value, its echo),
+/// built by hand.
+fn forge_ts(net: &mut Net, seq: u32, ack: u32, flags: u8, data: &[u8], ts: (u32, u32)) {
+    let h = Header { src_port: 80, dst_port: 40000, seq, ack, flags, window: 1000 };
+    let o = Options { timestamps: Some(ts), ..Options::default() };
+    let mut b = [0u8; 1600];
+    let n = tcp::build(&mut b, B, A, &h, &o, data).unwrap();
+    net.log.clear();
+    let s = tcp::parse(&b[..n], B, A).unwrap();
+    net.a.on_segment(net.now, &s);
+    net.flush();
+}
+
+/// PAWS keeps the peer's newest timestamp only as long as it can mean
+/// anything (RFC 7323 5.5): a connection idle for 25 days, whose peer's
+/// millisecond clock has since run more than half its range, takes the
+/// peer's next segment. Before, the old timestamp was kept for ever, every
+/// new segment looked older than it, and the connection was wedged.
+#[test]
+fn paws_forgets_a_timestamp_older_than_24_days() {
+    let mut net = Net::new((4096, 4096), (4096, 4096));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    let b_val = net.log.iter().rev().find_map(|l| (!l.0).then_some(l.2.timestamps).flatten()).expect("B sent a timestamp").0;
+    let (seq, ack) = (net.a.received_to(), net.a.sent_to());
+    net.wire.clear();
+    net.now += 25 * 24 * 3600 * SECOND;
+    // The peer's clock ran on by more than half its range: its value now
+    // compares as older than the one A kept.
+    forge_ts(&mut net, seq, ack, ACK, b"after a long idle", (b_val.wrapping_add(0x8000_0001), 0));
+    assert_eq!(net.a.readable(), 17, "a connection idle 25 days refused its peer's next segment (PAWS kept a stale timestamp)");
+}
+
+/// A round trip is measured from an echoed timestamp only when the echo is
+/// one this side sent: a peer that echoes a value never sent (newer than
+/// anything this side sent) cannot make the round trip look shorter and
+/// the retransmission timer fire early.
+#[test]
+fn a_forged_timestamp_echo_measures_nothing() {
+    let mut net = Net::new((8192, 8192), (8192, 8192));
+    net.run_until(SECOND, |n| n.b.as_ref().is_some_and(|b| b.state() == State::Established));
+    net.a.send(&pattern(1000));
+    for _ in 0..200 {
+        if !net.step() || net.a.srtt().is_some() && net.wire.is_empty() {
+            break;
+        }
+    }
+    let before_srtt = net.a.srtt().expect("a round trip was measured");
+    // A segment that is lost, then resent on the timer: its acknowledgement
+    // has no send time on the scoreboard (Karn), so an echo is all there is.
+    net.a.send(&pattern(500));
+    net.flush();
+    net.wire.clear();
+    let due = net.a.deadline().expect("a retransmission timer");
+    net.now = due;
+    net.a.on_time(net.now);
+    net.flush();
+    net.wire.clear();
+    let (val, end, b_ack) = net
+        .log
+        .iter()
+        .rev()
+        .find(|l| l.0 && l.3 > 0)
+        .map(|l| (l.2.timestamps.unwrap().0, l.1.seq.wrapping_add(l.3 as u32), l.1.ack))
+        .expect("the resent segment");
+    let b_val = net.log.iter().rev().find_map(|l| (!l.0).then_some(l.2.timestamps).flatten()).map_or(1, |t| t.0);
+    net.now += 500 * MS;
+    // The echo of A's clock now, a value A never sent: the round trip it
+    // claims is nothing.
+    forge_ts(&mut net, b_ack, end, ACK, b"", (b_val.wrapping_add(500), val.wrapping_add(500)));
+    assert_eq!(net.a.srtt(), Some(before_srtt), "a forged echo changed the measured round trip");
+}
