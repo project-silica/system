@@ -110,7 +110,7 @@ fn table(id: u32, names: &mut Vec<&'static str>) -> Result<Vec<Part>, &'static s
     };
     // The table from one copy of the header: `Ok(None)` when that copy is
     // not there at all.
-    let mut copy = |disk: &mut Disk, at: u64| -> Result<Option<Vec<gpt::Entry>>, &'static str> {
+    let copy = |disk: &mut Disk, at: u64| -> Result<Option<Vec<gpt::Entry>>, &'static str> {
         let Some(header) = gpt::header_at(&read(disk, at, bs)?, disk_blocks, at)? else { return Ok(None) };
         let entries = read(disk, header.entries_at, header.entries_len())?;
         gpt::entries(&header, &entries, |i, why| println!("partitions: disk {id:#x}: entry {i} left out: {why}")).map(Some)
