@@ -480,6 +480,21 @@ impl Tcp {
         silica_inet::tcp::reset_reply(s)
     }
 
+    /// A router said the path from `local`:`local_port` to
+    /// `remote`:`remote_port` carries at most `mtu` bytes, quoting the
+    /// segment that began at `seq` (`Connection::path_mtu` decides whether
+    /// to believe it). Whether that connection's segments got smaller.
+    pub fn path_mtu(&mut self, local: Ipv4, local_port: u16, remote: Ipv4, remote_port: u16, mtu: u16, seq: u32) -> bool {
+        let ends = Endpoints { local, local_port, remote, remote_port };
+        let Some(&i) = self.index.get(&key(&ends)) else { return false };
+        let c = &mut self.conns[i];
+        let smaller = c.tcp.path_mtu(mtu, seq);
+        if smaller {
+            c.due = true;
+        }
+        smaller
+    }
+
     /// The soonest time a connection waits for.
     pub fn deadline(&self) -> Option<u64> {
         self.conns.iter().filter_map(|c| c.tcp.deadline()).min()

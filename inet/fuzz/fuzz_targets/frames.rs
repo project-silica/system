@@ -42,6 +42,11 @@ fuzz_target!(|frame: &[u8]| {
     inside(f.payload, p.payload);
     if let Ok(m) = icmp::parse(p.payload) {
         inside(p.payload, m.data);
+        // A router's "fragmentation needed": what it quotes lies in what
+        // it carried.
+        if let Some((_, q)) = icmp::too_big(&m) {
+            assert!(m.data.len() >= 28 && q.src.0 == m.data[12..16]);
+        }
     }
     if let Ok(s) = tcp::parse(p.payload, p.src, p.dst) {
         inside(p.payload, s.data);

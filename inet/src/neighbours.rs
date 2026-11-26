@@ -26,6 +26,14 @@ use crate::{Ipv4, Mac};
 
 /// How long a neighbour is believed without hearing from it again.
 pub const LIFE: u64 = 300_000_000_000;
+/// How long before its entry ends a neighbour in use is asked again, so
+/// traffic to it never waits for an answer: frames to the router through a
+/// long transfer were dropped every [`LIFE`] while it was asked anew.
+pub const REFRESH_AHEAD: u64 = 30_000_000_000;
+/// Neighbours a machine remembers: as many as the peers its connection table
+/// holds (one table for the machine, bounded per program), so a server with
+/// many clients on its link does not push them out of each other's place.
+pub const NEIGHBOURS: usize = 256;
 /// Questions remembered while unanswered.
 const ASKING: usize = 4;
 
@@ -34,14 +42,20 @@ struct Entry {
     ip: Ipv4,
     mac: Mac,
     expires: u64,
+    /// Sent to since it was last learned or answered: worth asking again
+    /// before it ends (an entry nobody uses is left to end: an idle machine
+    /// asks nothing).
+    used: bool,
 }
 
-const EMPTY: Entry = Entry { ip: Ipv4::UNSPECIFIED, mac: Mac::ZERO, expires: 0 };
+const EMPTY: Entry = Entry { ip: Ipv4::UNSPECIFIED, mac: Mac::ZERO, expires: 0, used: false };
 
 /// The table: `N` neighbours, and the questions in flight.
 pub struct Neighbours<const N: usize> {
     entries: [Entry; N],
     asking: [Ipv4; ASKING],
+    /// The entry the last lookup found: most frames go to one hop.
+    last: usize,
 }
 
 /// What an ARP packet means to the machine that heard it.
@@ -66,12 +80,41 @@ impl<const N: usize> Default for Neighbours<N> {
 
 impl<const N: usize> Neighbours<N> {
     pub const fn new() -> Self {
-        Neighbours { entries: [EMPTY; N], asking: [Ipv4::UNSPECIFIED; ASKING] }
+        Neighbours { entries: [EMPTY; N], asking: [Ipv4::UNSPECIFIED; ASKING], last: 0 }
     }
 
-    /// Where `ip` is, if known and not expired at `now`.
-    pub fn lookup(&self, ip: Ipv4, now: u64) -> Option<Mac> {
-        self.entries.iter().find(|n| n.ip == ip && n.expires > now).map(|n| n.mac)
+    /// Where `ip` is, if known and not expired at `now`: what a frame to it
+    /// is sent to, which marks the entry in use.
+    pub fn lookup(&mut self, ip: Ipv4, now: u64) -> Option<Mac> {
+        let at = match self.entries.get(self.last) {
+            Some(n) if n.ip == ip => self.last,
+            _ => self.entries.iter().position(|n| n.ip == ip)?,
+        };
+        self.last = at;
+        let n = &mut self.entries[at];
+        (n.expires > now).then(|| {
+            n.used = true;
+            n.mac
+        })
+    }
+
+    /// A neighbour in use whose entry ends within [`REFRESH_AHEAD`], not
+    /// answered since: ask it again now (the caller sends the request; its
+    /// answer is believed as any to a question asked). One at a time.
+    pub fn refresh(&mut self, now: u64) -> Option<Ipv4> {
+        let ip = self.entries.iter().find(|n| n.used && n.expires > now && n.expires - now <= REFRESH_AHEAD && !self.asking(n.ip))?.ip;
+        self.asked(ip);
+        Some(ip)
+    }
+
+    /// When [`Neighbours::refresh`] has something to ask (`u64::MAX`: never).
+    pub fn refresh_at(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|n| n.used && !self.asking(n.ip))
+            .map(|n| n.expires.saturating_sub(REFRESH_AHEAD))
+            .min()
+            .unwrap_or(u64::MAX)
     }
 
     /// Whether a question about `ip` is in flight.
@@ -144,7 +187,7 @@ impl<const N: usize> Neighbours<N> {
             oldest
         });
         if let Some(at) = at {
-            self.entries[at] = Entry { ip, mac, expires: now + LIFE };
+            self.entries[at] = Entry { ip, mac, expires: now + LIFE, used: false };
         }
     }
 }
@@ -237,5 +280,55 @@ mod tests {
         assert_eq!(t.lookup(ME.0, 6), None);
         assert_eq!(t.heard(&request(ME.0, ME.1, ME.0), ME, Some(ROUTER), 7), Heard::default());
         assert_eq!(t.heard(&request(Ipv4([10, 0, 2, 9]), Mac::BROADCAST, ME.0), ME, Some(ROUTER), 8), Heard::default());
+    }
+
+    /// A neighbour in use never lapses: the router through a transfer, and a
+    /// peer that is only sent to, are asked again before their entries end, and twenty hosts on the link stay
+    /// known together. Before, every entry ended after [`LIFE`] whatever its
+    /// traffic (frames to it dropped while it was asked anew, each a
+    /// retransmission and a smaller window), and sixteen entries thrashed
+    /// with more peers on the link.
+    #[test]
+    fn a_neighbour_in_use_never_lapses() {
+        const S: u64 = 1_000_000_000;
+        let mut t = Neighbours::<NEIGHBOURS>::new();
+        t.asked(ROUTER);
+        t.heard(&reply(ROUTER, ROUTER_MAC, ME.0), ME, Some(ROUTER), 0);
+        // A transfer through the router: a frame to it each second; asked
+        // again before its entry ends, it answers.
+        for s in 1..=301 {
+            if let Some(ip) = t.refresh(s * S) {
+                assert_eq!(ip, ROUTER);
+                t.heard(&reply(ROUTER, ROUTER_MAC, ME.0), ME, Some(ROUTER), s * S + S / 100);
+            }
+            assert_eq!(t.lookup(ROUTER, s * S), Some(ROUTER_MAC), "the router was unknown at {s} s of a transfer through it");
+        }
+        // A peer that is sent to and never heard from: asked again before
+        // its entry ends, and its answer renews it.
+        let (peer, peer_mac) = (Ipv4([10, 0, 2, 7]), Mac([2, 0, 0, 0, 0, 7]));
+        let start = 1000 * S;
+        t.heard(&request(peer, peer_mac, ME.0), ME, Some(ROUTER), start);
+        let mut asked = 0;
+        for s in 1..=301 {
+            let now = start + s * S;
+            if let Some(ip) = t.refresh(now) {
+                assert_eq!(ip, peer);
+                asked += 1;
+                t.heard(&reply(peer, peer_mac, ME.0), ME, Some(ROUTER), now + S / 100);
+            }
+            assert_eq!(t.lookup(peer, now), Some(peer_mac), "a peer in use was unknown at {s} s");
+        }
+        assert_eq!(asked, 1, "asked again once, shortly before its entry ended");
+        // Nobody uses it: never asked again (an idle machine asks nothing).
+        let later = start + 2000 * S;
+        assert_eq!(t.refresh(later), None);
+        // Twenty hosts on the link, each known from its own request.
+        let hosts: [(Ipv4, Mac); 20] = core::array::from_fn(|i| (Ipv4([10, 0, 3, i as u8]), Mac([2, 0, 0, 0, 3, i as u8])));
+        for (k, (ip, mac)) in hosts.iter().enumerate() {
+            t.heard(&request(*ip, *mac, ME.0), ME, Some(ROUTER), later + k as u64);
+        }
+        for (ip, mac) in &hosts {
+            assert_eq!(t.lookup(*ip, later + 100), Some(*mac), "{ip:?} was pushed out by the hosts after it");
+        }
     }
 }

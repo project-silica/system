@@ -34,6 +34,12 @@ const RTO_INITIAL: u64 = SECOND;
 /// Its floor and ceiling.
 const RTO_MIN: u64 = 200 * MS;
 const RTO_MAX: u64 = 60 * SECOND;
+/// The smallest packet a path is taken to carry (RFC 1191: 576 bytes, what
+/// every IPv4 host takes whole); a router's word for less is not believed.
+pub const MTU_FLOOR: u32 = 576;
+/// How long PAWS keeps the newest timestamp it saw (RFC 7323 5.5: less
+/// than the 24.8 days a 1 kHz clock takes to run half its range).
+const PAWS_IDLE: u64 = 24 * 24 * 3600 * SECOND;
 /// Retransmissions of one segment before the connection is given up:
 /// about 15 minutes at the ceiling for data, as Linux's default; a SYN is
 /// given up sooner (about two minutes).
@@ -368,6 +374,12 @@ pub struct Connection<S> {
     timestamps: bool,
     ts_offset: u32,
     ts_recent: u32,
+    /// When `ts_recent` was last set: PAWS forgets it after [`PAWS_IDLE`].
+    ts_recent_at: Option<u64>,
+    /// The first and the newest timestamp this side has sent: an echo is
+    /// believed only between them (a peer cannot make the round trip look
+    /// shorter by echoing a value never sent).
+    ts_sent: Option<(u32, u32)>,
     /// Peer understands SACK blocks.
     sack: bool,
     /// The peer's SYN carried a window scale (so both sides scale).
@@ -456,6 +468,8 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             timestamps: true,
             ts_offset,
             ts_recent: 0,
+            ts_recent_at: None,
+            ts_sent: None,
             sack: true,
             scaling: false,
             reset: None,
@@ -665,6 +679,40 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         self.mss
     }
 
+    /// A router says the path to the peer carries at most `mtu` bytes a
+    /// packet (ICMP fragmentation needed, RFC 1191), quoting the segment
+    /// that did not fit, which began at `seq`. Believed only if `seq` is in
+    /// flight (RFC 5927 5.1: a blind sender does not know it); then segments
+    /// are cut to fit, and what is in flight goes again in pieces that do:
+    /// a lost segment, not congestion. A size below [`MTU_FLOOR`] is not
+    /// taken. Returns whether the segment size went down.
+    pub fn path_mtu(&mut self, mtu: u16, seq: u32) -> bool {
+        if !matches!(self.state, State::Established | State::CloseWait | State::FinWait1 | State::Closing | State::LastAck)
+            || before(seq, self.snd_una)
+            || !before(seq, self.snd_max)
+        {
+            return false;
+        }
+        let mss = self.mss_for(u32::from(mtu).max(MTU_FLOOR));
+        if mss >= self.mss {
+            return false;
+        }
+        self.mss = mss;
+        self.cwnd = self.cwnd.max(self.mss);
+        for k in 0..self.segs_len {
+            if self.seg(k).flags & SACKED == 0 {
+                self.seg_mut(k).flags |= LOST;
+            }
+        }
+        true
+    }
+
+    /// The segment data a packet of `mtu` bytes carries: IPv4 and TCP
+    /// headers and the timestamps option taken off.
+    fn mss_for(&self, mtu: u32) -> u32 {
+        mtu - 40 - if self.timestamps { 12 } else { 0 }
+    }
+
     /// Take what fits of `data` to send; returns how much it took.
     pub fn send(&mut self, data: &[u8]) -> usize {
         if self.fin_queued || !self.can_send_data() {
@@ -767,6 +815,12 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         }
         self.retries += 1;
         let flight = self.snd_max.wrapping_sub(self.snd_una);
+        // Full-size segments unanswered twice in a row on a path that says
+        // nothing (its routers' ICMP filtered): try smaller ones (RFC 4821
+        // section 7.7's black hole), down to what any path carries.
+        if self.retries >= 2 && flight > self.mss && self.mss > self.mss_for(MTU_FLOOR) {
+            self.mss = (self.mss / 2).max(self.mss_for(MTU_FLOOR));
+        }
         if flight == 0 {
             // The persist timer: the peer's window is shut and nothing is
             // in flight; the next poll probes it.
@@ -817,11 +871,21 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         ((now / MS) as u32).wrapping_add(self.ts_offset)
     }
 
+    /// Timestamp `val` goes out in a segment.
+    fn note_ts_sent(&mut self, val: u32) {
+        self.ts_sent = Some(match self.ts_sent {
+            Some((first, _)) => (first, val),
+            None => (val, val),
+        });
+    }
+
     /// The options of a segment that is not a SYN.
     fn options(&mut self, now: u64) -> Options {
         let mut o = Options::default();
         if self.timestamps {
-            o.timestamps = Some((self.ts_now(now), self.ts_recent));
+            let val = self.ts_now(now);
+            self.note_ts_sent(val);
+            o.timestamps = Some((val, self.ts_recent));
         }
         let dsack = self.dsack.take().filter(|_| self.sack);
         if self.sack && (self.holes_len > 0 || dsack.is_some()) {
@@ -886,6 +950,9 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
                 h.window = self.receive.free().min(u16::MAX as usize) as u16;
                 self.rcv_adv = self.rcv_nxt.wrapping_add(u32::from(h.window));
                 let o = self.syn_options(now, answer);
+                if let Some((val, _)) = o.timestamps {
+                    self.note_ts_sent(val);
+                }
                 self.sent(now, 1);
                 return self.emit(out, h, &o, None);
             }
@@ -1015,9 +1082,17 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     /// Send segment `k` of the scoreboard again, as it went the first time.
     fn resend(&mut self, now: u64, out: &mut [u8], k: usize) -> Option<usize> {
         let start = self.seg_start(k);
+        // Larger than segments are now (the path said so): cut, the rest
+        // left as its own record, lost too.
+        if self.seg(k).end.wrapping_sub(start) > self.mss {
+            self.split(k, start.wrapping_add(self.mss));
+        }
         let seg = *self.seg(k);
         let fin = self.fin_sent.is_some() && seg.end == self.fin_seq().wrapping_add(1);
-        let n = seg.end.wrapping_sub(start) - fin as u32;
+        // A record that could not be split (the scoreboard is full) goes a
+        // piece at a time: the peer acknowledges inside it.
+        let n = (seg.end.wrapping_sub(start) - fin as u32).min(self.mss);
+        let fin = fin && n == seg.end.wrapping_sub(start) - 1;
         let offset = start.wrapping_sub(self.send_base()) as usize;
         let mut flags = ACK;
         if fin {
@@ -1054,6 +1129,20 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
     /// Where segment `k` of the scoreboard starts.
     fn seg_start(&self, k: usize) -> u32 {
         if k == 0 { self.segs_start } else { self.seg(k - 1).end }
+    }
+
+    /// Split scoreboard record `k` at `at` into two records alike (when
+    /// there is room for one more).
+    fn split(&mut self, k: usize, at: u32) {
+        if self.segs_len == SEGS {
+            return;
+        }
+        for j in (k + 1..=self.segs_len).rev() {
+            let s = *self.seg(j - 1);
+            *self.seg_mut(j) = s;
+        }
+        self.segs_len += 1;
+        self.seg_mut(k).end = at;
     }
 
     /// Put a segment just sent on the scoreboard.
@@ -1319,6 +1408,10 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
 
     /// A segment for this connection arrived at `now`.
     pub fn on_segment(&mut self, now: u64, s: &Segment<'_>) {
+        // The peer's first timestamp (taken with its SYN) dates from now.
+        if self.ts_recent_at.is_none() {
+            self.ts_recent_at = Some(now);
+        }
         match self.state {
             State::Closed => {}
             State::SynSent => self.on_syn_sent(now, s),
@@ -1381,8 +1474,13 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             return;
         }
         // PAWS (RFC 7323): a segment whose timestamp is older than the
-        // newest seen is an old duplicate.
+        // newest seen is an old duplicate, unless the newest is so old
+        // that the peer's clock may have run half its range since (5.5):
+        // then it is forgotten, or a connection idle for 24.8 days at a
+        // millisecond a tick would refuse its peer for good.
+        let recent_at = self.ts_recent_at.unwrap_or(now);
         if self.timestamps
+            && now.saturating_sub(recent_at) < PAWS_IDLE
             && !s.has(RST)
             && let Some((val, _)) = s.options.timestamps
             && before(val, self.ts_recent)
@@ -1449,6 +1547,7 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             && before_eq(h.seq, self.rcv_nxt)
         {
             self.ts_recent = val;
+            self.ts_recent_at = Some(now);
         }
         self.acknowledged(now, s);
         if self.state == State::Closed {
@@ -1560,7 +1659,11 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
         // went, else from the echoed timestamp, or the timed segment.
         let sample = match (self.timestamps, s.options.timestamps) {
             _ if sent_at.is_some() => sent_at,
-            (true, Some((_, ecr))) if ecr != 0 && self.resent_ts.is_none_or(|r| !before(ecr, r)) => {
+            (true, Some((_, ecr)))
+                if ecr != 0
+                    && self.resent_ts.is_none_or(|r| !before(ecr, r))
+                    && self.ts_sent.is_some_and(|(first, last)| !before(ecr, first) && !before(last, ecr)) =>
+            {
                 Some(u64::from(self.ts_now(now).wrapping_sub(ecr)) * MS).filter(|&r| r < RTO_MAX)
             }
             (true, _) => None,
