@@ -179,8 +179,10 @@ impl Dma {
         self.space.is_some()
     }
 
-    /// From now on every access of `device` the IOMMU refuses signals
-    /// `faults` (a notification), and is counted ([`Dma::refused`]).
+    /// From now on an access of `device` the IOMMU refuses signals `faults`
+    /// (a notification) and is counted. The device is then held quiet (still
+    /// refused, nothing reported) until the count is read ([`Dma::refused`]):
+    /// a driver told of a refusal reads it, and hears of the next.
     /// `Unsupported` where DMA is not confined.
     pub fn watch_faults(&self, device: &Device, faults: Cap) -> Result<(), DeviceError> {
         let space = self.space.ok_or(sys::Error::Unsupported)?;
@@ -188,8 +190,9 @@ impl Dma {
         Ok(())
     }
 
-    /// How many accesses of the device the IOMMU has refused (0 where DMA is
-    /// not confined).
+    /// How many refused accesses of the device were reported (0 where DMA is
+    /// not confined). Reading it takes the report: the next refusal is
+    /// reported again.
     pub fn refused(&self) -> u64 {
         self.space.and_then(|s| sys::inspect_io_space(s).ok()).map_or(0, |(_, n)| n)
     }

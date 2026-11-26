@@ -306,10 +306,11 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     }
     let outcome = disk.aim(T_IN, 0x10_0000)?;
     println!("virtio-rogue: told the device to write at 0x100000: {outcome:?}");
-    // Time for the kernel to report the refusal before the next one: an
-    // IOMMU keeps few fault records (QEMU's, one), and drops faults while
-    // they are full.
+    // Time for the kernel to report the refusal, and the report taken
+    // (the count read) before the next one: a device is reported once and
+    // then held quiet until whoever attached it has looked.
     pause(50_000_000);
+    let first = dma.refused();
     // To read from it: a disk write whose data is someone else's memory.
     // (Sector 2: nothing in this test reads it afterwards, and the disk is
     // a snapshot.)
@@ -317,6 +318,13 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     let outcome = disk.aim(T_OUT, 0x20_0000)?;
     println!("virtio-rogue: told the device to read at 0x200000: {outcome:?}");
     pause(50_000_000);
+    let second = dma.refused();
+    if first == 0 || second <= first {
+        return Err(fail(
+            "rogue_faults_reported",
+            format_args!("refused accesses counted: {first} after the first, {second} after the second"),
+        ));
+    }
     // To write to memory it may only read. This one the driver sees for
     // itself: the memory is its own.
     let mut disk = bring_up(&device, &dma)?;
@@ -340,13 +348,15 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     }
     pass("rogue_recovers");
 
-    // A flood of refused accesses: forty, then, after the kernel's pause,
-    // one more. The kernel stopped reporting for good after 32 refusals
-    // since boot, so a device attacking memory weeks into uptime went
-    // unseen; now the lines are rated, the fault interrupt resumes, and
-    // whoever attached the device hears of each (a notification given with
-    // the attach, and the space's count). The harness requires the
-    // kernel's line for the last one, at 0x3f0000.
+    // A flood of refused accesses: forty with nobody looking, then, the
+    // report taken, one more. The kernel once stopped reporting for good
+    // after 32 refusals since boot, then held every device's reports off
+    // for a second once ten lines were written in one. Now a refusal is
+    // reported once (the kernel's line, a notification given with the
+    // attach, the space's count) and its device held quiet until its
+    // attacher has read the count: the flood is one report, and the
+    // refusal after it is reported at once. The harness requires the
+    // kernel's line for that last one, at 0x3f0000.
     let faults = mem::Object::new(sys::ObjectType::Notification, 0)?;
     dma.watch_faults(&device, faults.cap())?;
     let before = dma.refused();
@@ -359,16 +369,24 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
         }
         pause(5_000_000);
     }
-    pause(1_500_000_000);
+    let told = sys::recv(faults.cap(), sys::Wait::Poll).is_ok();
+    let flood = dma.refused().saturating_sub(before);
     let mut disk = bring_up(&device, &dma)?;
     let outcome = disk.aim(T_IN, 0x3F_0000)?;
     println!("virtio-rogue: after the flood, told the device to write at 0x3f0000: {outcome:?}");
     pause(50_000_000);
-    let told = sys::recv(faults.cap(), sys::Wait::Poll).is_ok();
-    let refused = dma.refused().saturating_sub(before);
-    println!("virtio-rogue: its attacher was told: {told}; refused accesses counted: {refused}");
-    if !told || refused < 2 {
-        return Err(fail("rogue_faults_reported", format_args!("told {told}, {refused} refused accesses counted")));
+    let told_after = sys::recv(faults.cap(), sys::Wait::Poll).is_ok();
+    let after = dma.refused().saturating_sub(before + flood);
+    println!(
+        "virtio-rogue: the flood: its attacher told {told}, {flood} reported; the refusal after it: told {told_after}, {after} reported"
+    );
+    // (A request's refusals already on their way when the first is
+    // reported may still be counted: a few, never the forty.)
+    if !told || !(1..=4).contains(&flood) || !told_after || after == 0 {
+        return Err(fail(
+            "rogue_faults_reported",
+            format_args!("the flood: told {told}, {flood} reported; the refusal after it: told {told_after}, {after} reported"),
+        ));
     }
     pass("rogue_faults_reported");
 
