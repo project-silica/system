@@ -1275,6 +1275,11 @@ impl proto::Server<Handle> for Stack {
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.close(badge, connection)
     }
 
+    fn reset(&mut self, connection: u32) -> Result<proto::ResetReply, proto::Error> {
+        let badge = self.caller;
+        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.reset_conn(badge, connection)
+    }
+
     fn unlisten(&mut self, listener: u32) -> Result<proto::UnlistenReply, proto::Error> {
         let badge = self.caller;
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.unlisten(badge, listener)

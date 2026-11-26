@@ -38,6 +38,16 @@
 //! listeners and connections are let go of at once, so its ports are free
 //! and its peers reset, and the next instance of the service starts clean.
 //!
+//! Whose a connection is. A program has as many connections as the memory
+//! it lent pays for (`Tcp::add_memory`), whatever their state: waiting on
+//! its listener, accepted, or let go of in order while TCP still has the
+//! rest to send or its peer's end to hear. There is no connection that is
+//! nobody's: one let go of ends with its program, gives its place to its
+//! program's next when the program has no other, and is given up on when
+//! its peer keeps its window shut (`silica_inet`'s `release`). A listener's
+//! unfinished handshakes are its own too: a flood of them evicts only
+//! that listener's.
+//!
 //! What it does not do yet: IPv6, more than one address, and sending from
 //! the program's memory in place (G14).
 
@@ -64,7 +74,13 @@ pub const GONE: u64 = 1 << 8;
 /// their connections.
 pub const FIRST_BIT: u32 = 9;
 const BITS: u32 = 64 - FIRST_BIT;
-/// The most listeners, connections and programs with memory at once.
+/// The most listeners and programs with memory at once, and the
+/// connections the stack's own memory holds: each has `2 * BUFFER` bytes
+/// of the stack's buffers (16 MiB for all of them, of the 32 MiB the stack
+/// is declared, beside `GROWN_MOST`). No program has a share of them by
+/// default: a program has as many as the memory it lent pays for, one for
+/// every `2 * BUFFER` bytes (`Tcp::add_memory`), kept for it from then on,
+/// so that what one program holds is never another's to take.
 const LISTENERS: usize = 32;
 const CONNECTIONS: usize = 256;
 /// Connections in TIME-WAIT, kept beside those: their buffers shed, each
@@ -72,13 +88,6 @@ const CONNECTIONS: usize = 256;
 /// four connections a second for a minute. Past this many the one nearest
 /// its end goes first (as Linux's `tcp_max_tw_buckets`).
 const TIME_WAITING: usize = 1024;
-/// Handshakes a listener has answered and not seen finished, for the
-/// machine: each holds 64 KiB of buffers, so a flood of SYNs from
-/// addresses that never answer could take every connection and 16 MiB.
-/// Past this many the oldest gives its place to the newest (a real
-/// handshake finishes within a round trip; a spoofed one never does).
-/// SYN cookies, which hold nothing until the handshake finishes, are owed.
-const HALF_OPEN: usize = 64;
 const CLIENTS: usize = 32;
 /// Each connection's own buffers: bytes sent and not acknowledged, and
 /// bytes received and not yet in the program's stream.
@@ -110,6 +119,10 @@ struct Client {
     /// its slot links its mappings. The program's notifications, which
     /// go with it too, are watched instead: `Watched`.)
     frame: Handle,
+    /// How many connections it may have: one for every `2 * BUFFER` bytes
+    /// it lent (what a connection costs the stack in buffers of its own),
+    /// within what the stack's own memory had left when it lent them.
+    most: usize,
 }
 
 /// A connection's two streams in its program's memory.
@@ -356,17 +369,37 @@ impl Tcp {
         }
     }
 
-    /// Connections that count against [`CONNECTIONS`]: all but those in
-    /// TIME-WAIT. With `owner`, its alone.
-    fn live(&self, owner: Option<u64>) -> usize {
-        self.conns.iter().filter(|c| c.tcp.state() != State::TimeWait && owner.is_none_or(|o| c.owner == o)).count()
+    /// Connections of program `owner` that hold a place: all but those in
+    /// TIME-WAIT (a small record, [`TIME_WAITING`]) and those it let go of
+    /// that have ended and only wait to be forgotten.
+    fn held(&self, owner: u64) -> usize {
+        self.conns.iter().filter(|c| c.owner == owner && c.tcp.state() != State::TimeWait && !(c.released && c.tcp.is_closed())).count()
     }
 
-    /// Whether program `owner` may have one more connection: the table has
-    /// room, and it holds less than half of it (one program, or one remote
-    /// peer through one program's listener, cannot take them all).
-    fn room_for(&self, owner: u64) -> bool {
-        self.live(None) < CONNECTIONS && self.live(Some(owner)) < CONNECTIONS / 2
+    /// How many connections program `owner` may have: what it paid for when
+    /// it lent its memory ([`Tcp::add_memory`]); none before it lent any.
+    fn most(&self, owner: u64) -> usize {
+        self.client(owner).map_or(0, |c| c.most)
+    }
+
+    /// Whether program `owner` may have one more connection. At its bound,
+    /// a connection it let go of that TCP is not done with (its peer has
+    /// not taken or acknowledged the rest, or has not finished) gives its
+    /// place, the oldest first, reset: such a connection is its program's
+    /// to pay for until it is done, so a peer that never lets one finish
+    /// (a window kept shut, every probe answered) holds a place only
+    /// until its program needs it. Before, they were nobody's to give up
+    /// and counted all the same: 128 of them shut a server for good.
+    fn make_room(&mut self, owner: u64) -> bool {
+        let most = self.most(owner);
+        if self.held(owner) < most {
+            return true;
+        }
+        let lingering = |c: &Conn| c.owner == owner && c.released && !c.tcp.is_closed() && c.tcp.state() != State::TimeWait;
+        let Some(c) = self.conns.iter_mut().filter(|c| lingering(c)).min_by_key(|c| c.id) else { return false };
+        c.tcp.abort();
+        c.due = true;
+        self.held(owner) < most
     }
 
     /// Forget connection `i` (closed, or never to be), and its record.
@@ -437,33 +470,23 @@ impl Tcp {
             // A handshake that never finishes (a SYN from an address that
             // never answers: spoofed) holds its place and 64 KiB until its
             // SYN-ACKs give up, minutes later; a real one finishes within a
-            // round trip. So a full backlog gives the place of the
-            // listener's oldest unfinished handshake to this one, and so
-            // does the machine past `HALF_OPEN` of them: a flood of spoofed
-            // SYNs no longer shuts a listener, or every listener, to the
-            // peers that answer.
-            let half_open = |c: &Conn| c.tcp.state() == State::SynReceived;
-            let oldest = |conns: &[Conn], of: Option<u32>| {
-                conns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| half_open(c) && of.is_none_or(|l| c.listener == Some(l)))
-                    .min_by_key(|(_, c)| c.id)
-                    .map(|(i, _)| i)
-            };
-            if self.conns.iter().filter(|c| c.listener == Some(lid)).count() >= backlog as usize
-                && let Some(i) = oldest(&self.conns, Some(lid))
-            {
-                self.drop_conn(i);
-            }
-            if self.conns.iter().filter(|c| half_open(c)).count() >= HALF_OPEN
-                && let Some(i) = oldest(&self.conns, None)
+            // round trip. So a listener whose backlog is full, or whose
+            // program has every connection it may, gives the place of its
+            // own oldest unfinished handshake to this one: a flood of
+            // spoofed SYNs does not shut it to the peers that answer, and
+            // costs no other listener anything (before, the machine kept
+            // 64 unfinished handshakes between all listeners, and a flood
+            // on one evicted another's).
+            let unfinished = |c: &Conn| c.listener == Some(lid) && c.tcp.state() == State::SynReceived;
+            let full = self.conns.iter().filter(|c| c.listener == Some(lid)).count() >= backlog as usize;
+            if (full || self.held(owner) >= self.most(owner))
+                && let Some(i) = self.conns.iter().enumerate().filter(|(_, c)| unfinished(c)).min_by_key(|(_, c)| c.id).map(|(i, _)| i)
             {
                 self.drop_conn(i);
             }
             let waiting = self.conns.iter().filter(|c| c.listener == Some(lid)).count();
             if waiting < backlog as usize
-                && self.room_for(owner)
+                && self.make_room(owner)
                 && let Some(buffers) = buffers()
             {
                 let r = silica_rt::random::u64();
@@ -749,6 +772,13 @@ impl Tcp {
     /// badges a service's capability, and runs one instance at a time),
     /// which may call before the kernel's notice of the last one's end has
     /// been looked at: what the last instance had is let go of first.
+    ///
+    /// What it lends says how many connections it may have: one for every
+    /// `2 * BUFFER` bytes, the stack's own cost of a connection, so that a
+    /// program holds places in proportion to what it gave and none by
+    /// default. They are kept for it out of the [`CONNECTIONS`] the stack's
+    /// memory holds, never taken by a later lender; a program that lends
+    /// when none are left is refused, and told so (`no_room`).
     pub fn add_memory(&mut self, badge: u64, memory: Handle) -> Result<proto::AddMemoryReply, Error> {
         if self.client(badge).is_some() {
             self.forget(badge);
@@ -761,7 +791,15 @@ impl Tcp {
             return Err(Error::BadMemory);
         }
         let region = mem::Lent::map(memory.cap(), info.bits, Rights(Rights::READ.0 | Rights::WRITE.0)).map_err(|_| Error::BadMemory)?;
-        self.clients.push(Client { badge, memory: region, frame: memory });
+        let kept: usize = self.clients.iter().map(|c| c.most).sum();
+        let most = ((1usize << info.bits) / (2 * BUFFER)).min(CONNECTIONS.saturating_sub(kept));
+        if most == 0 {
+            silica_rt::println!(
+                "netd: a program lent memory for connections, and the stack's own memory holds no more than the {kept} kept for others"
+            );
+            return Err(Error::NoRoom);
+        }
+        self.clients.push(Client { badge, memory: region, frame: memory, most });
         Ok(proto::AddMemoryReply {})
     }
 
@@ -791,11 +829,20 @@ impl Tcp {
         self.listeners.retain(|l| l.owner != badge);
         for c in self.conns.iter_mut() {
             let waiting = c.listener.is_some_and(|l| listeners.contains(&l));
-            if (c.owner == badge || waiting) && !c.released {
+            if !(c.owner == badge || waiting) {
+                continue;
+            }
+            if !c.released {
                 c.tcp.abort();
                 c.released = true;
                 c.due = true;
                 c.streams = None;
+            } else if !c.tcp.is_closed() && c.tcp.state() != State::TimeWait {
+                // One it had let go of that TCP was not done with: it was
+                // its program's to pay for, and ends with it (before, it
+                // outlived its program for as long as its peer liked).
+                c.tcp.abort();
+                c.due = true;
             }
         }
         self.clients.retain(|c| c.badge != badge);
@@ -858,7 +905,7 @@ impl Tcp {
         if peer.port == 0 || peer.address == 0 {
             return Err(Error::BadArgument);
         }
-        if !self.room_for(badge) {
+        if !self.make_room(badge) {
             return Err(Error::NoRoom);
         }
         let (rx, tx) = self.block(badge, offset, bits)?;
@@ -934,7 +981,9 @@ impl Tcp {
         }
         // Ended in order on this side, with nothing received left unread:
         // TCP finishes on its own (its FIN after the data, its last
-        // acknowledgements, TIME-WAIT), as a socket closed on Linux does.
+        // acknowledgements, TIME-WAIT). Until it has, the connection is
+        // still its program's: counted among its connections, ended when
+        // it ends, and giving its place when it needs one (`make_room`).
         // Otherwise (the program never finished, or left bytes unread: RFC
         // 9293 section 3.6, RFC 1122 4.2.2.13) a reset.
         let unread = c.tcp.readable() > 0 || c.streams.as_ref().is_some_and(|s| s.rx.unread() > 0);
@@ -947,6 +996,17 @@ impl Tcp {
         c.due = true;
         c.streams = None;
         Ok(proto::CloseReply {})
+    }
+
+    /// Reset a connection now and let go of it, whatever it had still to
+    /// send (`reset`): one its program closed and will not wait for.
+    pub fn reset_conn(&mut self, badge: u64, connection: u32) -> Result<proto::ResetReply, Error> {
+        let c = self.conns.iter_mut().find(|c| c.id == connection && c.owner == badge && !c.released).ok_or(Error::NoSuch)?;
+        c.tcp.abort();
+        c.released = true;
+        c.due = true;
+        c.streams = None;
+        Ok(proto::ResetReply {})
     }
 
     /// The machine's address went (its lease ended): every connection on it

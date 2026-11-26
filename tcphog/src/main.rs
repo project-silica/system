@@ -3,10 +3,12 @@
 //!
 //! - It opens connections, to an address on the link that never answers
 //!   (each stays a handshake that is retried), until the stack refuses.
-//!   The stack is one table for the machine: before 2026-11-25 one program
-//!   took every place in it, and no other program could connect or accept
-//!   until its handshakes gave up minutes later. It must be refused with
-//!   `no_room` after a fair share and before half the table.
+//!   A program has as many connections as the memory it lent pays for,
+//!   one for every 64 KiB (what a connection costs the stack in buffers
+//!   of its own), however small it cuts its blocks: before 2026-11-25
+//!   one program took every place in the stack's table, then half of
+//!   it whatever it lent. It lends 1 MiB and must be refused its 17th
+//!   with `no_room`.
 //! - It names blocks of the memory it lent that are not in it: at the top
 //!   of the 64-bit range (where the end wraps past zero), past its end, and
 //!   larger than all of it. Each must be refused as `bad_memory`, and the
@@ -30,9 +32,10 @@ use silica_rt::{ProcessInfo, println, slots};
 
 silica_rt::main!(main);
 
-/// The stack's table (netd's `CONNECTIONS`) and what one program may hold.
-const TABLE: usize = 256;
-const SHARE: usize = TABLE / 2;
+/// What a connection costs the stack (netd's two buffers of 32 KiB), and
+/// so how many this program's memory pays for.
+const COST: usize = 64 << 10;
+const SHARE: usize = (1 << MEMORY_BITS) / COST;
 /// 10.0.2.99: on QEMU's user-mode link, nobody.
 const NOBODY: Endpoint = Endpoint { address: 0x0A00_0263, port: 9 };
 /// The memory lent, in blocks of 4 KiB.
@@ -106,9 +109,10 @@ fn run() -> Result<(), silica_rt::alloc::string::String> {
         }
     };
     println!("tcphog: {} connections held, then {refusal:?}", held.len());
-    if refusal != Some(CallError::Error(Error::NoRoom)) || held.len() > SHARE || held.len() < SHARE * 3 / 4 {
+    if refusal != Some(CallError::Error(Error::NoRoom)) || held.len() != SHARE {
         return Err(format!(
-            "one program held {} of the stack's {TABLE} connections before it was refused ({refusal:?}); its share is at most {SHARE}",
+            "a program that lent {} KiB held {} connections before it was refused ({refusal:?}); its memory pays for {SHARE}",
+            (1 << MEMORY_BITS) >> 10,
             held.len()
         ));
     }

@@ -131,6 +131,10 @@ pub struct Tcp {
     /// Streams closed while the stack still had bytes of theirs to take
     /// (`close`): kept, their blocks with them, until it took them.
     closing: Vec<Stream>,
+    /// A listener was signalled (a connection waits to be accepted) and
+    /// no `accept` since found none: only then does an `accept` with no
+    /// block free take a closing stream's ([`Tcp::block`]).
+    announced: bool,
 }
 
 /// A connection.
@@ -179,8 +183,19 @@ impl Tcp {
         for b in 0..blocks {
             free[b / 64] |= 1 << (b % 64);
         }
-        let mut tcp =
-            Tcp { stack, memory, block_bits, free, note, first, restarted, generation: 0, listening: Vec::new(), closing: Vec::new() };
+        let mut tcp = Tcp {
+            stack,
+            memory,
+            block_bits,
+            free,
+            note,
+            first,
+            restarted,
+            generation: 0,
+            listening: Vec::new(),
+            closing: Vec::new(),
+            announced: false,
+        };
         tcp.lend_memory()?;
         Ok(tcp)
     }
@@ -226,7 +241,7 @@ impl Tcp {
 
     fn accept_once(&mut self, listener: u32) -> Result<Option<Stream>, Failure> {
         let id = self.listening.get(listener as usize).ok_or(Failure::Refused(Error::NoSuch))?.id;
-        let (block, offset) = self.block()?;
+        let (block, offset) = self.block(self.announced)?;
         let wake = lend(self.note.cap(), Rights::WRITE, self.wake_bit(block))?;
         match self.stack.accept(id, offset, self.block_bits, wake) {
             Ok(r) => {
@@ -236,7 +251,10 @@ impl Tcp {
             Err(e) => {
                 self.give_back(offset);
                 match Failure::from(e) {
-                    Failure::Refused(Error::WouldBlock) => Ok(None),
+                    Failure::Refused(Error::WouldBlock) => {
+                        self.announced = false;
+                        Ok(None)
+                    }
                     f => Err(f),
                 }
             }
@@ -245,7 +263,7 @@ impl Tcp {
 
     /// Connect to `peer`; the stream may be written at once.
     pub fn connect(&mut self, peer: Endpoint) -> Result<Stream, Failure> {
-        let (block, offset) = self.block()?;
+        let (block, offset) = self.block(true)?;
         let wake = lend(self.note.cap(), Rights::WRITE, self.wake_bit(block))?;
         match self.stack.connect(peer, offset, self.block_bits, wake) {
             Ok(r) => self.stream(r.connection, offset, r.requests, None),
@@ -280,11 +298,21 @@ impl Tcp {
         }
     }
 
-    /// Close again what the stack could not let go of yet (it signals the
-    /// stream's bit when it has taken the last of a finished stream's bytes).
-    fn close_pending(&mut self) {
+    /// Close again what the stack could not let go of yet, of the streams
+    /// whose bits are in `bits` (the stack signals a stream's bit when it
+    /// has taken the last of its finished bytes): a call for those, none
+    /// for the rest, however many wait on peers that take nothing.
+    fn close_pending(&mut self, bits: u64) {
+        if self.closing.is_empty() {
+            return;
+        }
         for s in core::mem::take(&mut self.closing) {
-            let _ = self.close(s);
+            let block = (s.offset >> self.block_bits) as usize;
+            if s.generation != self.generation || bits & self.wake_bit(block) != 0 {
+                let _ = self.close(s);
+            } else {
+                self.closing.push(s);
+            }
         }
     }
 
@@ -295,14 +323,17 @@ impl Tcp {
     /// started again, the new one is set up first (see the module's
     /// documentation).
     pub fn wait(&mut self, deadline: Option<u64>) -> u64 {
-        self.close_pending();
         let bits = match sys::recv(self.note.cap(), deadline.map_or(Wait::Forever, Wait::Until)) {
             Ok(m) => m.badge,
             Err(_) => 0,
         };
+        if bits & self.ready_bit() != 0 {
+            self.announced = true;
+        }
         if bits & self.restarted != 0 {
             self.recover();
         }
+        self.close_pending(bits);
         bits
     }
 
@@ -319,6 +350,10 @@ impl Tcp {
             return false;
         }
         self.generation = self.generation.wrapping_add(1);
+        // Streams still closing were the last stack's: their blocks are free.
+        for s in core::mem::take(&mut self.closing) {
+            self.give_back(s.offset);
+        }
         // Every block in use is a connection of the stack that ended: its
         // receive stream ends, reset, which its reads and writes then say.
         let size = 1usize << self.block_bits;
@@ -346,9 +381,25 @@ impl Tcp {
         true
     }
 
-    /// A free block: its number and offset, zeroed.
-    fn block(&mut self) -> Result<(usize, u64), Failure> {
-        let w = self.free.iter().position(|w| *w != 0).ok_or(Failure::NoRoom)?;
+    /// A free block: its number and offset, its headers zeroed. With none
+    /// free, the oldest stream closed and not yet let go of by the stack
+    /// (its peer does not take what is left for it) is reset and gives
+    /// its block: a peer holds a block of this program's only until the
+    /// program needs it (`reclaim`: to connect, or to accept a connection
+    /// that waits; an `accept` that only looks takes nobody's).
+    fn block(&mut self, reclaim: bool) -> Result<(usize, u64), Failure> {
+        let w = match self.free.iter().position(|w| *w != 0) {
+            Some(w) => w,
+            None if !reclaim || self.closing.is_empty() => return Err(Failure::NoRoom),
+            None => {
+                let s = self.closing.remove(0);
+                if s.generation == self.generation {
+                    let _ = self.stack.reset(s.id);
+                }
+                self.give_back(s.offset);
+                self.free.iter().position(|w| *w != 0).ok_or(Failure::NoRoom)?
+            }
+        };
         let b = w * 64 + self.free[w].trailing_zeros() as usize;
         self.free[w] &= !(1 << (b % 64));
         let offset = (b as u64) << self.block_bits;

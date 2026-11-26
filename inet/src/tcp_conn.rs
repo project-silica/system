@@ -1623,8 +1623,15 @@ impl<S: AsRef<[u8]> + AsMut<[u8]>> Connection<S> {
             self.snd_wl2 = ack;
             if self.snd_max == self.snd_una && self.retransmit_at.is_some() {
                 // Nothing is in flight. A current window report answers the
-                // persist probe even when the receiver still has no room.
-                self.retries = 0;
+                // persist probe even when the receiver still has no room:
+                // a peer that is there keeps a connection its program
+                // holds for as long as it likes. One its program let go of
+                // waits on nobody but the peer: a window still shut is a
+                // probe unanswered, and the connection ends after as many
+                // as a segment is sent again (RFC 6429).
+                if window > 0 || !self.released {
+                    self.retries = 0;
+                }
                 if window > 0 {
                     self.retransmit_at = None;
                     self.probe_due = false;
