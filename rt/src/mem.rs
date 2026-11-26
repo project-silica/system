@@ -73,7 +73,22 @@ pub fn add_source(untyped: Cap, bits: u8) {
     SOURCES[SOURCES.len() - 1].store(entry, Ordering::Relaxed);
 }
 
+/// Blocks this small or smaller are small: made from a pool.
+const SMALL_BITS: u8 = 16;
+/// A pool small blocks are made from: a block of the program's memory, an
+/// eighth of its largest source, at most this.
+const POOL_BITS: u8 = 20;
+
 /// An empty Untyped of `2^bits` bytes, or `NoMemory`.
+///
+/// Small blocks come from pools of their own ([`POOL_BITS`]): the kernel
+/// makes each block at the next multiple of its size in its source, so a
+/// large block made after small ones skips up to its whole size, and a
+/// parent whose children's large blocks alternated with its own small
+/// objects lost half its memory to the gaps (the device manager, with 16 MB
+/// of its 32 counted free, could not make a notification after its fourth
+/// driver). A small request is served from a source no larger than a pool;
+/// when none has room, a new pool is made from a larger source.
 pub fn alloc(bits: u8) -> Result<Cap, Error> {
     for f in &FREE {
         let v = f.load(Ordering::Relaxed);
@@ -83,6 +98,40 @@ pub fn alloc(bits: u8) -> Result<Cap, Error> {
         }
     }
     let slot = free_slot().ok_or(Error::NoMemory)?;
+    if bits <= SMALL_BITS {
+        if let Some(r) = from_sources(bits, slot, POOL_BITS) {
+            return r;
+        }
+        // No pool has room: a new one, and the block from it (none when
+        // the program's sources are no larger than a pool).
+        let largest = SOURCES
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .filter(|e| *e != 0 && *e != SPENT)
+            .map(|e| ((e & !USED) >> 56) as u8)
+            .max()
+            .unwrap_or(0);
+        let pool = largest.saturating_sub(3).min(POOL_BITS);
+        if pool > SMALL_BITS
+            && pool >= bits
+            && let Ok(block) = alloc(pool)
+        {
+            add_source(block, pool);
+            if let Some(r) = from_sources(bits, slot, pool) {
+                return r;
+            }
+        }
+    }
+    from_sources(bits, slot, u8::MAX).unwrap_or_else(|| {
+        release_slot(slot);
+        Err(Error::NoMemory)
+    })
+}
+
+/// A block of `2^bits` bytes into `slot` from a source no larger than
+/// `2^largest` bytes, smallest first; `None` when none has room (the slot
+/// is then still the caller's).
+fn from_sources(bits: u8, slot: u64, largest: u8) -> Option<Result<Cap, Error>> {
     for s in &SOURCES {
         let entry = s.load(Ordering::Relaxed);
         if entry == 0 {
@@ -92,12 +141,15 @@ pub fn alloc(bits: u8) -> Result<Cap, Error> {
         if entry == SPENT || entry_bits < bits {
             continue;
         }
+        if entry_bits > largest {
+            return None;
+        }
         let source = entry & ((1 << 56) - 1);
         match sys::retype(Cap(source), ObjectType::Untyped, bits, slots::SPACE, slot, 1) {
             Ok(()) => {
                 s.store(entry | USED, Ordering::Relaxed);
                 MADE.fetch_add(1 << bits, Ordering::Relaxed);
-                return Ok(Cap(slot));
+                return Some(Ok(Cap(slot)));
             }
             // A source of exactly this size cannot be made into a smaller
             // one: while nothing has been made from it, it is the block.
@@ -105,18 +157,17 @@ pub fn alloc(bits: u8) -> Result<Cap, Error> {
                 if s.compare_exchange(entry, SPENT, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                     MADE.fetch_add(1 << bits, Ordering::Relaxed);
                     release_slot(slot);
-                    return Ok(Cap(source));
+                    return Some(Ok(Cap(source)));
                 }
             }
             Err(Error::NoMemory) => {}
             Err(e) => {
                 release_slot(slot);
-                return Err(e);
+                return Some(Err(e));
             }
         }
     }
-    release_slot(slot);
-    Err(Error::NoMemory)
+    None
 }
 
 /// Give back the block `block` of `2^bits` bytes from [`alloc()`]: everything
