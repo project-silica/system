@@ -21,6 +21,7 @@
 //! | `generation` | virtio: its configuration's generation changes on every read, from bring-up on |
 //! | `short` | virtio-blk: completes a read saying it wrote only the status byte, not the data |
 //! | `unplugged` | e1000e: holds every transmit while its link is down, as an 82574 does |
+//! | `slow_start` | NVMe: answers the first admin command 3 s late, so whatever the driver is told while it comes up arrives during an admin wait |
 //!
 //! The virtio queue ([`crate::virtio`]) commits all six (`broken` by
 //! offering the device a descriptor chain it must refuse, which a virtio
@@ -48,6 +49,7 @@ pub enum Fault {
     Generation = 9,
     Short = 10,
     Unplugged = 11,
+    SlowStart = 12,
 }
 
 impl Fault {
@@ -65,6 +67,7 @@ impl Fault {
             b"generation" => Fault::Generation,
             b"short" => Fault::Short,
             b"unplugged" => Fault::Unplugged,
+            b"slow_start" => Fault::SlowStart,
             _ => return None,
         })
     }
@@ -82,6 +85,7 @@ impl Fault {
             9 => Fault::Generation,
             10 => Fault::Short,
             11 => Fault::Unplugged,
+            12 => Fault::SlowStart,
             _ => return None,
         })
     }

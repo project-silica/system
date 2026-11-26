@@ -166,6 +166,11 @@ struct Controller {
     listen: Cap,
     admin: Queue,
     cid: u16,
+    /// Every bit its admin waits took from that notification: it is the
+    /// driver's one notification, so they took its parent's
+    /// `silica_rt::END` and its clients' wake-ups too (`main` gives them
+    /// back before it serves).
+    taken: u64,
 }
 
 impl Controller {
@@ -210,6 +215,19 @@ impl Controller {
         let lost = lose_interrupt && inject::pending(Fault::AdminMissed);
         #[cfg(not(feature = "harness"))]
         let lost = false;
+        // An injected fault: the controller answers this, its first admin
+        // command, 3 s late. The driver waits as it does for any answer,
+        // and whatever it is told meanwhile (its parent's END: the machine
+        // turned off as it comes up) arrives during this wait.
+        #[cfg(feature = "harness")]
+        if inject::planned() == Some(Fault::SlowStart) && inject::due() == Some(Fault::SlowStart) && inject::pending(Fault::SlowStart) {
+            let late = now() + 3_000_000_000;
+            while now() < late {
+                if let Ok(m) = sys::recv(self.listen, Wait::Until(late)) {
+                    self.taken |= m.badge;
+                }
+            }
+        }
         let mut woken = !lost;
         loop {
             if let Some(c) = self.admin.pop()? {
@@ -238,7 +256,13 @@ impl Controller {
             }
             let until = (t + poll).min(deadline);
             // Lost: the driver does not know it came, and waits on.
-            woken = sys::recv(self.listen, Wait::Until(until)).is_ok() && !lost;
+            woken = match sys::recv(self.listen, Wait::Until(until)) {
+                Ok(m) => {
+                    self.taken |= m.badge;
+                    !lost
+                }
+                Err(_) => false,
+            };
             poll = (poll * 2).min(ADMIN_POLL_MAX_NS);
         }
     }
@@ -533,6 +557,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         listen: signals.listen(),
         admin,
         cid: 0,
+        taken: 0,
     };
 
     // Reset: a driver started again finds the controller as the last one left it.
@@ -647,6 +672,17 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         _admin: ctl.admin,
         _interrupts: (admin_irq, io_irq),
     };
+    // What the admin waits took that was not theirs goes back on the
+    // notification, for the loop below to see: the parent's END above all.
+    // Taken and dropped, a machine turned off while this driver was coming
+    // up was never told to the service, which never flushed the cache or
+    // shut the controller down, and was ended where it stood 8 s later
+    // (shutdown_flush on a hosted runner, 2026-11-26).
+    let back = ctl.taken & !ADMIN_BIT;
+    // (The capability that signals them lives as long as the driver.)
+    if back != 0 {
+        let _ = sys::signal(signals.sender(back)?);
+    }
     let mut service = Service::new(disk, signals.sender(CLIENT)?, silica_driver::granted(silica_driver::grant::SERVICE));
     silica_rt::ipc::serve_events(silica_driver::granted(silica_driver::grant::SERVICE), signals.listen(), &mut service)
 }
