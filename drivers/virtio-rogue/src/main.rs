@@ -340,6 +340,38 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     }
     pass("rogue_recovers");
 
+    // A flood of refused accesses: forty, then, after the kernel's pause,
+    // one more. The kernel stopped reporting for good after 32 refusals
+    // since boot, so a device attacking memory weeks into uptime went
+    // unseen; now the lines are rated, the fault interrupt resumes, and
+    // whoever attached the device hears of each (a notification given with
+    // the attach, and the space's count). The harness requires the
+    // kernel's line for the last one, at 0x3f0000.
+    let faults = mem::Object::new(sys::ObjectType::Notification, 0)?;
+    dma.watch_faults(&device, faults.cap())?;
+    let before = dma.refused();
+    // One bring-up for the flood, again only when the device gives up
+    // (each leaves its rings behind, and a network device's are large).
+    let mut disk = bring_up(&device, &dma)?;
+    for i in 0..40u64 {
+        if disk.aim(T_IN, 0x40_0000 + i * 0x1000)? == Outcome::Refused {
+            disk = bring_up(&device, &dma)?;
+        }
+        pause(5_000_000);
+    }
+    pause(1_500_000_000);
+    let mut disk = bring_up(&device, &dma)?;
+    let outcome = disk.aim(T_IN, 0x3F_0000)?;
+    println!("virtio-rogue: after the flood, told the device to write at 0x3f0000: {outcome:?}");
+    pause(50_000_000);
+    let told = sys::recv(faults.cap(), sys::Wait::Poll).is_ok();
+    let refused = dma.refused().saturating_sub(before);
+    println!("virtio-rogue: its attacher was told: {told}; refused accesses counted: {refused}");
+    if !told || refused < 2 {
+        return Err(fail("rogue_faults_reported", format_args!("told {told}, {refused} refused accesses counted")));
+    }
+    pass("rogue_faults_reported");
+
     // Interrupts: the driver holds the BAR with its device's MSI-X table, so
     // it can make the device send any message at all. First one in the old
     // format, naming a processor (0) and the vector this driver's own line
