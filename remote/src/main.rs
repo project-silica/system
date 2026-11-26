@@ -77,6 +77,9 @@ const MAX_UNPROVEN: usize = 8;
 const MAX_UNPROVEN_FROM_ONE: usize = 2;
 /// A connection not proven an owner's in this long is closed.
 const HANDSHAKE: u64 = 10_000_000_000;
+/// How far behind this machine's clock an owner's first message may be
+/// made (its clock may lag): older is a recording.
+const STAMP_WINDOW: u64 = 300_000_000_000;
 /// How long a new connection has to give an owner's handshake before a
 /// newer one may take its place.
 const GRACE: u64 = 1_000_000_000;
@@ -516,6 +519,21 @@ impl Session {
             println!(
                 "remote: a connection from {} closed: a handshake of {} made no later than the last taken from them (replayed, or their clock went back)",
                 self.peer, m.owners[o].1
+            );
+            return self.close();
+        }
+        // Made long before this machine's clock: a recording, even when the
+        // newest times were lost (the kept page is empty after a boot and
+        // after this service's program changes), as long as the machine
+        // knows the time. An owner's clock may lag it by `STAMP_WINDOW`.
+        if let Some(wall) = silica_rt::time::now()
+            && made.saturating_add(STAMP_WINDOW) < wall.ns
+        {
+            println!(
+                "remote: a connection from {} closed: a handshake of {} made {} s before this machine's clock (replayed, or their clock is behind)",
+                self.peer,
+                m.owners[o].1,
+                (wall.ns - made) / 1_000_000_000
             );
             return self.close();
         }

@@ -202,6 +202,13 @@ pub const PROBE_LABEL: u64 = 0xFFFF_FFFF;
 /// manager and the device manager both honour it.
 pub const EXIT_AGAIN: i64 = 75;
 
+/// The bit of [`slots::EVENTS`] a parent signals to ask the program to end:
+/// finish what must be finished (a block driver makes its device's write
+/// cache durable and shuts the device down) and exit. A parent that asks
+/// waits a while for the exit, then ends the program itself. The parent's
+/// other bits (a need started again) are the ones below it.
+pub const END: u64 = 1 << 31;
+
 /// What a program is told when it starts. Read-only, mapped by the parent.
 #[repr(C)]
 pub struct ProcessInfo {

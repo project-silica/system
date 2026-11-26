@@ -19,7 +19,7 @@
 use silica_driver::pci::{CAP_EXPRESS, COMMAND_MASTER, COMMAND_MEMORY, Config};
 
 /// The bit of the device manager's notification a slot's change sets.
-pub const HOTPLUG: u64 = 2;
+pub const HOTPLUG: u64 = 1 << 33;
 
 // The PCI Express capability's registers, from its start.
 const CAPS: usize = 0x02;

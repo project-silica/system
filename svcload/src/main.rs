@@ -133,6 +133,12 @@ fn scopes_hold(system: &mut system::Client<Channel, Handle>) -> Result<(), Strin
         return Err(String::from("a capability to the service manager was given a badge of every scope by its holder"));
     }
     silica_rt::ipc::release_slot(slot);
+    // What the scopes do allow still works: a test that only counted
+    // refusals would pass on a manager that refused everything.
+    let listed = system.list(0).map_err(|e| format!("list, which observe allows: {e:?}"))?;
+    if listed.services.iter().next().is_none() {
+        return Err(String::from("list, which observe allows, answered no service"));
+    }
     println!("svcload: the service manager refuses stage, update, revert and shutdown to a holder of observe+control+logs");
     Ok(())
 }
@@ -157,9 +163,14 @@ fn logs_bounded(system: &mut system::Client<Channel, Handle>) -> Result<u32, Str
         }
         rings.push(ring);
     }
-    if given > 32 {
-        return Err(format!("one service was given {given} logs, more than half of the machine's 64"));
+    // Exactly the allowance, no more and no fewer: a manager that refused
+    // every log would pass a test that only bounded it from above. This
+    // service had asked for none before.
+    if given != 32 {
+        return Err(format!("one service was given {given} logs; its allowance is 32, half of the machine's 64"));
     }
+    // And a call its scopes allow still answers once it holds them all.
+    system.memory().map_err(|e| format!("memory, which observe allows, after the flood: {e:?}"))?;
     println!("svcload: one service is given {given} logs and refused the next");
     // The rings stay this program's while it runs (their places stay taken).
     core::mem::forget(rings);

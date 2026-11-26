@@ -5,7 +5,7 @@
 //! ```text
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
-//!        [restart=always|never] [seed] [keeps] [sets_time] [secrets] [files=<name>,...]
+//!        [restart=always|never] [seed] [keeps] [ends] [sets_time] [secrets] [files=<name>,...]
 //! ```
 //!
 //! - `provides`: the protocol it serves; the service manager makes its
@@ -43,6 +43,11 @@
 //!   that the service manager keeps across its restarts: what a service
 //!   started again needs to pick up where the last one was (the network
 //!   stack's lease, so that it answers on its address at once).
+//! - `ends`: it has something to finish before it is let go of (the device
+//!   manager: its disks' caches). When the machine is turned off it is
+//!   asked to end (`silica_rt::END` on its events notification) and given a
+//!   while to exit before it is ended where it stands; every other service
+//!   is ended at once, last started first, as it always was.
 //! - `sets_time`: its time page (`slots::TIME`, which every service can
 //!   read) is writable: it may set the wall clock (the network stack's
 //!   time-server client).
@@ -89,6 +94,7 @@ pub struct Service {
     pub machine: bool,
     pub seed: bool,
     pub keeps: bool,
+    pub ends: bool,
     pub sets_time: bool,
     /// It holds secrets: its address space is isolated against speculation.
     pub secrets: bool,
@@ -115,6 +121,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             machine: false,
             seed: false,
             keeps: false,
+            ends: false,
             sets_time: false,
             secrets: false,
             files: Vec::new(),
@@ -142,6 +149,11 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                             (Some(_), spec) => silica_protocols::scope::parse(protocol, spec)
                                 .map_err(|_| "a need names a scope its protocol does not have")?,
                         };
+                        // A need's restart is bit n of the events notification,
+                        // below `silica_rt::END`.
+                        if s.needs.len() == 31 {
+                            return Err("a service needs more than 31 protocols");
+                        }
                         s.needs.push(protocol);
                         s.scopes.push(scopes);
                     }
@@ -149,6 +161,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("machine", "") => s.machine = true,
                 ("seed", "") => s.seed = true,
                 ("keeps", "") => s.keeps = true,
+                ("ends", "") => s.ends = true,
                 ("sets_time", "") => s.sets_time = true,
                 ("secrets", "") => s.secrets = true,
                 ("files", f) => s.files = f.split(',').filter(|n| !n.is_empty()).collect(),

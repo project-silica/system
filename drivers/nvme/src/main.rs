@@ -73,6 +73,8 @@ const CC_EN: u32 = 1;
 const CC_ENTRY_SIZES: u32 = (6 << 16) | (4 << 20);
 const CSTS_RDY: u32 = 1;
 const CSTS_CFS: u32 = 2;
+/// How long a controller that gives no RTD3E may take to shut down.
+const SHUTDOWN_NS: u64 = 5_000_000_000;
 
 const ADMIN_CREATE_SQ: u32 = 0x01;
 const ADMIN_CREATE_CQ: u32 = 0x05;
@@ -310,6 +312,9 @@ struct Disk {
     /// The bit the I/O queue's interrupt signals: `IO_BIT`, or `ADMIN_BIT`
     /// when both queues share a vector.
     io_bit: u64,
+    /// How long the controller may take to shut down (Identify Controller's
+    /// RTD3E, nanoseconds), or a few seconds when it gives none.
+    shutdown_ns: u64,
     // Kept alive for as long as the controller may use them.
     _admin: Queue,
     _interrupts: (Interrupt, Option<Interrupt>),
@@ -467,6 +472,24 @@ impl BlockDevice for Disk {
             give_up(DeviceError::Timeout("an I/O command the controller never completed"));
         }
     }
+
+    fn shutdown(&mut self) {
+        // A normal shutdown (NVMe base specification 2.0, 3.6.2): CC.SHN
+        // 01b, then CSTS.SHST reads 10b once the controller has made what
+        // it holds durable. A controller turned off without it records an
+        // unsafe shutdown and may lose what its cache held.
+        let cc = self.regs.read32(CC);
+        self.regs.write32(CC, cc & !(3 << 14) | 1 << 14);
+        let deadline = now() + self.shutdown_ns;
+        while self.regs.read32(CSTS) >> 2 & 3 != 2 {
+            if now() >= deadline {
+                println!("nvme: the controller did not finish its shutdown within {} ms", self.shutdown_ns / 1_000_000);
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        println!("nvme: the controller shut down in order");
+    }
 }
 
 fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
@@ -538,6 +561,10 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
     }
     let namespaces = m.read32(516);
     let write_cache = m.read8(525) & 1 != 0;
+    let shutdown_ns = match m.read32(88) as u64 {
+        0 => SHUTDOWN_NS,
+        us => (us * 1000).clamp(1_000_000, 60_000_000_000),
+    };
     let mut model = [0u8; 40];
     for (i, b) in model.iter_mut().enumerate() {
         *b = match m.read8(24 + i) {
@@ -615,6 +642,7 @@ fn run(info: &silica_rt::ProcessInfo) -> Result<Infallible, DeviceError> {
         free: (0..io_entries).rev().collect(),
         unrung: false,
         io_bit,
+        shutdown_ns,
         io,
         _admin: ctl.admin,
         _interrupts: (admin_irq, io_irq),
