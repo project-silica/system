@@ -47,6 +47,9 @@ const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
 /// The notification bit of the queue's interrupt.
 const INTERRUPT: u64 = 2;
+/// The notification bit of the configuration interrupt (when it has its own
+/// entry: `Transport::config_vector`).
+const CONFIG: u64 = 4;
 /// Descriptors in the queue, and so requests in flight at most a third of that.
 const QUEUE_SIZE: u16 = 256;
 /// Most bytes in one request.
@@ -59,6 +62,9 @@ struct Disk {
     dma: Dma,
     queue: Queue,
     _interrupt: Interrupt,
+    _config: Option<Interrupt>,
+    /// The configuration interrupt shares the queue's.
+    config_shared: bool,
     /// A 16-byte header per request slot: the device reads them.
     headers: DmaMemory,
     /// A status byte per request slot: the device writes them.
@@ -150,10 +156,18 @@ impl silica_block::service::Device for Disk {
         }
     }
 
-    fn signals(&mut self, _bits: u64, done: &mut Completions<'_>) {
+    fn signals(&mut self, bits: u64, done: &mut Completions<'_>) {
+        // A device that gave up asks to be reset with a configuration
+        // interrupt (on the queue's entry when it has no other: then an
+        // interrupt that brings no completion is asked about).
+        if bits & CONFIG != 0 && self.transport.needs_reset() {
+            self.give_up(DeviceError::Protocol("the device asks to be reset"));
+        }
+        let mut any = false;
         loop {
             match self.queue.pop() {
                 Ok(Some((token, _))) => {
+                    any = true;
                     let Some((ticket, _)) = self.slots.get_mut(token as usize).and_then(Option::take) else { continue };
                     self.free.push(token as u16);
                     done(
@@ -165,7 +179,12 @@ impl silica_block::service::Device for Disk {
                         },
                     );
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    if !any && self.config_shared && bits & INTERRUPT != 0 && self.transport.needs_reset() {
+                        self.give_up(DeviceError::Protocol("the device asks to be reset"));
+                    }
+                    return;
+                }
                 Err(e) => self.give_up(e),
             }
         }
@@ -190,7 +209,11 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let signals = Signals::new()?;
     let interrupt = Interrupt::bind_to(&device, 0, signals.sender(INTERRUPT)?)?;
     inject::interrupts(signals.sender(INTERRUPT)?);
-    let mut queue = transport.queue(&dma, 0, QUEUE_SIZE, Some(0))?;
+    // A request is a header, its data and a status byte.
+    let mut queue = transport.queue(&dma, 0, QUEUE_SIZE, 3, Some(0))?;
+    let config_vector = Transport::config_vector(&device, 1);
+    let config_irq = if config_vector != 0 { Some(Interrupt::bind_to(&device, config_vector, signals.sender(CONFIG)?)?) } else { None };
+    transport.config_interrupt(config_vector)?;
     // A processor idling for a completion sees the device write it, without
     // waiting for the interrupt to arrive (spec/ARCHITECTURE.md section 7).
     if let Err(e) = queue.watch(&interrupt) {
@@ -231,6 +254,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         dma,
         queue,
         _interrupt: interrupt,
+        _config: config_irq,
+        config_shared: config_vector == 0,
     };
     disk.transport.start();
     println!(

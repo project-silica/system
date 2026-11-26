@@ -213,6 +213,10 @@ impl silica_net::service::Device for Nic {
             }
         }
         if bits & CONFIG != 0 {
+            // A device that gave up asks to be reset this way too.
+            if self.transport.needs_reset() {
+                self.give_up(DeviceError::Protocol("the device asks to be reset"));
+            }
             let up = self.link_up();
             if up != self.info.link_up {
                 self.info.link_up = up;
@@ -280,8 +284,9 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         interrupts.push(Interrupt::bind_to(&device, 0, signals.sender(RX | TX | CONFIG)?)?);
     }
     inject::interrupts(signals.sender(RX | TX)?);
-    let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, Some(rx_v))?;
-    let tx = transport.queue(&dma, 1, QUEUE_SIZE, Some(tx_v))?;
+    // A frame takes a header and its data: two descriptors each way.
+    let mut rx = transport.queue(&dma, 0, QUEUE_SIZE, 2, Some(rx_v))?;
+    let tx = transport.queue(&dma, 1, QUEUE_SIZE, 2, Some(tx_v))?;
     // A processor idling for a frame sees the device write it, without
     // waiting for the interrupt (spec/ARCHITECTURE.md section 7). Only where
     // the receive queue has an interrupt of its own (a shared one's news is
@@ -292,9 +297,8 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     {
         println!("virtio-net: completions wait for the interrupt alone: {e:?}");
     }
-    if features & F_STATUS != 0 {
-        transport.config_interrupt(cfg_v)?;
-    }
+    // The link's changes, and a device asking to be reset (`needs_reset`).
+    transport.config_interrupt(cfg_v)?;
     let config = transport.device_config().ok_or(DeviceError::Missing("the network device's configuration"))?;
     if config.len() < 12 {
         return Err(DeviceError::Protocol("the network device's configuration is too short"));

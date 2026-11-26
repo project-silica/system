@@ -66,10 +66,12 @@ silica_rt::main!(main);
 const CTRL: usize = 0x0000;
 const STATUS: usize = 0x0008;
 const CTRL_EXT: usize = 0x0018;
+const EECD: usize = 0x0010;
 const ICR: usize = 0x00C0;
 const IMS: usize = 0x00D0;
 const IMC: usize = 0x00D8;
 const EIAC: usize = 0x00DC;
+const IAM: usize = 0x00E0;
 const IVAR: usize = 0x00E4;
 const RCTL: usize = 0x0100;
 const TCTL: usize = 0x0400;
@@ -93,6 +95,10 @@ const CTRL_SLU: u32 = 1 << 6;
 const CTRL_RST: u32 = 1 << 26;
 const STATUS_LU: u32 = 1 << 1;
 const CTRL_EXT_PBA_CLR: u32 = 1 << 31;
+/// CTRL_EXT: the queues' interrupts mask themselves (IAM) when sent by MSI-X.
+const CTRL_EXT_EIAME: u32 = 1 << 24;
+/// EECD: the device has read its NVM (the Ethernet address among it).
+const EECD_AUTO_RD: u32 = 1 << 9;
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_BAM: u32 = 1 << 15;
 const RCTL_SECRC: u32 = 1 << 26;
@@ -121,6 +127,9 @@ const OTHER: u64 = 8;
 const TX_TIMEOUT_NS: u64 = 5_000_000_000;
 /// How long a reset may take (the datasheet: about 1 ms, then the NVM is read).
 const RESET_TIMEOUT_NS: u64 = 100_000_000;
+/// How long the NVM may take to load after a reset (Intel's own drivers
+/// wait 10 ms).
+const NVM_TIMEOUT_NS: u64 = 10_000_000;
 
 fn now() -> u64 {
     silica_rt::clock().now()
@@ -342,6 +351,18 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     let dma = Dma::new(&device)?;
     reset(&regs)?;
 
+    // The Ethernet address is loaded from the NVM after the reset: read
+    // before the load is done, RAL/RAH hold nothing yet, and the driver
+    // would replace the burned-in address with one of its own (82574
+    // datasheet, EECD.AUTO_RD).
+    let deadline = now() + NVM_TIMEOUT_NS;
+    while regs.read32(EECD) & EECD_AUTO_RD == 0 {
+        if now() >= deadline {
+            println!("e1000e: the NVM did not finish loading within 10 ms; its address may be missing");
+            break;
+        }
+        silica_rt::sys::yield_now();
+    }
     // The Ethernet address: the NVM's, or one made from the device's identity.
     let (low, high) = (regs.read32(RAL0), regs.read32(RAH0));
     let address = if high & RAH_AV != 0 {
@@ -379,12 +400,15 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     regs.write32(IVAR, ivar | IVAR_TX_EVERY);
     // Where an injected spurious interrupt goes.
     inject::interrupts(signals.sender(RX | TX)?);
-    regs.write32(CTRL_EXT, regs.read32(CTRL_EXT) | CTRL_EXT_PBA_CLR);
-    // A queue's cause clears itself when its message is sent, and the queue
-    // is masked until the driver has looked at it (`signals` unmasks it):
-    // without the auto-clear the cause would stay set and the device would
-    // not interrupt again.
+    regs.write32(CTRL_EXT, regs.read32(CTRL_EXT) | CTRL_EXT_PBA_CLR | CTRL_EXT_EIAME);
+    // A queue's cause clears itself when its message is sent (EIAC), and
+    // the queue masks itself then (IAM, with CTRL_EXT.EIAME) until the
+    // driver has looked at it (`signals` unmasks it): without the
+    // auto-clear the cause would stay set and the device would not
+    // interrupt again; without the auto-mask it would interrupt for every
+    // frame while the driver is still taking the last ones.
     regs.write32(EIAC, INT_RXQ0 | INT_TXQ0);
+    regs.write32(IAM, INT_RXQ0 | INT_TXQ0);
 
     // The rings, then the queues on.
     let (rx_memory, rx) = ring(&dma)?;

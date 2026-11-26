@@ -29,6 +29,8 @@ silica_rt::main!(main);
 
 /// The notification bit of the queues' interrupt.
 const INTERRUPT: u64 = 2;
+/// The notification bit of the configuration interrupt, on an entry of its own.
+const CONFIG: u64 = 4;
 /// Receive buffers kept with the device, of [`RX_BYTES`] each (one page).
 const RX_BUFFERS: u16 = 16;
 const RX_BYTES: u32 = 256;
@@ -54,6 +56,13 @@ struct Port {
     mapped: Option<mem::Lent>,
     held: VecDeque<u8>,
     _interrupt: Interrupt,
+    _config: Option<Interrupt>,
+    transport: Transport,
+    /// The configuration interrupt shares the queues'.
+    config_shared: bool,
+    /// The notification the interrupts signal: a write waiting for a
+    /// transmit buffer sleeps on it, and does what each interrupt brings.
+    signals: Signals,
 }
 
 /// The device cannot be relied on: end, so that the device manager starts
@@ -103,7 +112,9 @@ impl Port {
         }
     }
 
-    /// Wait until transmit buffer `slot` is free, or `stalled`.
+    /// Wait until transmit buffer `slot` is free, or `stalled`: asleep
+    /// until an interrupt, not spinning, and taking in what arrives
+    /// meanwhile (it went unread while a slow host held a write).
     fn free(&mut self, slot: usize) -> Result<(), Error> {
         let deadline = silica_rt::clock().now() + WAIT_NS;
         loop {
@@ -114,7 +125,9 @@ impl Port {
             if silica_rt::clock().now() > deadline {
                 return Err(Error::Stalled);
             }
-            sys::yield_now();
+            if let Some(bits) = self.signals.wait(Some(deadline)) {
+                self.interrupt(bits);
+            }
         }
     }
 }
@@ -175,7 +188,20 @@ impl Events for Port {
         port::dispatch(self, request, caps, reply, reply_caps)
     }
 
-    fn signals(&mut self, _bits: u64) {
+    fn signals(&mut self, bits: u64) {
+        self.interrupt(bits);
+    }
+}
+
+impl Port {
+    /// What an interrupt with `bits` brings: buffers the device took, bytes
+    /// that arrived, or a device that asks to be reset.
+    fn interrupt(&mut self, bits: u64) {
+        let shared = self.config_shared && bits & INTERRUPT != 0;
+        if (bits & CONFIG != 0 || shared) && self.transport.needs_reset() {
+            self.transport.fail();
+            give_up(DeviceError::Protocol("the device asks to be reset"));
+        }
         self.reap();
         let mut added = false;
         let mut buf = [0u8; RX_BYTES as usize];
@@ -219,8 +245,11 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
     transport.negotiate(&dma, 0, 0)?;
     let signals = Signals::new()?;
     let interrupt = Interrupt::bind_to(&device, 0, signals.sender(INTERRUPT)?)?;
-    let rx = transport.queue(&dma, 0, RX_BUFFERS, Some(0))?;
-    let tx = transport.queue(&dma, 1, TX_BUFFERS as u16, Some(0))?;
+    let rx = transport.queue(&dma, 0, RX_BUFFERS, 1, Some(0))?;
+    let tx = transport.queue(&dma, 1, TX_BUFFERS as u16, 1, Some(0))?;
+    let config_vector = Transport::config_vector(&device, 1);
+    let config_irq = if config_vector != 0 { Some(Interrupt::bind_to(&device, config_vector, signals.sender(CONFIG)?)?) } else { None };
+    transport.config_interrupt(config_vector)?;
     let (rx_mem, tx_mem) = (dma.memory(12, true)?, dma.memory(12, false)?);
     let mut port = Port {
         rx,
@@ -232,12 +261,17 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         mapped: None,
         held: VecDeque::new(),
         _interrupt: interrupt,
+        _config: config_irq,
+        transport,
+        config_shared: config_vector == 0,
+        signals,
     };
     for slot in 0..RX_BUFFERS.min(port.rx.size()) {
         port.offer(slot);
     }
-    transport.start();
+    port.transport.start();
     port.rx.notify();
     println!("virtio-console: port 0, {}", if dma.confined() { "DMA confined by the IOMMU" } else { "DMA not confined" });
-    serve_events(granted(grant::SERVICE), signals.listen(), &mut port)
+    let listen = port.signals.listen();
+    serve_events(granted(grant::SERVICE), listen, &mut port)
 }

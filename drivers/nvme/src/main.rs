@@ -93,6 +93,9 @@ const PRP_LIST_BYTES: usize = (MAX_TRANSFER / PAGE) as usize * 8;
 const ADMIN_TIMEOUT_NS: u64 = 5_000_000_000;
 /// How often a register is read while waiting for the controller.
 const POLL_NS: u64 = 50_000;
+/// The longest between two looks at the admin queue while a command is in
+/// progress (the interval doubles from `POLL_NS` up to this).
+const ADMIN_POLL_MAX_NS: u64 = 10_000_000;
 
 // The bits of the driver's notification: interrupt n signals 2 << n.
 const ADMIN_BIT: u64 = 2;
@@ -195,11 +198,23 @@ impl Controller {
     fn admin(&mut self, mut command: [u32; 16], what: &'static str) -> Result<u32, DeviceError> {
         self.cid = (self.cid + 1) & 0x7FFF;
         command[0] |= (self.cid as u32) << 16;
+        // An injected fault (`inject`): this command's interrupt is lost.
+        let lose_interrupt = inject::planned() == Some(Fault::AdminMissed) && inject::due() == Some(Fault::AdminMissed);
         self.admin.push(&command);
         self.admin.ring();
-        let deadline = now() + ADMIN_TIMEOUT_NS;
+        let start = now();
+        let deadline = start + ADMIN_TIMEOUT_NS;
+        // The interrupt normally ends the wait; the queue is looked at
+        // again after a poll interval that doubles from POLL_NS, so a lost
+        // interrupt costs milliseconds, not the whole timeout, and a
+        // controller that has died is seen as soon (CSTS).
+        let mut poll = POLL_NS;
+        let mut woken = true;
         loop {
             if let Some(c) = self.admin.pop()? {
+                if !woken {
+                    println!("nvme: {what}: its completion came without its interrupt; found by polling after {} us", (now() - start) / 1000);
+                }
                 self.admin.release();
                 if c.cid != self.cid {
                     return Err(DeviceError::Protocol("an admin completion names a command not in progress"));
@@ -213,10 +228,18 @@ impl Controller {
             if self.status()? & CSTS_CFS != 0 {
                 return Err(DeviceError::Protocol("the controller reports fatal status"));
             }
-            if now() >= deadline {
+            let t = now();
+            if t >= deadline {
                 return Err(DeviceError::Timeout(what));
             }
-            self.sleep(deadline);
+            let until = (t + poll).min(deadline);
+            woken = sys::recv(self.listen, Wait::Until(until)).is_ok();
+            if woken && lose_interrupt && inject::pending(Fault::AdminMissed) {
+                // Lost: the driver does not know it came, and waits on.
+                woken = false;
+                let _ = sys::recv(self.listen, Wait::Until(until));
+            }
+            poll = (poll * 2).min(ADMIN_POLL_MAX_NS);
         }
     }
 
