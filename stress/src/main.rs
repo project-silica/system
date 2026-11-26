@@ -34,6 +34,10 @@
 //!   served and the program's free memory after the last round is what
 //!   it was after the first (the heap reuses what it freed at one size for
 //!   another), else the round and size that failed (its line says how).
+//! - `CACHE`: serves `args[1]` requests, each needing 256 KiB for its duration, and caches
+//!   64 KiB after each, without limit; with `args[2]` 1 it watches its memory
+//!   (`silica_rt::mem::watch_low`) and lets the cache go, and trims its heap, when told it is low.
+//!   Exits 0 if every request was served, else 100 + the request that found no memory.
 #![no_std]
 #![no_main]
 
@@ -50,6 +54,7 @@ const TIME_READER: u64 = 6;
 const BORROWER: u64 = 7;
 const CHURN: u64 = 8;
 const BLOCKS: u64 = 9;
+const CACHE: u64 = 10;
 
 const PING: u64 = 1;
 const COUNT: u64 = 2;
@@ -78,6 +83,7 @@ fn main(info: &'static ProcessInfo) -> i64 {
         BORROWER => borrower(info.args[1], info.args[2] as u8),
         CHURN => churn(info.args[1], info.args[2] as usize),
         BLOCKS => blocks(info.args[1] as u8, info.args[2] as u8),
+        CACHE => cache(info.args[1], info.args[2] != 0),
         ONE_CALL => match sys::call(grant, MsgInfo::new(PING, 1), [41, 0, 0, 0]) {
             Ok(_) => 0,
             Err(e) => e as i64,
@@ -333,4 +339,46 @@ fn blocks(small: u8, large: u8) -> i64 {
     // The large blocks hold what the small did, but for what the program's
     // own heap and the alignment of the large ones take.
     if n == 0 || m == 0 || large_bytes + (1u64 << large) < small_bytes { 1 } else { 0 }
+}
+
+/// See `CACHE` in the module's documentation.
+fn cache(requests: u64, watching: bool) -> i64 {
+    use silica_rt::alloc::vec::Vec;
+    use silica_rt::mem::{OwnedObject, trim, watch_low};
+    const REQUEST: usize = 256 << 10;
+    const ENTRY: usize = 64 << 10;
+    let Ok(note) = OwnedObject::new(ObjectType::Notification, 0) else { return 10 };
+    if watching {
+        // Told when less than two requests' worth is left.
+        watch_low(2 * REQUEST as u64, note.cap());
+    }
+    let mut cache: Vec<Vec<u8>> = Vec::new();
+    let mut let_go = 0u64;
+    for r in 0..requests {
+        // Before each request, as a server looks at its events: was it told?
+        if sys::recv(note.cap(), Wait::Poll).is_ok() {
+            cache.clear();
+            cache.shrink_to_fit();
+            let _ = trim();
+            let_go += 1;
+        }
+        let mut request: Vec<u8> = Vec::new();
+        if request.try_reserve_exact(REQUEST).is_err() {
+            println!("stress cache: request {r} found no memory, {} KiB cached", cache.len() * ENTRY / 1024);
+            return 100 + r as i64;
+        }
+        request.resize(REQUEST, r as u8);
+        if request[REQUEST - 1] != r as u8 {
+            return 11;
+        }
+        drop(request);
+        // The cache is a convenience: an entry that cannot be had is skipped.
+        let mut entry: Vec<u8> = Vec::new();
+        if cache.try_reserve(1).is_ok() && entry.try_reserve_exact(ENTRY).is_ok() {
+            entry.resize(ENTRY, 1);
+            cache.push(entry);
+        }
+    }
+    println!("stress cache: {requests} requests served, the cache let go {let_go} times");
+    0
 }

@@ -18,6 +18,7 @@ keeps = true
 memory = 23
 start = "boot"
 restart = "always"
+secrets = true
 
 [[bin]]
 name = "remote"
