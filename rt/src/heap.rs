@@ -370,6 +370,23 @@ impl<S: Source> Core<S> {
         self.give_block(i, order);
     }
 
+    /// Give back the spare chunk kept for the next request (none is kept
+    /// after this until a chunk is wholly free again): what a program short
+    /// of memory does (`mem::trim`). Returns the bytes given back.
+    #[cfg_attr(not(target_os = "silica"), allow(dead_code))]
+    pub(crate) fn trim(&mut self) -> u64 {
+        let i = self.spare;
+        if i == 0 {
+            return 0;
+        }
+        let order = (self.rec(i).chunk_bits - CHUNK_MIN_BITS) as usize;
+        self.unlink(List::Free(order), i);
+        self.rec(i).kind = Kind::None;
+        self.spare = 0;
+        self.give_chunk(i, order);
+        1 << (order as u32 + CHUNK_MIN_BITS as u32)
+    }
+
     /// The chunk at unit `i`, of 2^order units, is wholly free, and a spare
     /// is kept already: its frame goes back to the program's memory, which
     /// serves any size with it (`mem`), and its range of the window to the
@@ -592,6 +609,12 @@ impl Heap {
     /// An empty heap.
     pub const fn new() -> Heap {
         Heap { lock: AtomicBool::new(false), core: UnsafeCell::new(Core::new(System, WINDOW_BITS)) }
+    }
+
+    /// Give back the spare chunk ([`Core::trim`]); the bytes given back.
+    #[cfg_attr(not(target_os = "silica"), allow(dead_code))]
+    pub(crate) fn trim(&self) -> u64 {
+        self.with(|c| c.trim())
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Core<System>) -> R) -> R {

@@ -24,6 +24,7 @@ const TIME_WRITER: u64 = 5;
 const TIME_READER: u64 = 6;
 const BORROWER: u64 = 7;
 const CHURN: u64 = 8;
+const CACHE: u64 = 10;
 const BLOCKS: u64 = 9;
 
 const SECOND: u64 = 1_000_000_000;
@@ -376,6 +377,34 @@ impl Tests {
         }
     }
 
+    /// A server whose cache grows with every request keeps serving when it
+    /// is told its memory is low (`silica_rt::mem::watch_low`): it lets
+    /// the cache go and trims its heap. Without the watch (how every
+    /// program ran before) the same server ran out in the middle of a
+    /// request; that run is made too, so the test shows the pressure is
+    /// real.
+    fn a_program_told_its_memory_is_low_keeps_serving(&mut self) -> Outcome {
+        const REQUESTS: u64 = 200;
+        let (_, id) = self.start_with(CACHE, [REQUESTS, 1, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, 0) if who == id => {}
+            (who, s) if who == id => {
+                println!("systest:   watching its memory, the server stopped at request {}", s - 100);
+                return Err("a program watching its memory ran out in the middle of a request");
+            }
+            _ => return Err("something other than the caching server ended"),
+        }
+        let (_, id) = self.start_with(CACHE, [REQUESTS, 0, 0], 0, &[])?;
+        match self.next_exit(60 * SECOND)? {
+            (who, s) if who == id && s >= 100 => {
+                println!("systest:   not watching, the same server ran out at request {}", s - 100);
+                Ok(())
+            }
+            (who, _) if who == id => Err("the caching server never ran out of memory unwatched: the test puts it under no pressure"),
+            _ => Err("something other than the caching server ended"),
+        }
+    }
+
     fn heap_churn(&mut self) -> Outcome {
         let (_, id) = self.start_with(CHURN, [4, 0, 0], 0, &[])?;
         match self.next_exit(60 * SECOND)? {
@@ -536,10 +565,11 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     let mut t = Tests { root, stress, next_id: 0, children: [const { None }; 16], caps: [None; 16], objects: [const { None }; 8], pace: 0 };
     let mut failed = false;
     type Test = fn(&mut Tests) -> Outcome;
-    let tests: [(&str, Test); 14] = [
+    let tests: [(&str, Test); 15] = [
         ("lent_memory_taken_back_any_number_of_times", Tests::lent_memory_taken_back_any_number_of_times),
         ("memory_freed_at_one_size_serves_another", Tests::heap_churn),
         ("blocks_given_back_serve_any_size", Tests::blocks_given_back_serve_any_size),
+        ("a_program_told_its_memory_is_low_keeps_serving", Tests::a_program_told_its_memory_is_low_keeps_serving),
         ("runtime_allocates_capspace_storage", Tests::object_storage),
         ("time_reader_survives_its_writer", Tests::abandoned_time_page),
         ("failed_spawn_returns_grants", Tests::failed_spawn_returns_grants),

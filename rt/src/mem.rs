@@ -80,7 +80,63 @@ pub fn add_source(untyped: Cap, bits: u8) {
 
 /// An empty Untyped of `2^bits` bytes, or `NoMemory`.
 pub fn alloc(bits: u8) -> Result<Cap, Error> {
-    with(|b| b.alloc(&mut Kernel, bits)).map(Cap)
+    let r = with(|b| b.alloc(&mut Kernel, bits)).map(Cap);
+    watch();
+    r
+}
+
+/// The low-memory watch ([`watch_low`]): the mark, the capability to signal
+/// (0: none) and whether it may be signalled (armed until it is, again once
+/// memory is back above the mark).
+static LOW_MARK: AtomicU64 = AtomicU64::new(0);
+static LOW_NOTE: AtomicU64 = AtomicU64::new(0);
+static LOW_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Be told before memory runs out: `note` (a notification capability,
+/// badged with the bits to set) is signalled once when what [`alloc()`] can
+/// still give falls below `mark` bytes, and once more each time it falls
+/// below again after rising to the mark or above. A program with caches or
+/// buffers it can do without lets them go then (and calls [`trim`]), so a
+/// request that needs memory finds it instead of failing half done. It is
+/// looked at when memory is taken or given back, never on a timer: a program
+/// that does neither is not woken. One watch per program; a later call
+/// replaces it, and `Cap::NONE` ends it.
+pub fn watch_low(mark: u64, note: Cap) {
+    LOW_MARK.store(mark, Ordering::Relaxed);
+    LOW_ARMED.store(true, Ordering::Relaxed);
+    LOW_NOTE.store(note.0, Ordering::Release);
+    watch();
+}
+
+/// After memory was taken or given back: signal the watch on a fall below
+/// its mark, re-arm it on a rise to the mark. Nothing for a program without
+/// one.
+fn watch() {
+    let note = LOW_NOTE.load(Ordering::Acquire);
+    if note == 0 {
+        return;
+    }
+    if available() < LOW_MARK.load(Ordering::Relaxed) {
+        if LOW_ARMED.swap(false, Ordering::Relaxed) {
+            let _ = sys::signal(Cap(note));
+        }
+    } else {
+        LOW_ARMED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Give back what the program's heap keeps for its next request (a wholly
+/// free chunk, kept so that taking and giving back in turn costs nothing):
+/// what a program short of memory does once it has let its own caches go.
+/// The bytes given back.
+pub fn trim() -> u64 {
+    // The program's heap is the global allocator only on Silica itself.
+    #[cfg(target_os = "silica")]
+    let n = crate::HEAP.trim();
+    #[cfg(not(target_os = "silica"))]
+    let n = 0;
+    watch();
+    n
 }
 
 /// Give back the block `block` of `2^bits` bytes from [`alloc()`]: everything
@@ -105,6 +161,7 @@ pub unsafe fn free(block: Cap, bits: u8) {
         let _ = unsafe { sys::cap_delete(block) };
         release_slot(block.0);
     }
+    watch();
 }
 
 /// A kernel object with a block of memory to itself, so that freeing it

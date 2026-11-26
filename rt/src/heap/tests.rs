@@ -286,4 +286,15 @@ fn free_chunks_go_back_but_one_stays() {
         unsafe { h.dealloc(p, layout(128 << 10)) };
     }
     assert_eq!(h.src.made, made, "a hot take-and-give pair made and gave back frames");
+    // Short of memory, the program gives the spare back too: nothing is held.
+    let unmapped = h.src.unmapped;
+    assert!(h.trim() > 0, "a spare chunk was kept, and trim gave nothing back");
+    assert_eq!(h.src.unmapped, unmapped + 1);
+    assert_eq!(held(&h), 0, "the heap kept {} bytes after trim", held(&h));
+    assert_eq!(h.trim(), 0, "a second trim found another spare");
+    // And it serves again afterwards.
+    let p = h.alloc(layout(64 << 10));
+    assert!(!p.is_null());
+    // SAFETY: as above.
+    unsafe { h.dealloc(p, layout(64 << 10)) };
 }
