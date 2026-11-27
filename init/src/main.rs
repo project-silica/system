@@ -164,6 +164,9 @@ struct Running {
     /// The boot archive's files it is given (`files=`), each in a frame of
     /// its own made once.
     files: Vec<Option<silica_rt::mem::Memory>>,
+    /// Its key (`key`): made at boot from the machine's secret and its
+    /// name, lent read-only at every start; `None` without either.
+    key: Option<silica_rt::mem::Memory>,
 }
 
 /// The machine's hardware watchdog (`silica.watchdog.Device`), which the
@@ -197,6 +200,11 @@ struct Watchdog {
 
 struct Manager {
     root: Root,
+    /// The drivers the device manager may start and its list of them, in a
+    /// boot archive of their own (`drivers_archive`): what a `machine`
+    /// service is lent of the boot archive, which also holds files
+    /// provisioned for other services.
+    drivers: Option<silica_rt::mem::Memory>,
     info: &'static RootInfo,
     services: Vec<Service>,
     /// The endpoint of each service that provides a protocol.
@@ -302,6 +310,10 @@ impl Manager {
                 None => Grant::none(),
             });
         }
+        // Its key, read-only, after its files.
+        if s.key {
+            grants.push(self.running[i].key.as_ref().map_or(Grant::none(), |m| Grant::lend(m.frame(), Rights::READ)));
+        }
         if let Some(log) = self.log.as_ref().filter(|l| l.service == i) {
             // The notification its writers signal (its own events, where it
             // is also asked to end), the directory, then a slot for each
@@ -336,13 +348,17 @@ impl Manager {
             // What it signals when the watchdog's driver changes: the
             // watchdog's notification, to signal and nothing else.
             grants.push(self.dog.note.as_ref().map_or(Grant::none(), |n| Grant::badged(n.cap(), Rights::WRITE, 1)));
-            grants.extend(self.root.ramdisk.iter().map(|f| Grant::lend(*f, Rights::READ)));
+            // Of the boot archive, the drivers and their list alone: the
+            // archive holds files provisioned for other services (the
+            // remote service's machine key), and this program parses what
+            // hostile devices say.
+            grants.push(self.drivers.as_ref().map_or(Grant::none(), |d| Grant::lend(d.frame(), Rights::READ)));
             // Device registers and the firmware's memory (its tables), given outright.
             let untyped = &info.untyped[..info.untyped_count as usize];
             let device = untyped.iter().enumerate().filter(|(_, d)| d.kind == KIND_DEVICE || d.kind == KIND_FIRMWARE);
             let before = grants.len();
             grants.extend(device.map(|(n, _)| Grant::give(sys::Cap(SLOT_FIRST_UNTYPED + n as u64))));
-            args[0] = self.root.ramdisk.len() as u64;
+            args[0] = self.drivers.is_some() as u64;
             args[1] = (grants.len() - before) as u64;
         }
         if s.seed {
@@ -1321,7 +1337,8 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     } else {
         println!("init: the firmware gave no wall clock; it is unknown until a time server sets it");
     }
-    let root = Root { parent: silica_proc::Parent { fault: root.parent.exit, time: time.frame(), ..root.parent }, ..root };
+    let mut root = root;
+    root.parent = silica_proc::Parent { fault: root.parent.exit, time: time.frame(), ..root.parent };
     say_last_panic(info);
     let cmdline: &'static [u8] = &info.cmdline[..(info.cmdline_len as usize).min(info.cmdline.len())];
     #[cfg(feature = "harness")]
@@ -1358,9 +1375,21 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             None => None,
         });
     }
+    // The machine's secret, which the loader put in the boot archive in
+    // memory alone (`machine.secret`: kept by the firmware, on no disk):
+    // what each service declared `key` has its key made from.
+    let mut secret = [0u8; 32];
+    let has_secret = match ramdisk::find(root.archive, SECRET_ENTRY) {
+        Some(b) if b.len() == secret.len() => {
+            secret.copy_from_slice(b);
+            true
+        }
+        _ => false,
+    };
     // The boot archive's files services are given (`files=`), each copied
-    // once into a frame of its own: lent read-only at every start, so no
-    // instance can change what the next is given.
+    // once into a frame of its own, and each key made into one: lent
+    // read-only at every start, so no instance can change what the next is
+    // given.
     let running = services
         .iter()
         .map(|s| Running {
@@ -1373,8 +1402,45 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             trial: None,
             hash: None,
             files: s.files.iter().map(|f| file_frame(root.archive, s.name, f)).collect(),
+            key: if !s.key {
+                None
+            } else if has_secret {
+                Some(service_key(&secret, s.name))
+            } else {
+                println!("init: the loader gave no machine secret: {} has no key", s.name);
+                None
+            },
         })
         .collect();
+    // Then the files and the machine's secret are wiped from the boot
+    // archive, and this program's copy of the secret: each service's frame
+    // is the only copy left of what it was given (lent read-only at every
+    // start, a restart's included), in this program's memory and that
+    // service's.
+    let wiped = services.iter().flat_map(|s| s.files.iter().map(move |f| (s.name, *f))).chain([("the loader", SECRET_ENTRY)]);
+    for (owner, f) in wiped {
+        if let Some(bytes) = ramdisk::find(root.archive, f)
+            && let Err(why) = root.wipe(bytes)
+        {
+            fail!("cannot wipe {owner}'s {f} from the boot archive: {why}");
+        }
+        // A test image reads it back: nothing of it is left there.
+        #[cfg(feature = "harness")]
+        if ramdisk::find(root.archive, f).is_some_and(|b| {
+            b.iter().any(|x| {
+                // SAFETY: a byte of the archive, which `Root::wipe` has just
+                // written through another mapping: read from memory, not
+                // assumed from what was read before.
+                #[allow(unsafe_code)]
+                unsafe {
+                    core::ptr::read_volatile(x) != 0
+                }
+            })
+        }) {
+            fail!("{owner}'s {f} is still in the boot archive after it was wiped");
+        }
+    }
+    silica_crypto::wipe(&mut secret);
     // Each service's events, and a capability per need to tell it.
     let mut events = Vec::new();
     for s in &services {
@@ -1463,8 +1529,10 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             o
         })
         .collect();
+    let drivers = drivers_archive(root.archive);
     let mut m = Manager {
         root,
+        drivers,
         info,
         services,
         endpoints,
@@ -1733,6 +1801,53 @@ fn program_checks(root: &Root) {
             endpoint_object.destroy()
         };
         println!("init: {client_name} and {server_name} talked over sample.Echo; both are gone and their memory is back");
+    }
+}
+
+/// The boot archive's entry holding the machine's secret, which the loader
+/// adds in memory (it is on no disk) and this program wipes once the keys
+/// are made.
+const SECRET_ENTRY: &str = "machine.secret";
+
+/// Service `name`'s key (`key`): 32 bytes made from the machine's secret
+/// and its name, the same at every boot and different for every service, in
+/// a frame of its own (a page, zeros after them).
+fn service_key(secret: &[u8; 32], name: &str) -> silica_rt::mem::Memory {
+    let mut key = silica_formats::blake2s::Blake2s::keyed(secret).update(b"silica service key").update(name.as_bytes()).finish();
+    let m = silica_rt::mem::Memory::new(12).unwrap_or_else(|_| fail!("no memory for {name}'s key"));
+    m.shared().write_bytes(0, &key);
+    silica_crypto::wipe(&mut key);
+    m
+}
+
+/// The boot archive's `drivers` list and every program it names (the
+/// third word of each line: `pci <id> <program>`, `class <class>
+/// <program>`), in an archive of their own (`silica_proc::root::archive_of`):
+/// what the device manager is lent of the boot archive. `None`, said, when
+/// the archive has no list or the copy cannot be made: the device manager
+/// then starts no driver and says so.
+fn drivers_archive(archive: &'static [u8]) -> Option<silica_rt::mem::Memory> {
+    let list = ramdisk::find(archive, "drivers")?;
+    let mut entries: Vec<(&str, &[u8])> = Vec::new();
+    entries.push(("drivers", list));
+    let text = core::str::from_utf8(list).unwrap_or("");
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some(program) = line.split_ascii_whitespace().nth(2) else { continue };
+        if entries.iter().any(|(n, _)| *n == program) {
+            continue;
+        }
+        // A program the archive does not have: the device manager says so
+        // when it would start it, as before.
+        if let Some(image) = ramdisk::find(archive, program) {
+            entries.push((program, image));
+        }
+    }
+    match root::archive_of(&entries) {
+        Ok(m) => Some(m),
+        Err(why) => {
+            println!("ERROR: init: the device manager's drivers cannot be copied for it: {why}");
+            None
+        }
     }
 }
 

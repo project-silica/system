@@ -59,8 +59,9 @@
 //! 4 the interrupt lines, 5 the I/O ports (or nothing), 6 a capability that
 //! signals the service manager's watchdog notification (how it is told
 //! that the watchdog's driver changed: `Manager::tell_watchdog`), then
-//! `args[0]` frames of the ramdisk (in
-//! `RootInfo` order, read-only), then `args[1]` Untyped capabilities, given
+//! `args[0]` frames (one, or none): the drivers' archive, read-only (the
+//! drivers list and the programs it names, nothing else of the boot
+//! archive: `map_archive`), then `args[1]` Untyped capabilities, given
 //! outright: the machine's device memory and the firmware's memory (where
 //! its ACPI tables are), in `RootInfo` order.
 #![no_std]
@@ -70,7 +71,7 @@ mod phys;
 mod power;
 
 use devmgr::hotplug;
-use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, KIND_RAMDISK, ROOT_MAGIC, RootInfo};
+use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, ROOT_MAGIC, RootInfo};
 use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use phys::DeviceMemory;
 use silica_driver::pci::{self, Config};
@@ -1242,30 +1243,40 @@ fn signal_bits(cap: Cap, bits: u64) -> Result<(), sys::Error> {
     made
 }
 
-/// Map the boot archive: the ramdisk frames, laid out as they are in memory.
-fn map_archive(info: &RootInfo, frames: u64) -> Result<&'static [u8], &'static str> {
-    let pieces = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_RAMDISK);
-    let first = pieces.clone().map(|d| d.base).min().ok_or("the machine has no boot archive")?;
-    let end = pieces.clone().map(|d| d.base + (1 << d.bits)).max().unwrap_or(first);
-    // Each piece lands at the same offset within a 2 MiB page as it has in
-    // physical memory, so a piece of 2 MiB maps as one large page.
-    let skew = first & ((1 << 21) - 1);
-    let region = mem::reserve((end - first + skew) as usize, 1 << 21).ok_or("no address space for the boot archive")? + skew as usize;
-    for (i, d) in pieces.enumerate() {
-        if i as u64 >= frames {
-            return Err("the root task passed fewer boot archive frames than the machine has");
-        }
-        sys::map(slots::ASPACE, granted(GRANT_FIRST_RAMDISK + i as u64), region + (d.base - first) as usize, Rights::READ).map_err(
-            |e| {
-                println!("devmgr: mapping the boot archive's frame {i} ({} bytes at {:#x}): {e:?}", 1u64 << d.bits, d.base);
-                "cannot map the boot archive"
-            },
-        )?;
+/// Map what this program is lent of the boot archive: an archive of its
+/// own (the service manager's `drivers_archive`), holding the drivers list
+/// and the programs it names and nothing else of the boot archive, which
+/// holds files provisioned for other services. Checked against every rule
+/// of its format before anything in it is read.
+fn map_archive(frames: u64) -> Result<&'static [u8], &'static str> {
+    // None (the boot archive had no drivers list, or there was no memory
+    // for the copy, which the service manager says): no drivers, and the
+    // rest of what this program does (the power button, the firmware's
+    // tables, the clients' calls) as on any machine.
+    if frames == 0 {
+        println!("devmgr: lent no drivers' archive: no driver is started");
+        return Ok(&[]);
     }
-    // SAFETY: the archive's frames were just mapped read-only, contiguous
-    // as they are in memory, and stay mapped; nothing writes them.
+    if frames != 1 {
+        return Err("not lent the drivers' archive");
+    }
+    let frame = granted(GRANT_FIRST_RAMDISK);
+    let bits = match sys::inspect_slot(slots::SPACE, frame.0) {
+        Ok(Some(s)) if s.ty == ObjectType::Frame => s.bits,
+        _ => return Err("not lent the drivers' archive"),
+    };
+    let at = mem::map(frame, bits, Rights::READ).map_err(|_| "cannot map the drivers' archive")?;
+    // SAFETY: the frame was just mapped read-only for good; the service
+    // manager wrote it before lending it and writes it no more.
     #[allow(unsafe_code)]
-    Ok(unsafe { core::slice::from_raw_parts((region + (info.ramdisk[0] - first) as usize) as *const u8, info.ramdisk[1] as usize) })
+    let whole = unsafe { core::slice::from_raw_parts(at as *const u8, 1usize << bits) };
+    let len = whole.get(16..24).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))) as usize;
+    let archive = whole.get(..len).ok_or("the drivers' archive is longer than its frame")?;
+    ramdisk::check(archive, ramdisk::crc32c_update).map_err(|e| {
+        println!("devmgr: the drivers' archive is refused: {e}");
+        "the drivers' archive is not one"
+    })?;
+    Ok(archive)
 }
 
 fn main(process: &ProcessInfo) -> i64 {
@@ -1292,7 +1303,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         return Err("the machine's description is not one");
     }
     let (ramdisk_frames, untypeds) = (process.args[0], process.args[1]);
-    let archive = map_archive(info, ramdisk_frames)?;
+    let archive = map_archive(ramdisk_frames)?;
     // The device memory, in the order the kernel listed it.
     let mut memory = DeviceMemory::new();
     let device = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_DEVICE || d.kind == KIND_FIRMWARE);
@@ -1300,6 +1311,13 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         if (i as u64) < untypeds {
             memory.add(d.base, d.bits, granted(GRANT_FIRST_RAMDISK + ramdisk_frames + i as u64));
         }
+    }
+    #[cfg(feature = "harness")]
+    {
+        // SAFETY: the RootInfo frame, mapped read-only above for good.
+        #[allow(unsafe_code)]
+        let info_bytes = unsafe { core::slice::from_raw_parts(at as *const u8, 1usize << bits) };
+        find_in_lent(archive, info_bytes, &mut memory, info);
     }
     // Drivers report their exit, and the kernel their faults, to the
     // endpoint clients call, each badged with the driver's identifier.
@@ -1570,5 +1588,102 @@ fn silence(config: &Config) {
     }
     if registers.read16(4) & pci::COMMAND_MASTER != 0 {
         println!("ERROR: devmgr: a device kept bus mastering after it was switched off");
+    }
+}
+
+/// `find=<hex>` (test images only; a machine's device manager has no such
+/// option): whether the bytes `<hex>` spells occur anywhere in what this
+/// program is lent to read (the drivers' archive, the kernel's `RootInfo`
+/// frame, and the firmware's memory, where its tables are), said on the
+/// console. Device registers are not read, reading one being an act, but
+/// for ranges a test names with `find_device=<base>+<length>` (hexadecimal):
+/// the firmware's flash, which reads as memory. The secrets test gives it
+/// the machine's secret, the flash it is kept in, and a part of the boot
+/// archive the device manager must not see (`run_secrets`): a program that
+/// parses what hostile devices say must hold none of it.
+#[cfg(feature = "harness")]
+fn find_in_lent(archive: &[u8], info: &[u8], memory: &mut DeviceMemory, root: &RootInfo) {
+    let hex = |s: &str| -> Option<Vec<u8>> {
+        let b = s.as_bytes();
+        (b.len() % 2 == 0 && !b.is_empty())
+            .then(|| b.chunks(2).map(|p| u8::from_str_radix(core::str::from_utf8(p).ok()?, 16).ok()).collect())
+            .flatten()
+    };
+    // The memory read a page at a time: the firmware's, and the named ranges.
+    let mut ranges: Vec<(u64, u64, &str)> = root.untyped[..root.untyped_count as usize]
+        .iter()
+        .filter(|d| d.kind == KIND_FIRMWARE)
+        .map(|d| (d.base, 1u64 << d.bits, "the firmware's memory"))
+        .collect();
+    for w in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("find_device=")) {
+        let range = w.split_once('+').and_then(|(b, l)| Some((u64::from_str_radix(b, 16).ok()?, u64::from_str_radix(l, 16).ok()?)));
+        let Some((base, len)) = range else {
+            println!("devmgr: find: {w} is not <base>+<length> in hexadecimal");
+            continue;
+        };
+        // How much of it this program can read at all: what it is lent of it.
+        let mut readable = 0;
+        for page in (base & !0xFFF..base.saturating_add(len)).step_by(4096) {
+            if memory.frame(page, 12).is_ok() {
+                readable += 1;
+                // SAFETY: the frame was just made and never mapped.
+                #[allow(unsafe_code)]
+                unsafe {
+                    memory.release(page, 12)
+                };
+            }
+        }
+        println!("devmgr: find: of the device memory at {w}, this program can read {readable} pages");
+        ranges.push((base & !0xFFF, len, "the named device memory"));
+    }
+    for word in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("find=")) {
+        let Some(needle) = hex(word) else {
+            println!("devmgr: find: {word} is not hexadecimal bytes");
+            continue;
+        };
+        let has = |hay: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        let mut found = if has(archive) {
+            Some("the drivers' archive")
+        } else if has(info) {
+            Some("the kernel's RootInfo")
+        } else {
+            None
+        };
+        // A page at a time, the needle's length less a byte carried over
+        // from each page to the next. A page this program cannot make a
+        // frame of is not lent to it.
+        'ranges: for &(base, len, what) in &ranges {
+            if found.is_some() {
+                break;
+            }
+            let mut carry: Vec<u8> = Vec::new();
+            for page in (base..base.saturating_add(len)).step_by(4096) {
+                let Ok(at) = memory.frame(page, 12).and_then(|fr| mem::map(fr, 12, Rights::READ)) else {
+                    carry.clear();
+                    continue;
+                };
+                let mut window = core::mem::take(&mut carry);
+                // SAFETY: the page was just mapped read-only (firmware
+                // memory, or a range the test names that reads as memory),
+                // is copied, and is given back at once (its frame revoked,
+                // which unmaps it): nothing refers to it after, and nothing
+                // else had been made of it before the probe.
+                #[allow(unsafe_code)]
+                unsafe {
+                    window.extend_from_slice(core::slice::from_raw_parts(at as *const u8, 4096));
+                    memory.release(page, 12);
+                }
+                if has(&window) {
+                    found = Some(what);
+                    break 'ranges;
+                }
+                let keep = needle.len().saturating_sub(1).min(window.len());
+                carry = window[window.len() - keep..].to_vec();
+            }
+        }
+        match found {
+            Some(where_) => println!("devmgr: find: {word} is in what this program was lent, in {where_}"),
+            None => println!("devmgr: find: {word} is not in what this program was lent"),
+        }
     }
 }

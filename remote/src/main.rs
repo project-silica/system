@@ -5,7 +5,7 @@
 //! `silica_remote` the framing) and answers only owners: a connection's
 //! first message is a Noise IK handshake whose initiator key must be one
 //! of the owners the machine was given (the boot archive's `remote.owners`),
-//! sealed to this machine's key (`remote.key`), and made later than every
+//! sealed to this machine's key (its `key`, made on the machine), and made later than every
 //! first message taken from that owner before (`silica_remote::stamp`;
 //! the newest time of each kept across this service's restarts in its kept
 //! page), so a recorded one sent again is refused at once. Anyone else is
@@ -63,12 +63,12 @@ use silica_rt::{ProcessInfo, println, slots};
 
 silica_rt::main!(main);
 
-/// Grants, in the order the declaration's needs and files give them.
+/// Grants, in the order the declaration's needs, files and key give them.
 const TCP: u64 = slots::FIRST_GRANT;
 const MANAGER: u64 = slots::FIRST_GRANT + 1;
 const LOG: u64 = slots::FIRST_GRANT + 2;
-const KEY_FILE: u64 = slots::FIRST_GRANT + 3;
-const OWNERS_FILE: u64 = slots::FIRST_GRANT + 4;
+const OWNERS_FILE: u64 = slots::FIRST_GRANT + 3;
+const KEY: u64 = slots::FIRST_GRANT + 4;
 
 /// The protocols a session carries, on channels 1 and 2.
 const PROTOCOLS: [&str; 2] = [manager::NAME, silica_protocols::log::reader::NAME];
@@ -210,14 +210,14 @@ impl Machine {
 
 fn main(_info: &'static ProcessInfo) -> i64 {
     // The key's text is as secret as the key (`read_key` wipes it).
-    let key = match read_key(KEY_FILE) {
+    let key = match read_key(KEY) {
         Some(mut k) => {
             let pair = Keypair::new(k);
             silica_crypto::wipe(&mut k);
             pair
         }
         None => {
-            println!("remote: no machine key (the boot archive's remote.key): remote management is off");
+            println!("remote: no machine key (the service manager gives none without the machine's secret): remote management is off");
             return 0;
         }
     };
@@ -922,20 +922,21 @@ fn address(a: u32, port: u16) -> String {
     let [x, y, z, w] = a.to_be_bytes();
     silica_rt::alloc::format!("{x}.{y}.{z}.{w}:{port}")
 }
-/// The machine's key from the file in `slot` (`remote.key`): its 64
-/// hexadecimal digits, read into a buffer of this function's that is wiped
-/// before it returns, the file's mapping let go of with it. (The text was
-/// read into a growing string before, every copy of it left behind.)
+/// The machine's key: the 32 bytes of this service's own key (`key` in its
+/// declaration: made on the machine from its secret, the same at every
+/// boot), from the frame in `slot`, the mapping let go of before it
+/// returns. A key file on the boot disk (`remote.key`, as provisioned
+/// before) is no longer read: every program that reaches the disk's
+/// blocks could read it.
 fn read_key(slot: u64) -> Option<[u8; 32]> {
     let info = sys::inspect_slot(slots::SPACE, slot).ok()??;
     let lent = silica_rt::mem::Lent::map(Cap(slot), info.bits, Rights::READ).ok()?;
     let region = lent.region();
-    let mut text = [0u8; 128];
-    let n = text.len().min(region.len());
-    region.read_bytes(0, &mut text[..n]);
-    let end = text[..n].iter().position(|b| *b == 0).unwrap_or(n);
-    let key = core::str::from_utf8(&text[..end]).ok().and_then(silica_remote::parse_key);
-    silica_crypto::wipe(&mut text);
+    let mut key = [0u8; 32];
+    if region.len() < key.len() {
+        return None;
+    }
+    region.read_bytes(0, &mut key);
     drop(lent);
-    key
+    Some(key)
 }
