@@ -5,7 +5,7 @@
 //! ```text
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
-//!        [restart=always|never] [seed] [keeps] [ends] [sets_time] [secrets] [files=<name>,...]
+//!        [restart=always|never] [seed] [keeps] [ends] [sets_time] [secrets] [key] [files=<name>,...]
 //!        [logs=<n>] [controls=<service>,...|*]
 //! ```
 //!
@@ -64,6 +64,9 @@
 //! - `secrets`: it holds keys or other secrets: its address space is
 //!   isolated against speculative execution (`libsys::ASPACE_ISOLATED`), so
 //!   no other program can train predictors against it or read through them.
+//! - `key`: it is given a key of its own, made from the machine's secret
+//!   (the remote service's machine key). Like `secrets`, only its name in
+//!   a caller's `controls=` reaches it, never `*`.
 //! - `files=<name>,<name>...`: files of the boot archive it is given, each
 //!   read-only in a frame of its own (the smallest power of two that holds
 //!   it, at least a page, zeros after it), as grants after its needs, in
@@ -77,14 +80,19 @@
 //!   refused.
 //! - `controls=<service>,<service>...`: the services its
 //!   `silica.system.Manager` `control` (start, stop, restart) and `update`
-//!   (update, revert) reach; `*` names every service that is neither the
-//!   machine's (`machine`) nor holding secrets (`secrets`), which only
-//!   their own names reach. A service given either scope names them, or
-//!   the list is refused. A `machine` service is never updated or
-//!   reverted, whoever names it: no program a caller sends is given the
-//!   machine.
+//!   (update, revert) reach ([`reaches`]): a name, the service it names;
+//!   `*`, for `control` every service neither `machine`, `secrets` nor `key`, and
+//!   for `update` every service that governs nothing beyond itself
+//!   ([`governs`]), since an update gives the program a caller sends
+//!   everything its target holds. A service given either scope names
+//!   them, each name a declared service, or the list is refused. A
+//!   `machine` service is never updated or reverted, whoever names it.
 
-use silica_rt::alloc::vec::Vec;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
 
 /// The protocol the service manager itself provides: a service that needs
 /// it is given a capability to the root task.
@@ -122,6 +130,8 @@ pub struct Service {
     /// It holds secrets: its address space is isolated against speculation.
     pub secrets: bool,
     pub files: Vec<&'static str>,
+    /// It is given a key of its own made from the machine's secret (`key`).
+    pub key: bool,
     /// How many logs it may give its programs (`logs=`).
     pub logs: u32,
     pub start: Start,
@@ -155,6 +165,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             sets_time: false,
             secrets: false,
             files: Vec::new(),
+            key: false,
             logs: 0,
             start: Start::Boot,
             restart: false,
@@ -197,6 +208,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("sets_time", "") => s.sets_time = true,
                 ("secrets", "") => s.secrets = true,
                 ("controls", c) if !c.is_empty() => s.controls = Some(c),
+                ("key", "") => s.key = true,
                 ("files", f) => s.files = f.split(',').filter(|n| !n.is_empty()).collect(),
                 ("logs", n) => s.logs = n.parse().ok().filter(|n| *n <= 64).ok_or("a service's logs is not a number up to 64")?,
                 ("start", "boot") => s.start = Start::Boot,
@@ -269,6 +281,55 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
     Ok(out)
 }
 
+/// Protocols whose capabilities govern other services or the machine's
+/// devices and disks: the service manager's, the device manager's, the
+/// partitions' and the console's (a person's keyboard and screen).
+const GOVERNING: [&str; 4] = ["silica.system.Manager", "silica.device.Manager", "silica.block.Partitions", "silica.console.Terminal"];
+
+/// Whether service `s` holds authority over more than itself: the machine
+/// (`machine`), secrets, a key of its own (`key`), the wall clock, files of
+/// the boot archive, control
+/// of other services (`controls=`, `logs=`), a protocol others call
+/// (`provides`: its program answers for it to its clients), or a
+/// capability to a protocol that governs others (the service manager's,
+/// the device manager's, the partitions' or the console's).
+pub fn governs(s: &Service) -> bool {
+    s.machine
+        || s.secrets
+        || s.key
+        || s.sets_time
+        || !s.files.is_empty()
+        || s.controls.is_some()
+        || s.logs != 0
+        || s.provides.is_some()
+        || s.needs.iter().any(|n| GOVERNING.contains(n))
+}
+
+/// Whether `caller`'s `control` (`update`: its `update` and `revert`)
+/// reaches service `target`, by `caller`'s `controls=`.
+///
+/// The rule. A name reaches the service it names. `*` reaches, for
+/// `control`, every service that is neither `machine`, `secrets` nor `key`, and
+/// for `update`, every service that governs nothing beyond itself
+/// ([`governs`]): an update runs a program the caller sends with
+/// everything its target holds, so `*` must not hand on authority the
+/// caller was never given (the shell's, through an update of the shell:
+/// the review of audit-control). A service that governs more is updated
+/// only by a caller whose declaration names it, which is the image's
+/// author deciding that this caller may hold what the target holds. A
+/// `machine` service is never updated or reverted, whoever names it: no
+/// program a caller sends is given the machine.
+pub fn reaches(caller: &Service, target: &Service, update: bool) -> bool {
+    let Some(list) = caller.controls else { return false };
+    if update && target.machine {
+        return false;
+    }
+    let named = list.split(',').any(|c| c == target.name);
+    let every =
+        list.split(',').any(|c| c == "*") && if update { !governs(target) } else { !target.machine && !target.secrets && !target.key };
+    named || every
+}
+
 /// The order to start `services` in: providers before what needs them.
 /// `Err` when the needs go round in a circle.
 pub fn order(services: &[Service]) -> Result<Vec<usize>, &'static str> {
@@ -292,4 +353,72 @@ pub fn order(services: &[Service]) -> Result<Vec<usize>, &'static str> {
         }
     }
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Services as the image's declarations give them: a console with the
+    /// shell's authority, a web server, the network stack, the device
+    /// manager and a service holding secrets.
+    const LIST: &str = "\
+console provides=silica.console.Terminal
+shell needs=silica.console.Terminal,silica.system.Manager:observe+control+update+power controls=*,devmgr
+admin needs=silica.system.Manager:control+update controls=*
+httpd needs=silica.net.Tcp:listen=80
+netd provides=silica.net.Tcp sets_time
+devmgr provides=silica.device.Manager machine
+entropy needs=silica.device.Manager:entropy secrets
+vault key
+";
+
+    fn by_name<'a>(s: &'a [Service], n: &str) -> &'a Service {
+        s.iter().find(|s| s.name == n).unwrap()
+    }
+
+    /// Authority over other services names them: a service whose service
+    /// manager capability may control or update, with no `controls=`, or
+    /// naming a service that is not declared, stops the boot by name.
+    #[test]
+    fn control_names_declared_services_or_the_list_is_refused() {
+        assert!(parse(LIST).is_ok());
+        assert_eq!(
+            parse("a needs=silica.system.Manager:control\n").err(),
+            Some("a service that may control or update services does not name them (`controls=`)")
+        );
+        assert_eq!(
+            parse("a needs=silica.system.Manager:observe+update\n").err(),
+            Some("a service that may control or update services does not name them (`controls=`)")
+        );
+        assert_eq!(
+            parse("a needs=silica.system.Manager:control controls=b\n").err(),
+            Some("a service's `controls=` names a service that is not declared")
+        );
+        assert!(parse("a needs=silica.system.Manager:observe+power\n").is_ok(), "no reach, no list");
+    }
+
+    /// The rule of [`reaches`]: `*` updates only what governs nothing
+    /// beyond itself, so no update hands on authority the caller was not
+    /// given (an `update` with `controls=*` updated the shell and got its
+    /// console, device control and every scope: the review of
+    /// audit-control); a name reaches what it names, but never the
+    /// machine for an update.
+    #[test]
+    fn an_update_hands_on_no_authority_the_caller_was_not_given() {
+        let s = parse(LIST).unwrap();
+        let (shell, admin) = (by_name(&s, "shell"), by_name(&s, "admin"));
+        let can = |c: &Service, t: &str, update| reaches(c, by_name(&s, t), update);
+        assert!(can(admin, "httpd", true), "a service that governs nothing");
+        for t in ["shell", "console", "netd", "entropy", "vault", "devmgr", "admin"] {
+            assert!(!can(admin, t, true), "`*` updated {t}, which governs more than itself");
+        }
+        assert!(!can(shell, "devmgr", true), "the machine is never updated, though named");
+        // Control is not an update: `*` restarts what is neither the
+        // machine's nor holding secrets; a name reaches those.
+        assert!(can(admin, "netd", false) && can(admin, "shell", false));
+        assert!(!can(admin, "devmgr", false) && !can(admin, "entropy", false) && !can(admin, "vault", false), "`*` controls no key");
+        assert!(can(shell, "devmgr", false));
+        assert!(!can(by_name(&s, "httpd"), "httpd", false), "no controls=, no reach");
+    }
 }

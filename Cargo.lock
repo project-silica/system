@@ -128,6 +128,7 @@ dependencies = [
  "libsys",
  "silica-formats",
  "silica-idl-rt",
+ "silica-manifest",
  "silica-proc",
  "silica-protocols",
  "silica-rt",
@@ -287,6 +288,13 @@ version = "0.0.0"
 [[package]]
 name = "silica-inet"
 version = "0.0.0"
+
+[[package]]
+name = "silica-manifest"
+version = "0.0.0"
+dependencies = [
+ "silica-protocols",
+]
 
 [[package]]
 name = "silica-net"

@@ -13,7 +13,11 @@ publish.workspace = true
 # neither, it says so and ends: remote management is off.
 [package.metadata.silica.service]
 needs = ["silica.net.Tcp:listen=22", "silica.system.Manager:observe+control+update+power", "silica.log.Reader"]
-controls = ["*", "remote"]
+# What its owners' control and update reach: an update hands on what its
+# target holds, so netd (the stack, updated in place by its owners) is named;
+# remote itself is not: updating it is holding its key and every scope, which
+# no owner is given until each has a capability of its own (S4).
+controls = ["*", "netd"]
 files = ["remote.key", "remote.owners"]
 keeps = true
 memory = 23

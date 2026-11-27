@@ -20,6 +20,7 @@ harness = []
 
 [dependencies]
 silica-protocols = { workspace = true }
+silica-manifest = { workspace = true }
 silica-idl-rt = { workspace = true }
 libsys = { workspace = true }
 silica-formats = { workspace = true }
