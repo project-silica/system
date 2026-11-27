@@ -318,18 +318,21 @@ impl Responder {
     }
 
     /// Write the answer into `out` ([`SECOND`] + payload bytes), with `e`
-    /// fresh random bytes; the session's transport.
-    pub fn answer(mut self, mut e: Secret, payload: &[u8], out: &mut [u8]) -> Result<(Transport, usize), Error> {
+    /// fresh random bytes, wiped here whatever happens (taken by value, the
+    /// caller's copy of the session's ephemeral secret stayed on its
+    /// stack: the audit of 2026-11-27); the session's transport.
+    pub fn answer(mut self, e: &mut Secret, payload: &[u8], out: &mut [u8]) -> Result<(Transport, usize), Error> {
         let len = SECOND + payload.len();
         if out.len() < len {
+            crate::wipe(e);
             return Err(Error::Length);
         }
-        let e_pub = x25519::public(&e);
+        let e_pub = x25519::public(e);
         out[..32].copy_from_slice(&e_pub);
         self.sym.mix_hash(&e_pub);
-        let ee = x25519::exchange(&e, &self.re);
-        let se = x25519::exchange(&e, &self.rs);
-        crate::wipe(&mut e);
+        let ee = x25519::exchange(e, &self.re);
+        let se = x25519::exchange(e, &self.rs);
+        crate::wipe(e);
         let (mut ee, mut se) = match (ee, se) {
             (Ok(ee), Ok(se)) => (ee, se),
             (Ok(mut x), Err(l)) | (Err(l), Ok(mut x)) => {
@@ -365,6 +368,23 @@ mod tests {
         keys(seed).0.secret
     }
 
+    /// The ephemeral secret handed to the answer is the caller's and is
+    /// wiped through its reference, whether the answer is made or refused:
+    /// taken by value, the caller's copy stayed on its stack.
+    #[test]
+    fn the_answer_wipes_the_callers_ephemeral_secret() {
+        for out_len in [SECOND, SECOND - 1] {
+            let (is, _) = keys(1);
+            let (rs, rp) = keys(2);
+            let mut m1 = [0u8; 256];
+            let (_, n1) = Initiator::start(PROLOGUE, &is, &rp, eph(3), b"", &mut m1).unwrap();
+            let (resp, _) = Responder::read(PROLOGUE, &rs, &mut m1[..n1]).unwrap();
+            let mut e = eph(4);
+            let _ = resp.answer(&mut e, b"", &mut [0u8; 256][..out_len]);
+            assert_eq!(e, [0; 32], "an answer into {out_len} bytes left the ephemeral secret");
+        }
+    }
+
     fn handshake() -> (Transport, Transport) {
         let (is, _) = keys(1);
         let (rs, rp) = keys(2);
@@ -374,7 +394,7 @@ mod tests {
         assert_eq!(&m1[..p], b"hello");
         assert_eq!(resp.peer(), &keys(1).1);
         let mut m2 = [0u8; 256];
-        let (rt, n2) = resp.answer(eph(4), b"hi", &mut m2).unwrap();
+        let (rt, n2) = resp.answer(&mut eph(4), b"hi", &mut m2).unwrap();
         let (it, p) = init.finish(&mut m2[..n2]).unwrap();
         assert_eq!(&m2[..p], b"hi");
         assert_eq!(it.hash, rt.hash);
@@ -444,7 +464,7 @@ mod tests {
         }
         let (resp, _) = Responder::read(PROLOGUE, &rs, &mut { m1 }[..n1]).unwrap();
         let mut m2 = [0u8; 128];
-        let (_, n2) = resp.answer(eph(4), b"y", &mut m2).unwrap();
+        let (_, n2) = resp.answer(&mut eph(4), b"y", &mut m2).unwrap();
         // The initiator can only finish once; check each change on a fresh one.
         drop(init);
         for k in 0..n2 {
@@ -482,8 +502,8 @@ mod tests {
         let (_, n1) = Initiator::start(PROLOGUE, &is, &rp, eph(3), b"", &mut m1).unwrap();
         let (r1, _) = Responder::read(PROLOGUE, &rs, &mut { m1 }[..n1]).unwrap();
         let (r2, _) = Responder::read(PROLOGUE, &rs, &mut { m1 }[..n1]).unwrap();
-        let (t1, _) = r1.answer(eph(4), b"", &mut [0u8; 64]).unwrap();
-        let (t2, _) = r2.answer(eph(5), b"", &mut [0u8; 64]).unwrap();
+        let (t1, _) = r1.answer(&mut eph(4), b"", &mut [0u8; 64]).unwrap();
+        let (t2, _) = r2.answer(&mut eph(5), b"", &mut [0u8; 64]).unwrap();
         assert_ne!(t1.hash, t2.hash);
     }
 
@@ -529,7 +549,7 @@ mod tests {
         assert_eq!(resp.peer(), &is.public);
         let (p, pn) = bytes(messages[1].0);
         let (c, cn) = bytes(messages[1].1);
-        let (mut rt, n) = resp.answer(re, &p[..pn], &mut out).unwrap();
+        let (mut rt, n) = resp.answer(&mut re.clone(), &p[..pn], &mut out).unwrap();
         assert_eq!(out[..n], c[..cn], "second message");
         let (mut it, k) = init.finish(&mut out[..n]).unwrap();
         assert_eq!(out[..k], p[..pn]);

@@ -544,7 +544,7 @@ impl Session {
         let mut e = [0u8; 32];
         silica_rt::random::fill(&mut e);
         let mut out = [0u8; noise::SECOND];
-        match r.answer(e, &[], &mut out) {
+        match r.answer(&mut e, &[], &mut out) {
             Ok((t, n)) => {
                 self.send(&out[..n]);
                 // Not connected yet: whoever sent this first message may have
