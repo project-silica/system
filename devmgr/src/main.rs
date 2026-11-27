@@ -1157,8 +1157,13 @@ impl Manager {
     /// and exit; one that has not is ended where it stands, as is every
     /// other driver (nothing they hold outlives them). Before, every driver
     /// was destroyed where it stood: a power cut for the disks' caches.
-    /// Exits arrive on the endpoint clients call: a call taken meanwhile is
-    /// not answered (the machine is going down).
+    /// Exits arrive on the endpoint clients call, and a client's call taken
+    /// meanwhile is answered as at any other time. Before, it was left
+    /// unanswered, and the next receive ended it as if this program had
+    /// gone: a driver's end tells the class's watchers (`changed`), whose
+    /// next call came in the wait for the others, and the service it was
+    /// (netd, the service manager listing watchdogs) heard `PeerGone`
+    /// from a device manager still running, and netd ended in error.
     fn end_drivers(&mut self, listener: &mut Listener) {
         let mut asked = Vec::new();
         for r in &self.running {
@@ -1174,6 +1179,11 @@ impl Manager {
         let deadline = silica_rt::clock().now() + END_NS;
         while !asked.is_empty() {
             let Ok(msg) = listener.recv(Wait::Until(deadline)) else { break };
+            if msg.signals().is_none() && msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 {
+                self.caller = msg.badge;
+                listener.answer(&msg, |request, caps, reply, reply_caps| manager::dispatch(self, request, caps, reply, reply_caps));
+                continue;
+            }
             let Some(k) = asked.iter().position(|id| *id == msg.badge & !FAULT_BADGE) else { continue };
             asked.swap_remove(k);
             let Some(at) = self.running.iter().position(|r| r.id == msg.badge & !FAULT_BADGE) else { continue };
