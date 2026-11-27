@@ -9,6 +9,7 @@ publish.workspace = true
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
 needs = ["silica.console.Terminal", "silica.system.Manager:observe+control+update+power", "silica.device.Manager:block+network+display+port+input+entropy+control", "silica.log.Reader", "silica.block.Partitions:list+open"]
+controls = ["*", "devmgr"]
 memory = 22
 start = "boot"
 restart = "always"

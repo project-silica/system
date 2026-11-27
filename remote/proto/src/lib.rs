@@ -238,22 +238,26 @@ impl Sending {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadLine(pub usize);
 
-/// An owner an owners file names: its key, its name, what it may do
-/// (`None`: all the remote service has) and how long its sessions may
-/// stay without a whole message, in seconds (`None`: the service's own
-/// bound).
-pub type Owner<'a> = ([u8; 32], &'a str, Option<&'a str>, Option<u64>);
+/// An owner an owners file names: its key, its name, what it may do (the
+/// scopes), which services its `control` and `update` reach (`None`: the
+/// line names none), and how long its sessions may stay without a whole
+/// message, in seconds (`None`: the service's own bound), and its line
+/// (from 1).
+pub type Owner<'a> = ([u8; 32], &'a str, &'a str, Option<&'a str>, Option<u64>, usize);
 
 /// The owners an owners file names: each line a public key, space, the
-/// owner's name (no spaces in it), optionally what the owner may do
+/// owner's name (no spaces in it), what the owner may do
 /// (`silica.system.Manager` scopes joined with `+`, as a service
-/// declaration gives them: `observe+control`; without them, all the
-/// remote service has), and optionally `idle=<seconds>` (from 1): how
-/// long a session of that owner's is kept with no whole message arriving,
-/// a bound on a peer set where the peer is named. Blank lines and lines
-/// from `#` are skipped. The first line that is none of these is an error
-/// naming it (from 1), so that a mistyped key, scope or bound is never
-/// silently nobody's or nothing.
+/// declaration gives them: `observe+control`), optionally
+/// `controls=<service>,<service>...` (or `*`: every service the remote
+/// service may control): the services its `control` and `update` reach,
+/// and optionally `idle=<seconds>` (from 1): how long a session of that
+/// owner's is kept with no whole message arriving, a bound on a peer set
+/// where the peer is named. The scopes are not optional: a line without
+/// them is no owner (it was given everything the remote service has, the
+/// audit's M2). Blank lines and lines from `#` are skipped. The first line
+/// that is none of these is an error naming it (from 1), so that a
+/// mistyped key, scope or bound is never silently nobody's or nothing.
 pub fn owners(text: &str) -> impl Iterator<Item = Result<Owner<'_>, BadLine>> {
     text.lines().enumerate().filter_map(|(n, line)| {
         let line = line.trim();
@@ -265,13 +269,30 @@ pub fn owners(text: &str) -> impl Iterator<Item = Result<Owner<'_>, BadLine>> {
         let name = words.next();
         let mut rest = words.peekable();
         let scopes = rest.next_if(|w| !w.contains('='));
+        let controls = rest.next_if(|w| w.starts_with("controls=")).map(|w| &w[9..]);
         let idle = rest.next_if(|w| w.starts_with("idle=")).map(|w| w[5..].parse::<u64>().ok().filter(|s| *s > 0));
-        Some(match (key, name, idle, rest.next()) {
-            (Some(k), Some(name), None, None) => Ok((k, name, scopes, None)),
-            (Some(k), Some(name), Some(Some(s)), None) => Ok((k, name, scopes, Some(s))),
+        // Every item of a list names something: an empty one (`controls=`,
+        // `controls=,`, `controls=httpd,`) is a mistyped line.
+        if controls.is_some_and(|c| c.split(',').any(str::is_empty)) {
+            return Some(Err(BadLine(n + 1)));
+        }
+        Some(match (key, name, scopes, controls, idle, rest.next()) {
+            (Some(k), Some(name), Some(s), c, None, None) => Ok((k, name, s, c, None, n + 1)),
+            (Some(k), Some(name), Some(s), c, Some(Some(i)), None) => Ok((k, name, s, c, Some(i), n + 1)),
             _ => Err(BadLine(n + 1)),
         })
     })
+}
+
+/// The service that runs the sessions: reached by its name alone.
+pub const SELF: &str = "remote";
+
+/// Whether an owner's `controls=` list reaches service `name`: by its
+/// name, or by `*`, which reaches every service but [`SELF`]. Updating the
+/// remote service is holding its machine key and every scope it has, so an
+/// owner does it only where its line names it.
+pub fn controls(list: &str, name: &str) -> bool {
+    list.split(',').any(|c| c == name || (c == "*" && name != SELF))
 }
 
 #[cfg(test)]
@@ -331,26 +352,38 @@ mod tests {
             let mut it = owners(&text);
             [it.next().unwrap(), it.next().unwrap()]
         };
-        assert_eq!(got[0], Ok(([0; 32], "alice@laptop", None, None)));
-        assert_eq!(got[1], Ok(([0x11; 32], "ci", None, None)));
+        assert_eq!(got[0], Ok(([0; 32], "alice@laptop", "observe+control", Some("*"), None, 2)));
+        assert_eq!(got[1], Ok(([0x11; 32], "ci", "observe", None, None, 4)));
         let scoped = std::format!("{a} watcher observe\n");
-        assert_eq!(owners(&scoped).next(), Some(Ok(([0; 32], "watcher", Some("observe"), None))));
-        // A bound on that owner's idle sessions, with or without scopes;
-        // one that is no number of seconds, zero, given twice or before
-        // the scopes is the line's error.
-        let line = |rest: &str| owners(&std::format!("{a} w {rest}\n")).next().unwrap().map(|(_, _, s, i)| (s.map(String::from), i));
-        assert_eq!(line("idle=6"), Ok((None, Some(6))));
-        assert_eq!(line("observe+control idle=3600"), Ok((Some(String::from("observe+control")), Some(3600))));
+        assert_eq!(owners(&scoped).next(), Some(Ok(([0; 32], "watcher", "observe", None, None, 1))));
+        // A bound on that owner's idle sessions, after its scopes; one that
+        // is no number of seconds, zero, given twice or before the scopes
+        // is the line's error.
+        let line = |rest: &str| {
+            owners(&std::format!("{a} w {rest}\n")).next().unwrap().map(|(_, _, s, c, i, _)| (String::from(s), c.map(String::from), i))
+        };
+        assert_eq!(line("observe idle=6"), Ok((String::from("observe"), None, Some(6))));
+        assert_eq!(line("observe+control idle=3600"), Ok((String::from("observe+control"), None, Some(3600))));
+        assert_eq!(
+            line("observe+control controls=httpd,netd idle=5"),
+            Ok((String::from("observe+control"), Some(String::from("httpd,netd")), Some(5)))
+        );
         for bad in [
             "idle=",
             "idle=0",
-            "idle=-1",
-            "idle=six",
-            "idle=6 idle=7",
+            "observe idle=-1",
+            "observe idle=six",
+            "observe idle=6 idle=7",
             "idle=6 observe",
             "observe idle=6 more",
+            "observe idle=6 controls=*",
+            "controls=* observe",
+            "observe controls=",
+            "observe controls=,",
+            "observe controls=httpd,",
+            "observe controls=,httpd",
             "mode=1",
-            "idle=99999999999999999999",
+            "observe idle=99999999999999999999",
         ] {
             assert_eq!(line(bad), Err(BadLine(1)), "{bad}");
         }
@@ -361,6 +394,27 @@ mod tests {
         let mut no_name = a.clone();
         no_name.insert(0, '\n');
         assert_eq!(owners(&no_name).next(), Some(Err(BadLine(2))));
+    }
+
+    /// An owner is given what its line says and nothing it does not: a line
+    /// that names no scopes is no owner (before, it was given every scope
+    /// the remote service has, update and power among them: the audit's
+    /// M2).
+    #[test]
+    fn an_owner_line_names_its_scopes() {
+        let a = "00".repeat(32);
+        let first = |rest: &str| owners(&std::format!("{a} alice {rest}\n")).next().unwrap().map(|_| ());
+        assert_eq!(first(""), Err(BadLine(1)), "an owner with no scopes");
+        assert_eq!(first("idle=6"), Err(BadLine(1)), "an owner with no scopes, a bound on its sessions");
+        assert_eq!(first("controls=*"), Err(BadLine(1)), "an owner with no scopes, the services they would reach");
+        assert_eq!(first("observe"), Ok(()));
+        // Whom a `controls=` list reaches: the names it gives, or every one.
+        assert!(controls("httpd,netd", "netd") && !controls("httpd,netd", "logd") && controls("*", "logd"));
+        // The remote service itself, only by its name: updating it is
+        // holding its machine key and every scope (the review of
+        // audit-control: `*` reached it).
+        assert!(!controls("*", SELF) && controls("*,remote", SELF) && controls("remote", SELF));
+        assert!(!controls("httpd", "http") && !controls("httpd", ""));
     }
 
     #[test]
@@ -400,6 +454,6 @@ mod tests {
     use std::string::String;
 
     fn owners_text(a: &str, b: &str) -> String {
-        std::format!("# who may manage this machine\n{a} alice@laptop\n\n  {b} ci  \n")
+        std::format!("# who may manage this machine\n{a} alice@laptop observe+control controls=*\n\n  {b} ci observe \n")
     }
 }
