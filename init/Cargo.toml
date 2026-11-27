@@ -24,6 +24,7 @@ silica-manifest = { workspace = true }
 silica-idl-rt = { workspace = true }
 libsys = { workspace = true }
 silica-formats = { workspace = true }
+silica-crypto = { workspace = true }
 silica-rt = { workspace = true }
 silica-proc = { workspace = true }
 

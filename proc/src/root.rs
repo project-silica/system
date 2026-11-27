@@ -131,10 +131,12 @@ impl Root {
                 .map_err(|_| "cannot map the boot archive to wipe it")?;
             // SAFETY: the frame's copy was just mapped writable at
             // WIPE_VADDR plus its physical base, and `lo..hi` lies inside
-            // it. The bytes are the archive's, mapped read-only at
-            // RAMDISK_VADDR for `archive`, whose readers never read an
-            // entry they have taken (init reads each provisioned file once,
-            // to copy it, before it is wiped).
+            // it. The bytes are also seen through `archive` (read-only at
+            // RAMDISK_VADDR), which the compiler takes for memory that never
+            // changes: so a wiped entry is never read through it as plain
+            // memory again. Its reader (init) copies each provisioned entry
+            // once, before it is wiped, and a test image's check after the
+            // wipe reads it with volatile reads.
             #[allow(unsafe_code)]
             unsafe {
                 core::ptr::write_bytes((WIPE_VADDR + lo as usize) as *mut u8, 0, (hi - lo) as usize);
@@ -148,68 +150,23 @@ impl Root {
 }
 
 /// A boot archive holding `entries` (name and bytes, in this order) in a
-/// frame of its own, in `silica_formats::ramdisk`'s format, checked by its
-/// validator before it is returned: what a program that reads part of the
-/// boot archive is lent instead of all of it (the device manager: the
-/// drivers it starts). Written in place, its checksum computed as it is.
+/// frame of its own, written by the format's own writer
+/// (`silica_formats::ramdisk::write`, which the loader uses too) and checked
+/// by its validator before it is returned: what a program that reads part of
+/// the boot archive is lent instead of all of it (the device manager: the
+/// drivers it starts).
 pub fn archive_of(entries: &[(&str, &[u8])]) -> Result<mem::Memory, &'static str> {
     use silica_formats::ramdisk as f;
-    let align = |n: usize| n.div_ceil(f::ALIGN) * f::ALIGN;
-    if entries.len() > f::MAX_ENTRIES {
-        return Err("too many entries for one archive");
-    }
-    let table_end = f::HEADER + f::ENTRY * entries.len();
-    let mut offsets = Vec::with_capacity(entries.len());
-    let mut len = align(table_end);
-    for (name, data) in entries {
-        if !f::name_ok(name.as_bytes()) {
-            return Err("an entry name the archive's format does not allow");
-        }
-        offsets.push(len);
-        len = align(len + data.len());
-    }
+    let len = f::archive_len(entries).ok_or("these entries make no archive")?;
     let bits = (len.next_power_of_two().trailing_zeros() as u8).max(12);
     let m = mem::Memory::new(bits).map_err(|_| "no memory for an archive")?;
-    let out = m.shared();
-    // The frame is zeroed: padding is written as nothing, and counted.
-    let zeros = |mut crc: u32, mut n: usize| {
-        while n > 0 {
-            let k = n.min(64);
-            crc = f::crc32c_update(crc, &[0; 64][..k]);
-            n -= k;
-        }
-        crc
-    };
-    // The header, its checksum and reserved fields zero while it is summed.
-    let mut header = [0u8; f::HEADER];
-    header[..8].copy_from_slice(&f::MAGIC);
-    header[8..12].copy_from_slice(&f::VERSION.to_le_bytes());
-    header[12..16].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-    header[16..24].copy_from_slice(&(len as u64).to_le_bytes());
-    let mut crc = f::crc32c_update(!0, &header);
-    for (i, ((name, data), at)) in entries.iter().zip(&offsets).enumerate() {
-        let mut e = [0u8; f::ENTRY];
-        e[..name.len()].copy_from_slice(name.as_bytes());
-        e[32..40].copy_from_slice(&(*at as u64).to_le_bytes());
-        e[40..48].copy_from_slice(&(data.len() as u64).to_le_bytes());
-        out.write_bytes(f::HEADER + i * f::ENTRY, &e);
-        crc = f::crc32c_update(crc, &e);
-    }
-    let mut pos = table_end;
-    for ((_, data), at) in entries.iter().zip(&offsets) {
-        crc = zeros(crc, at - pos);
-        out.write_bytes(*at, data);
-        crc = f::crc32c_update(crc, data);
-        pos = at + data.len();
-    }
-    crc = zeros(crc, len - pos);
-    header[24..28].copy_from_slice(&(!crc).to_le_bytes());
-    out.write_bytes(0, &header);
-    // SAFETY: the frame is this program's own, mapped readable for as long
-    // as `m` lives, and at least `len` bytes; nothing writes it now.
+    // SAFETY: the frame is this program's own, mapped readable and writable
+    // for as long as `m` lives, zeroed, at least `len` bytes; nothing else
+    // refers to it yet.
     #[allow(unsafe_code)]
-    let made = unsafe { core::slice::from_raw_parts(m.addr() as *const u8, len) };
-    f::check(made, f::crc32c_update).map_err(|_| "the archive made does not pass its format's check")?;
+    let out = unsafe { core::slice::from_raw_parts_mut(m.addr() as *mut u8, len) };
+    let len = f::write(entries, out, f::crc32c_update).ok_or("these entries make no archive")?;
+    f::check(&out[..len], f::crc32c_update).map_err(|_| "the archive made does not pass its format's check")?;
     Ok(m)
 }
 

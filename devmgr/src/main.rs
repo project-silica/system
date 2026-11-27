@@ -59,8 +59,9 @@
 //! 4 the interrupt lines, 5 the I/O ports (or nothing), 6 a capability that
 //! signals the service manager's watchdog notification (how it is told
 //! that the watchdog's driver changed: `Manager::tell_watchdog`), then
-//! `args[0]` frames of the ramdisk (in
-//! `RootInfo` order, read-only), then `args[1]` Untyped capabilities, given
+//! `args[0]` frames (one, or none): the drivers' archive, read-only (the
+//! drivers list and the programs it names, nothing else of the boot
+//! archive: `map_archive`), then `args[1]` Untyped capabilities, given
 //! outright: the machine's device memory and the firmware's memory (where
 //! its ACPI tables are), in `RootInfo` order.
 #![no_std]
@@ -1227,6 +1228,14 @@ fn signal_bits(cap: Cap, bits: u64) -> Result<(), sys::Error> {
 /// holds files provisioned for other services. Checked against every rule
 /// of its format before anything in it is read.
 fn map_archive(frames: u64) -> Result<&'static [u8], &'static str> {
+    // None (the boot archive had no drivers list, or there was no memory
+    // for the copy, which the service manager says): no drivers, and the
+    // rest of what this program does (the power button, the firmware's
+    // tables, the clients' calls) as on any machine.
+    if frames == 0 {
+        println!("devmgr: lent no drivers' archive: no driver is started");
+        return Ok(&[]);
+    }
     if frames != 1 {
         return Err("not lent the drivers' archive");
     }
@@ -1274,8 +1283,6 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     }
     let (ramdisk_frames, untypeds) = (process.args[0], process.args[1]);
     let archive = map_archive(ramdisk_frames)?;
-    #[cfg(feature = "harness")]
-    find_in_lent(archive);
     // The device memory, in the order the kernel listed it.
     let mut memory = DeviceMemory::new();
     let device = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_DEVICE || d.kind == KIND_FIRMWARE);
@@ -1283,6 +1290,13 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         if (i as u64) < untypeds {
             memory.add(d.base, d.bits, granted(GRANT_FIRST_RAMDISK + ramdisk_frames + i as u64));
         }
+    }
+    #[cfg(feature = "harness")]
+    {
+        // SAFETY: the RootInfo frame, mapped read-only above for good.
+        #[allow(unsafe_code)]
+        let info_bytes = unsafe { core::slice::from_raw_parts(at as *const u8, 1usize << bits) };
+        find_in_lent(archive, info_bytes, &mut memory, info);
     }
     // Drivers report their exit, and the kernel their faults, to the
     // endpoint clients call, each badged with the driver's identifier.
@@ -1545,19 +1559,67 @@ fn silence(config: &Config) {
     }
 }
 
-/// `find=<text>` (test images only; a machine's device manager has no such
-/// option): whether the bytes of `<text>` occur anywhere in the boot
-/// archive as this program is lent it, said on the console. The secrets
-/// test gives it part of the key provisioned for the remote service
-/// (`run_secrets`): a program that parses what hostile devices say must
-/// not hold another service's secret.
+/// `find=<hex>` (test images only; a machine's device manager has no such
+/// option): whether the bytes `<hex>` spells occur anywhere in what this
+/// program is lent to read (the drivers' archive, the kernel's `RootInfo`
+/// frame, and the firmware's memory, where its tables are), said on the
+/// console. Device registers are not read: reading one is an act. The
+/// secrets test gives it the machine's secret and a part of the boot
+/// archive the device manager must not see (`run_secrets`): a program that
+/// parses what hostile devices say must hold neither.
 #[cfg(feature = "harness")]
-fn find_in_lent(archive: &[u8]) {
-    for needle in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("find=")) {
-        let n = needle.as_bytes();
-        match archive.windows(n.len().max(1)).position(|w| w == n) {
-            Some(at) => println!("devmgr: find: {needle} is in what this program was lent, {at} bytes into the boot archive"),
-            None => println!("devmgr: find: {needle} is not in what this program was lent"),
+fn find_in_lent(archive: &[u8], info: &[u8], memory: &mut DeviceMemory, root: &RootInfo) {
+    let hex = |s: &str| -> Option<Vec<u8>> {
+        let b = s.as_bytes();
+        (b.len() % 2 == 0 && !b.is_empty())
+            .then(|| b.chunks(2).map(|p| u8::from_str_radix(core::str::from_utf8(p).ok()?, 16).ok()).collect())
+            .flatten()
+    };
+    for word in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("find=")) {
+        let Some(needle) = hex(word) else {
+            println!("devmgr: find: {word} is not hexadecimal bytes");
+            continue;
+        };
+        let has = |hay: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        let mut found = if has(archive) {
+            Some("the drivers' archive")
+        } else if has(info) {
+            Some("the kernel's RootInfo")
+        } else {
+            None
+        };
+        // The firmware's memory, a page at a time, the needle's length less
+        // a byte carried over from each page to the next.
+        let firmware = root.untyped[..root.untyped_count as usize].iter().filter(|d| d.kind == KIND_FIRMWARE);
+        'regions: for d in firmware {
+            if found.is_some() {
+                break;
+            }
+            let mut carry: Vec<u8> = Vec::new();
+            for page in (d.base..d.base + (1 << d.bits)).step_by(4096) {
+                let Ok(at) = memory.frame(page, 12).and_then(|fr| mem::map(fr, 12, Rights::READ)) else { continue };
+                let mut window = core::mem::take(&mut carry);
+                // SAFETY: the page was just mapped read-only (firmware
+                // memory, not registers), is copied, and is given back at
+                // once (its frame revoked, which unmaps it): nothing refers
+                // to it after, and nothing else had been made of the
+                // firmware's memory before the probe.
+                #[allow(unsafe_code)]
+                unsafe {
+                    window.extend_from_slice(core::slice::from_raw_parts(at as *const u8, 4096));
+                    memory.release(page, 12);
+                }
+                if has(&window) {
+                    found = Some("the firmware's memory");
+                    break 'regions;
+                }
+                let keep = needle.len().saturating_sub(1).min(window.len());
+                carry = window[window.len() - keep..].to_vec();
+            }
+        }
+        match found {
+            Some(where_) => println!("devmgr: find: {word} is in what this program was lent, in {where_}"),
+            None => println!("devmgr: find: {word} is not in what this program was lent"),
         }
     }
 }
