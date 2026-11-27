@@ -70,7 +70,7 @@ mod phys;
 mod power;
 
 use devmgr::hotplug;
-use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, KIND_RAMDISK, ROOT_MAGIC, RootInfo};
+use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, ROOT_MAGIC, RootInfo};
 use libsys::{self as sys, Cap, ObjectType, Rights, Wait};
 use phys::DeviceMemory;
 use silica_driver::pci::{self, Config};
@@ -1221,30 +1221,32 @@ fn signal_bits(cap: Cap, bits: u64) -> Result<(), sys::Error> {
     made
 }
 
-/// Map the boot archive: the ramdisk frames, laid out as they are in memory.
-fn map_archive(info: &RootInfo, frames: u64) -> Result<&'static [u8], &'static str> {
-    let pieces = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_RAMDISK);
-    let first = pieces.clone().map(|d| d.base).min().ok_or("the machine has no boot archive")?;
-    let end = pieces.clone().map(|d| d.base + (1 << d.bits)).max().unwrap_or(first);
-    // Each piece lands at the same offset within a 2 MiB page as it has in
-    // physical memory, so a piece of 2 MiB maps as one large page.
-    let skew = first & ((1 << 21) - 1);
-    let region = mem::reserve((end - first + skew) as usize, 1 << 21).ok_or("no address space for the boot archive")? + skew as usize;
-    for (i, d) in pieces.enumerate() {
-        if i as u64 >= frames {
-            return Err("the root task passed fewer boot archive frames than the machine has");
-        }
-        sys::map(slots::ASPACE, granted(GRANT_FIRST_RAMDISK + i as u64), region + (d.base - first) as usize, Rights::READ).map_err(
-            |e| {
-                println!("devmgr: mapping the boot archive's frame {i} ({} bytes at {:#x}): {e:?}", 1u64 << d.bits, d.base);
-                "cannot map the boot archive"
-            },
-        )?;
+/// Map what this program is lent of the boot archive: an archive of its
+/// own (the service manager's `drivers_archive`), holding the drivers list
+/// and the programs it names and nothing else of the boot archive, which
+/// holds files provisioned for other services. Checked against every rule
+/// of its format before anything in it is read.
+fn map_archive(frames: u64) -> Result<&'static [u8], &'static str> {
+    if frames != 1 {
+        return Err("not lent the drivers' archive");
     }
-    // SAFETY: the archive's frames were just mapped read-only, contiguous
-    // as they are in memory, and stay mapped; nothing writes them.
+    let frame = granted(GRANT_FIRST_RAMDISK);
+    let bits = match sys::inspect_slot(slots::SPACE, frame.0) {
+        Ok(Some(s)) if s.ty == ObjectType::Frame => s.bits,
+        _ => return Err("not lent the drivers' archive"),
+    };
+    let at = mem::map(frame, bits, Rights::READ).map_err(|_| "cannot map the drivers' archive")?;
+    // SAFETY: the frame was just mapped read-only for good; the service
+    // manager wrote it before lending it and writes it no more.
     #[allow(unsafe_code)]
-    Ok(unsafe { core::slice::from_raw_parts((region + (info.ramdisk[0] - first) as usize) as *const u8, info.ramdisk[1] as usize) })
+    let whole = unsafe { core::slice::from_raw_parts(at as *const u8, 1usize << bits) };
+    let len = whole.get(16..24).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))) as usize;
+    let archive = whole.get(..len).ok_or("the drivers' archive is longer than its frame")?;
+    ramdisk::check(archive, ramdisk::crc32c_update).map_err(|e| {
+        println!("devmgr: the drivers' archive is refused: {e}");
+        "the drivers' archive is not one"
+    })?;
+    Ok(archive)
 }
 
 fn main(process: &ProcessInfo) -> i64 {
@@ -1271,7 +1273,9 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         return Err("the machine's description is not one");
     }
     let (ramdisk_frames, untypeds) = (process.args[0], process.args[1]);
-    let archive = map_archive(info, ramdisk_frames)?;
+    let archive = map_archive(ramdisk_frames)?;
+    #[cfg(feature = "harness")]
+    find_in_lent(archive);
     // The device memory, in the order the kernel listed it.
     let mut memory = DeviceMemory::new();
     let device = info.untyped[..info.untyped_count as usize].iter().filter(|d| d.kind == KIND_DEVICE || d.kind == KIND_FIRMWARE);
@@ -1538,5 +1542,22 @@ fn silence(config: &Config) {
     }
     if registers.read16(4) & pci::COMMAND_MASTER != 0 {
         println!("ERROR: devmgr: a device kept bus mastering after it was switched off");
+    }
+}
+
+/// `find=<text>` (test images only; a machine's device manager has no such
+/// option): whether the bytes of `<text>` occur anywhere in the boot
+/// archive as this program is lent it, said on the console. The secrets
+/// test gives it part of the key provisioned for the remote service
+/// (`run_secrets`): a program that parses what hostile devices say must
+/// not hold another service's secret.
+#[cfg(feature = "harness")]
+fn find_in_lent(archive: &[u8]) {
+    for needle in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("find=")) {
+        let n = needle.as_bytes();
+        match archive.windows(n.len().max(1)).position(|w| w == n) {
+            Some(at) => println!("devmgr: find: {needle} is in what this program was lent, {at} bytes into the boot archive"),
+            None => println!("devmgr: find: {needle} is not in what this program was lent"),
+        }
     }
 }
