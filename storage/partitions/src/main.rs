@@ -228,7 +228,12 @@ impl partitions::Server<Handle> for Server {
             self.parts.extend(t);
         }
         let p = self.parts.iter().find(|p| p.id == id).ok_or(Error::NoSuchPartition)?;
-        let driver = self.devices.open(p.disk, gone).map_err(|_| Error::Gone)?.driver;
+        // Charged to the client at the driver, not to this service: what each
+        // client holds of a disk (its windows, its connections) is its own
+        // share, and no client of this service fills what another needs
+        // (`silica.device.Manager`'s `open_for`).
+        let client = silica_protocols::driver_badge::consumer_of_caller(self.caller) as u32;
+        let driver = self.devices.open_for(p.disk, client, gone).map_err(|_| Error::Gone)?.driver;
         let mut control = device::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         let narrowed = control.narrow(p.first, p.blocks).map_err(|_| Error::Gone)?.device;
         Ok(OpenReply { device: narrowed })

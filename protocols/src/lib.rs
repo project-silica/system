@@ -129,9 +129,13 @@ pub mod scope {
     pub const DEVICE_WATCHDOG: u64 = 1 << 7;
     /// `silica.device.Manager`: `list` and `watch` of every class but the
     /// watchdog, and no `open`: what a program that shows or waits for
-    /// devices needs (the shell's `devices`), which before could only be
-    /// given with `open`, and with it every class's drivers.
+    /// devices needs (the shell's `devices`).
     pub const DEVICE_LIST: u64 = 1 << 8;
+    /// `silica.device.Manager`: `open_for`, a driver of a class it may open
+    /// charged to another consumer: the block server's, which opens
+    /// partitions for its clients so each client's use of a disk is its
+    /// own at the driver, not the block server's for all of them together.
+    pub const DEVICE_DELEGATE: u64 = 1 << 9;
 
     /// `silica.block.Partitions`: `list`.
     pub const PARTITIONS_LIST: u64 = 1 << 0;
@@ -178,6 +182,7 @@ pub mod scope {
                 ("entropy", DEVICE_ENTROPY),
                 ("control", DEVICE_CONTROL),
                 ("list", DEVICE_LIST),
+                ("delegate", DEVICE_DELEGATE),
             ],
             "silica.block.Partitions" => &[("list", PARTITIONS_LIST), ("open", PARTITIONS_OPEN)],
             "silica.net.Tcp" => &[("connect", TCP_CONNECT)],
@@ -231,22 +236,28 @@ pub mod scope {
 }
 
 /// The badge of a capability to a driver the device manager hands out
-/// (`silica.device.Manager`'s `open`): the consumer that asked, in bits 32
-/// to 47 (its number in its own badge to the device manager, the bits below
-/// [`scope::SHIFT`]), and which of the device manager's opens it was, in the
-/// low 32 bits, never reused. A driver keeps state for each capability (a
-/// connection, a window) and charges it to the consumer, so one program
-/// filling its share takes none of another's (2026-11-27: one program
-/// opening a disk 16 times kept every other from connecting to it).
+/// (`silica.device.Manager`'s `open` and `open_for`): the consumer it is
+/// charged to in bits 47 to 62 (its number in its own badge to the device
+/// manager, the bits below [`scope::SHIFT`]), and which of that driver's
+/// opens it was in the low 47 bits, counted for each running driver and
+/// never reused while it runs. Bit 63 is never set: a driver's own badges
+/// (a block driver's windows) are from there up. A driver keeps state for
+/// each capability (a connection, a window) and charges it to the
+/// consumer, so one program filling its share takes none of another's.
 pub mod driver_badge {
-    /// The badge of a consumer's `open`-th capability to a driver.
-    pub const fn of(consumer: u64, open: u32) -> u64 {
-        (consumer & 0xFFFF) << 32 | open as u64
+    /// Opens of one running driver a badge can tell apart: at a million a
+    /// second, four and a half years of them.
+    pub const OPENS: u64 = 1 << 47;
+
+    /// The badge of a consumer's capability from a driver's `open`-th open
+    /// (below [`OPENS`]).
+    pub const fn of(consumer: u64, open: u64) -> u64 {
+        (consumer & 0xFFFF) << 47 | (open & (OPENS - 1))
     }
 
-    /// The consumer a driver capability's `badge` was given to.
+    /// The consumer a driver capability's `badge` is charged to.
     pub const fn consumer(badge: u64) -> u64 {
-        badge >> 32 & 0xFFFF
+        badge >> 47 & 0xFFFF
     }
 
     /// The consumer's number in its badge to the device manager.

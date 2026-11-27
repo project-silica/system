@@ -229,19 +229,33 @@ fn status(s: Result<(), Status>) -> u32 {
 
 /// Badges of the capabilities `narrow` makes: this plus the window's index
 /// in [`Windows`], so a request finds what its capability reaches in one
-/// step. Above any badge the device manager gives clients.
-const NARROWED: u64 = 1 << 48;
-/// Most windows narrowed from capabilities to the whole device (a partition
-/// each, as the partitions service opens them) that one consumer of the
-/// device manager holds at once (`silica_protocols::driver_badge`): a
-/// consumer that holds them all is refused more (`no_room`), and no other
-/// consumer's window is touched.
-const FIRST_PER_CLIENT: usize = 128;
+/// step. Above any badge the device manager gives clients
+/// (`silica_protocols::driver_badge`).
+const NARROWED: u64 = 1 << 63;
+/// What one program (a consumer of the device manager,
+/// `silica_protocols::driver_badge`) may keep in this driver at once,
+/// counted in the driver's capability slots, which every program's state
+/// is held in: a window one (its capability), a connection two (its rings
+/// and its notification), a registered frame two (the frame and the
+/// device's copy). Eight programs at their full share fit the driver's
+/// capability space (1024 slots, `silica_proc`) beside the driver's own;
+/// past its share a program's own windows that nobody holds any more make
+/// room, else it is refused (`no_room`), and no other program's state is
+/// touched. (Bounds of 128 windows and 16 connections a program let one
+/// program at its bounds empty the driver's capability space.)
+pub const SHARE: usize = 96;
 /// Most windows narrowed (at any depth) under one first window, held at once.
 const INNER_PER_FIRST: u32 = 4;
-/// Most windows of every consumer together: the table's bound, far above
-/// what the consumers a service manager declares hold.
-const WINDOWS_MOST: usize = 1 << 16;
+/// Most windows of every consumer together: the table's bound, above what
+/// the programs' shares can hold.
+const WINDOWS_MOST: usize = 1 << 12;
+/// Windows a pass that looks for ones nobody holds any more examines, at
+/// most: each look is a system call on the driver's one thread (and four
+/// more for a first window let go of with windows under it), so a call at
+/// its program's share costs at most 80 of them. The next pass starts
+/// where this one stopped: a program holding more windows than this, and
+/// letting go of others, may be refused once and find room on a later call.
+const LOOKS: usize = 16;
 
 /// A request's tag with this bit set asks for its way through the provider
 /// to be kept (`trace`).
@@ -261,6 +275,9 @@ const TRACES: usize = 16;
 struct Trace {
     client: u64,
     tag: u64,
+    /// The request the device was given, once it was: its completion is
+    /// this trace's and no other request's, whatever tag another uses.
+    ticket: Option<Ticket>,
     taken: u64,
     started: u64,
     done: u64,
@@ -295,11 +312,13 @@ struct Window {
 /// disconnected: then the window is nobody's.
 struct Windows {
     all: Vec<Option<Window>>,
+    /// Where the next pass that looks for windows nobody holds starts.
+    cursor: usize,
 }
 
 impl Windows {
     fn new() -> Windows {
-        Windows { all: Vec::new() }
+        Windows { all: Vec::new(), cursor: 0 }
     }
 
     /// The consumer a capability with `badge` is charged to.
@@ -421,12 +440,13 @@ impl<D: Device> Service<D> {
         let broken = session.take(|raw, ticket, region, client| {
             let traced = ticket.tag() & TRACED != 0;
             if traced {
-                traces[*next_trace] = Trace { client, tag: ticket.tag(), taken: clock.now(), started: 0, done: 0 };
+                traces[*next_trace] = Trace { client, tag: ticket.tag(), ticket: None, taken: clock.now(), started: 0, done: 0 };
             }
             let r = Service::<D>::check_and_start(device, windows, flushes, &info, raw, ticket, region, client);
             if traced {
-                if r.is_ok() {
+                if let Ok(t) = r {
                     traces[*next_trace].started = clock.now();
+                    traces[*next_trace].ticket = Some(t);
                 }
                 *next_trace = (*next_trace + 1) % TRACES;
             }
@@ -537,7 +557,7 @@ impl<D: Device> Service<D> {
                 return;
             }
             if ticket.tag() & TRACED != 0
-                && let Some(t) = traces.iter_mut().find(|t| t.tag == ticket.tag() && t.done == 0 && t.taken != 0)
+                && let Some(t) = traces.iter_mut().find(|t| t.ticket == Some(ticket) && t.done == 0)
             {
                 t.done = clock.now();
             }
@@ -564,25 +584,78 @@ impl<D: Device> Service<D> {
         self.session.unmap_finished(&mut Map(&mut self.device));
     }
 
-    /// Whether nobody holds window `k` any more: nothing derived from its
-    /// capability exists (the kernel says so: `Inspect`'s `INSPECT_DERIVED`),
-    /// no client is connected through it, and no window lies under it.
-    fn unheld(&self, k: usize) -> bool {
+    /// Whether window `k` itself is nobody's: nothing derived from its
+    /// capability exists (the kernel says so: `Inspect`'s `INSPECT_DERIVED`)
+    /// and no client is connected through it.
+    fn idle(&self, k: usize) -> bool {
         let Some(w) = self.windows.all.get(k).and_then(Option::as_ref) else { return false };
-        w.inner == 0
-            && matches!(sys::inspect_slot(slots::SPACE, w.keep.cap().0), Ok(Some(s)) if !s.derived)
-            && !self.session.connected(NARROWED + k as u64)
+        matches!(sys::inspect_slot(slots::SPACE, w.keep.cap().0), Ok(Some(s)) if !s.derived) && !self.session.connected(NARROWED + k as u64)
     }
 
-    /// End every window `which` picks that nobody holds any more: what a
-    /// consumer at its share gets back of its own. Looks only at the
-    /// windows `which` picks (one consumer's, or one first window's).
-    fn give_back(&mut self, which: impl Fn(&Window) -> bool) {
-        for k in 0..self.windows.all.len() {
-            if self.windows.all[k].as_ref().is_some_and(&which) && self.unheld(k) {
+    /// Whether nobody holds window `k` any more: it is idle (`Service::idle`)
+    /// and so is every window under it, which end with it. (A first window
+    /// that had a window under it once could never be given back while one
+    /// had to be let go of before it: before, every partition opened and
+    /// narrowed once stayed for as long as the driver ran.)
+    fn unheld(&self, k: usize) -> bool {
+        let Some(w) = self.windows.all.get(k).and_then(Option::as_ref) else { return false };
+        if !self.idle(k) {
+            return false;
+        }
+        if w.under.is_some() || w.inner == 0 {
+            return true;
+        }
+        let inner = |i: &usize| self.windows.all[*i].as_ref().is_some_and(|x| x.under == Some(k));
+        (0..self.windows.all.len()).filter(inner).all(|i| self.idle(i))
+    }
+
+    /// End a window `which` picks that nobody holds any more, looking at no
+    /// more than [`LOOKS`] of them from where the last pass stopped: each
+    /// look costs system calls on the driver's one thread, so a program at
+    /// its share gets back what it let go of a few looks at a time, a few
+    /// for each of its calls. Returns whether a window ended.
+    fn give_back(&mut self, which: impl Fn(&Window) -> bool) -> bool {
+        let n = self.windows.all.len();
+        let mut looked = 0;
+        for step in 0..n {
+            let k = (self.windows.cursor + step) % n;
+            if !self.windows.all[k].as_ref().is_some_and(&which) {
+                continue;
+            }
+            looked += 1;
+            let ended = self.unheld(k);
+            if ended {
                 self.end_window(k);
             }
+            if ended || looked >= LOOKS {
+                self.windows.cursor = (k + 1) % n;
+                return ended;
+            }
         }
+        false
+    }
+
+    /// What program `owner` keeps in this driver, in capability slots
+    /// ([`SHARE`]): its windows and its connections' state.
+    fn kept(&self, owner: u64) -> usize {
+        self.windows.all.iter().flatten().filter(|w| w.owner == owner).count() + self.session.kept_by(owner)
+    }
+
+    /// Room for `need` more slots of program `owner`'s within its share: its
+    /// own windows that nobody holds any more given back first (a few looks
+    /// at a time), else `no_room`. Nobody else's state is touched.
+    fn room(&mut self, owner: u64, need: usize) -> Result<(), Error> {
+        if self.kept(owner) + need > SHARE {
+            // Its connections whose client has gone first (a client that
+            // ended and is connecting again at its share), then its windows.
+            self.session.close_gone(owner, &mut Map(&mut self.device));
+        }
+        while self.kept(owner) + need > SHARE {
+            if !self.give_back(|w| w.owner == owner) {
+                return Err(Error::NoRoom);
+            }
+        }
+        Ok(())
     }
 
     /// End window `k`: every capability to it goes, its client is
@@ -696,15 +769,17 @@ impl<D: Device> device::Server<Handle> for Service<D> {
     }
 
     /// Each `narrow` is a window of its own, for one holder (see
-    /// `Window`), charged to the consumer whose capability it was narrowed
-    /// from. A consumer holds at most `FIRST_PER_CLIENT` windows of the
-    /// whole device, and under one first window there are at most
-    /// `INNER_PER_FIRST`; past either, the consumer's own windows that
-    /// nobody holds any more (the kernel says when: `Service::unheld`) make
-    /// room, and else it is refused (`no_room`). No window anyone holds is
-    /// ever taken to make room: before, past 128 windows the oldest ended,
-    /// so any holder of the whole disk could narrow 128 ranges and cut off
-    /// every partition's holder, the root filesystem's among them.
+    /// `Window`), charged to the program whose capability it was narrowed
+    /// from: one slot of its share (`SHARE`), and under one first window
+    /// there are at most `INNER_PER_FIRST`. Past either, the program's own
+    /// windows that nobody holds any more (the kernel says when:
+    /// `Service::unheld`) make room, and else it is refused (`no_room`). No
+    /// window anyone holds is ever taken to make room: before, past 128
+    /// windows the oldest ended, so any holder of the whole disk could
+    /// narrow 128 ranges and cut off every partition's holder, the root
+    /// filesystem's among them. When the driver's capability space or its
+    /// table runs out, windows nobody holds are given back whoever's they
+    /// were.
     fn narrow(&mut self, first: u64, blocks: u64) -> Result<NarrowReply<Handle>, Error> {
         let info = self.device.info();
         let caller = self.caller;
@@ -719,20 +794,14 @@ impl<D: Device> device::Server<Handle> for Service<D> {
             let k = (caller - NARROWED) as usize;
             self.windows.all[k].as_ref().and_then(|w| w.under).unwrap_or(k)
         });
-        let full = |s: &Self| match under {
-            Some(f) => s.windows.all[f].as_ref().is_none_or(|w| w.inner >= INNER_PER_FIRST),
-            None => s.windows.all.iter().flatten().filter(|w| w.owner == owner && w.under.is_none()).count() >= FIRST_PER_CLIENT,
-        };
-        if full(self) {
-            match under {
-                Some(f) => self.give_back(|w| w.under == Some(f)),
-                None => self.give_back(|w| w.owner == owner && w.under.is_none()),
-            }
-            if full(self) {
+        if let Some(f) = under {
+            let full = |s: &Self| s.windows.all[f].as_ref().is_none_or(|w| w.inner >= INNER_PER_FIRST);
+            if full(self) && (!self.give_back(|w| w.under == Some(f)) || full(self)) {
                 return Err(Error::NoRoom);
             }
         }
-        // A free index, else a new one.
+        self.room(owner, 1)?;
+        // A free index, else a new one, else one nobody holds any more.
         let k = match self.windows.all.iter().position(Option::is_none) {
             Some(k) => k,
             None if self.windows.all.len() < WINDOWS_MOST => {
@@ -740,10 +809,21 @@ impl<D: Device> device::Server<Handle> for Service<D> {
                 self.windows.all.push(None);
                 self.windows.all.len() - 1
             }
-            None => return Err(Error::NoRoom),
+            None => {
+                if !self.give_back(|_| true) {
+                    return Err(Error::NoRoom);
+                }
+                self.windows.all.iter().position(Option::is_none).ok_or(Error::NoRoom)?
+            }
+        };
+        let keep = match free_slot() {
+            Some(s) => s,
+            None => {
+                self.give_back(|_| true);
+                free_slot().ok_or(Error::NoRoom)?
+            }
         };
         let badge = NARROWED + k as u64;
-        let keep = free_slot().ok_or(Error::NoRoom)?;
         if sys::cap_derive(slots::SPACE, keep, self.endpoint, Rights(Rights::WRITE.0 | Rights::GRANT.0), badge).is_err() {
             release_slot(keep);
             return Err(Error::NoRoom);
@@ -759,11 +839,15 @@ impl<D: Device> device::Server<Handle> for Service<D> {
 
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<ConnectReply<Handle>, Error> {
         let owner = self.windows.owner(self.caller);
+        // Its rings and its notification: two slots of its program's share.
+        self.room(owner, 2)?;
         let requests = self.session.connect(self.caller, owner, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
         Ok(ConnectReply { requests })
     }
 
     fn add_memory(&mut self, id: u32, frame: Handle, writable: bool) -> Result<AddMemoryReply, Error> {
+        // The frame and the device's copy: two slots of its program's share.
+        self.room(self.windows.owner(self.caller), 2)?;
         self.session.add_memory(self.caller, id, frame, writable, &mut Map(&mut self.device)).map_err(error)?;
         Ok(AddMemoryReply {})
     }

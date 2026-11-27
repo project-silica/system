@@ -257,6 +257,26 @@ impl<M> Session<M> {
         self.connections.iter().flatten().any(Connection::alive)
     }
 
+    /// What the connections charged to program `owner` keep in the
+    /// provider's capability space: two slots a connection (its rings and
+    /// its notification) and two a registered frame (the frame and the
+    /// device's copy of it).
+    pub fn kept_by(&self, owner: u64) -> usize {
+        self.connections.iter().flatten().filter(|c| c.owner == owner).map(|c| 2 + 2 * c.memories.iter().flatten().count()).sum()
+    }
+
+    /// End program `owner`'s connections whose client has gone; returns
+    /// whether there was one. What a program at its share gets back of its
+    /// own before it is refused.
+    pub fn close_gone(&mut self, owner: u64, mapper: &mut impl Mapper<Mapping = M>) -> bool {
+        let gone: Vec<usize> =
+            (0..self.connections.len()).filter(|&s| self.connections[s].as_ref().is_some_and(|c| c.owner == owner && !c.alive())).collect();
+        for &s in &gone {
+            self.close_slot(s, mapper);
+        }
+        !gone.is_empty()
+    }
+
     /// Whether the client calling with badge `caller` is connected and
     /// still there: while it is, what its capability reaches is in use.
     pub fn connected(&self, caller: u64) -> bool {
@@ -305,8 +325,9 @@ impl<M> Session<M> {
                     dead
                 }
                 None => {
-                    // Tickets name a connection's slot in 16 bits.
-                    if self.connections.len() > u16::MAX as usize {
+                    // Tickets name a connection's slot in 16 bits, and
+                    // slot 65535 is the provider's own (`Ticket::own`).
+                    if self.connections.len() >= u16::MAX as usize {
                         return Err(Refused::NoRoom);
                     }
                     self.connections.try_reserve(1).map_err(|_| Refused::NoRoom)?;

@@ -152,6 +152,10 @@ struct Running<'a> {
     /// asking to be started again (`silica_rt::AGAIN_LABEL`) is, at once; one
     /// nobody opened is not (it could keep the device manager starting it).
     opened: bool,
+    /// Capabilities to it handed out since it started: the low part of
+    /// their badges (`silica_protocols::driver_badge`), never reused while
+    /// it runs.
+    opens: u64,
 }
 
 struct Manager {
@@ -175,9 +179,6 @@ struct Manager {
     listing: Vec<manager::Device<'static>>,
     /// What `describe` answers with, one part of it.
     described: silica_rt::alloc::string::String,
-    /// Driver capabilities handed out, so each is told apart: the low half
-    /// of their badges (`silica_protocols::driver_badge`).
-    opens: u32,
     /// Hot-plug capable ports, with the configuration space base (ECAM)
     /// and segment of the buses behind them.
     /// (Each with the segment's last bus.)
@@ -308,40 +309,15 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<manager::OpenReply<Handle>, manager::Error> {
-        let (functions, caller) = (&self.functions, self.caller);
-        let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
-        let class = class_of(&functions[r.function]);
-        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+        let consumer = silica_protocols::driver_badge::consumer_of_caller(self.caller);
+        self.open_charged(id, gone, consumer).map(|driver| manager::OpenReply { driver })
+    }
+
+    fn open_for(&mut self, id: u32, consumer: u32, gone: Option<Handle>) -> Result<manager::OpenForReply<Handle>, manager::Error> {
+        if !scope::has(self.caller, scope::DEVICE_DELEGATE) {
             return Err(manager::Error::Refused);
         }
-        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
-        // Each capability its own badge, never one given before, and charged
-        // to the consumer that asked: the driver keeps its connections and
-        // windows apart by it (`silica_protocols::driver_badge`).
-        let Some(open) = self.opens.checked_add(1) else {
-            release_slot(slot);
-            return Err(manager::Error::NoRoom);
-        };
-        self.opens = open;
-        let badge = silica_protocols::driver_badge::of(silica_protocols::driver_badge::consumer_of_caller(caller), open);
-        let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
-        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, badge).is_err() {
-            release_slot(slot);
-            return Err(manager::Error::NoRoom);
-        }
-        if let Some(g) = gone {
-            // Kept until the driver ends, one for each caller: a caller's
-            // later notice (its reconnecting) replaces its earlier one.
-            r.gone.retain(|(c, _)| *c != caller);
-            r.gone.push((caller, g));
-        }
-        r.opened = true;
-        if class == Some(manager::Class::Watchdog) {
-            // The service manager takes the watchdog's driver: it knows
-            // (`tell_watchdog`).
-            self.watchdog_news = false;
-        }
-        Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
+        self.open_charged(id, gone, consumer as u64).map(|driver| manager::OpenForReply { driver })
     }
 
     fn restart(&mut self, id: u32) -> Result<manager::RestartReply, manager::Error> {
@@ -392,6 +368,47 @@ impl manager::Server<Handle> for Manager {
             self.described.push('\n');
         }
         Ok(manager::DescribeReply { text: &self.described, next })
+    }
+}
+
+impl Manager {
+    /// `open` of the driver of device `id` by the caller, charged to
+    /// `consumer` at the driver (`silica_protocols::driver_badge`).
+    fn open_charged(&mut self, id: u32, gone: Option<Handle>, consumer: u64) -> Result<Handle, manager::Error> {
+        let (functions, caller) = (&self.functions, self.caller);
+        let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+        let class = class_of(&functions[r.function]);
+        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+            return Err(manager::Error::Refused);
+        }
+        // Each capability its own badge, never one this driver was given
+        // before while it runs, charged to the consumer: the driver keeps
+        // its connections and windows apart by it. (One count for the
+        // whole device manager, 32 bits wide, once ran out for everyone.)
+        if r.opens >= silica_protocols::driver_badge::OPENS - 1 {
+            return Err(manager::Error::NoRoom);
+        }
+        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
+        r.opens += 1;
+        let badge = silica_protocols::driver_badge::of(consumer, r.opens);
+        let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
+        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, badge).is_err() {
+            release_slot(slot);
+            return Err(manager::Error::NoRoom);
+        }
+        if let Some(g) = gone {
+            // Kept until the driver ends, one for each caller: a caller's
+            // later notice (its reconnecting) replaces its earlier one.
+            r.gone.retain(|(c, _)| *c != caller);
+            r.gone.push((caller, g));
+        }
+        r.opened = true;
+        if class == Some(manager::Class::Watchdog) {
+            // The service manager takes the watchdog's driver: it knows
+            // (`tell_watchdog`).
+            self.watchdog_news = false;
+        }
+        Ok(Handle::new(Cap(slot)))
     }
 }
 
@@ -1091,6 +1108,7 @@ impl Manager {
             events,
             gone: Vec::new(),
             opened: false,
+            opens: 0,
         });
         self.changed(index);
         Ok(())
@@ -1319,7 +1337,6 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         next_id: 0,
         listing: Vec::new(),
         described: silica_rt::alloc::string::String::new(),
-        opens: 0,
         ports: Vec::new(),
         bridges: Vec::new(),
         settling: Vec::new(),
