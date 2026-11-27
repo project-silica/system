@@ -243,6 +243,10 @@ fn main(info: &ProcessInfo) -> i64 {
 
 fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     let device = Device::take(info)?;
+    #[cfg(feature = "harness")]
+    if silica_driver::inject::planned() == Some(silica_driver::inject::Fault::EndFaults) {
+        return fault_when_ended();
+    }
     let dma = Dma::new(&device)?;
     if !dma.confined() {
         println!("ERROR: virtio-rogue: this machine does not confine DMA; there is no boundary to test");
@@ -467,4 +471,31 @@ fn run(info: &ProcessInfo) -> Result<(), DeviceError> {
     println!("virtio-rogue: writing configuration space; a fault is expected");
     device.config().registers().write16(4, 0);
     Err(fail("rogue_config_space", format_args!("the driver wrote its device's configuration space")))
+}
+
+/// `end_faults` (a test image's `devmgr.inject=virtio-rogue:end_faults@1`):
+/// nothing until the device manager asks this driver to end, then a read of
+/// a page a peer took back, a new one each time, for ever. The device
+/// manager answers each such fault with a page of zeros, as it must for a
+/// driver whose client went; what it may not do is let a driver that keeps
+/// faulting hold it past its time for ending drivers (`END_NS`): it ends
+/// this one where it stands, on time.
+#[cfg(feature = "harness")]
+fn fault_when_ended() -> Result<(), DeviceError> {
+    let signals = silica_driver::irq::Signals::new()?;
+    println!("virtio-rogue: waiting to be asked to end");
+    while signals.wait(None).is_none_or(|bits| bits & silica_rt::END == 0) {}
+    println!("virtio-rogue: asked to end; reading pages a peer took back, a new one each time");
+    let frame = mem::Object::new(sys::ObjectType::Frame, 12)?;
+    loop {
+        // A copy of the frame mapped at a fresh address among lent memory,
+        // then taken back (deleting the copy unmaps it): the read faults
+        // there, as a read of a client's memory after the client went.
+        let slot = silica_rt::ipc::free_slot().ok_or(DeviceError::Missing("a free slot"))?;
+        sys::cap_derive(slots::SPACE, slot, frame.cap(), Rights::READ, 0)?;
+        let copy = silica_rt::ipc::Handle::new(Cap(slot));
+        let page = mem::peer(copy.cap(), 12, Rights::READ)?;
+        drop(copy);
+        let _ = page.read32(0);
+    }
 }

@@ -18,3 +18,7 @@ silica-driver = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Test images only: the device faults committed on purpose (`end_faults`).
+harness = ["silica-driver/harness"]
