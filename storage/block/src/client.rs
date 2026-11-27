@@ -170,7 +170,12 @@ impl Disk {
     /// `partitions` (`silica.block.Partitions`): a disk whose blocks are the
     /// partition's, from 0, that outlives its driver as a whole disk does.
     pub fn open_partition(partitions: Cap, id: u32) -> Result<Disk, Error> {
-        let opener = silica_rt::alloc::boxed::Box::new(partitions::Client::<Channel, Handle>::from(Channel::new(partitions)));
+        Disk::open_with(silica_rt::alloc::boxed::Box::new(partitions::Client::<Channel, Handle>::from(Channel::new(partitions))), id)
+    }
+
+    /// Open device `id` through `opener` (what finds its provider, now and
+    /// after a driver ends).
+    pub fn open_with(opener: silica_rt::alloc::boxed::Box<dyn silica_queue::client::Opener>, id: u32) -> Result<Disk, Error> {
         let mut queue = Queue::<Block>::open_with(opener, id)?;
         let info = queue.control()?.info.clone();
         Ok(Disk::over(queue, info))

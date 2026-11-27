@@ -147,12 +147,18 @@ struct Running<'a> {
     /// The driver's events notification (`slots::EVENTS` in it): what
     /// the device manager asks it to end on ([`silica_rt::END`]).
     events: OwnedObject,
-    /// What clients asked to have signalled when this driver ends.
-    gone: Vec<(u64, Handle)>,
+    /// What clients asked to have signalled when this driver ends: the
+    /// caller, the holder it opened for (`silica_protocols::driver_badge`)
+    /// and the notification.
+    gone: Vec<(u64, u64, Handle)>,
     /// A client was given it (`open`) since it started: one that then ends
     /// asking to be started again (`silica_rt::AGAIN_LABEL`) is, at once; one
     /// nobody opened is not (it could keep the device manager starting it).
     opened: bool,
+    /// Capabilities to it handed out since it started: the low part of
+    /// their badges (`silica_protocols::driver_badge`), never reused while
+    /// it runs.
+    opens: u64,
 }
 
 struct Manager {
@@ -176,8 +182,6 @@ struct Manager {
     listing: Vec<manager::Device<'static>>,
     /// What `describe` answers with, one part of it.
     described: silica_rt::alloc::string::String,
-    /// Badges of driver capabilities handed out, so each client is told apart.
-    next_client: u64,
     /// Hot-plug capable ports, with the configuration space base (ECAM)
     /// and segment of the buses behind them.
     /// (Each with the segment's last bus.)
@@ -219,6 +223,14 @@ struct Manager {
     /// The badge of the call being answered: whose capability, and its
     /// scopes (`silica_protocols::scope`).
     caller: u64,
+}
+
+/// Whether `caller` may see the devices of `class` (`list`, `watch`): with
+/// the class's scope, or with `list` for any class but the watchdog. Seeing
+/// a device does not let a caller open it (`open` takes the class's scope).
+fn may_see(caller: u64, class: manager::Class) -> bool {
+    let s = scope_of(class);
+    s != 0 && (scope::has(caller, s) || (class != manager::Class::Watchdog && scope::has(caller, scope::DEVICE_LIST)))
 }
 
 /// The scope a caller needs for devices of `class`.
@@ -281,7 +293,7 @@ fn class_of(f: &Function) -> Option<manager::Class> {
 impl manager::Server<Handle> for Manager {
     fn list<'a>(&'a mut self, class: manager::Class, from: u32) -> manager::ListReply<'a, Handle> {
         self.listing.clear();
-        if scope_of(class) == 0 || !scope::has(self.caller, scope_of(class)) {
+        if !may_see(self.caller, class) {
             return manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing), next: 0 };
         }
         let functions = &self.functions;
@@ -302,32 +314,23 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<manager::OpenReply<Handle>, manager::Error> {
-        let (functions, caller) = (&self.functions, self.caller);
-        let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
-        let class = class_of(&functions[r.function]);
-        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+        let consumer = silica_protocols::driver_badge::consumer_of_caller(self.caller).ok_or(manager::Error::Refused)?;
+        self.open_charged(id, gone, |opens| silica_protocols::driver_badge::of(consumer, opens)).map(|driver| manager::OpenReply { driver })
+    }
+
+    fn open_for(&mut self, id: u32, client: u32, gone: Option<Handle>) -> Result<manager::OpenForReply<Handle>, manager::Error> {
+        if !scope::has(self.caller, scope::DEVICE_DELEGATE) {
             return Err(manager::Error::Refused);
         }
-        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
-        self.next_client += 1;
-        let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
-        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, self.next_client).is_err() {
-            release_slot(slot);
-            return Err(manager::Error::NoRoom);
+        // Charged to the pair (caller, client), within the caller's share: a
+        // client number is the caller's own, and a badge holds it whole or
+        // not at all.
+        let delegator = silica_protocols::driver_badge::consumer_of_caller(self.caller).ok_or(manager::Error::Refused)?;
+        if client as u64 > silica_protocols::driver_badge::MOST {
+            return Err(manager::Error::Refused);
         }
-        if let Some(g) = gone {
-            // Kept until the driver ends, one for each caller: a caller's
-            // later notice (its reconnecting) replaces its earlier one.
-            r.gone.retain(|(c, _)| *c != caller);
-            r.gone.push((caller, g));
-        }
-        r.opened = true;
-        if class == Some(manager::Class::Watchdog) {
-            // The service manager takes the watchdog's driver: it knows
-            // (`tell_watchdog`).
-            self.watchdog_news = false;
-        }
-        Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
+        let badge = silica_protocols::driver_badge::delegated(delegator, client as u64);
+        self.open_charged(id, gone, |_| badge).map(|driver| manager::OpenForReply { driver })
     }
 
     fn restart(&mut self, id: u32) -> Result<manager::RestartReply, manager::Error> {
@@ -349,7 +352,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn watch(&mut self, class: manager::Class, changed: Handle) -> manager::WatchReply {
-        if scope_of(class) != 0 && scope::has(self.caller, scope_of(class)) {
+        if may_see(self.caller, class) {
             let caller = self.caller;
             self.watchers.retain(|(c, k, _)| (*c, *k) != (caller, class));
             self.watchers.push((caller, class, changed));
@@ -378,6 +381,64 @@ impl manager::Server<Handle> for Manager {
             self.described.push('\n');
         }
         Ok(manager::DescribeReply { text: &self.described, next })
+    }
+}
+
+impl Manager {
+    /// `open` of the driver of device `id` by the caller, with the badge
+    /// `badge` makes of the driver's count of opens
+    /// (`silica_protocols::driver_badge`).
+    fn open_charged(&mut self, id: u32, gone: Option<Handle>, badge: impl Fn(u64) -> u64) -> Result<Handle, manager::Error> {
+        let (functions, caller) = (&self.functions, self.caller);
+        let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+        let class = class_of(&functions[r.function]);
+        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+            return Err(manager::Error::Refused);
+        }
+        // Each capability from `open` its own badge, never one this driver
+        // was given before while it runs, charged to the consumer: the
+        // driver keeps its connections and windows apart by it. (One count
+        // for the whole device manager, 32 bits wide, once ran out for
+        // everyone.)
+        if r.opens >= silica_protocols::driver_badge::OPENS - 1 {
+            return Err(manager::Error::NoRoom);
+        }
+        let badge = badge(r.opens + 1);
+        let holder = silica_protocols::driver_badge::holder(badge);
+        // A notice is kept for each notification given, the same one given
+        // again (a reconnecting) replacing the earlier; those whose
+        // notification has gone with its holder are forgotten first; at most
+        // `GONE_PER_HOLDER` for one holder (the caller, or a delegator's
+        // client) and `GONE_PER_CALLER` for one caller. (Kept one for each
+        // caller, every client of the block server lost its notice to the
+        // next one's open.)
+        if let Some(g) = &gone {
+            let object = |h: &Handle| sys::inspect_slot(slots::SPACE, h.cap().0).ok().flatten().map(|s| s.object);
+            let new = object(g);
+            r.gone.retain(|(c, _, old)| !(*c == caller && (new.is_some() && object(old) == new || !held(old))));
+            let (by_caller, by_holder) =
+                r.gone.iter().filter(|(c, _, _)| *c == caller).fold((0, 0), |(a, b), (_, h, _)| (a + 1, b + usize::from(*h == holder)));
+            if by_caller >= GONE_PER_CALLER || by_holder >= GONE_PER_HOLDER {
+                return Err(manager::Error::NoRoom);
+            }
+        }
+        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
+        let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
+        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, badge).is_err() {
+            release_slot(slot);
+            return Err(manager::Error::NoRoom);
+        }
+        r.opens += 1;
+        if let Some(g) = gone {
+            r.gone.push((caller, holder, g));
+        }
+        r.opened = true;
+        if class == Some(manager::Class::Watchdog) {
+            // The service manager takes the watchdog's driver: it knows
+            // (`tell_watchdog`).
+            self.watchdog_news = false;
+        }
+        Ok(Handle::new(Cap(slot)))
     }
 }
 
@@ -1162,6 +1223,7 @@ impl Manager {
             events,
             gone: Vec::new(),
             opened: false,
+            opens: 0,
         });
         self.changed(index);
         Ok(())
@@ -1227,7 +1289,7 @@ impl Manager {
         silence(&config);
         let ok = r.child.destroy().is_ok();
         // Its clients hear of it now, not on their next call.
-        for (_, g) in r.gone {
+        for (_, _, g) in r.gone {
             let _ = sys::signal(g.cap());
         }
         self.changed(r.function);
@@ -1428,7 +1490,6 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         next_id: 0,
         listing: Vec::new(),
         described: silica_rt::alloc::string::String::new(),
-        next_client: CLIENTS,
         ports: Vec::new(),
         bridges: Vec::new(),
         settling: Vec::new(),
@@ -1791,4 +1852,16 @@ fn find_in_lent(archive: &[u8], info: &[u8], memory: &mut DeviceMemory, root: &R
             None => println!("devmgr: find: {word} is not in what this program was lent"),
         }
     }
+}
+
+/// `gone` notices kept for one caller at once: the block server's, one for
+/// each client of it a driver has.
+const GONE_PER_CALLER: usize = 64;
+/// `gone` notices kept for one holder at once (`silica_protocols::driver_badge`).
+const GONE_PER_HOLDER: usize = 16;
+
+/// Whether this program still holds `h` (a notification whose holder has
+/// ended is gone from its slot).
+fn held(h: &Handle) -> bool {
+    matches!(sys::inspect_slot(slots::SPACE, h.cap().0), Ok(Some(_)))
 }

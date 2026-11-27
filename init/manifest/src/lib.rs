@@ -248,6 +248,21 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
         if out.iter().any(|o: &Service| o.name == s.name) {
             return Err("two services have one name");
         }
+        // Opening a device charged to another program (`delegate`) is the
+        // block server's alone, for its clients: any other holder could
+        // charge any program, or invent them.
+        let device = |s: &Service| s.needs.iter().zip(&s.scopes).filter(|(n, _)| **n == "silica.device.Manager").fold(0, |a, (_, b)| a | b);
+        if device(&s) & silica_protocols::scope::DEVICE_DELEGATE != 0 && s.provides != Some("silica.block.Partitions") {
+            return Err("a service that does not provide silica.block.Partitions is given `delegate`");
+        }
+        // A block driver's share of each program that may reach it is sized
+        // for at most `BLOCK_PROGRAMS` of them.
+        if device(&s) & silica_protocols::scope::DEVICE_BLOCK != 0
+            && out.iter().filter(|o| device(o) & silica_protocols::scope::DEVICE_BLOCK != 0).count()
+                >= silica_protocols::driver_badge::BLOCK_PROGRAMS
+        {
+            return Err("more programs are given the device manager's `block` than a block driver has shares for");
+        }
         // Each has a bit of the service manager's notification to say it
         // serves after an update (bit 0 is the watchdog's).
         if out.len() == 63 {
