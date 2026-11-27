@@ -31,6 +31,11 @@ struct Display {
     /// The client's frame and where it is mapped (read only, among lent
     /// memory: a client that takes it back leaves zeros, not a fault).
     attached: Option<(Handle, mem::Lent)>,
+    /// The badge of the client that attached it (the device manager gives
+    /// each holder it opens the driver for a badge of its own), and of the
+    /// call being answered: only the attacher presents.
+    attacher: u64,
+    caller: u64,
 }
 
 impl device::Server<Handle> for Display {
@@ -53,11 +58,15 @@ impl device::Server<Handle> for Display {
         // Among lent memory: taking it back leaves zeros, never a fault.
         let region = mem::Lent::map(pixels.cap(), bits, Rights::READ).map_err(|_| Error::BadMemory)?;
         self.attached = Some((pixels, region));
+        self.attacher = self.caller;
         Ok(AttachReply {})
     }
 
     fn present(&mut self, rect: Rect, offset: u64, stride: u32) -> Result<PresentReply, Error> {
-        let Some((_, lent)) = &self.attached else { return Err(Error::NotAttached) };
+        // Only the client that attached the frame presents it: any other
+        // holder of the driver chose when, and which parts of, the
+        // attacher's frame reached the screen (the audit of 2026-11-27).
+        let Some((_, lent)) = self.attached.as_ref().filter(|_| self.caller == self.attacher) else { return Err(Error::NotAttached) };
         let from = lent.region();
         let Rect { x, y, width, height } = rect;
         let (x, y, w, h) = (x as u64, y as u64, width as u64, height as u64);
@@ -109,8 +118,9 @@ fn run(info: &ProcessInfo) -> Result<core::convert::Infallible, DeviceError> {
         return Err(DeviceError::Protocol("the framebuffer does not fit its BAR"));
     }
     println!("fbdisplay: {width}x{height}, {stride} pixels a row");
-    let mut display = Display { mode: Mode { width, height, format }, stride, framebuffer, attached: None };
-    serve(granted(grant::SERVICE), |_badge, request, caps: CapList<Handle>, reply, reply_caps| {
+    let mut display = Display { mode: Mode { width, height, format }, stride, framebuffer, attached: None, attacher: 0, caller: 0 };
+    serve(granted(grant::SERVICE), |badge, request, caps: CapList<Handle>, reply, reply_caps| {
+        display.caller = badge;
         device::dispatch(&mut display, request, caps, reply, reply_caps)
     })
 }

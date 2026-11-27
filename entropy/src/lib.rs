@@ -13,10 +13,11 @@
 
 use silica_formats::blake2s::Blake2s;
 
-/// Domain separation of the three uses of the key.
+/// Domain separation of the three uses of the key, and of a read's digest.
 const MIX: &[u8] = b"silica.entropy mix";
 const OUT: &[u8] = b"silica.entropy out";
 const NEXT: &[u8] = b"silica.entropy next key";
+const LAST: &[u8] = b"silica.entropy last read";
 
 /// The pool.
 pub struct Pool {
@@ -38,8 +39,12 @@ impl Pool {
     /// Fill `out` with output, then replace the key.
     pub fn fill(&mut self, out: &mut [u8]) {
         for chunk in out.chunks_mut(32) {
-            let block = self.block(OUT);
+            let mut block = self.block(OUT);
             chunk.copy_from_slice(&block[..chunk.len()]);
+            // Not left on the stack: the last block, or the part of it the
+            // answer did not take, is output nobody else may see.
+            block.fill(0);
+            core::hint::black_box(&block);
         }
         self.key = self.block(NEXT);
     }
@@ -50,11 +55,18 @@ impl Pool {
     }
 }
 
+/// What of a device's read is kept for comparing the next with it: its
+/// digest, not its bytes. They went into the pool, and kept raw they stayed
+/// in this service's memory past their use (the audit of 2026-11-27).
+pub fn digest(read: &[u8]) -> [u8; 32] {
+    Blake2s::new().update(LAST).update(read).finish()
+}
+
 /// Whether `read`, bytes a randomness device just gave, may be counted
 /// towards the pool being seeded: they pass the continuous health tests a
 /// noise source's output must (NIST SP 800-90B, 4.4), for the full entropy
 /// a device claims (8 bits a byte), and do not repeat the device's last
-/// read (`last`). Bytes that fail are still mixed in (they cannot weaken the
+/// read (`last`, its [`digest`]). Bytes that fail are still mixed in (they cannot weaken the
 /// pool) but are not counted: a broken device that gives constant bytes, or
 /// the same bytes every time, does not make the service say it is seeded.
 ///
@@ -63,11 +75,11 @@ impl Pool {
 /// - Proportion: no value more than 13 times among the 64 bytes asked for
 ///   (the binomial's tail for p = 1/256 at 2^-20 is near 9; 13 leaves room).
 /// - At least 32 distinct values among 64 (about 56 are expected).
-pub fn healthy(read: &[u8], last: &[u8]) -> Result<(), &'static str> {
+pub fn healthy(read: &[u8], last: &[u8; 32]) -> Result<(), &'static str> {
     if read.len() < 16 {
         return Err("too few bytes to judge");
     }
-    if read == last {
+    if &digest(read) == last {
         return Err("the same bytes as the read before");
     }
     let mut run = 1;
@@ -152,22 +164,22 @@ mod tests {
     #[test]
     fn a_device_that_is_stuck_or_constant_is_not_counted() {
         let zeros = [0u8; 64];
-        assert!(healthy(&zeros, &[]).is_err(), "all zeros");
+        assert!(healthy(&zeros, &[0; 32]).is_err(), "all zeros");
         let mut run = [0u8; 64];
         for (i, b) in run.iter_mut().enumerate() {
             *b = i as u8;
         }
         run[10..14].fill(7);
-        assert!(healthy(&run, &[]).is_err(), "a byte four times in a row");
+        assert!(healthy(&run, &[0; 32]).is_err(), "a byte four times in a row");
         let two: [u8; 64] = core::array::from_fn(|i| if i % 2 == 0 { 0x55 } else { 0xAA });
-        assert!(healthy(&two, &[]).is_err(), "two values alternating");
+        assert!(healthy(&two, &[0; 32]).is_err(), "two values alternating");
         // What a generator gives passes, but not twice the same.
         let mut pool = Pool::new([9; 32]);
         let mut good = [0u8; 64];
         for _ in 0..1000 {
             pool.fill(&mut good);
-            assert_eq!(healthy(&good, &[]), Ok(()));
+            assert_eq!(healthy(&good, &[0; 32]), Ok(()));
         }
-        assert!(healthy(&good, &good).is_err(), "the same read again");
+        assert!(healthy(&good, &digest(&good)).is_err(), "the same read again");
     }
 }
