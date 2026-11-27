@@ -25,8 +25,9 @@ pub struct Lease {
     pub prefix: u8,
     pub router: Option<Ipv4>,
     pub dns: [Ipv4; 3],
-    /// The network's time server, if it names one (option 42).
-    pub ntp: Option<Ipv4>,
+    /// The network's time servers, up to three (option 42), unused ones
+    /// unspecified.
+    pub ntp: [Ipv4; 3],
     /// The server that gave it, which renewals go to.
     pub server: Ipv4,
     /// How long it was given for, in seconds (`u32::MAX`: for ever).
@@ -301,7 +302,10 @@ fn lease_of(now: u64, r: &Reply, server: Ipv4) -> Option<Lease> {
     for d in dns.iter_mut().filter(|d| !unicast(**d)) {
         *d = Ipv4::UNSPECIFIED;
     }
-    let ntp = r.ntp.filter(|n| unicast(*n));
+    let mut ntp = r.ntp;
+    for t in ntp.iter_mut().filter(|t| !unicast(**t)) {
+        *t = Ipv4::UNSPECIFIED;
+    }
     let (renew_at, rebind_at, expires_at) = if seconds == u32::MAX {
         (u64::MAX, u64::MAX, u64::MAX)
     } else {
@@ -345,7 +349,7 @@ mod tests {
             prefix: Some(24),
             router: Some(SERVER),
             dns: [Ipv4([10, 0, 2, 3]), Ipv4::UNSPECIFIED, Ipv4::UNSPECIFIED],
-            ntp: None,
+            ntp: [Ipv4::UNSPECIFIED; 3],
         }
     }
 
@@ -570,11 +574,11 @@ mod tests {
         }
         let e = with(&|r: &mut Reply| {
             r.dns = [Ipv4([127, 0, 0, 53]), Ipv4([10, 0, 2, 3]), Ipv4([224, 0, 0, 1])];
-            r.ntp = Some(Ipv4([127, 0, 0, 1]));
+            r.ntp = [Ipv4([127, 0, 0, 1]), Ipv4([10, 0, 2, 4]), Ipv4::UNSPECIFIED];
         });
         let Some(Event::Bound(l)) = e else { panic!("{e:?}") };
         assert_eq!(l.dns, [Ipv4::UNSPECIFIED, Ipv4([10, 0, 2, 3]), Ipv4::UNSPECIFIED]);
-        assert_eq!(l.ntp, None);
+        assert_eq!(l.ntp, [Ipv4::UNSPECIFIED, Ipv4([10, 0, 2, 4]), Ipv4::UNSPECIFIED]);
     }
 
     /// A server's answer as it arrives on port 68: BOOTP's fixed part, the

@@ -239,6 +239,9 @@ struct Manager {
     described: String,
     /// The badge of the call being answered.
     caller: u64,
+    /// A shutdown that was asked for (`reboot`: a reset), made once its
+    /// call is answered ([`Manager::go_down`]).
+    going_down: Option<bool>,
     /// The memory each calling service was lent to write a program into
     /// (`program`), with its size in bits: one a service, the service
     /// manager's own frame, taken back by `update`, by the next `program`
@@ -758,6 +761,11 @@ impl Manager {
         if m.badge >= CONSUMERS && m.badge & FAULT_BADGE == 0 {
             self.caller = m.badge;
             listener.answer(&m, |request, caps, reply, reply_caps| manager::dispatch(self, request, caps, reply, reply_caps));
+            // Asked for and answered: now the machine goes down, its caller
+            // stopped or asked to end like every other service.
+            if let Some(reboot) = self.going_down.take() {
+                self.go_down(reboot);
+            }
             return Ok(None);
         }
         match self.ended(&m) {
@@ -953,6 +961,56 @@ impl Manager {
         if scope::has(self.caller, want) { Ok(()) } else { Err(manager::Error::Refused) }
     }
 
+    /// Stop every service, in the reverse of the order they started, then
+    /// turn the machine off (`reboot`: reset it): the shutdown a caller asked
+    /// for, made once its call was answered. Returns only if the machine
+    /// could not be turned off, having said so.
+    fn go_down(&mut self, reboot: bool) {
+        println!("init: shutting down{}", if reboot { " to reset" } else { "" });
+        let log = self.log.as_ref().map(|l| l.service);
+        // Taken back only once the log service has ended.
+        let mut later = Vec::new();
+        for &i in self.order.clone().iter().rev() {
+            if Some(i) == log {
+                continue;
+            }
+            // A service with something to finish (`ends`: the device
+            // manager, its disks' caches) is asked to end and its exit
+            // waited for; whoever asked for the shutdown too (its call was
+            // answered: it waits for nothing).
+            if self.services[i].ends && self.running[i].child.is_some() {
+                self.end_in_order(i);
+            }
+            // The logs it gave its programs are rings in its own memory: it
+            // keeps that until the log service has read them (it runs no
+            // more: it has ended in order).
+            if self.gave_logs(i) {
+                later.push(i);
+                continue;
+            }
+            if self.stop(i) {
+                println!("init: {} stopped", self.services[i].name);
+            }
+        }
+        // The log service, last: every ring is still whole, so what the
+        // services said as they ended reaches the console before it goes,
+        // and its exit says that it has.
+        if let Some(l) = log
+            && self.services[l].ends
+            && self.running[l].child.is_some()
+        {
+            self.end_in_order(l);
+        }
+        for i in later.into_iter().chain(log) {
+            if self.stop(i) {
+                println!("init: {} stopped", self.services[i].name);
+            }
+        }
+        let power = sys::Cap(libsys::root::SLOT_POWER);
+        let why = if reboot { sys::reboot(power, 0) } else { sys::power_off(power, 0) };
+        println!("ERROR: init: the machine cannot be turned off: {why:?}");
+    }
+
     /// Whether the caller's `control` (`update`: its `update` and `revert`)
     /// reaches service `i`, by its declaration's `controls=`
     /// (`manifest::reaches`, which states the rule). A scope says what a
@@ -1075,55 +1133,18 @@ impl manager::Server<Handle> for Manager {
         Ok(manager::DescribeReply { text: &self.described, next })
     }
 
+    /// Accepted and answered; the machine goes down once the answer is sent
+    /// (`step`: [`Manager::go_down`]). Made inside the call, the caller
+    /// waited in it, answering nothing and unable to be asked to end: the
+    /// device manager, calling this when its power button was pressed, had
+    /// to end its drivers first and then answered none of its clients until
+    /// it was destroyed (a hosted runner's shutdown test: the shell's call
+    /// went unanswered). Answered first, the caller is a service like any
+    /// other while the machine goes down.
     fn shutdown(&mut self, reboot: bool) -> Result<manager::ShutdownReply, manager::Error> {
         self.may(scope::SYSTEM_POWER)?;
-        println!("init: shutting down{}", if reboot { " to reset" } else { "" });
-        let caller = (self.caller & CONSUMERS != 0).then_some(self.caller & 0xFFFF_FFFF);
-        let log = self.log.as_ref().map(|l| l.service);
-        // Taken back only once the log service has ended.
-        let mut later = Vec::new();
-        for &i in self.order.clone().iter().rev() {
-            if Some(i) == log {
-                continue;
-            }
-            // A service with something to finish (`ends`: the device
-            // manager, its disks' caches) is asked to end and its exit
-            // waited for; not the one whose call this is, which cannot
-            // answer while it waits for it (it ends what it must before it
-            // calls).
-            if self.services[i].ends && self.running[i].child.is_some() && caller != Some(i as u64) {
-                self.end_in_order(i);
-            }
-            // The logs it gave its programs are rings in its own memory: it
-            // keeps that until the log service has read them (it runs no
-            // more: it has ended in order, or waits for this call's answer).
-            if self.gave_logs(i) {
-                later.push(i);
-                continue;
-            }
-            if self.stop(i) {
-                println!("init: {} stopped", self.services[i].name);
-            }
-        }
-        // The log service, last: every ring is still whole, so what the
-        // services said as they ended reaches the console before it goes,
-        // and its exit says that it has.
-        if let Some(l) = log
-            && self.services[l].ends
-            && self.running[l].child.is_some()
-            && caller != Some(l as u64)
-        {
-            self.end_in_order(l);
-        }
-        for i in later.into_iter().chain(log) {
-            if self.stop(i) {
-                println!("init: {} stopped", self.services[i].name);
-            }
-        }
-        let power = sys::Cap(libsys::root::SLOT_POWER);
-        let why = if reboot { sys::reboot(power, 0) } else { sys::power_off(power, 0) };
-        println!("ERROR: init: the machine cannot be turned off: {why:?}");
-        Err(manager::Error::Refused)
+        self.going_down = Some(reboot);
+        Ok(manager::ShutdownReply {})
     }
 
     fn stage(&mut self, _at: u64, _data: &[u8]) -> Result<manager::StageReply, manager::Error> {
@@ -1526,6 +1547,7 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
         listed: Vec::new(),
         described: String::new(),
         caller: 0,
+        going_down: None,
         lent: Vec::new(),
         hashes: Vec::new(),
         log,
