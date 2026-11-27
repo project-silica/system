@@ -15,8 +15,10 @@
 //!   stack must still answer (one that checked the end with an addition
 //!   that overflowed aborted, taking every connection on the machine).
 //! - It listens on ports its capability does not carry (it is given
-//!   `connect` alone): the remote service's, the web server's and one
+//!   `connect=9` alone): the remote service's, the web server's and one
 //!   nobody holds. Each must be refused as `not_granted`.
+//! - It connects to a port its capability does not name (port 80 of the
+//!   address it may reach on port 9): refused as `not_granted`.
 //!
 //! Says `tcphog: PASS` and exits 0, or says what went wrong and exits 1.
 #![no_std]
@@ -71,7 +73,8 @@ fn run() -> Result<(), silica_rt::alloc::string::String> {
     let note = Object::new(ObjectType::Notification, 0).map_err(|e| format!("no notification: {e:?}"))?;
     let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
     stack.add_memory(lend(memory.frame(), rw, 0).ok_or("no slot")?).map_err(|e| format!("add_memory: {e:?}"))?;
-    // Its capability carries no port (`connect` alone). Before, any holder
+    // Its capability carries no port to listen on (`connect=9` alone: a
+    // peer's port, not its own). Before, any holder
     // took any port first come, first served (the remote service's, while it
     // started again). Naming one (the retired `listen`) is refused whatever
     // the port, and so is listening on the port its capability carries.
@@ -109,6 +112,14 @@ fn run() -> Result<(), silica_rt::alloc::string::String> {
             Err(e) => return Err(format!("the first connection: {e:?}")),
         }
     };
+    // Its capability names the one peer port it may reach (`connect=9`):
+    // any other port is refused, whatever the address (before 2026-11-27 a
+    // capability to connect reached every address and port).
+    let wake = lend(note.cap(), Rights::WRITE, 1).ok_or("no slot")?;
+    match stack.connect(Endpoint { port: 80, ..NOBODY }, 1 << BLOCK_BITS, BLOCK_BITS, wake) {
+        Err(CallError::Error(Error::NotGranted)) => {}
+        r => return Err(format!("connecting to port 80 with a capability for port 9: {:?}, not not_granted", r.map(|r| r.connection))),
+    }
     let mut held = Vec::from([first]);
     let refusal = loop {
         let block = held.len() as u64;

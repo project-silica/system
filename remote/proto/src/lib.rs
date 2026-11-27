@@ -50,6 +50,78 @@ pub fn stamp_of(payload: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(payload.try_into().ok()?))
 }
 
+/// How far behind the machine's clock an owner's first message may be made
+/// (its clock may lag): older is a recording.
+pub const STAMP_WINDOW: u64 = 300_000_000_000;
+
+/// What a first message made at `made` is, to a machine that took one made
+/// at `newest` from that owner last and whose wall clock reads `wall`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    /// Later than the last, and within [`STAMP_WINDOW`] of the clock.
+    Fresh,
+    /// Later than the last, but the machine does not know the time, so a
+    /// recording made after the newest it kept cannot be told from a new
+    /// message.
+    Unjudged,
+    /// No later than the last taken from the owner: a replay, or the
+    /// owner's clock went back.
+    Replayed,
+    /// This many nanoseconds older than the clock allows.
+    Stale(u64),
+}
+
+/// The wall clock first messages are judged by: the machine's, but never
+/// earlier than this service has read it to be, so a step back (one time
+/// server's answer moves the clock up to 1000 s, and anyone on the path to
+/// it can answer) does not widen [`STAMP_WINDOW`] for a recording. Kept as
+/// the largest wall-minus-monotonic offset read (`offset`, 0: the time was
+/// never known), which this service keeps across its restarts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Floor {
+    pub offset: u64,
+}
+
+impl Floor {
+    /// The clock to judge by at monotonic time `now` (ns), given the
+    /// machine's wall clock `wall` (`None`: unknown): `None` only while it
+    /// was never known.
+    pub fn read(&mut self, wall: Option<u64>, now: u64) -> Option<u64> {
+        if let Some(w) = wall {
+            self.offset = self.offset.max(w.saturating_sub(now));
+        }
+        (self.offset != 0).then(|| self.offset.saturating_add(now))
+    }
+}
+
+/// The most handshakes answered while the machine does not know the time
+/// ([`Stamp::Unjudged`]) that wait at once to be proven.
+pub const MAX_UNJUDGED: usize = 2;
+
+/// Of the unjudged handshakes waiting (each a key and its first message's
+/// time), the one to close while more than [`MAX_UNJUDGED`] wait: the
+/// oldest made. A recording is answered only while it is newer than every
+/// first message taken from its owner, so an owner's new handshake is the
+/// newest of its owner's and is never the one closed for a recording.
+pub fn unjudged_to_close<K: Copy>(waiting: impl Iterator<Item = (K, u64)> + Clone) -> Option<K> {
+    if waiting.clone().count() <= MAX_UNJUDGED {
+        return None;
+    }
+    waiting.min_by_key(|w| w.1).map(|w| w.0)
+}
+
+/// Judge a first message's time ([`Stamp`]).
+pub fn judge_stamp(made: u64, newest: u64, wall: Option<u64>) -> Stamp {
+    if made <= newest {
+        return Stamp::Replayed;
+    }
+    match wall {
+        Some(w) if made.saturating_add(STAMP_WINDOW) < w => Stamp::Stale(w - made),
+        Some(_) => Stamp::Fresh,
+        None => Stamp::Unjudged,
+    }
+}
+
 /// The largest IDL message (`silica_idl_rt::MAX_MESSAGE`).
 pub const MAX_MESSAGE: usize = 4000;
 /// The largest plaintext: an answer's channel and status, then a message.
@@ -298,6 +370,62 @@ pub fn controls(list: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step back of the machine's clock (up to 1000 s from one time
+    /// server's answer) does not let a recording older than the window be
+    /// judged fresh: first messages are judged by a clock that never goes
+    /// back (the review of audit-net-auth). A step forward is taken.
+    #[test]
+    fn a_clock_stepped_back_does_not_widen_the_window() {
+        let s = 1_000_000_000u64;
+        let wall = 1_800_000_000 * s;
+        let mut floor = Floor::default();
+        assert_eq!(floor.read(None, 10 * s), None);
+        assert_eq!(floor.read(Some(wall), 20 * s), Some(wall));
+        // Ten seconds on, the clock is stepped back 999 s.
+        let judged = floor.read(Some(wall + 10 * s - 999 * s), 30 * s);
+        assert_eq!(judged, Some(wall + 10 * s), "the step back moved the clock first messages are judged by");
+        let recording = wall - 1300 * s;
+        assert!(matches!(judge_stamp(recording, 0, judged), Stamp::Stale(_)), "a recording 1300 s old judged fresh");
+        // Forward steps are taken.
+        assert_eq!(floor.read(Some(wall + 500 * s), 40 * s), Some(wall + 500 * s));
+        assert_eq!(floor.read(None, 50 * s), Some(wall + 510 * s));
+    }
+
+    /// Handshakes answered while the time is unknown have a bound of their
+    /// own, the oldest made closed first: recordings crowding in do not
+    /// close an owner's new handshake, which is the newest (the review of
+    /// audit-net-auth: as strangers, any crowd closed the oldest arrival,
+    /// the owner's).
+    #[test]
+    fn an_owners_unjudged_handshake_outlasts_recordings() {
+        let s = 1_000_000_000u64;
+        // The owner's, made now, arrived first; recordings made before it.
+        let waiting = [("owner", 1000 * s), ("r1", 10 * s), ("r2", 20 * s), ("r3", 30 * s)];
+        let mut open: alloc::vec::Vec<(&str, u64)> = waiting.to_vec();
+        while let Some(k) = unjudged_to_close(open.iter().copied()) {
+            assert_ne!(k, "owner", "the owner's handshake was closed for room");
+            open.retain(|w| w.0 != k);
+        }
+        assert_eq!(open.len(), MAX_UNJUDGED);
+        assert!(open.iter().any(|w| w.0 == "owner"));
+        assert_eq!(unjudged_to_close([("a", 1u64)].into_iter()), None);
+    }
+
+    /// A machine that does not know the time cannot tell a recorded first
+    /// message made after the newest it kept from a new one: it says so
+    /// (`Unjudged`) rather than calling it fresh (the audit of 2026-11-27,
+    /// M9: the check of the clock was skipped and the recording answered as
+    /// an owner's). Known times judge as before.
+    #[test]
+    fn a_first_message_is_judged_fresh_only_against_a_known_clock() {
+        let s = 1_000_000_000u64;
+        assert_eq!(judge_stamp(100 * s, 0, None), Stamp::Unjudged, "a recording answered as fresh while the time is unknown");
+        assert_eq!(judge_stamp(100 * s, 100 * s, None), Stamp::Replayed);
+        assert_eq!(judge_stamp(100 * s, 50 * s, Some(200 * s)), Stamp::Fresh);
+        assert_eq!(judge_stamp(100 * s, 50 * s, Some(100 * s + STAMP_WINDOW + s)), Stamp::Stale(STAMP_WINDOW + s));
+        assert_eq!(judge_stamp(100 * s, 0, Some(100 * s + STAMP_WINDOW)), Stamp::Fresh);
+    }
 
     #[test]
     fn a_stamp_is_eight_bytes_of_time_and_nothing_else_is_one() {
