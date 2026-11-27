@@ -298,7 +298,24 @@ impl Transport<Handle> for Channel {
 ///
 /// The request's capabilities are `handle`'s: what it does not move out of
 /// the list is deleted when the list is dropped.
-pub fn serve(endpoint: Cap, mut handle: impl FnMut(u64, &[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize) -> ! {
+pub fn serve(endpoint: Cap, handle: impl FnMut(u64, &[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize) -> ! {
+    serve_loop::<false>(endpoint, handle)
+}
+
+/// [`serve`], for a provider whose replies are secrets (random bytes a
+/// client makes keys from): once each reply is sent, what of it the loop
+/// held is wiped, its copy on this stack and the words of it the IPC buffer
+/// still holds past the next request's. Kept, they stayed in the
+/// provider's memory until a later reply happened to overwrite them (the
+/// audit of 2026-11-27). The provider wipes its own copies.
+pub fn serve_secret(endpoint: Cap, handle: impl FnMut(u64, &[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize) -> ! {
+    serve_loop::<true>(endpoint, handle)
+}
+
+fn serve_loop<const WIPE: bool>(
+    endpoint: Cap,
+    mut handle: impl FnMut(u64, &[u8], CapList<Handle>, &mut [u8], &mut CapList<Handle>) -> usize,
+) -> ! {
     let buf = buffer();
     let mut request = [0u8; MAX_MESSAGE];
     let mut reply = [0u8; MAX_MESSAGE];
@@ -313,10 +330,54 @@ pub fn serve(endpoint: Cap, mut handle: impl FnMut(u64, &[u8], CapList<Handle>, 
         let mut reply_caps = CapList::new();
         let n = dispatch(&buf, &m, &mut request, &mut reply, &mut reply_caps, |req, caps, out, rc| handle(m.badge, req, caps, out, rc));
         let (slots, sent) = give(&buf, &mut reply_caps);
-        let words = pack(&buf, &reply[..n]);
+        let mut words = if WIPE { pack_wiped(&buf, &reply[..n]) } else { pack(&buf, &reply[..n]) };
         next = sys::reply_recv(endpoint, info(n, sent), words);
         given(slots, sent);
+        if WIPE {
+            // The next request is in the IPC buffer's words up to its own
+            // length: every message word past it goes, the reply's and what
+            // the provider's own calls left there (a device's answer).
+            wipe_message_words_from(&buf, next.as_ref().map_or(0, |m| m.info.words()));
+            reply[..n].fill(0);
+            words = [0; 4];
+            core::hint::black_box((&reply, &words));
+        }
     }
+}
+
+/// [`pack`], wiping its copy of the message's first words once they are in
+/// the returned registers ([`serve_secret`]).
+fn pack_wiped(buf: &IpcBuffer, bytes: &[u8]) -> [u64; 4] {
+    let mut head = [0u8; 32];
+    let n = bytes.len().min(32);
+    head[..n].copy_from_slice(&bytes[..n]);
+    if bytes.len() > 32 {
+        if !bytes.len().is_multiple_of(8) {
+            buf.set_word(bytes.len() / 8, 0);
+        }
+        buf.copy_in(32, &bytes[32..]);
+    }
+    let words = core::array::from_fn(|i| u64::from_le_bytes(head[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8])));
+    head.fill(0);
+    core::hint::black_box(&head);
+    words
+}
+
+/// Zero the IPC buffer's message words from word `from` (and never the
+/// four the registers carry) to the end of the message area; the
+/// capability areas after it are left alone.
+fn wipe_message_words_from(buf: &IpcBuffer, from: usize) {
+    for i in from.max(4)..MAX_MESSAGE / 8 {
+        buf.set_word(i, 0);
+    }
+}
+
+/// Zero this thread's IPC buffer's message words: what a call's reply left
+/// there (a secret a provider was answered with: a randomness device's
+/// bytes) is not kept until a later message happens to overwrite it. Call
+/// between calls, with no message of this thread's in flight.
+pub fn wipe_message_words() {
+    wipe_message_words_from(&buffer(), 0);
 }
 
 /// What a provider that also hears signals does with each: the two halves
