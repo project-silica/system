@@ -104,5 +104,29 @@ fn run() -> Result<(), String> {
         }
     }
     println!("TEST entropy.a_restarted_service_repeats_nothing PASS");
+
+    // Its `control` reaches the service its declaration names (`controls=`)
+    // and no other: before, any service by name (the audit's M1).
+    match system.restart("netd") {
+        Err(silica_idl_rt::CallError::Error(system::Error::Refused)) => {}
+        other => return Err(format!("restarting netd, which this check's declaration does not name, was not refused: {other:?}")),
+    }
+    println!("TEST entropy.control_reaches_only_the_services_declared PASS");
+
+    // The machine's service is never updated or reverted, though this
+    // check's declaration names it (`controls=`): no program a caller sends
+    // is given the machine. The update is refused before its bytes are
+    // looked at (one byte, no program: before, `NotAProgram`; a revert of a
+    // program never updated was `Ok`).
+    system.program(1).map_err(|e| format!("asking for memory for a program: {e:?}"))?;
+    match system.update("devmgr", 1) {
+        Err(silica_idl_rt::CallError::Error(system::Error::Refused)) => {}
+        other => return Err(format!("updating devmgr, the machine's service, was not refused: {other:?}")),
+    }
+    match system.revert("devmgr") {
+        Err(silica_idl_rt::CallError::Error(system::Error::Refused)) => {}
+        other => return Err(format!("reverting devmgr, the machine's service, was not refused: {other:?}")),
+    }
+    println!("TEST entropy.the_machine_is_never_updated PASS");
     Ok(())
 }

@@ -8,7 +8,8 @@ publish.workspace = true
 
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
-needs = ["silica.entropy.Source", "silica.system.Manager:control"]
+needs = ["silica.entropy.Source", "silica.system.Manager:control+update"]
+controls = ["entropy", "devmgr"]
 memory = 22
 start = "check:entropy"
 

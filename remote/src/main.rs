@@ -25,8 +25,12 @@
 //! the log (`silica.log.Reader`). The service holds a capability to each,
 //! badged as itself and scoped to what owners may do through it; each
 //! owner may do what its line of `remote.owners` says (`observe`,
-//! `control`, `update`, `power`, joined with `+`; all four when it says
-//! none), and a call beyond it is refused here and said in the log. The
+//! `control`, `update`, `power`, joined with `+`, which every line names:
+//! a line without them is no owner, and turns remote management off), to
+//! the services its `controls=` names (`*`: every one this service may
+//! control; required with `control` or `update`), and a call beyond it is
+//! refused here and said in the log. The service manager holds this
+//! service to the services its own declaration's `controls=` names. The
 //! providers check every request as they check a local one: nothing a
 //! session sends is trusted here beyond its framing. A program an owner
 //! sends (`send`, a piece a call) is held here, in this service's own
@@ -128,9 +132,11 @@ struct Session {
 struct Machine {
     key: Keypair,
     /// Each owner's key, name, what of the service manager it may use
-    /// (`silica_protocols::scope`), and how long its sessions may stay
-    /// without a whole message ([`IDLE`], or its line's `idle=`).
-    owners: Vec<([u8; 32], String, u64, u64)>,
+    /// (`silica_protocols::scope`), how long its sessions may stay without
+    /// a whole message ([`IDLE`], or its line's `idle=`), and which
+    /// services its `control` and `update` reach (its line's `controls=`;
+    /// the service manager bounds them by this service's own declaration).
+    owners: Vec<([u8; 32], String, u64, u64, String)>,
     manager: Channel,
     log: Channel,
     /// The program each owner is sending (`send`), held here until that
@@ -217,17 +223,57 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     };
     let mut owners = Vec::new();
     if let Some(text) = read_file(OWNERS_FILE) {
+        // The services an owner's `controls=` may name: those this machine
+        // runs, as the service manager lists them (`observe`).
+        let Some(known) = service_names() else {
+            println!("ERROR: remote: the service manager did not list its services, which remote.owners names; remote management is off");
+            return 1;
+        };
         for o in silica_remote::owners(&text) {
             match o {
-                Ok((k, name, spec, idle)) => {
+                Ok((k, name, spec, controls, idle, line)) => {
                     let all = scope::SYSTEM_OBSERVE | scope::SYSTEM_CONTROL | scope::SYSTEM_UPDATE | scope::SYSTEM_POWER;
-                    let Ok(may) = spec.map_or(Ok(all), |s| scope::parse(manager::NAME, s)) else {
+                    let Ok(may) = scope::parse(manager::NAME, spec) else {
                         println!(
-                            "ERROR: remote: {name} in remote.owners is given a scope the service manager does not have; remote management is off"
+                            "ERROR: remote: line {line} of remote.owners gives {name} a scope the service manager does not have; remote management is off"
                         );
                         return 1;
                     };
-                    owners.push((k, String::from(name), may & all, idle.map_or(IDLE, |s| s.saturating_mul(1_000_000_000))));
+                    // A scope the service manager has that no session uses
+                    // (`logs`): named, it would be given nothing.
+                    if may & !all != 0 {
+                        println!(
+                            "ERROR: remote: line {line} of remote.owners gives {name} a scope this service does not pass on (only observe, control, update and power); remote management is off"
+                        );
+                        return 1;
+                    }
+                    // Scopes that reach a service reach the services the
+                    // line names, and none it does not.
+                    if may & (scope::SYSTEM_CONTROL | scope::SYSTEM_UPDATE) != 0 && controls.is_none() {
+                        println!(
+                            "ERROR: remote: line {line} of remote.owners lets {name} control or update services but names none (controls=); remote management is off"
+                        );
+                        return 1;
+                    }
+                    // Each name a service this machine runs: a mistyped one
+                    // is the owner's mistake, said now, not a reach that
+                    // silently matches nothing.
+                    if let Some(c) = controls
+                        && let Some(bad) = c.split(',').find(|n| *n != "*" && !known.iter().any(|k| k == n))
+                    {
+                        println!(
+                            "ERROR: remote: line {line} of remote.owners names {}, which is no service here (controls=); remote management is off",
+                            inert(bad)
+                        );
+                        return 1;
+                    }
+                    owners.push((
+                        k,
+                        String::from(name),
+                        may & all,
+                        idle.map_or(IDLE, |s| s.saturating_mul(1_000_000_000)),
+                        String::from(controls.unwrap_or("")),
+                    ));
                 }
                 Err(silica_remote::BadLine(n)) => {
                     println!(
@@ -644,9 +690,21 @@ impl Session {
                     answer[1] = Status::Reply as u8;
                     return Some(2 + n);
                 }
+                // A call that names a service: one the owner's line says its
+                // `control` and `update` reach (`controls=`). Each owner is
+                // held to its own line here; the service manager holds this
+                // service to its declaration.
+                if let Some(target) = target_in(request)
+                    && !self.owner.is_some_and(|o| silica_remote::controls(&m.owners[o].4, target))
+                {
+                    println!("remote: {} may not control the service {}", self.who(m), inert(target));
+                    let n = refuse(reply, &mut caps);
+                    answer[1] = Status::Reply as u8;
+                    return Some(2 + n);
+                }
                 if let Some(what) = changes(ordinal) {
                     let name = name_in(request).unwrap_or("?");
-                    println!("remote: {} asks the service manager to {what} {name}", self.who(m));
+                    println!("remote: {} asks the service manager to {what} {}", self.who(m), inert(name));
                 }
                 // An update runs what this owner sent: written into memory
                 // the service manager lends for it, in this one turn, so no
@@ -728,6 +786,45 @@ fn name_in(request: &[u8]) -> Option<&str> {
     }
     named!(StopRequest, StartRequest, RestartRequest, UpdateRequest, RevertRequest);
     (ordinal == manager::ShutdownRequest::ORDINAL).then_some("the machine")
+}
+
+/// The names of the services the service manager runs (`list`, every part);
+/// `None` when it does not answer.
+fn service_names() -> Option<Vec<String>> {
+    let mut system = manager::Client::<Channel, Handle>::from(Channel::new(Cap(MANAGER)));
+    let (mut names, mut from) = (Vec::new(), 0);
+    loop {
+        let r = system.list(from).ok()?;
+        names.extend(r.services.iter().map(|s| String::from(s.name)));
+        if r.next <= from {
+            return Some(names);
+        }
+        from = r.next;
+    }
+}
+
+/// A name a session sent, as it is shown in the log: every control
+/// character, line ends among them, as `?`, so that no name ends a log line
+/// or starts a forged one, or reaches a terminal as anything but text.
+fn inert(name: &str) -> String {
+    name.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
+/// The service a call that controls or updates one names (`control`,
+/// `update`: start, stop, restart, update, revert); `None` for any other
+/// call. A request of those methods that does not decode names "", which
+/// no `controls=` list reaches.
+fn target_in(request: &[u8]) -> Option<&str> {
+    let ordinal = silica_idl_rt::request_ordinal(request).ok()?;
+    matches!(
+        ordinal,
+        manager::StopRequest::ORDINAL
+            | manager::StartRequest::ORDINAL
+            | manager::RestartRequest::ORDINAL
+            | manager::UpdateRequest::ORDINAL
+            | manager::RevertRequest::ORDINAL
+    )
+    .then(|| name_in(request).unwrap_or(""))
 }
 
 /// The largest program an owner sends: the largest the service manager
