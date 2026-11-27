@@ -10,9 +10,6 @@ publish.workspace = true
 # any VGA-compatible controller (silica_driver documents the forms).
 [package.metadata.silica]
 drivers = ["class 03.00.00"]
-# It draws in its device's framebuffer and never asks it to read memory:
-# its device is left without bus mastering (no DMA to confine).
-dma = false
 
 [[bin]]
 name = "fbdisplay"

@@ -418,50 +418,59 @@ enum Match {
 
 /// The drivers the boot archive offers, in its order.
 fn drivers(archive: &'static [u8]) -> Vec<(Match, &'static str)> {
-    let mut table = Vec::new();
-    let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return table };
-    let hex16 = |s: &str| u16::from_str_radix(s, 16).ok().filter(|_| s.len() == 4);
-    let hex8 = |s: &str| u8::from_str_radix(s, 16).ok().filter(|_| s.len() == 2);
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        let mut w = line.split_ascii_whitespace();
-        let m = match (w.next(), w.next()) {
-            (Some("pci"), Some(id)) => id.split_once(':').and_then(|(v, d)| Some(Match::Id(hex16(v)?, hex16(d)?))),
-            (Some("class"), Some(c)) => {
-                let mut p = c.split('.');
-                (|| Some(Match::Class(hex8(p.next()?)?, hex8(p.next()?)?, hex8(p.next()?)?)))()
-            }
-            _ => None,
-        };
-        let program = w.next();
-        // After the program: its configuration writes and `nodma`, each at
-        // most once, and nothing else.
-        let rest: Vec<&str> = w.collect();
-        let known = rest.len() <= 2
-            && rest.iter().all(|x| x.starts_with("config=") || *x == "nodma")
-            && rest.iter().filter(|x| x.starts_with("config=")).count() <= 1
-            && rest.iter().filter(|x| **x == "nodma").count() <= 1;
-        match (m, program) {
-            (Some(m), Some(program)) if known => table.push((m, program)),
-            _ => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
-        }
-    }
-    table
+    driver_lines(archive).into_iter().map(|(m, program, _)| (m, program)).collect()
 }
 
 /// The driver programs the archive's driver list says do no DMA (`nodma`,
 /// from a driver's declaration `dma = false`): their devices are left
 /// without bus mastering, and they start where DMA cannot be confined.
+/// Only from lines the list's reader takes, and only for an exact device
+/// identity (`pci <vendor>:<device>`): a class matches devices whose
+/// registers can do anything (a display class takes in GPUs whose register
+/// window mirrors configuration space, where a driver could turn bus
+/// mastering on).
 fn no_dma_drivers(archive: &'static [u8]) -> Vec<&'static str> {
-    let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return Vec::new() };
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            let mut w = l.split_ascii_whitespace().skip(2);
-            let program = w.next()?;
-            w.any(|x| x == "nodma").then_some(program)
-        })
-        .collect()
+    driver_lines(archive).into_iter().filter(|(_, _, no_dma)| *no_dma).map(|(_, program, _)| program).collect()
+}
+
+/// The lines of the archive's driver list: a match, its program, and
+/// whether it says `nodma`. A line it cannot read is said and skipped.
+fn driver_lines(archive: &'static [u8]) -> Vec<(Match, &'static str, bool)> {
+    let mut table = Vec::new();
+    let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return table };
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        match driver_line(line) {
+            Some(entry) => table.push(entry),
+            None => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
+        }
+    }
+    table
+}
+
+/// One line of the driver list: `pci <vendor>:<device>` or `class
+/// <class>.<subclass>.<interface>`, the program, then its configuration
+/// writes (`config=`) and `nodma`, each at most once and nothing else;
+/// `nodma` only with an exact device identity.
+fn driver_line(line: &'static str) -> Option<(Match, &'static str, bool)> {
+    let hex16 = |s: &str| u16::from_str_radix(s, 16).ok().filter(|_| s.len() == 4);
+    let hex8 = |s: &str| u8::from_str_radix(s, 16).ok().filter(|_| s.len() == 2);
+    let mut w = line.split_ascii_whitespace();
+    let m = match (w.next()?, w.next()?) {
+        ("pci", id) => id.split_once(':').and_then(|(v, d)| Some(Match::Id(hex16(v)?, hex16(d)?)))?,
+        ("class", c) => {
+            let mut p = c.split('.');
+            Match::Class(hex8(p.next()?)?, hex8(p.next()?)?, hex8(p.next()?)?)
+        }
+        _ => return None,
+    };
+    let program = w.next()?;
+    let rest: Vec<&str> = w.collect();
+    let configs = rest.iter().filter(|x| x.starts_with("config=")).count();
+    let no_dma = rest.iter().filter(|x| **x == "nodma").count();
+    if configs + no_dma != rest.len() || configs > 1 || no_dma > 1 || (no_dma == 1 && !matches!(m, Match::Id(..))) {
+        return None;
+    }
+    Some((m, program, no_dma == 1))
 }
 
 /// A write to a device's configuration space that its driver's declaration
@@ -714,6 +723,9 @@ impl Manager {
                     );
                     continue;
                 }
+                // Nothing masters the bus until a driver that does DMA is
+                // started for it (`silence_found`).
+                silence_found(&config);
                 let f = function_of(id, config, frame);
                 let index = match self.functions.iter().position(|g| g.id == id) {
                     Some(i) => {
@@ -880,6 +892,7 @@ impl Manager {
                         self.ports.push((port, ecam, segment, last_bus));
                     }
                 }
+                silence_found(&config);
                 self.functions.push(function_of(id, config, config_frame));
             }
         }
@@ -924,18 +937,30 @@ impl Manager {
         Ok(())
     }
 
-    /// Start the driver `driver` for function number `index`.
+    /// Start the driver `driver` for function number `index`. Whatever
+    /// keeps it from starting, its device is left silenced ([`silence`]):
+    /// no bus mastering, no message interrupts.
     fn start(&mut self, index: usize, driver: &'static str) -> Result<(), &'static str> {
+        let config = self.functions[index].config;
+        let r = self.start_driver(index, driver);
+        if r.is_err() {
+            silence(&config);
+        }
+        r
+    }
+
+    fn start_driver(&mut self, index: usize, driver: &'static str) -> Result<(), &'static str> {
         // Whether the kernel confines this device's DMA, asked of the
         // kernel for this device: attaching it to no address space succeeds
-        // only for a device behind an IOMMU unit the kernel drives (on a
-        // machine without one, on a segment no driven unit covers, or with
-        // segment 0 not wholly covered, it is `Unsupported`). A driver that
-        // does no DMA (`nodma` in the driver list) needs no confinement: its
-        // device is left without bus mastering, which drivers cannot turn on
-        // (configuration space is the device manager's to write).
+        // only for a device an IOMMU unit the kernel drives translates (on a
+        // machine without one, on a segment no driven unit covers, or outside
+        // every driven unit's scopes, it is `Unsupported`). A driver that
+        // does no DMA (`nodma` in the driver list, exact device identities
+        // only) needs no confinement: its device is left without bus
+        // mastering, which drivers cannot turn on (configuration space is
+        // the device manager's to write).
         let dma = !self.no_dma.contains(&driver);
-        let confined = dma && sys::device_attach(granted(GRANT_DEVICES), self.functions[index].id, Cap::NONE).is_ok();
+        let attached = dma.then(|| sys::device_attach(granted(GRANT_DEVICES), self.functions[index].id, Cap::NONE));
         // A machine's image starts no driver it cannot confine: one that is
         // not is trusted with all of memory, and a promise of confinement
         // that is not kept is refused by name, not logged and broken
@@ -943,11 +968,18 @@ impl Manager {
         // test image runs it unconfined and says so: the same image on a
         // machine without an IOMMU (`unconfined`).
         #[cfg(not(feature = "harness"))]
-        if dma && !confined {
-            return Err("its DMA cannot be confined on this machine, and only a test image trusts a driver with all of memory");
+        match attached {
+            Some(Err(sys::Error::Unsupported)) => {
+                return Err("its DMA cannot be confined on this machine, and only a test image trusts a driver with all of memory");
+            }
+            Some(Err(e)) => {
+                println!("devmgr: the kernel did not say whether {} can be confined: {e:?}", PciAddress(self.functions[index].id));
+                return Err("the kernel did not say whether its DMA can be confined");
+            }
+            _ => {}
         }
         #[cfg(feature = "harness")]
-        let _ = confined;
+        let _ = attached;
         let f = &self.functions[index];
         let image = ramdisk::find(self.archive, driver).ok_or("its driver is not in the boot archive")?;
         let (id, config) = (f.id, f.config);
@@ -1041,6 +1073,11 @@ impl Manager {
         // Bus mastering only for a driver that does DMA (`nodma`: off).
         let master = if dma { pci::COMMAND_MASTER } else { 0 };
         registers.write16(4, (registers.read16(4) & !pci::COMMAND_MASTER) | pci::COMMAND_MEMORY | master | pci::COMMAND_NO_INTX);
+        // A device that keeps bus mastering after it was told no is not
+        // given a driver trusted to do no DMA.
+        if !dma && registers.read16(4) & pci::COMMAND_MASTER != 0 {
+            return Err("its device kept bus mastering on, and its driver is trusted only because it does no DMA");
+        }
         if let Some(msix) = config.msix() {
             // Every entry masked and emptied before any can fire: the table
             // still holds the last driver's messages, whose lines may since
@@ -1586,6 +1623,18 @@ fn mask_msix_table(frame: Cap, bits: u8, offset: usize, vectors: usize) -> Resul
 /// a device without a running driver (stopped, or never started because
 /// starting it failed) is silenced, so that without an IOMMU it cannot
 /// reach memory at all. Says so if the device does not take it.
+/// A function just found: an endpoint is silenced ([`silence`]) until a
+/// driver that does DMA is started for it, whatever the firmware left on
+/// (the review of 2026-11-27: a device with no driver, or one refused,
+/// kept the firmware's bus mastering). A bridge is left alone: its bus
+/// mastering carries the requests of every device below it, each of which
+/// is silenced itself.
+fn silence_found(config: &Config) {
+    if config.registers().read8(0x0E) & 0x7F == 0 {
+        silence(config);
+    }
+}
+
 fn silence(config: &Config) {
     let registers = config.registers();
     registers.write16(4, registers.read16(4) & !pci::COMMAND_MASTER);
