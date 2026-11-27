@@ -900,6 +900,16 @@ impl Manager {
 
     /// Start the driver `driver` for function number `index`.
     fn start(&mut self, index: usize, driver: &'static str) -> Result<(), &'static str> {
+        // A machine's image starts no driver it cannot confine: one that is
+        // not is trusted with all of memory, and a promise of confinement
+        // that is not kept is refused by name, not logged and broken
+        // (spec/ARCHITECTURE.md, invariant 7; the 2026-11-26 review, H2). A
+        // test image runs it unconfined and says so: the same image on a
+        // machine without an IOMMU (`unconfined`).
+        #[cfg(not(feature = "harness"))]
+        if self.info.dma_top == 0 {
+            return Err("this machine cannot confine its DMA, and only a test image trusts a driver with all of memory");
+        }
         let f = &self.functions[index];
         let image = ramdisk::find(self.archive, driver).ok_or("its driver is not in the boot archive")?;
         let (id, config) = (f.id, f.config);
@@ -1322,8 +1332,13 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     if table.is_empty() {
         println!("devmgr: the boot archive lists no drivers");
     }
+    #[cfg(feature = "harness")]
     if info.dma_top == 0 {
         println!("devmgr: this machine cannot confine DMA: every driver started here is trusted with all of memory");
+    }
+    #[cfg(not(feature = "harness"))]
+    if info.dma_top == 0 {
+        println!("devmgr: this machine cannot confine DMA: no driver is started (only a test image runs one unconfined)");
     }
     // Say what there is, then start the drivers.
     let mut failed = false;
