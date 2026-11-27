@@ -388,17 +388,43 @@ impl Tcp {
     /// to pay for until it is done, so a peer that never lets one finish
     /// (a window kept shut, every probe answered) holds a place only
     /// until its program needs it. Before, they were nobody's to give up
-    /// and counted all the same: 128 of them shut a server for good.
-    fn make_room(&mut self, owner: u64) -> bool {
+    /// and counted all the same: 128 of them shut a server for good. For a
+    /// SYN to `listener`, that listener's oldest unfinished handshake gives
+    /// its place too, after every connection let go of.
+    ///
+    /// The place is given now: the one evicted is sent its reset here and
+    /// forgotten, so the connection that asked takes the place it freed.
+    /// (Before, the evicted one kept its place until its reset went out on
+    /// the next turn, and the SYN that evicted it was refused: after a
+    /// flood of SYNs that never finish, every peer's first SYN was reset,
+    /// and one that did not try again never got in.) With no room to send
+    /// the reset, nothing is evicted and the connection is refused.
+    fn make_room(&mut self, owner: u64, listener: Option<u32>, out: &mut dyn Out) -> bool {
         let most = self.most(owner);
         if self.held(owner) < most {
             return true;
         }
-        let lingering = |c: &Conn| c.owner == owner && c.released && !c.tcp.is_closed() && c.tcp.state() != State::TimeWait;
-        let Some(c) = self.conns.iter_mut().filter(|c| lingering(c)).min_by_key(|c| c.id) else { return false };
+        let reclaimable = |c: &Conn| {
+            c.owner == owner
+                && !c.tcp.is_closed()
+                && c.tcp.state() != State::TimeWait
+                && (c.released || (listener.is_some() && c.listener == listener && c.tcp.state() == State::SynReceived))
+        };
+        let Some((i, c)) = self.conns.iter_mut().enumerate().filter(|(_, c)| reclaimable(c)).min_by_key(|(_, c)| (!c.released, c.id))
+        else {
+            return false;
+        };
+        if !out.room() {
+            return false;
+        }
+        // A reset still to send keeps is_closed() false. Send it before
+        // giving back the slot so the arriving connection can use it now.
         c.tcp.abort();
-        c.due = true;
-        self.held(owner) < most
+        if let Some(n) = c.tcp.poll(silica_rt::clock().now(), &mut self.segment) {
+            out.send(c.tcp.endpoints().remote, &self.segment[..n], self.checksum_offload, c.tcp.mss() as u16);
+        }
+        self.drop_conn(i);
+        true
     }
 
     /// Forget connection `i` (closed, or never to be), and its record.
@@ -451,7 +477,7 @@ impl Tcp {
     /// A segment for `local`, from `remote`: given to its connection, or
     /// a new one a listener takes. Returns the reset to answer with when
     /// nothing takes it.
-    pub fn segment(&mut self, now: u64, local: Ipv4, remote: Ipv4, s: &Segment<'_>) -> Option<Header> {
+    pub fn segment(&mut self, now: u64, local: Ipv4, remote: Ipv4, s: &Segment<'_>, out: &mut dyn Out) -> Option<Header> {
         let h = &s.header;
         let ends = Endpoints { local, local_port: h.dst_port, remote, remote_port: h.src_port };
         if let Some(&i) = self.index.get(&key(&ends)) {
@@ -482,16 +508,7 @@ impl Tcp {
             // unfinished handshakes between all listeners, and a flood on
             // one evicted another's). The one evicted is told, by a reset,
             // rather than left to wait for SYN-ACKs that never come.
-            let unfinished = |c: &Conn| c.listener == Some(lid) && c.tcp.state() == State::SynReceived;
-            if self.held(owner) >= self.most(owner)
-                && let Some(c) = self.conns.iter_mut().filter(|c| unfinished(c)).min_by_key(|c| c.id)
-            {
-                c.tcp.abort();
-                c.listener = None;
-                c.released = true;
-                c.due = true;
-            }
-            if self.make_room(owner)
+            if self.make_room(owner, Some(lid), out)
                 && let Some(buffers) = buffers()
             {
                 let r = silica_rt::random::u64();
@@ -896,9 +913,9 @@ impl Tcp {
         badge: u64,
         local: Option<Ipv4>,
         peer: Endpoint,
-        offset: u64,
-        bits: u8,
+        (offset, bits): (u64, u8),
         wake: Handle,
+        out: &mut dyn Out,
     ) -> Result<proto::ConnectReply<Handle>, Error> {
         // Any peer with `connect`, else only the port `connect=<port>` names.
         if !scope::tcp_connect(badge, peer.port) {
@@ -908,7 +925,7 @@ impl Tcp {
         if peer.port == 0 || peer.address == 0 {
             return Err(Error::BadArgument);
         }
-        if !self.make_room(badge) {
+        if !self.make_room(badge, None, out) {
             return Err(Error::NoRoom);
         }
         let (rx, tx) = self.block(badge, offset, bits)?;

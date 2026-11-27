@@ -1260,7 +1260,7 @@ impl Stack {
                 Ok(seg) => {
                     let Some(l) = self.lease else { return };
                     let mut tcp = self.tcp.take().expect("TCP is in its place between turns");
-                    if let Some(reset) = tcp.segment(now, l.address, p.src, &seg) {
+                    if let Some(reset) = tcp.segment(now, l.address, p.src, &seg, self) {
                         tcp.reset(l.address, p.src, &reset, self);
                     }
                     self.tcp = Some(tcp);
@@ -1394,7 +1394,10 @@ impl proto::Server<Handle> for Stack {
 
     fn connect(&mut self, peer: proto::Endpoint, offset: u64, bits: u8, wake: Handle) -> Result<proto::ConnectReply<Handle>, proto::Error> {
         let (badge, local) = (self.caller, self.lease.map(|l| l.address));
-        self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.connect(badge, local, peer, offset, bits, wake)
+        let mut tcp = self.tcp.take().ok_or(proto::Error::NoRoom)?;
+        let result = tcp.connect(badge, local, peer, (offset, bits), wake, self);
+        self.tcp = Some(tcp);
+        result
     }
 
     fn close(&mut self, connection: u32) -> Result<proto::CloseReply, proto::Error> {
