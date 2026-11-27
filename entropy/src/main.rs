@@ -19,7 +19,7 @@ use silica_idl_rt::CapList;
 use silica_protocols::device::manager;
 use silica_protocols::entropy::device as rng;
 use silica_protocols::entropy::source::{self, Error, FillReply, Status, StatusReply};
-use silica_rt::ipc::{Channel, Handle, serve};
+use silica_rt::ipc::{Channel, Handle, serve_secret};
 use silica_rt::sys::Cap;
 use silica_rt::{ProcessInfo, println, slots};
 
@@ -39,8 +39,9 @@ struct Service {
     boot: bool,
     device_bytes: u64,
     mixes: u32,
-    /// Each device's last read (its identity, the bytes), for the health tests.
-    last: [(u32, [u8; FROM_DEVICE as usize]); 4],
+    /// Each device's last read (its identity, the read's digest), for the
+    /// health tests.
+    last: [(u32, [u8; 32]); 4],
     /// When devices were last mixed in (0: never asked).
     mixed_at: u64,
     out: [u8; MOST as usize],
@@ -67,16 +68,19 @@ impl Service {
                     .position(|(d, _)| *d == id)
                     .or_else(|| self.last.iter().position(|(d, _)| *d == u32::MAX))
                     .unwrap_or(0);
-                let verdict = entropy::healthy(r.data, &self.last[k].1[..]);
-                self.last[k].0 = id;
-                let n = r.data.len().min(FROM_DEVICE as usize);
-                self.last[k].1[..n].copy_from_slice(&r.data[..n]);
+                let verdict = entropy::healthy(r.data, &self.last[k].1);
+                self.last[k] = (id, entropy::digest(r.data));
                 match verdict {
                     Ok(()) => self.device_bytes += r.data.len() as u64,
                     Err(why) => println!("entropy: device {id:#x}'s bytes failed a health test ({why}); not counted"),
                 }
                 self.mixes += 1;
             }
+            // The device's bytes went into the pool: neither the client's
+            // message buffer nor the IPC buffer keeps them (a later, shorter
+            // reply would have left them there).
+            device.core.wipe();
+            silica_rt::ipc::wipe_message_words();
         }
     }
 
@@ -116,17 +120,25 @@ fn main(info: &'static ProcessInfo) -> i64 {
         device_bytes: 0,
         mixes: 0,
         mixed_at: 0,
-        last: [(u32::MAX, [0; FROM_DEVICE as usize]); 4],
+        last: [(u32::MAX, [0; 32]); 4],
         out: [0; MOST as usize],
     };
     seed.fill(0);
+    core::hint::black_box(&seed);
     service.mix_devices();
     println!(
         "entropy: seeded from {}{}",
         if service.boot { "the boot's trusted sources" } else { "the boot's timing alone" },
         if service.device_bytes > 0 { " and a device" } else { "; no device" }
     );
-    serve(grant(0), |_badge, request, caps: CapList<Handle>, reply, reply_caps| {
-        source::dispatch(&mut service, request, caps, reply, reply_caps)
+    // An answer is what a client makes its keys from: once it is sent, no
+    // copy of it stays here (`serve_secret` wipes the loop's; `out` is
+    // wiped as soon as the reply is written). Kept, the last answer stayed
+    // in this service's memory until the next (the audit of 2026-11-27).
+    serve_secret(grant(0), |_badge, request, caps: CapList<Handle>, reply, reply_caps| {
+        let n = source::dispatch(&mut service, request, caps, reply, reply_caps);
+        service.out.fill(0);
+        core::hint::black_box(&service.out);
+        n
     })
 }
