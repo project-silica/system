@@ -230,7 +230,9 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 // The loader's secret is no file to give: what is made
                 // from it is (`key`).
                 ("files", f) if f.split(',').any(|n| n == "machine.secret") => {
-                    return Err("a service's files name machine.secret, the loader's secret: a service is given a key made from it (`key`)");
+                    return Err(
+                        "a service's files name machine.secret, the loader's secret: a service is given a key made from it (`key`)",
+                    );
                 }
                 ("files", f) => s.files = f.split(',').filter(|n| !n.is_empty()).collect(),
                 ("logs", n) => s.logs = n.parse().ok().filter(|n| *n <= 64).ok_or("a service's logs is not a number up to 64")?,
@@ -403,6 +405,18 @@ vault key
     /// Authority over other services names them: a service whose service
     /// manager capability may control or update, with no `controls=`, or
     /// naming a service that is not declared, stops the boot by name.
+    /// The loader's secret (`machine.secret`, in the boot archive in memory
+    /// until the service manager has made the keys) is given to no service
+    /// as a file: every key on the machine is made from it. Only `key`.
+    #[test]
+    fn no_service_is_given_the_machines_secret_as_a_file() {
+        let refused = Some("a service's files name machine.secret, the loader's secret: a service is given a key made from it (`key`)");
+        assert_eq!(parse("a files=machine.secret\n").err(), refused);
+        assert_eq!(parse("a files=remote.owners,machine.secret\n").err(), refused);
+        let s = parse("a files=remote.owners key\n").unwrap();
+        assert_eq!((s[0].files.clone(), s[0].key), (alloc::vec!["remote.owners"], true));
+    }
+
     #[test]
     fn control_names_declared_services_or_the_list_is_refused() {
         assert!(parse(LIST).is_ok());

@@ -1563,10 +1563,12 @@ fn silence(config: &Config) {
 /// option): whether the bytes `<hex>` spells occur anywhere in what this
 /// program is lent to read (the drivers' archive, the kernel's `RootInfo`
 /// frame, and the firmware's memory, where its tables are), said on the
-/// console. Device registers are not read: reading one is an act. The
-/// secrets test gives it the machine's secret and a part of the boot
+/// console. Device registers are not read, reading one being an act, but
+/// for ranges a test names with `find_device=<base>+<length>` (hexadecimal):
+/// the firmware's flash, which reads as memory. The secrets test gives it
+/// the machine's secret, the flash it is kept in, and a part of the boot
 /// archive the device manager must not see (`run_secrets`): a program that
-/// parses what hostile devices say must hold neither.
+/// parses what hostile devices say must hold none of it.
 #[cfg(feature = "harness")]
 fn find_in_lent(archive: &[u8], info: &[u8], memory: &mut DeviceMemory, root: &RootInfo) {
     let hex = |s: &str| -> Option<Vec<u8>> {
@@ -1575,6 +1577,33 @@ fn find_in_lent(archive: &[u8], info: &[u8], memory: &mut DeviceMemory, root: &R
             .then(|| b.chunks(2).map(|p| u8::from_str_radix(core::str::from_utf8(p).ok()?, 16).ok()).collect())
             .flatten()
     };
+    // The memory read a page at a time: the firmware's, and the named ranges.
+    let mut ranges: Vec<(u64, u64, &str)> = root.untyped[..root.untyped_count as usize]
+        .iter()
+        .filter(|d| d.kind == KIND_FIRMWARE)
+        .map(|d| (d.base, 1u64 << d.bits, "the firmware's memory"))
+        .collect();
+    for w in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("find_device=")) {
+        let range = w.split_once('+').and_then(|(b, l)| Some((u64::from_str_radix(b, 16).ok()?, u64::from_str_radix(l, 16).ok()?)));
+        let Some((base, len)) = range else {
+            println!("devmgr: find: {w} is not <base>+<length> in hexadecimal");
+            continue;
+        };
+        // How much of it this program can read at all: what it is lent of it.
+        let mut readable = 0;
+        for page in (base & !0xFFF..base.saturating_add(len)).step_by(4096) {
+            if memory.frame(page, 12).is_ok() {
+                readable += 1;
+                // SAFETY: the frame was just made and never mapped.
+                #[allow(unsafe_code)]
+                unsafe {
+                    memory.release(page, 12)
+                };
+            }
+        }
+        println!("devmgr: find: of the device memory at {w}, this program can read {readable} pages");
+        ranges.push((base & !0xFFF, len, "the named device memory"));
+    }
     for word in silica_rt::options().split_ascii_whitespace().filter_map(|w| w.strip_prefix("find=")) {
         let Some(needle) = hex(word) else {
             println!("devmgr: find: {word} is not hexadecimal bytes");
@@ -1588,30 +1617,33 @@ fn find_in_lent(archive: &[u8], info: &[u8], memory: &mut DeviceMemory, root: &R
         } else {
             None
         };
-        // The firmware's memory, a page at a time, the needle's length less
-        // a byte carried over from each page to the next.
-        let firmware = root.untyped[..root.untyped_count as usize].iter().filter(|d| d.kind == KIND_FIRMWARE);
-        'regions: for d in firmware {
+        // A page at a time, the needle's length less a byte carried over
+        // from each page to the next. A page this program cannot make a
+        // frame of is not lent to it.
+        'ranges: for &(base, len, what) in &ranges {
             if found.is_some() {
                 break;
             }
             let mut carry: Vec<u8> = Vec::new();
-            for page in (d.base..d.base + (1 << d.bits)).step_by(4096) {
-                let Ok(at) = memory.frame(page, 12).and_then(|fr| mem::map(fr, 12, Rights::READ)) else { continue };
+            for page in (base..base.saturating_add(len)).step_by(4096) {
+                let Ok(at) = memory.frame(page, 12).and_then(|fr| mem::map(fr, 12, Rights::READ)) else {
+                    carry.clear();
+                    continue;
+                };
                 let mut window = core::mem::take(&mut carry);
                 // SAFETY: the page was just mapped read-only (firmware
-                // memory, not registers), is copied, and is given back at
-                // once (its frame revoked, which unmaps it): nothing refers
-                // to it after, and nothing else had been made of the
-                // firmware's memory before the probe.
+                // memory, or a range the test names that reads as memory),
+                // is copied, and is given back at once (its frame revoked,
+                // which unmaps it): nothing refers to it after, and nothing
+                // else had been made of it before the probe.
                 #[allow(unsafe_code)]
                 unsafe {
                     window.extend_from_slice(core::slice::from_raw_parts(at as *const u8, 4096));
                     memory.release(page, 12);
                 }
                 if has(&window) {
-                    found = Some("the firmware's memory");
-                    break 'regions;
+                    found = Some(what);
+                    break 'ranges;
                 }
                 let keep = needle.len().saturating_sub(1).min(window.len());
                 carry = window[window.len() - keep..].to_vec();
