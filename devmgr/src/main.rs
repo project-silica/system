@@ -1164,6 +1164,11 @@ impl Manager {
     /// next call came in the wait for the others, and the service it was
     /// (netd, the service manager listing watchdogs) heard `PeerGone`
     /// from a device manager still running, and netd ended in error.
+    /// Since the service manager answers `shutdown` before it stops anything
+    /// and asks this program to end only after stopping every service that
+    /// needs it (they started after it: providers start first), no client is
+    /// left to call during this wait on a shutdown; the answering stays for
+    /// any other way it comes to be asked to end.
     fn end_drivers(&mut self, listener: &mut Listener) {
         let mut asked = Vec::new();
         for r in &self.running {
@@ -1177,7 +1182,12 @@ impl Manager {
         }
         println!("devmgr: {} disk drivers asked to end, {} drivers in all", asked.len(), self.running.len());
         let deadline = silica_rt::clock().now() + END_NS;
-        while !asked.is_empty() {
+        // The deadline is looked at on every turn: the kernel gives a message
+        // already waiting even after it, and a driver that keeps faulting
+        // (each fault answered below) would otherwise hold this wait, and
+        // the drivers not yet ended, until the service manager gave up on
+        // this program (`rogue_end`).
+        while !asked.is_empty() && silica_rt::clock().now() < deadline {
             let Ok(msg) = listener.recv(Wait::Until(deadline)) else { break };
             if msg.signals().is_none() && msg.badge >= CLIENTS && msg.badge & FAULT_BADGE == 0 {
                 self.caller = msg.badge;
@@ -1389,6 +1399,10 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     m.slots_changed();
     // From here on: clients' calls, drivers that end, the button and the slots.
     let mut listener = Listener::new(events);
+    // The service manager accepted a shutdown this program asked for: a
+    // later press asks nothing (its call would come while the machine goes
+    // down, and fail).
+    let mut going_down = false;
     // When the device manager last took something to do: how long it then
     // went without listening is its turn (`longest_turn`).
     let mut took = silica_rt::clock().now();
@@ -1430,6 +1444,10 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
                 && let Some(b) = &button
                 && b.pressed()
             {
+                if going_down {
+                    println!("devmgr: the power button was pressed again; the machine is already going down");
+                    continue;
+                }
                 println!("devmgr: the power button was pressed: shutting down");
                 // The service manager answers at once and then turns the
                 // machine off, asking this program to end (END, below) like
@@ -1437,8 +1455,9 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
                 // end in order then, and its clients are answered until it
                 // exits.
                 let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
-                if let Err(e) = system.shutdown(false) {
-                    println!("ERROR: devmgr: the service manager would not shut down: {e:?}");
+                match system.shutdown(false) {
+                    Ok(_) => going_down = true,
+                    Err(e) => println!("ERROR: devmgr: the service manager would not shut down: {e:?}"),
                 }
             }
             continue;
