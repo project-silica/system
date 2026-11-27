@@ -578,7 +578,8 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     // Its programs' faults come where their exits do: a fault on lent
     // memory taken back is answered (`lent_memory_taken_back_any_number_of_times`),
     // any other ends the test that made the program.
-    let root = Root { parent: silica_proc::Parent { fault: root.parent.exit, ..root.parent }, ..root };
+    let mut root = root;
+    root.parent = silica_proc::Parent { fault: root.parent.exit, ..root.parent };
     let Some(stress) = ramdisk::find(root.archive, "stress") else {
         println!("ERROR: systest: the ramdisk has no program named stress");
         finish(false)

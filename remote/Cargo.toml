@@ -8,9 +8,11 @@ publish.workspace = true
 
 # How the service manager runs it (init documents the fields). It needs the
 # network stack, the service manager and the log, in that order (channels 1
-# and 2 of a session are the last two), and is given the machine's key and
-# its owners from the boot archive, as provisioned for this machine. With
-# neither, it says so and ends: remote management is off.
+# and 2 of a session are the last two), is given its owners from the boot
+# archive, as provisioned for this machine, and a key of its own that lasts
+# across boots (`key`: made on the machine from its secret, on no disk): the
+# machine's key. Without either it says so and ends: remote management is
+# off.
 [package.metadata.silica.service]
 needs = ["silica.net.Tcp:listen=22", "silica.system.Manager:observe+control+update+power", "silica.log.Reader"]
 # What its owners' control and update reach: an update hands on what its
@@ -18,7 +20,8 @@ needs = ["silica.net.Tcp:listen=22", "silica.system.Manager:observe+control+upda
 # remote itself is not: updating it is holding its key and every scope, which
 # no owner is given until each has a capability of its own (S4).
 controls = ["*", "netd"]
-files = ["remote.key", "remote.owners"]
+files = ["remote.owners"]
+key = true
 keeps = true
 memory = 23
 start = "boot"

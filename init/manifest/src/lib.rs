@@ -21,8 +21,10 @@
 //! - `machine`: it is given the machine, as grants after those: its
 //!   description, the device authority, the interrupt lines, the I/O ports
 //!   (an empty slot where there are none), a capability that signals the
-//!   service manager's watchdog notification, the boot archive's frames, and
-//!   the device and firmware memory, given outright; `args[0]` and `args[1]`
+//!   service manager's watchdog notification, an archive of the drivers
+//!   list and the programs it names (one frame: nothing else of the boot
+//!   archive, which holds files provisioned for other services), and the
+//!   device and firmware memory, given outright; `args[0]` and `args[1]`
 //!   count the last two. The device manager alone; when it ends, the
 //!   service manager takes the memory given outright back first, emptied,
 //!   for its next start.
@@ -64,15 +66,31 @@
 //! - `secrets`: it holds keys or other secrets: its address space is
 //!   isolated against speculative execution (`libsys::ASPACE_ISOLATED`), so
 //!   no other program can train predictors against it or read through them.
-//! - `key`: it is given a key of its own, made from the machine's secret
-//!   (the remote service's machine key). Like `secrets`, only its name in
-//!   a caller's `controls=` reaches it, never `*`.
 //! - `files=<name>,<name>...`: files of the boot archive it is given, each
 //!   read-only in a frame of its own (the smallest power of two that holds
 //!   it, at least a page, zeros after it), as grants after its needs, in
 //!   that order; a file the archive lacks is an empty slot, and the log
 //!   says so. How an image gives a service what was provisioned for that
-//!   machine: the remote management service's key and its owners.
+//!   machine: the remote management service's owners. Each
+//!   is wiped from the boot archive once copied: the frame lent at every
+//!   start is the only copy, in the service manager's memory and the
+//!   service's. Nothing secret belongs there: the archive is a file on the
+//!   boot disk, which every program that reaches the disk's blocks can
+//!   read (`key` is how a service gets a secret that lasts).
+//! - `key`: it is given a key of its own that lasts across boots: 32 bytes
+//!   in a frame of their own, read-only, as the grant after its files,
+//!   made from the machine's secret and the service's name. The machine's
+//!   secret is the loader's (kept by the firmware where no running system
+//!   can ask for it, made at the first boot), in the boot archive in
+//!   memory alone (`machine.secret`), and wiped from it once the keys are
+//!   made; it is on no disk. Without it (a firmware that cannot keep it
+//!   gives one for that boot) the slot is empty, and the log says so. The
+//!   remote management service's machine key is made so. A program that
+//!   replaces the service's (`update`, `revert`) is given the same key, as
+//!   it is given the service's files: the authority to replace a service's
+//!   program is the authority over what the service holds. Like
+//!   `secrets`, only its name in a caller's `controls=` reaches it, never
+//!   `*`.
 //! - `logs=<n>`: it may give `n` programs of its own a log each
 //!   (`silica.system.Manager`'s `add_log`, with the `logs` scope): the
 //!   device manager, one per device it starts a driver for. Those places
@@ -209,6 +227,13 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("secrets", "") => s.secrets = true,
                 ("controls", c) if !c.is_empty() => s.controls = Some(c),
                 ("key", "") => s.key = true,
+                // The loader's secret is no file to give: what is made
+                // from it is (`key`).
+                ("files", f) if f.split(',').any(|n| n == "machine.secret") => {
+                    return Err(
+                        "a service's files name machine.secret, the loader's secret: a service is given a key made from it (`key`)",
+                    );
+                }
                 ("files", f) => s.files = f.split(',').filter(|n| !n.is_empty()).collect(),
                 ("logs", n) => s.logs = n.parse().ok().filter(|n| *n <= 64).ok_or("a service's logs is not a number up to 64")?,
                 ("start", "boot") => s.start = Start::Boot,
@@ -380,6 +405,18 @@ vault key
     /// Authority over other services names them: a service whose service
     /// manager capability may control or update, with no `controls=`, or
     /// naming a service that is not declared, stops the boot by name.
+    /// The loader's secret (`machine.secret`, in the boot archive in memory
+    /// until the service manager has made the keys) is given to no service
+    /// as a file: every key on the machine is made from it. Only `key`.
+    #[test]
+    fn no_service_is_given_the_machines_secret_as_a_file() {
+        let refused = Some("a service's files name machine.secret, the loader's secret: a service is given a key made from it (`key`)");
+        assert_eq!(parse("a files=machine.secret\n").err(), refused);
+        assert_eq!(parse("a files=remote.owners,machine.secret\n").err(), refused);
+        let s = parse("a files=remote.owners key\n").unwrap();
+        assert_eq!((s[0].files.clone(), s[0].key), (alloc::vec!["remote.owners"], true));
+    }
+
     #[test]
     fn control_names_declared_services_or_the_list_is_refused() {
         assert!(parse(LIST).is_ok());
