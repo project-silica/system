@@ -37,7 +37,7 @@
 #![no_std]
 #![no_main]
 
-mod manifest;
+use silica_manifest as manifest;
 
 use libsys::root::{KIND_DEVICE, KIND_FIRMWARE, RootInfo, SLOT_DEVICES, SLOT_FIRST_UNTYPED, SLOT_INFO, SLOT_IRQS};
 use libsys::{self as sys, ObjectType, Rights, Wait};
@@ -995,6 +995,16 @@ impl Manager {
         println!("ERROR: init: the machine cannot be turned off: {why:?}");
     }
 
+    /// Whether the caller's `control` (`update`: its `update` and `revert`)
+    /// reaches service `i`, by its declaration's `controls=`
+    /// (`manifest::reaches`, which states the rule). A scope says what a
+    /// caller may do; this says to whom (before, every service by name: the
+    /// audit's M1).
+    fn reaches(&self, i: usize, update: bool) -> Result<(), manager::Error> {
+        let caller = self.calling().ok_or(manager::Error::Refused)?;
+        if manifest::reaches(caller, &self.services[i], update) { Ok(()) } else { Err(manager::Error::Refused) }
+    }
+
     /// The service the current caller is (its capability's badge holds its
     /// number below the scopes).
     fn calling(&self) -> Option<&Service> {
@@ -1047,6 +1057,7 @@ impl manager::Server<Handle> for Manager {
     fn stop(&mut self, name: &str) -> Result<manager::StopReply, manager::Error> {
         self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        self.reaches(i, false)?;
         if self.services[i].machine || self.running[i].child.is_none() {
             return Err(manager::Error::Refused);
         }
@@ -1058,6 +1069,7 @@ impl manager::Server<Handle> for Manager {
     fn restart(&mut self, name: &str) -> Result<manager::RestartReply, manager::Error> {
         self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        self.reaches(i, false)?;
         let child = self.running[i].child.take().ok_or(manager::Error::Refused)?;
         self.end(i, child);
         Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
@@ -1076,6 +1088,7 @@ impl manager::Server<Handle> for Manager {
     fn start(&mut self, name: &str) -> Result<manager::StartReply, manager::Error> {
         self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        self.reaches(i, false)?;
         if self.running[i].child.is_none() {
             self.running[i].stopped = false;
             Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
@@ -1175,6 +1188,9 @@ impl manager::Server<Handle> for Manager {
             frame.destroy()
         };
         let i = self.find(name)?;
+        // Never the machine's, and only a service the caller's declaration
+        // lets it hand a program of its own to (`manifest::reaches`).
+        self.reaches(i, true)?;
         let program = program?;
         if let Err(e) = silica_proc::check_image(&program) {
             println!("init: the program sent to update {name} is not one this machine runs: {e:?}");
@@ -1209,6 +1225,7 @@ impl manager::Server<Handle> for Manager {
     fn revert(&mut self, name: &str) -> Result<manager::RevertReply, manager::Error> {
         self.may(scope::SYSTEM_UPDATE)?;
         let i = self.find(name)?;
+        self.reaches(i, true)?;
         if self.running[i].program.is_none() {
             return Ok(manager::RevertReply {});
         }

@@ -4,6 +4,7 @@ members = [
     "rt",
     "proc",
     "init",
+    "init/manifest",
     "hello",
     "echo-server",
     "echo-client",
@@ -50,7 +51,7 @@ members = [
     "shell",
 ]
 # The libraries also build on the host, for clippy; the programs need the Silica target.
-default-members = ["rt", "proc", "queue", "protocols", "storage/block", "net", "inet", "crypto", "remote/proto", "drivers/framework", "console/grid"]
+default-members = ["rt", "proc", "init/manifest", "queue", "protocols", "storage/block", "net", "inet", "crypto", "remote/proto", "drivers/framework", "console/grid"]
 
 [workspace.package]
 version = "0.0.0"
@@ -81,6 +82,7 @@ silica-inet = { path = "inet" }
 silica-crypto = { path = "crypto" }
 silica-remote = { path = "remote/proto" }
 silica-protocols = { path = "protocols" }
+silica-manifest = { path = "init/manifest" }
 silica-block = { path = "storage/block" }
 
 [profile.dev]
