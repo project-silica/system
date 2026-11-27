@@ -72,8 +72,10 @@ pub struct Reply {
     pub router: Option<Ipv4>,
     /// Up to three DNS servers (option 6), unused ones unspecified.
     pub dns: [Ipv4; 3],
-    /// The first time server (option 42, NTP servers).
-    pub ntp: Option<Ipv4>,
+    /// Up to three time servers (option 42, NTP servers), unused ones
+    /// unspecified: a step of the clock is confirmed by another server than
+    /// the one that asked for it, where there is one.
+    pub ntp: [Ipv4; 3],
 }
 
 /// Read a server's answer (a UDP payload from port 67).
@@ -102,7 +104,7 @@ pub fn parse(p: &[u8]) -> Result<Reply, Malformed> {
         prefix: None,
         router: None,
         dns: [Ipv4::UNSPECIFIED; 3],
-        ntp: None,
+        ntp: [Ipv4::UNSPECIFIED; 3],
     };
     let mut kind = None;
     let mut at = FIXED + 4;
@@ -132,7 +134,11 @@ pub fn parse(p: &[u8]) -> Result<Reply, Malformed> {
                     *d = ip(v, i * 4);
                 }
             }
-            (42, n) if n >= 4 && n % 4 == 0 => r.ntp = Some(ip(v, 0)),
+            (42, n) if n >= 4 && n % 4 == 0 => {
+                for (i, t) in r.ntp.iter_mut().enumerate().take(n / 4) {
+                    *t = ip(v, i * 4);
+                }
+            }
             // A known option of a length it cannot have.
             (53 | 54 | 51 | 58 | 59 | 1, _) | (3 | 6 | 42, _) => return Err(Malformed::BadOptions),
             _ => {}
