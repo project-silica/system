@@ -216,7 +216,7 @@ impl<D: Device> device::Server<Handle> for Service<D> {
         if !self.session.has_client() && self.device.holding() > 0 {
             self.device.forget_client();
         }
-        let owner = silica_protocols::driver_badge::consumer(self.caller);
+        let owner = silica_protocols::driver_badge::holder(self.caller);
         let requests = self.session.connect(self.caller, owner, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
         Ok(ConnectReply { requests })
     }

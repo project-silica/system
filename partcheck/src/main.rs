@@ -78,6 +78,20 @@ fn run() -> Result<(), &'static str> {
     let server = Cap(slots::FIRST_GRANT + 1);
     let mut list = partitions::Client::<Channel, Handle>::from(Channel::new(server));
     wait_for_partitions(devices, &mut list)?;
+    // Asked to (`partcheck.direct=1`, beside a block server that abuses
+    // `delegate`): the disk through the device manager alone, this
+    // program's own share at the driver, connected, with memory, read.
+    if silica_rt::option("direct").is_some() {
+        let disk_id = list.list(0).ok().and_then(|r| r.partitions.iter().next().map(|p| p.disk)).ok_or("no disk")?;
+        let mut whole =
+            Disk::open(devices, disk_id).map_err(|_| "the disk cannot be opened and connected beside a delegator at its share")?;
+        let memory = Memory::new(12).map_err(|_| "no memory")?;
+        whole.add_memory(0, &memory, true).map_err(|_| "memory cannot be registered beside a delegator at its share")?;
+        let r = Request { op: Op::Read, memory: 0, block: 0, offset: 0, blocks: 1, tag: 1 };
+        whole.run(&r, Some(silica_rt::clock().now() + 5 * SECOND)).map_err(|_| "a read failed beside a delegator at its share")?;
+        pass("direct");
+        return Ok(());
+    }
     // Every partition of every disk, part after part: as many as the
     // machine's disks have (`partcheck.partitions=<n>` says how many to
     // expect: a disk with a full table of 128 is one before which the list
@@ -363,6 +377,16 @@ fn run() -> Result<(), &'static str> {
 /// asked to end (`silica_rt::END`).
 fn hold(server: Cap, devices: Cap, id: u32, disk_id: u32) -> Result<(), &'static str> {
     use silica_rt::sys::{self, Wait};
+    // One more partition of the disk, whose driver's end is told on this
+    // program's own events (`HEARD`): another program then opens one too
+    // (the harness's `trace`) and the driver is started again (its
+    // `restart-driver`); this program must still hear of it (each client
+    // of the block server's notice was replaced by the next one's open).
+    const HEARD: u64 = 1 << 20;
+    let mut list = partitions::Client::<Channel, Handle>::from(Channel::new(server));
+    let slot = silica_rt::ipc::free_slot().ok_or("no free slot")?;
+    sys::cap_derive(slots::SPACE, slot, slots::EVENTS, sys::Rights::WRITE, HEARD).map_err(|_| "the events notification cannot be lent")?;
+    let _watched = list.open(id, Some(Handle::new(Cap(slot)))).map_err(|_| "the watched partition cannot be opened")?.device;
     let memory = Memory::new(12).map_err(|_| "no memory")?;
     let mut parts = silica_rt::alloc::vec::Vec::new();
     for _ in 0..64 {
@@ -383,7 +407,11 @@ fn hold(server: Cap, devices: Cap, id: u32, disk_id: u32) -> Result<(), &'static
     }
     println!("partcheck: holding {} partitions and {} windows", parts.len(), windows.len());
     loop {
-        if sys::recv(slots::EVENTS, Wait::Forever).is_ok_and(|m| m.badge & silica_rt::END != 0) {
+        let Ok(m) = sys::recv(slots::EVENTS, Wait::Forever) else { continue };
+        if m.badge & HEARD != 0 {
+            println!("partcheck: heard its partition's driver end");
+        }
+        if m.badge & silica_rt::END != 0 {
             return Ok(());
         }
     }

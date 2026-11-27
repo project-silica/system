@@ -158,6 +158,9 @@ impl<M> Connection<M> {
 /// Memory of an ended connection that requests on the device still use.
 struct Draining<M> {
     slot: u16,
+    /// The client program its connection was charged to: it still keeps
+    /// the frame and the device's copy, so they are still its share's.
+    owner: u64,
     connection: u32,
     id: u32,
     /// Requests using it still on the device.
@@ -214,6 +217,7 @@ impl<M> Session<M> {
                 match m {
                     Some(m) if m.busy != 0 => self.draining.push(Draining {
                         slot: slot as u16,
+                        owner: c.owner,
                         connection: c.generation,
                         id: id as u32,
                         busy: m.busy,
@@ -261,20 +265,42 @@ impl<M> Session<M> {
     /// provider's capability space: two slots a connection (its rings and
     /// its notification) and two a registered frame (the frame and the
     /// device's copy of it).
-    pub fn kept_by(&self, owner: u64) -> usize {
-        self.connections.iter().flatten().filter(|c| c.owner == owner).map(|c| 2 + 2 * c.memories.iter().flatten().count()).sum()
+    /// Memory of a connection that ended while requests using it were on
+    /// the device counts too, until they complete: a program could
+    /// otherwise end connections with requests in flight to keep frames
+    /// outside its share. `whose` picks the owners counted.
+    pub fn kept_by(&self, whose: impl Fn(u64) -> bool) -> usize {
+        let live: usize =
+            self.connections.iter().flatten().filter(|c| whose(c.owner)).map(|c| 2 + 2 * c.memories.iter().flatten().count()).sum();
+        live + 2 * self.draining.iter().filter(|d| whose(d.owner)).count()
     }
 
-    /// End program `owner`'s connections whose client has gone; returns
-    /// whether there was one. What a program at its share gets back of its
-    /// own before it is refused.
-    pub fn close_gone(&mut self, owner: u64, mapper: &mut impl Mapper<Mapping = M>) -> bool {
-        let gone: Vec<usize> =
-            (0..self.connections.len()).filter(|&s| self.connections[s].as_ref().is_some_and(|c| c.owner == owner && !c.alive())).collect();
-        for &s in &gone {
-            self.close_slot(s, mapper);
+    /// End connections of an owner `whose` picks whose client has gone,
+    /// spending one of `looks` (a system call) on each it asks about;
+    /// returns whether one ended. What a program at its share gets back of
+    /// its own before it is refused.
+    pub fn close_gone(&mut self, whose: impl Fn(u64) -> bool, looks: &mut usize, mapper: &mut impl Mapper<Mapping = M>) -> bool {
+        let mut ended = false;
+        for s in 0..self.connections.len() {
+            if *looks == 0 {
+                break;
+            }
+            if !self.connections[s].as_ref().is_some_and(|c| whose(c.owner)) {
+                continue;
+            }
+            *looks -= 1;
+            if self.connections[s].as_ref().is_some_and(|c| !c.alive()) {
+                self.close_slot(s, mapper);
+                ended = true;
+            }
         }
-        !gone.is_empty()
+        ended
+    }
+
+    /// Whether the client calling with badge `caller` has a connection,
+    /// there or gone (no system call).
+    pub fn has(&self, caller: u64) -> bool {
+        self.connections.iter().flatten().any(|c| c.client == caller)
     }
 
     /// Whether the client calling with badge `caller` is connected and
@@ -292,8 +318,9 @@ impl<M> Session<M> {
     /// is): returns the capability the client wakes the service with. A
     /// client connects once; another client with a capability of its own
     /// connects beside it. A program has at most [`CONNECTIONS_PER_CLIENT`]
-    /// connections: past them one of its own whose client has gone makes
-    /// room, else it is refused (`NoRoom`); no other program's is touched.
+    /// connections: past them it is refused (`NoRoom`; the service may
+    /// first close its own whose client has gone, `close_gone`); no other
+    /// program's is looked at.
     pub fn connect(
         &mut self,
         caller: u64,
@@ -311,30 +338,26 @@ impl<M> Session<M> {
         if self.exclusive && self.connections.iter().flatten().any(|c| c.client != caller && c.alive()) {
             return Err(Refused::Busy);
         }
+        // Past its connections a program is refused; the service gives back
+        // its own whose client has gone first (`close_gone`). Nobody else's
+        // is looked at: a connection whose client has gone is closed when
+        // its ring is next found broken (`take`).
         if self.connections.iter().flatten().filter(|c| c.owner == owner).count() >= CONNECTIONS_PER_CLIENT {
-            let own_dead = |c: &Option<Connection<M>>| c.as_ref().is_some_and(|c| c.owner == owner && !c.alive());
-            let dead = self.connections.iter().position(own_dead).ok_or(Refused::NoRoom)?;
-            self.close_slot(dead, mapper);
+            return Err(Refused::NoRoom);
         }
-        // A free slot, else one whose client has gone (nobody's), else a new one.
+        // A free slot, else a new one.
         let slot = match self.connections.iter().position(Option::is_none) {
             Some(s) => s,
-            None => match self.connections.iter().position(|c| c.as_ref().is_some_and(|c| !c.alive())) {
-                Some(dead) => {
-                    self.close_slot(dead, mapper);
-                    dead
+            None => {
+                // Tickets name a connection's slot in 16 bits, and slot
+                // 65535 is the provider's own (`Ticket::own`).
+                if self.connections.len() >= u16::MAX as usize {
+                    return Err(Refused::NoRoom);
                 }
-                None => {
-                    // Tickets name a connection's slot in 16 bits, and
-                    // slot 65535 is the provider's own (`Ticket::own`).
-                    if self.connections.len() >= u16::MAX as usize {
-                        return Err(Refused::NoRoom);
-                    }
-                    self.connections.try_reserve(1).map_err(|_| Refused::NoRoom)?;
-                    self.connections.push(None);
-                    self.connections.len() - 1
-                }
-            },
+                self.connections.try_reserve(1).map_err(|_| Refused::NoRoom)?;
+                self.connections.push(None);
+                self.connections.len() - 1
+            }
         };
         match sys::inspect_slot(slots::SPACE, rings.cap().0) {
             Ok(Some(s)) if s.bits == RINGS_BITS && s.rights.has(Rights(3)) => {}

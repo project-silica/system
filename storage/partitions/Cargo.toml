@@ -30,6 +30,12 @@ silica-rt = { workspace = true }
 silica-idl-rt = { workspace = true }
 silica-protocols = { workspace = true }
 silica-block = { workspace = true }
+silica-queue = { workspace = true }
+
+[features]
+# Test images only (os/tools/lib/build.sh): a block server that abuses
+# `delegate`, for the test of what bounds it (`partitions.hostile_delegate`).
+harness = []
 
 [lints]
 workspace = true

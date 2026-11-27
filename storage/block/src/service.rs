@@ -237,25 +237,37 @@ const NARROWED: u64 = 1 << 63;
 /// counted in the driver's capability slots, which every program's state
 /// is held in: a window one (its capability), a connection two (its rings
 /// and its notification), a registered frame two (the frame and the
-/// device's copy). Eight programs at their full share fit the driver's
-/// capability space (1024 slots, `silica_proc`) beside the driver's own;
-/// past its share a program's own windows that nobody holds any more make
-/// room, else it is refused (`no_room`), and no other program's state is
-/// touched. (Bounds of 128 windows and 16 connections a program let one
-/// program at its bounds empty the driver's capability space.)
+/// device's copy; a connection's ended with requests on the device still
+/// count until they complete). Eight programs at their full share fit the
+/// driver's capability space (1024 slots, `silica_proc`) beside the
+/// driver's own, and an image may let at most eight programs reach a block
+/// driver (`BLOCK_PROGRAMS`, checked when the image is built). Past its
+/// share a program's own connections whose client has gone and its own
+/// windows that nobody holds any more make room, else it is refused
+/// (`no_room`), and no other program's state is touched. A program that
+/// opens partitions for its clients (`open_for`) divides its own share
+/// among them, each client at most [`CLIENT_SHARE`].
 pub const SHARE: usize = 96;
+/// What one client of a program that opens for its clients (a delegator,
+/// `silica_protocols::driver_badge`) may keep, within that program's share:
+/// four clients at their full part fill it, and none takes more than this
+/// of what the others have.
+pub const CLIENT_SHARE: usize = SHARE / 4;
+/// Programs an image may let reach a block driver: what [`SHARE`] is sized
+/// for.
+pub const BLOCK_PROGRAMS: usize = silica_protocols::driver_badge::BLOCK_PROGRAMS;
 /// Most windows narrowed (at any depth) under one first window, held at once.
 const INNER_PER_FIRST: u32 = 4;
 /// Most windows of every consumer together: the table's bound, above what
 /// the programs' shares can hold.
 const WINDOWS_MOST: usize = 1 << 12;
-/// Windows a pass that looks for ones nobody holds any more examines, at
-/// most: each look is a system call on the driver's one thread (and four
-/// more for a first window let go of with windows under it), so a call at
-/// its program's share costs at most 80 of them. The next pass starts
-/// where this one stopped: a program holding more windows than this, and
-/// letting go of others, may be refused once and find room on a later call.
-const LOOKS: usize = 16;
+/// System calls (`Inspect`) one call to the driver may spend finding what
+/// nobody holds any more (windows let go of, connections whose client has
+/// gone), whatever it asks: the bound of what a program at its share can
+/// make the driver's one thread do for it. The next search starts where the
+/// last stopped: a program holding more than this and letting go of other
+/// things may be refused once and find room on a later call.
+const LOOKS: usize = 32;
 
 /// A request's tag with this bit set asks for its way through the provider
 /// to be kept (`trace`).
@@ -324,7 +336,7 @@ impl Windows {
     /// The consumer a capability with `badge` is charged to.
     fn owner(&self, badge: u64) -> u64 {
         if badge < NARROWED {
-            return silica_protocols::driver_badge::consumer(badge);
+            return silica_protocols::driver_badge::holder(badge);
         }
         let at = usize::try_from(badge - NARROWED).ok();
         // A window that is gone reaches nothing and is charged to nobody
@@ -385,6 +397,9 @@ pub struct Service<D: Device> {
     next_trace: usize,
     /// The badge of the call being served.
     caller: u64,
+    /// What the call being served may still spend finding what nobody
+    /// holds any more ([`LOOKS`]).
+    looks: core::cell::Cell<usize>,
     /// A client to wake as the driver next waits (`Session::flush`).
     wake: Option<Cap>,
     /// The driver is ending in order (`Service::begin_end`).
@@ -422,6 +437,7 @@ impl<D: Device> Service<D> {
             traces: [Trace::default(); TRACES],
             next_trace: 0,
             caller: 0,
+            looks: core::cell::Cell::new(LOOKS),
             wake: None,
             ending: None,
         }
@@ -570,6 +586,10 @@ impl<D: Device> Service<D> {
                 flushes.ok = s.is_ok();
                 flushes.dirty |= s.is_err();
                 for t in core::mem::take(&mut flushes.riding) {
+                    // A traced flush that rode on this one is done with it.
+                    if let Some(tr) = traces.iter_mut().find(|tr| tr.ticket == Some(t) && tr.done == 0) {
+                        tr.done = clock.now();
+                    }
                     session.complete(t, status(s), 0);
                 }
             }
@@ -584,12 +604,26 @@ impl<D: Device> Service<D> {
         self.session.unmap_finished(&mut Map(&mut self.device));
     }
 
+    /// One of the call's [`LOOKS`], if any is left.
+    fn spend(&self) -> bool {
+        let n = self.looks.get();
+        if n > 0 {
+            self.looks.set(n - 1);
+        }
+        n > 0
+    }
+
     /// Whether window `k` itself is nobody's: nothing derived from its
     /// capability exists (the kernel says so: `Inspect`'s `INSPECT_DERIVED`)
-    /// and no client is connected through it.
+    /// and no client is connected through it. Each `Inspect` spends one of
+    /// the call's looks; with none left, it is taken to be held.
     fn idle(&self, k: usize) -> bool {
         let Some(w) = self.windows.all.get(k).and_then(Option::as_ref) else { return false };
-        matches!(sys::inspect_slot(slots::SPACE, w.keep.cap().0), Ok(Some(s)) if !s.derived) && !self.session.connected(NARROWED + k as u64)
+        if !self.spend() || !matches!(sys::inspect_slot(slots::SPACE, w.keep.cap().0), Ok(Some(s)) if !s.derived) {
+            return false;
+        }
+        let badge = NARROWED + k as u64;
+        !self.session.has(badge) || (self.spend() && !self.session.connected(badge))
     }
 
     /// Whether nobody holds window `k` any more: it is idle (`Service::idle`)
@@ -609,53 +643,86 @@ impl<D: Device> Service<D> {
         (0..self.windows.all.len()).filter(inner).all(|i| self.idle(i))
     }
 
-    /// End a window `which` picks that nobody holds any more, looking at no
-    /// more than [`LOOKS`] of them from where the last pass stopped: each
-    /// look costs system calls on the driver's one thread, so a program at
-    /// its share gets back what it let go of a few looks at a time, a few
-    /// for each of its calls. Returns whether a window ended.
+    /// End a window `which` picks that nobody holds any more, from where the
+    /// last search stopped, for as long as the call's looks last. Returns
+    /// whether a window ended.
     fn give_back(&mut self, which: impl Fn(&Window) -> bool) -> bool {
-        let n = self.windows.all.len();
-        let mut looked = 0;
+        let (n, start) = (self.windows.all.len(), self.windows.cursor);
         for step in 0..n {
-            let k = (self.windows.cursor + step) % n;
+            if self.looks.get() == 0 {
+                return false;
+            }
+            let k = (start + step) % n;
             if !self.windows.all[k].as_ref().is_some_and(&which) {
                 continue;
             }
-            looked += 1;
-            let ended = self.unheld(k);
-            if ended {
+            self.windows.cursor = (k + 1) % n;
+            if self.unheld(k) {
                 self.end_window(k);
-            }
-            if ended || looked >= LOOKS {
-                self.windows.cursor = (k + 1) % n;
-                return ended;
+                return true;
             }
         }
         false
     }
 
-    /// What program `owner` keeps in this driver, in capability slots
-    /// ([`SHARE`]): its windows and its connections' state.
-    fn kept(&self, owner: u64) -> usize {
-        self.windows.all.iter().flatten().filter(|w| w.owner == owner).count() + self.session.kept_by(owner)
+    /// What the holders `whose` picks keep in this driver, in capability
+    /// slots ([`SHARE`]): their windows and their connections' state.
+    fn kept(&self, whose: impl Fn(u64) -> bool + Copy) -> usize {
+        self.windows.all.iter().flatten().filter(|w| whose(w.owner)).count() + self.session.kept_by(whose)
     }
 
-    /// Room for `need` more slots of program `owner`'s within its share: its
-    /// own windows that nobody holds any more given back first (a few looks
-    /// at a time), else `no_room`. Nobody else's state is touched.
+    /// Room for `need` more slots of holder `owner`'s
+    /// (`silica_protocols::driver_badge::holder`): within its program's
+    /// share, and for a delegator's client within [`CLIENT_SHARE`]. What
+    /// those holders let go of (connections whose client has gone, windows
+    /// nobody holds) is given back first, as far as the call's looks go;
+    /// else `no_room`. Nobody else's state is touched.
     fn room(&mut self, owner: u64, need: usize) -> Result<(), Error> {
-        if self.kept(owner) + need > SHARE {
+        use silica_protocols::driver_badge::{is_delegated, share};
+        let program = share(owner);
+        let mine = move |o: u64| share(o) == program;
+        let client = move |o: u64| o == owner;
+        let limits: [(&dyn Fn(u64) -> bool, usize); 2] =
+            [(&mine, SHARE), (&client, if is_delegated(owner) { CLIENT_SHARE } else { SHARE })];
+        for (whose, most) in limits {
+            if self.kept(whose) + need <= most {
+                continue;
+            }
             // Its connections whose client has gone first (a client that
-            // ended and is connecting again at its share), then its windows.
-            self.session.close_gone(owner, &mut Map(&mut self.device));
-        }
-        while self.kept(owner) + need > SHARE {
-            if !self.give_back(|w| w.owner == owner) {
-                return Err(Error::NoRoom);
+            // ended and is connecting again), then its windows.
+            let mut looks = self.looks.get();
+            self.session.close_gone(whose, &mut looks, &mut Map(&mut self.device));
+            self.looks.set(looks);
+            while self.kept(whose) + need > most {
+                if !self.give_back(|w| whose(w.owner)) {
+                    return Err(Error::NoRoom);
+                }
             }
         }
         Ok(())
+    }
+
+    /// At least `n` free capability slots for what a call is about to keep:
+    /// when the driver's capability space has fewer, windows nobody holds
+    /// are given back whoever's they were (as far as the call's looks go).
+    fn spare(&mut self, n: usize) -> Result<(), Error> {
+        loop {
+            let mut taken = Vec::new();
+            while taken.len() < n {
+                let Some(s) = free_slot() else { break };
+                taken.push(s);
+            }
+            let enough = taken.len() == n;
+            for s in taken {
+                release_slot(s);
+            }
+            if enough {
+                return Ok(());
+            }
+            if !self.give_back(|_| true) {
+                return Err(Error::NoRoom);
+            }
+        }
     }
 
     /// End window `k`: every capability to it goes, its client is
@@ -764,7 +831,13 @@ impl<D: Device> device::Server<Handle> for Service<D> {
     }
 
     fn trace(&mut self, tag: u64) -> Result<TraceReply, Error> {
-        let t = self.traces.iter().find(|t| t.tag == tag && t.client == self.caller && t.taken != 0).ok_or(Error::NoSuchRequest)?;
+        // The newest of the caller's with that tag (a tag used again names
+        // its latest request).
+        let newest = (1..=TRACES).map(|back| (self.next_trace + TRACES - back) % TRACES);
+        let t = newest
+            .map(|i| &self.traces[i])
+            .find(|t| t.tag == tag && t.client == self.caller && t.taken != 0)
+            .ok_or(Error::NoSuchRequest)?;
         Ok(TraceReply { taken: t.taken, started: t.started, done: t.done })
     }
 
@@ -841,6 +914,7 @@ impl<D: Device> device::Server<Handle> for Service<D> {
         let owner = self.windows.owner(self.caller);
         // Its rings and its notification: two slots of its program's share.
         self.room(owner, 2)?;
+        self.spare(2)?;
         let requests = self.session.connect(self.caller, owner, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
         Ok(ConnectReply { requests })
     }
@@ -848,6 +922,7 @@ impl<D: Device> device::Server<Handle> for Service<D> {
     fn add_memory(&mut self, id: u32, frame: Handle, writable: bool) -> Result<AddMemoryReply, Error> {
         // The frame and the device's copy: two slots of its program's share.
         self.room(self.windows.owner(self.caller), 2)?;
+        self.spare(2)?;
         self.session.add_memory(self.caller, id, frame, writable, &mut Map(&mut self.device)).map_err(error)?;
         Ok(AddMemoryReply {})
     }
@@ -861,6 +936,7 @@ impl<D: Device> device::Server<Handle> for Service<D> {
 impl<D: Device> Events for Service<D> {
     fn call(&mut self, badge: u64, request: &[u8], caps: CapList<Handle>, reply: &mut [u8], reply_caps: &mut CapList<Handle>) -> usize {
         self.caller = badge;
+        self.looks.set(LOOKS);
         device::dispatch(self, request, caps, reply, reply_caps)
     }
 
