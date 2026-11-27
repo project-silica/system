@@ -200,6 +200,8 @@ struct Manager {
     /// The configuration writes each driver's declaration asks for, made
     /// before it starts (`drivers`).
     writes: Vec<(&'static str, Vec<ConfigWrite>)>,
+    /// The drivers the archive's list says do no DMA (`nodma`).
+    no_dma: Vec<&'static str>,
     /// Every configuration space mapped, by function identity.
     configs: BTreeMap<u32, (Config, Cap)>,
     /// What clients asked to have signalled when a device of a class gains
@@ -430,13 +432,36 @@ fn drivers(archive: &'static [u8]) -> Vec<(Match, &'static str)> {
             }
             _ => None,
         };
-        match (m, w.next(), w.next(), w.next()) {
-            (Some(m), Some(program), None, None) => table.push((m, program)),
-            (Some(m), Some(program), Some(c), None) if c.starts_with("config=") => table.push((m, program)),
+        let program = w.next();
+        // After the program: its configuration writes and `nodma`, each at
+        // most once, and nothing else.
+        let rest: Vec<&str> = w.collect();
+        let known = rest.len() <= 2
+            && rest.iter().all(|x| x.starts_with("config=") || *x == "nodma")
+            && rest.iter().filter(|x| x.starts_with("config=")).count() <= 1
+            && rest.iter().filter(|x| **x == "nodma").count() <= 1;
+        match (m, program) {
+            (Some(m), Some(program)) if known => table.push((m, program)),
             _ => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
         }
     }
     table
+}
+
+/// The driver programs the archive's driver list says do no DMA (`nodma`,
+/// from a driver's declaration `dma = false`): their devices are left
+/// without bus mastering, and they start where DMA cannot be confined.
+fn no_dma_drivers(archive: &'static [u8]) -> Vec<&'static str> {
+    let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return Vec::new() };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut w = l.split_ascii_whitespace().skip(2);
+            let program = w.next()?;
+            w.any(|x| x == "nodma").then_some(program)
+        })
+        .collect()
 }
 
 /// A write to a device's configuration space that its driver's declaration
@@ -457,7 +482,8 @@ fn config_writes(archive: &'static [u8]) -> Vec<(&'static str, Vec<ConfigWrite>)
     let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return all };
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let mut w = line.split_ascii_whitespace().skip(2);
-        let (Some(program), Some(spec)) = (w.next(), w.next().and_then(|c| c.strip_prefix("config="))) else { continue };
+        let Some(program) = w.next() else { continue };
+        let Some(spec) = w.find_map(|c| c.strip_prefix("config=")) else { continue };
         let writes: Option<Vec<ConfigWrite>> = spec
             .split(',')
             .map(|one| {
@@ -900,16 +926,28 @@ impl Manager {
 
     /// Start the driver `driver` for function number `index`.
     fn start(&mut self, index: usize, driver: &'static str) -> Result<(), &'static str> {
+        // Whether the kernel confines this device's DMA, asked of the
+        // kernel for this device: attaching it to no address space succeeds
+        // only for a device behind an IOMMU unit the kernel drives (on a
+        // machine without one, on a segment no driven unit covers, or with
+        // segment 0 not wholly covered, it is `Unsupported`). A driver that
+        // does no DMA (`nodma` in the driver list) needs no confinement: its
+        // device is left without bus mastering, which drivers cannot turn on
+        // (configuration space is the device manager's to write).
+        let dma = !self.no_dma.contains(&driver);
+        let confined = dma && sys::device_attach(granted(GRANT_DEVICES), self.functions[index].id, Cap::NONE).is_ok();
         // A machine's image starts no driver it cannot confine: one that is
         // not is trusted with all of memory, and a promise of confinement
         // that is not kept is refused by name, not logged and broken
-        // (spec/ARCHITECTURE.md, invariant 7; the 2026-11-26 review, H2). A
+        // (spec/ARCHITECTURE.md, invariant 7; the 2026-11-26 review, N5). A
         // test image runs it unconfined and says so: the same image on a
         // machine without an IOMMU (`unconfined`).
         #[cfg(not(feature = "harness"))]
-        if self.info.dma_top == 0 {
-            return Err("this machine cannot confine its DMA, and only a test image trusts a driver with all of memory");
+        if dma && !confined {
+            return Err("its DMA cannot be confined on this machine, and only a test image trusts a driver with all of memory");
         }
+        #[cfg(feature = "harness")]
+        let _ = confined;
         let f = &self.functions[index];
         let image = ramdisk::find(self.archive, driver).ok_or("its driver is not in the boot archive")?;
         let (id, config) = (f.id, f.config);
@@ -1000,7 +1038,9 @@ impl Manager {
                 }
             }
         }
-        registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
+        // Bus mastering only for a driver that does DMA (`nodma`: off).
+        let master = if dma { pci::COMMAND_MASTER } else { 0 };
+        registers.write16(4, (registers.read16(4) & !pci::COMMAND_MASTER) | pci::COMMAND_MEMORY | master | pci::COMMAND_NO_INTX);
         if let Some(msix) = config.msix() {
             // Every entry masked and emptied before any can fire: the table
             // still holds the last driver's messages, whose lines may since
@@ -1321,6 +1361,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         longest_turn: 0,
         table: drivers(archive),
         writes: config_writes(archive),
+        no_dma: no_dma_drivers(archive),
         configs: BTreeMap::new(),
         watchers: Vec::new(),
         watchdog_news: true,
@@ -1338,7 +1379,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     }
     #[cfg(not(feature = "harness"))]
     if info.dma_top == 0 {
-        println!("devmgr: this machine cannot confine DMA: no driver is started (only a test image runs one unconfined)");
+        println!("devmgr: this machine cannot confine DMA: no driver that does DMA is started (only a test image runs one unconfined)");
     }
     // Say what there is, then start the drivers.
     let mut failed = false;

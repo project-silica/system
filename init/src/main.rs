@@ -1486,20 +1486,25 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     };
     let mut listener = Listener::new(m.root.parent.exit);
 
-    // The system, in order, but for what a test image's command line keeps off.
+    // The system, in order, but for what a test image's command line keeps
+    // off. The code for `off=` is a test image's alone: compiled into no
+    // machine's init, whatever an optimizer would keep (`server_image`
+    // looks for its text).
     #[cfg(feature = "harness")]
-    let off: Vec<&[u8]> = option(cmdline, "off").unwrap_or(b"").split(|b| *b == b',').filter(|c| !c.is_empty()).collect();
-    #[cfg(not(feature = "harness"))]
-    let off: Vec<&[u8]> = Vec::new();
-    for o in &off {
-        if !m.services.iter().any(|s| s.name.as_bytes() == *o) {
-            fail!("off= names {}, which no service is declared for", core::str::from_utf8(o).unwrap_or("?"));
+    let off: Vec<&[u8]> = {
+        let off: Vec<&[u8]> = option(cmdline, "off").unwrap_or(b"").split(|b| *b == b',').filter(|c| !c.is_empty()).collect();
+        for o in &off {
+            if !m.services.iter().any(|s| s.name.as_bytes() == *o) {
+                fail!("off= names {}, which no service is declared for", core::str::from_utf8(o).unwrap_or("?"));
+            }
         }
-    }
+        off
+    };
     for &i in &order {
         if m.services[i].start != Start::Boot {
             continue;
         }
+        #[cfg(feature = "harness")]
         if off.contains(&m.services[i].name.as_bytes()) {
             m.running[i].stopped = true;
             println!("init: {} is off, as the command line asks", m.services[i].name);

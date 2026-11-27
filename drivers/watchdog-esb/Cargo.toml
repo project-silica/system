@@ -12,6 +12,9 @@ publish.workspace = true
 [package.metadata.silica]
 drivers = ["pci 8086:25ab"]
 config = ["60:2:0003", "68:1:02"]
+# Its registers are all it uses: no DMA, so it runs (and the machine is
+# watched) where DMA cannot be confined.
+dma = false
 
 [[bin]]
 name = "watchdog-esb"
