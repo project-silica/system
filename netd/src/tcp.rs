@@ -900,7 +900,8 @@ impl Tcp {
         bits: u8,
         wake: Handle,
     ) -> Result<proto::ConnectReply<Handle>, Error> {
-        if !scope::has(badge, scope::TCP_CONNECT) {
+        // Any peer with `connect`, else only the port `connect=<port>` names.
+        if !scope::tcp_connect(badge, peer.port) {
             return Err(Error::NotGranted);
         }
         let local = local.ok_or(Error::NoAddress)?;

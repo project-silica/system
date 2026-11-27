@@ -137,18 +137,38 @@ pub mod scope {
 
     /// `silica.net.Tcp`: `connect`, to any address and port.
     pub const TCP_CONNECT: u64 = 1 << 0;
-    /// `silica.net.Tcp`: `listen` on one port, the port itself in these 16
-    /// bits (`listen=<port>` in a declaration; 0: none). A port is the
-    /// owner's to give, never the first claimant's: no holder listens on a
-    /// port its capability does not carry.
-    const TCP_LISTEN_SHIFT: u32 = 1;
+    /// `silica.net.Tcp`: the one port a capability names, in these 16 bits
+    /// (0: none): the port it may `listen` on (`listen=<port>` in a
+    /// declaration), or with [`TCP_PORT_IS_PEER`] the one port of a peer it
+    /// may `connect` to (`connect=<port>`). A port is the owner's to give,
+    /// never the first claimant's: no holder listens on a port its
+    /// capability does not carry, nor connects, without `connect`, to one
+    /// it does not.
+    const TCP_PORT_SHIFT: u32 = 1;
+    /// `silica.net.Tcp`: the port a capability names is a peer's to connect
+    /// to, not its own to listen on.
+    const TCP_PORT_IS_PEER: u64 = 1 << 17;
 
-    /// The port `badge`'s `silica.net.Tcp` capability may listen on.
-    pub const fn tcp_listen(badge: u64) -> Option<u16> {
-        match (of(badge) >> TCP_LISTEN_SHIFT) as u16 {
+    /// The port `badge`'s `silica.net.Tcp` capability names, whichever use.
+    const fn tcp_port(badge: u64) -> Option<u16> {
+        match (of(badge) >> TCP_PORT_SHIFT) as u16 {
             0 => None,
             port => Some(port),
         }
+    }
+
+    /// The port `badge`'s `silica.net.Tcp` capability may listen on.
+    pub const fn tcp_listen(badge: u64) -> Option<u16> {
+        if of(badge) & TCP_PORT_IS_PEER != 0 { None } else { tcp_port(badge) }
+    }
+
+    /// Whether `badge`'s `silica.net.Tcp` capability may connect to a peer's
+    /// `port`: any port with `connect`, else only the one `connect=<port>`
+    /// names. (Before, `connect` was the only way to connect at all, to any
+    /// address and port: a program that needed one service elsewhere
+    /// could reach every one; the audit of 2026-11-27, M8.)
+    pub const fn tcp_connect(badge: u64, port: u16) -> bool {
+        has(badge, TCP_CONNECT) || (of(badge) & TCP_PORT_IS_PEER != 0 && matches!(tcp_port(badge), Some(p) if p == port))
     }
 
     /// The scopes protocol `protocol` defines, by the names declarations
@@ -181,21 +201,27 @@ pub mod scope {
 
     /// The bits of `spec`, a `+`-separated list of scope names of
     /// `protocol`, or the first name it does not define (for
-    /// `silica.net.Tcp`, also a `listen=<port>` that is not one port from 1
-    /// to 65535, or a second one).
+    /// `silica.net.Tcp`, also a `listen=<port>` or `connect=<port>` that is
+    /// not one port from 1 to 65535, or a second port of either kind: a
+    /// capability names one port).
     pub fn parse<'a>(protocol: &str, spec: &'a str) -> Result<u64, &'a str> {
         let known = names(protocol).unwrap_or(&[]);
         let mut bits = 0;
         for name in spec.split('+') {
-            if protocol == "silica.net.Tcp"
-                && let Some(port) = name.strip_prefix("listen=")
-            {
-                let port = port.parse::<u16>().ok().filter(|p| *p != 0).ok_or(name)?;
-                if tcp_listen(bits << SHIFT).is_some() {
-                    return Err(name);
+            if protocol == "silica.net.Tcp" {
+                let (port, peer) = match (name.strip_prefix("listen="), name.strip_prefix("connect=")) {
+                    (Some(p), _) => (Some(p), false),
+                    (_, Some(p)) => (Some(p), true),
+                    _ => (None, false),
+                };
+                if let Some(port) = port {
+                    let port = port.parse::<u16>().ok().filter(|p| *p != 0).ok_or(name)?;
+                    if tcp_port(bits << SHIFT).is_some() {
+                        return Err(name);
+                    }
+                    bits |= (port as u64) << TCP_PORT_SHIFT | if peer { TCP_PORT_IS_PEER } else { 0 };
+                    continue;
                 }
-                bits |= (port as u64) << TCP_LISTEN_SHIFT;
-                continue;
             }
             bits |= known.iter().find(|(n, _)| *n == name).ok_or(name)?.1;
         }
@@ -220,6 +246,31 @@ pub mod scope {
             }
             // The other protocols take no port.
             assert!(parse("silica.system.Manager", "listen=22").is_err());
+        }
+
+        /// A capability to connect can name the one peer port it may reach
+        /// (`connect=<port>`); it reaches no other, listens on none, and is
+        /// one port, not two; `connect` alone still reaches any.
+        #[test]
+        fn a_tcp_capability_can_connect_to_one_port_only() {
+            let b = |spec| parse("silica.net.Tcp", spec).map(|s| s << SHIFT);
+            let one = b("connect=443").expect("connect=443 is a scope");
+            assert!(tcp_connect(one, 443));
+            for other in [80, 444, 22, 1, 65535] {
+                assert!(!tcp_connect(one, other), "connect=443 reached port {other}");
+            }
+            assert_eq!(tcp_listen(one), None, "a peer's port is not one to listen on");
+            assert!(!has(one, TCP_CONNECT));
+            let any = b("connect").unwrap();
+            assert!(tcp_connect(any, 80) && tcp_connect(any, 443));
+            let listener = b("listen=443").unwrap();
+            assert!(!tcp_connect(listener, 443), "a port to listen on is not one to connect to");
+            assert!(tcp_connect(b("connect+listen=22").unwrap(), 9));
+            for bad in
+                ["connect=0", "connect=65536", "connect=", "connect=443+connect=80", "listen=22+connect=443", "connect=443+listen=22"]
+            {
+                assert!(parse("silica.net.Tcp", bad).is_err(), "{bad}");
+            }
         }
     }
 }
