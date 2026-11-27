@@ -1,0 +1,13 @@
+[package]
+name = "silica-manifest"
+description = "The boot archive's services list, as the service manager reads it: each service's declaration, checked whole before anything starts. Apart from init so that it is tested on the host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+silica-protocols = { workspace = true }
+
+[lints]
+workspace = true
