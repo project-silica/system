@@ -323,8 +323,8 @@ struct TimeClient {
     asked: Option<(u64, u64, u16)>,
     /// When to ask next, questions sent since the last answer, seconds
     /// between answers, and whether the clock was set: by the firmware, by
-    /// this instance, or by one before it (the time page says which), so
-    /// that the step limit holds from the first answer after a restart.
+    /// this instance, or by one before it (the time page says which), for
+    /// what is said of a step (the step limit holds whether or not).
     next: u64,
     tries: u32,
     poll: u64,
@@ -859,7 +859,7 @@ impl Stack {
         self.time.asked = None;
         let (offset, _) = silica_rt::time::read(&page);
         let t4 = offset.wrapping_add(now);
-        let (shift, delay) = match self.time.steps.judge(t1, t2, t3, t4, self.time.set, now) {
+        let (shift, delay) = match self.time.steps.judge(t1, t2, t3, t4, now) {
             Ok(j) => j,
             Err(ntp::Refused::Impossible) => {
                 println!("netd: a time server's answer gives times that cannot be; not believed");

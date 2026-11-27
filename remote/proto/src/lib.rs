@@ -50,6 +50,39 @@ pub fn stamp_of(payload: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(payload.try_into().ok()?))
 }
 
+/// How far behind the machine's clock an owner's first message may be made
+/// (its clock may lag): older is a recording.
+pub const STAMP_WINDOW: u64 = 300_000_000_000;
+
+/// What a first message made at `made` is, to a machine that took one made
+/// at `newest` from that owner last and whose wall clock reads `wall`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    /// Later than the last, and within [`STAMP_WINDOW`] of the clock.
+    Fresh,
+    /// Later than the last, but the machine does not know the time, so a
+    /// recording made after the newest it kept cannot be told from a new
+    /// message.
+    Unjudged,
+    /// No later than the last taken from the owner: a replay, or the
+    /// owner's clock went back.
+    Replayed,
+    /// This many nanoseconds older than the clock allows.
+    Stale(u64),
+}
+
+/// Judge a first message's time ([`Stamp`]).
+pub fn judge_stamp(made: u64, newest: u64, wall: Option<u64>) -> Stamp {
+    if made <= newest {
+        return Stamp::Replayed;
+    }
+    match wall {
+        Some(w) if made.saturating_add(STAMP_WINDOW) < w => Stamp::Stale(w - made),
+        Some(_) => Stamp::Fresh,
+        None => Stamp::Unjudged,
+    }
+}
+
 /// The largest IDL message (`silica_idl_rt::MAX_MESSAGE`).
 pub const MAX_MESSAGE: usize = 4000;
 /// The largest plaintext: an answer's channel and status, then a message.
@@ -277,6 +310,21 @@ pub fn owners(text: &str) -> impl Iterator<Item = Result<Owner<'_>, BadLine>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A machine that does not know the time cannot tell a recorded first
+    /// message made after the newest it kept from a new one: it says so
+    /// (`Unjudged`) rather than calling it fresh (the audit of 2026-11-27,
+    /// M9: the check of the clock was skipped and the recording answered as
+    /// an owner's). Known times judge as before.
+    #[test]
+    fn a_first_message_is_judged_fresh_only_against_a_known_clock() {
+        let s = 1_000_000_000u64;
+        assert_eq!(judge_stamp(100 * s, 0, None), Stamp::Unjudged, "a recording answered as fresh while the time is unknown");
+        assert_eq!(judge_stamp(100 * s, 100 * s, None), Stamp::Replayed);
+        assert_eq!(judge_stamp(100 * s, 50 * s, Some(200 * s)), Stamp::Fresh);
+        assert_eq!(judge_stamp(100 * s, 50 * s, Some(100 * s + STAMP_WINDOW + s)), Stamp::Stale(STAMP_WINDOW + s));
+        assert_eq!(judge_stamp(100 * s, 0, Some(100 * s + STAMP_WINDOW)), Stamp::Fresh);
+    }
 
     #[test]
     fn a_stamp_is_eight_bytes_of_time_and_nothing_else_is_one() {

@@ -64,13 +64,13 @@ fuzz_target!(|frame: &[u8]| {
                 }
             }
             // Whatever times a hostile server sends, an answer believed has
-            // a round trip within the bound and moves a set clock no more
+            // a round trip within the bound and moves the clock no more
             // than the step allowed (the client's times from the frame too).
             if let (Some(t2), Some(t3), Some(t1)) =
                 (ntp::to_unix_ns(reply.receive), ntp::to_unix_ns(reply.transmit), ntp::to_unix_ns(reply.originate))
             {
                 let t4 = t1.wrapping_add(u64::from(d.src_port) << 20);
-                if let Ok((shift, delay)) = ntp::judge(t1, t2, t3, t4, true) {
+                if let Ok((shift, delay)) = ntp::judge(t1, t2, t3, t4) {
                     assert!((0..=ntp::DELAY_MOST).contains(&delay) && shift.unsigned_abs() <= ntp::STEP_MOST);
                 }
             }

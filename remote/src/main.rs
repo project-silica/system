@@ -50,7 +50,7 @@ use silica_net::tcp::{Read, Stream, Tcp};
 use silica_protocols::remote::session;
 use silica_protocols::scope;
 use silica_protocols::system::manager;
-use silica_remote::{Frames, MAX_FRAME, MAX_MESSAGE, PROLOGUE, Status, TAG};
+use silica_remote::{Frames, MAX_FRAME, MAX_MESSAGE, PROLOGUE, Stamp, Status, TAG};
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle};
@@ -79,9 +79,6 @@ const MAX_UNPROVEN: usize = 8;
 const MAX_UNPROVEN_FROM_ONE: usize = 2;
 /// A connection not proven an owner's in this long is closed.
 const HANDSHAKE: u64 = 10_000_000_000;
-/// How far behind this machine's clock an owner's first message may be
-/// made (its clock may lag): older is a recording.
-const STAMP_WINDOW: u64 = 300_000_000_000;
 /// How long a new connection has to give an owner's handshake before a
 /// newer one may take its place.
 const GRACE: u64 = 1_000_000_000;
@@ -108,6 +105,10 @@ struct Session {
     /// message recorded and replayed is answered, but its sender cannot
     /// read the answer nor send one message that opens).
     proven: bool,
+    /// Its handshake was answered while this machine did not know the
+    /// time, so whether it is new could not be judged: until proven it
+    /// holds no place (`make_room`).
+    unjudged: bool,
     state: State,
     /// What arrived and is not yet a whole message.
     input: Vec<u8>,
@@ -258,6 +259,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         owner: None,
                         from,
                         proven: false,
+                        unjudged: false,
                         state: State::Handshake,
                         input: Vec::new(),
                         output: Vec::new(),
@@ -340,10 +342,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
 /// many there are), so a stream of newcomers cannot push out an owner's
 /// connection before its first message is read; one whose owner's
 /// handshake was answered (a fresh one: a replay is refused, `stamp`) is
-/// the owner's, a round trip from proving it, and is never closed for room.
+/// the owner's, a round trip from proving it, and is never closed for room,
+/// unless it was answered while the machine did not know the time
+/// (`unjudged`: a recording would be answered too), which holds no place.
 /// Whether any was closed.
 fn make_room(sessions: &mut [Session], now: u64) -> bool {
-    let stranger = |s: &Session| !s.proven && !s.closing && matches!(s.state, State::Handshake) && now >= s.since + GRACE;
+    let stranger = |s: &Session| !s.proven && !s.closing && (matches!(s.state, State::Handshake) || s.unjudged) && now >= s.since + GRACE;
     let mut closed = false;
     loop {
         let waiting = sessions.iter().filter(|s| !s.proven && !s.closing).count();
@@ -518,27 +522,33 @@ impl Session {
             println!("remote: a connection from {} closed: its handshake carries no time", self.peer);
             return self.close();
         };
-        if made <= m.newest[o] {
-            println!(
-                "remote: a connection from {} closed: a handshake of {} made no later than the last taken from them (replayed, or their clock went back)",
-                self.peer, m.owners[o].1
-            );
-            return self.close();
-        }
         // Made long before this machine's clock: a recording, even when the
         // newest times were lost (the kept page is empty after a boot and
         // after this service's program changes), as long as the machine
         // knows the time. An owner's clock may lag it by `STAMP_WINDOW`.
-        if let Some(wall) = silica_rt::time::now()
-            && made.saturating_add(STAMP_WINDOW) < wall.ns
-        {
-            println!(
-                "remote: a connection from {} closed: a handshake of {} made {} s before this machine's clock (replayed, or their clock is behind)",
-                self.peer,
-                m.owners[o].1,
-                (wall.ns - made) / 1_000_000_000
-            );
-            return self.close();
+        // While it does not, a recording made after the newest kept cannot
+        // be told from a new message: it is answered (the owner may need
+        // this machine before it knows the time), but holds no place until
+        // its sender proves itself, which a recording cannot (`make_room`).
+        match silica_remote::judge_stamp(made, m.newest[o], silica_rt::time::now().map(|w| w.ns)) {
+            Stamp::Fresh => {}
+            Stamp::Unjudged => self.unjudged = true,
+            Stamp::Replayed => {
+                println!(
+                    "remote: a connection from {} closed: a handshake of {} made no later than the last taken from them (replayed, or their clock went back)",
+                    self.peer, m.owners[o].1
+                );
+                return self.close();
+            }
+            Stamp::Stale(behind) => {
+                println!(
+                    "remote: a connection from {} closed: a handshake of {} made {} s before this machine's clock (replayed, or their clock is behind)",
+                    self.peer,
+                    m.owners[o].1,
+                    behind / 1_000_000_000
+                );
+                return self.close();
+            }
         }
         m.took(o, made);
         let mut e = [0u8; 32];
