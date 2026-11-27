@@ -10,9 +10,9 @@
 //! and reading it in place twice could see two different packets. What is
 //! malformed or not for this host is dropped and counted by reason.
 //!
-//! It sets the wall clock from a time server (SNTP: the `ntp` boot option,
-//! `netd.ntp=<address>[:<port>]`, else the servers the lease names, up to
-//! three), when bound and then every 64 s doubling to 1,024 s; an answer is
+//! It sets the wall clock from up to three time servers named by the lease.
+//! A test image can select a server with `netd.ntp=<address>[:<port>]`.
+//! It asks when bound and then every 64 s doubling to 1,024 s. An answer is
 //! taken only from the server asked, to the port asked from, echoing the
 //! question's random number. A step past 1,000 s waits for a second answer
 //! that agrees, from another server where one is known: where only one is,
@@ -381,11 +381,15 @@ impl TimeClient {
 /// The mark of a lease in the page kept across restarts.
 const KEPT_LEASE: u64 = 0x4553_4145_4c5f_4454; // "TD_LEASE"
 
-/// The address the boot options give this machine, as a lease that never
-/// ends: `netd.address=<address>/<prefix>`, with `netd.router=<address>`
-/// and `netd.dns=<address>,...` (at most three) if the network has them.
-/// What a server on a network without DHCP is given; `Err` for options
-/// that do not parse, which stops the stack rather than guess.
+/// The address this program's options give it, as a lease that never
+/// ends: `address=<address>/<prefix>`, with `router=<address>` and
+/// `dns=<address>,...` (at most three) if the network has them. Only a test
+/// image's service manager gives a service options from the boot command
+/// line (`netd.address=...`); a machine's gives none, so there the address
+/// comes from DHCP. (A server on a network without DHCP is owed its address
+/// as a provisioned file of its own, as the remote service is given its
+/// owners, never the unsigned line.) `Err` for options that do not parse,
+/// which stops the stack rather than guess.
 fn fixed_lease() -> Result<Option<Lease>, &'static str> {
     let Some(a) = silica_rt::option("address") else {
         if silica_rt::option("router").is_some() || silica_rt::option("dns").is_some() {

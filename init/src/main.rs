@@ -17,11 +17,20 @@
 //! one per program a service asks for (`add_log`), which the log service
 //! finds in its directory (`silica_rt::log::directory`).
 //!
-//! `off=` on the kernel command line (a comma list of service names) keeps
-//! those boot services from starting, as if stopped: what an owner does to
-//! boot without a service; `start <name>` starts one later. The system then
-//! stays up, and the machine is turned off only when a holder of the
-//! `power` scope asks (`shutdown`).
+//! The machine is turned off only when a holder of the `power` scope asks
+//! (`shutdown`).
+//!
+//! The boot command line is not a service's to read on a machine's image
+//! (spec/ARCHITECTURE.md, invariant 10): nothing signs it, and whoever last
+//! wrote the boot volume wrote it. So only a test image's init gives a
+//! service the line's `<service>.<word>` words as its options and obeys
+//! `off=` (a comma list of boot services kept from starting, as if
+//! stopped; `start <name>` starts one later). A machine's init gives
+//! services no options from it, starts every boot service, and says which
+//! words it did not obey. (Before, any image obeyed them: the network
+//! stack's address, router, name servers and time server, and any service
+//! kept off, the device manager and the log among them, were whoever
+//! wrote the disk's to choose: the 2026-11-26 review, H2.)
 //!
 //! A test image's init (the `harness` feature, which no image a machine
 //! runs is built with) also obeys `checks=` (a comma list; default
@@ -276,8 +285,28 @@ struct LogSetup {
 }
 
 /// The value of `key=` on the command line.
+#[cfg(feature = "harness")]
 fn option(cmdline: &'static [u8], key: &str) -> Option<&'static [u8]> {
     cmdline.split(|b| b.is_ascii_whitespace()).find_map(|w| w.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
+}
+
+/// A machine's image: say which words of the command line, a service's
+/// options or `off=`, this init does not obey (shown inertly: the line is
+/// whoever wrote the boot volume's).
+#[cfg(not(feature = "harness"))]
+fn not_obeyed(cmdline: &'static [u8], services: &[Service]) {
+    let words: Vec<&str> = cmdline
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|w| {
+            w.starts_with(b"off=")
+                || services.iter().any(|s| w.strip_prefix(s.name.as_bytes()).is_some_and(|rest| rest.first() == Some(&b'.')))
+        })
+        .map(|w| core::str::from_utf8(w).unwrap_or("(not text)"))
+        .collect();
+    if !words.is_empty() {
+        let shown = words.join(" ");
+        println!("init: the boot command line configures no service on this image; not obeyed: {}", silica_rt::text::printable(&shown));
+    }
 }
 
 impl Manager {
@@ -1515,7 +1544,14 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
             Some(LogSetup { service: l, rings, added: sys::Cap(to), given: (0..places).map(|_| None).collect(), first, directory })
         }
     };
-    // Each service's options, from the boot command line.
+    // Each service's options, from the boot command line: a test image's
+    // alone (the module's documentation says why).
+    #[cfg(not(feature = "harness"))]
+    let options: Vec<Vec<u8>> = {
+        not_obeyed(cmdline, &services);
+        services.iter().map(|_| Vec::new()).collect()
+    };
+    #[cfg(feature = "harness")]
     let options: Vec<Vec<u8>> = services
         .iter()
         .map(|s| {
@@ -1557,17 +1593,25 @@ extern "C" fn silica_main(info: &'static RootInfo, s0: u64, s1: u64, s2: u64, s3
     };
     let mut listener = Listener::new(m.root.parent.exit);
 
-    // The system, in order, but for what the command line keeps off.
-    let off: Vec<&[u8]> = option(cmdline, "off").unwrap_or(b"").split(|b| *b == b',').filter(|c| !c.is_empty()).collect();
-    for o in &off {
-        if !m.services.iter().any(|s| s.name.as_bytes() == *o) {
-            fail!("off= names {}, which no service is declared for", core::str::from_utf8(o).unwrap_or("?"));
+    // The system, in order, but for what a test image's command line keeps
+    // off. The code for `off=` is a test image's alone: compiled into no
+    // machine's init, whatever an optimizer would keep (`server_image`
+    // looks for its text).
+    #[cfg(feature = "harness")]
+    let off: Vec<&[u8]> = {
+        let off: Vec<&[u8]> = option(cmdline, "off").unwrap_or(b"").split(|b| *b == b',').filter(|c| !c.is_empty()).collect();
+        for o in &off {
+            if !m.services.iter().any(|s| s.name.as_bytes() == *o) {
+                fail!("off= names {}, which no service is declared for", core::str::from_utf8(o).unwrap_or("?"));
+            }
         }
-    }
+        off
+    };
     for &i in &order {
         if m.services[i].start != Start::Boot {
             continue;
         }
+        #[cfg(feature = "harness")]
         if off.contains(&m.services[i].name.as_bytes()) {
             m.running[i].stopped = true;
             println!("init: {} is off, as the command line asks", m.services[i].name);

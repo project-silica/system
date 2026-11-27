@@ -147,12 +147,18 @@ struct Running<'a> {
     /// The driver's events notification (`slots::EVENTS` in it): what
     /// the device manager asks it to end on ([`silica_rt::END`]).
     events: OwnedObject,
-    /// What clients asked to have signalled when this driver ends.
-    gone: Vec<(u64, Handle)>,
+    /// What clients asked to have signalled when this driver ends: the
+    /// caller, the holder it opened for (`silica_protocols::driver_badge`)
+    /// and the notification.
+    gone: Vec<(u64, u64, Handle)>,
     /// A client was given it (`open`) since it started: one that then ends
     /// asking to be started again (`silica_rt::AGAIN_LABEL`) is, at once; one
     /// nobody opened is not (it could keep the device manager starting it).
     opened: bool,
+    /// Capabilities to it handed out since it started: the low part of
+    /// their badges (`silica_protocols::driver_badge`), never reused while
+    /// it runs.
+    opens: u64,
 }
 
 struct Manager {
@@ -176,8 +182,6 @@ struct Manager {
     listing: Vec<manager::Device<'static>>,
     /// What `describe` answers with, one part of it.
     described: silica_rt::alloc::string::String,
-    /// Badges of driver capabilities handed out, so each client is told apart.
-    next_client: u64,
     /// Hot-plug capable ports, with the configuration space base (ECAM)
     /// and segment of the buses behind them.
     /// (Each with the segment's last bus.)
@@ -201,6 +205,8 @@ struct Manager {
     /// The configuration writes each driver's declaration asks for, made
     /// before it starts (`drivers`).
     writes: Vec<(&'static str, Vec<ConfigWrite>)>,
+    /// The drivers the archive's list says do no DMA (`nodma`).
+    no_dma: Vec<&'static str>,
     /// Every configuration space mapped, by function identity.
     configs: BTreeMap<u32, (Config, Cap)>,
     /// What clients asked to have signalled when a device of a class gains
@@ -217,6 +223,14 @@ struct Manager {
     /// The badge of the call being answered: whose capability, and its
     /// scopes (`silica_protocols::scope`).
     caller: u64,
+}
+
+/// Whether `caller` may see the devices of `class` (`list`, `watch`): with
+/// the class's scope, or with `list` for any class but the watchdog. Seeing
+/// a device does not let a caller open it (`open` takes the class's scope).
+fn may_see(caller: u64, class: manager::Class) -> bool {
+    let s = scope_of(class);
+    s != 0 && (scope::has(caller, s) || (class != manager::Class::Watchdog && scope::has(caller, scope::DEVICE_LIST)))
 }
 
 /// The scope a caller needs for devices of `class`.
@@ -279,7 +293,7 @@ fn class_of(f: &Function) -> Option<manager::Class> {
 impl manager::Server<Handle> for Manager {
     fn list<'a>(&'a mut self, class: manager::Class, from: u32) -> manager::ListReply<'a, Handle> {
         self.listing.clear();
-        if scope_of(class) == 0 || !scope::has(self.caller, scope_of(class)) {
+        if !may_see(self.caller, class) {
             return manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing), next: 0 };
         }
         let functions = &self.functions;
@@ -300,32 +314,23 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn open(&mut self, id: u32, gone: Option<Handle>) -> Result<manager::OpenReply<Handle>, manager::Error> {
-        let (functions, caller) = (&self.functions, self.caller);
-        let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
-        let class = class_of(&functions[r.function]);
-        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+        let consumer = silica_protocols::driver_badge::consumer_of_caller(self.caller).ok_or(manager::Error::Refused)?;
+        self.open_charged(id, gone, |opens| silica_protocols::driver_badge::of(consumer, opens)).map(|driver| manager::OpenReply { driver })
+    }
+
+    fn open_for(&mut self, id: u32, client: u32, gone: Option<Handle>) -> Result<manager::OpenForReply<Handle>, manager::Error> {
+        if !scope::has(self.caller, scope::DEVICE_DELEGATE) {
             return Err(manager::Error::Refused);
         }
-        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
-        self.next_client += 1;
-        let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
-        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, self.next_client).is_err() {
-            release_slot(slot);
-            return Err(manager::Error::NoRoom);
+        // Charged to the pair (caller, client), within the caller's share: a
+        // client number is the caller's own, and a badge holds it whole or
+        // not at all.
+        let delegator = silica_protocols::driver_badge::consumer_of_caller(self.caller).ok_or(manager::Error::Refused)?;
+        if client as u64 > silica_protocols::driver_badge::MOST {
+            return Err(manager::Error::Refused);
         }
-        if let Some(g) = gone {
-            // Kept until the driver ends, one for each caller: a caller's
-            // later notice (its reconnecting) replaces its earlier one.
-            r.gone.retain(|(c, _)| *c != caller);
-            r.gone.push((caller, g));
-        }
-        r.opened = true;
-        if class == Some(manager::Class::Watchdog) {
-            // The service manager takes the watchdog's driver: it knows
-            // (`tell_watchdog`).
-            self.watchdog_news = false;
-        }
-        Ok(manager::OpenReply { driver: Handle::new(Cap(slot)) })
+        let badge = silica_protocols::driver_badge::delegated(delegator, client as u64);
+        self.open_charged(id, gone, |_| badge).map(|driver| manager::OpenForReply { driver })
     }
 
     fn restart(&mut self, id: u32) -> Result<manager::RestartReply, manager::Error> {
@@ -347,7 +352,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn watch(&mut self, class: manager::Class, changed: Handle) -> manager::WatchReply {
-        if scope_of(class) != 0 && scope::has(self.caller, scope_of(class)) {
+        if may_see(self.caller, class) {
             let caller = self.caller;
             self.watchers.retain(|(c, k, _)| (*c, *k) != (caller, class));
             self.watchers.push((caller, class, changed));
@@ -376,6 +381,64 @@ impl manager::Server<Handle> for Manager {
             self.described.push('\n');
         }
         Ok(manager::DescribeReply { text: &self.described, next })
+    }
+}
+
+impl Manager {
+    /// `open` of the driver of device `id` by the caller, with the badge
+    /// `badge` makes of the driver's count of opens
+    /// (`silica_protocols::driver_badge`).
+    fn open_charged(&mut self, id: u32, gone: Option<Handle>, badge: impl Fn(u64) -> u64) -> Result<Handle, manager::Error> {
+        let (functions, caller) = (&self.functions, self.caller);
+        let r = self.running.iter_mut().find(|r| functions[r.function].id == id).ok_or(manager::Error::NoSuchDevice)?;
+        let class = class_of(&functions[r.function]);
+        if !class.is_some_and(|c| scope_of(c) != 0 && scope::has(caller, scope_of(c))) {
+            return Err(manager::Error::Refused);
+        }
+        // Each capability from `open` its own badge, never one this driver
+        // was given before while it runs, charged to the consumer: the
+        // driver keeps its connections and windows apart by it. (One count
+        // for the whole device manager, 32 bits wide, once ran out for
+        // everyone.)
+        if r.opens >= silica_protocols::driver_badge::OPENS - 1 {
+            return Err(manager::Error::NoRoom);
+        }
+        let badge = badge(r.opens + 1);
+        let holder = silica_protocols::driver_badge::holder(badge);
+        // A notice is kept for each notification given, the same one given
+        // again (a reconnecting) replacing the earlier; those whose
+        // notification has gone with its holder are forgotten first; at most
+        // `GONE_PER_HOLDER` for one holder (the caller, or a delegator's
+        // client) and `GONE_PER_CALLER` for one caller. (Kept one for each
+        // caller, every client of the block server lost its notice to the
+        // next one's open.)
+        if let Some(g) = &gone {
+            let object = |h: &Handle| sys::inspect_slot(slots::SPACE, h.cap().0).ok().flatten().map(|s| s.object);
+            let new = object(g);
+            r.gone.retain(|(c, _, old)| !(*c == caller && (new.is_some() && object(old) == new || !held(old))));
+            let (by_caller, by_holder) =
+                r.gone.iter().filter(|(c, _, _)| *c == caller).fold((0, 0), |(a, b), (_, h, _)| (a + 1, b + usize::from(*h == holder)));
+            if by_caller >= GONE_PER_CALLER || by_holder >= GONE_PER_HOLDER {
+                return Err(manager::Error::NoRoom);
+            }
+        }
+        let slot = free_slot().ok_or(manager::Error::NoRoom)?;
+        let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
+        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, badge).is_err() {
+            release_slot(slot);
+            return Err(manager::Error::NoRoom);
+        }
+        r.opens += 1;
+        if let Some(g) = gone {
+            r.gone.push((caller, holder, g));
+        }
+        r.opened = true;
+        if class == Some(manager::Class::Watchdog) {
+            // The service manager takes the watchdog's driver: it knows
+            // (`tell_watchdog`).
+            self.watchdog_news = false;
+        }
+        Ok(Handle::new(Cap(slot)))
     }
 }
 
@@ -417,27 +480,59 @@ enum Match {
 
 /// The drivers the boot archive offers, in its order.
 fn drivers(archive: &'static [u8]) -> Vec<(Match, &'static str)> {
+    driver_lines(archive).into_iter().map(|(m, program, _)| (m, program)).collect()
+}
+
+/// The driver programs the archive's driver list says do no DMA (`nodma`,
+/// from a driver's declaration `dma = false`): their devices are left
+/// without bus mastering, and they start where DMA cannot be confined.
+/// Only from lines the list's reader takes, and only for an exact device
+/// identity (`pci <vendor>:<device>`): a class matches devices whose
+/// registers can do anything (a display class takes in GPUs whose register
+/// window mirrors configuration space, where a driver could turn bus
+/// mastering on).
+fn no_dma_drivers(archive: &'static [u8]) -> Vec<&'static str> {
+    driver_lines(archive).into_iter().filter(|(_, _, no_dma)| *no_dma).map(|(_, program, _)| program).collect()
+}
+
+/// The lines of the archive's driver list: a match, its program, and
+/// whether it says `nodma`. A line it cannot read is said and skipped.
+fn driver_lines(archive: &'static [u8]) -> Vec<(Match, &'static str, bool)> {
     let mut table = Vec::new();
     let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return table };
-    let hex16 = |s: &str| u16::from_str_radix(s, 16).ok().filter(|_| s.len() == 4);
-    let hex8 = |s: &str| u8::from_str_radix(s, 16).ok().filter(|_| s.len() == 2);
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        let mut w = line.split_ascii_whitespace();
-        let m = match (w.next(), w.next()) {
-            (Some("pci"), Some(id)) => id.split_once(':').and_then(|(v, d)| Some(Match::Id(hex16(v)?, hex16(d)?))),
-            (Some("class"), Some(c)) => {
-                let mut p = c.split('.');
-                (|| Some(Match::Class(hex8(p.next()?)?, hex8(p.next()?)?, hex8(p.next()?)?)))()
-            }
-            _ => None,
-        };
-        match (m, w.next(), w.next(), w.next()) {
-            (Some(m), Some(program), None, None) => table.push((m, program)),
-            (Some(m), Some(program), Some(c), None) if c.starts_with("config=") => table.push((m, program)),
-            _ => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
+        match driver_line(line) {
+            Some(entry) => table.push(entry),
+            None => println!("devmgr: the archive's driver list has a line it cannot read: {line}"),
         }
     }
     table
+}
+
+/// One line of the driver list: `pci <vendor>:<device>` or `class
+/// <class>.<subclass>.<interface>`, the program, then its configuration
+/// writes (`config=`) and `nodma`, each at most once and nothing else;
+/// `nodma` only with an exact device identity.
+fn driver_line(line: &'static str) -> Option<(Match, &'static str, bool)> {
+    let hex16 = |s: &str| u16::from_str_radix(s, 16).ok().filter(|_| s.len() == 4);
+    let hex8 = |s: &str| u8::from_str_radix(s, 16).ok().filter(|_| s.len() == 2);
+    let mut w = line.split_ascii_whitespace();
+    let m = match (w.next()?, w.next()?) {
+        ("pci", id) => id.split_once(':').and_then(|(v, d)| Some(Match::Id(hex16(v)?, hex16(d)?)))?,
+        ("class", c) => {
+            let mut p = c.split('.');
+            Match::Class(hex8(p.next()?)?, hex8(p.next()?)?, hex8(p.next()?)?)
+        }
+        _ => return None,
+    };
+    let program = w.next()?;
+    let rest: Vec<&str> = w.collect();
+    let configs = rest.iter().filter(|x| x.starts_with("config=")).count();
+    let no_dma = rest.iter().filter(|x| **x == "nodma").count();
+    if configs + no_dma != rest.len() || configs > 1 || no_dma > 1 || (no_dma == 1 && !matches!(m, Match::Id(..))) {
+        return None;
+    }
+    Some((m, program, no_dma == 1))
 }
 
 /// A write to a device's configuration space that its driver's declaration
@@ -458,7 +553,8 @@ fn config_writes(archive: &'static [u8]) -> Vec<(&'static str, Vec<ConfigWrite>)
     let Some(text) = ramdisk::find(archive, "drivers").and_then(|b| core::str::from_utf8(b).ok()) else { return all };
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let mut w = line.split_ascii_whitespace().skip(2);
-        let (Some(program), Some(spec)) = (w.next(), w.next().and_then(|c| c.strip_prefix("config="))) else { continue };
+        let Some(program) = w.next() else { continue };
+        let Some(spec) = w.find_map(|c| c.strip_prefix("config=")) else { continue };
         let writes: Option<Vec<ConfigWrite>> = spec
             .split(',')
             .map(|one| {
@@ -689,6 +785,9 @@ impl Manager {
                     );
                     continue;
                 }
+                // Nothing masters the bus until a driver that does DMA is
+                // started for it (`silence_found`).
+                silence_found(&config);
                 let f = function_of(id, config, frame);
                 let index = match self.functions.iter().position(|g| g.id == id) {
                     Some(i) => {
@@ -855,6 +954,7 @@ impl Manager {
                         self.ports.push((port, ecam, segment, last_bus));
                     }
                 }
+                silence_found(&config);
                 self.functions.push(function_of(id, config, config_frame));
             }
         }
@@ -899,8 +999,49 @@ impl Manager {
         Ok(())
     }
 
-    /// Start the driver `driver` for function number `index`.
+    /// Start the driver `driver` for function number `index`. Whatever
+    /// keeps it from starting, its device is left silenced ([`silence`]):
+    /// no bus mastering, no message interrupts.
     fn start(&mut self, index: usize, driver: &'static str) -> Result<(), &'static str> {
+        let config = self.functions[index].config;
+        let r = self.start_driver(index, driver);
+        if r.is_err() {
+            silence(&config);
+        }
+        r
+    }
+
+    fn start_driver(&mut self, index: usize, driver: &'static str) -> Result<(), &'static str> {
+        // Whether the kernel confines this device's DMA, asked of the
+        // kernel for this device: attaching it to no address space succeeds
+        // only for a device an IOMMU unit the kernel drives translates (on a
+        // machine without one, on a segment no driven unit covers, or outside
+        // every driven unit's scopes, it is `Unsupported`). A driver that
+        // does no DMA (`nodma` in the driver list, exact device identities
+        // only) needs no confinement: its device is left without bus
+        // mastering, which drivers cannot turn on (configuration space is
+        // the device manager's to write).
+        let dma = !self.no_dma.contains(&driver);
+        let attached = dma.then(|| sys::device_attach(granted(GRANT_DEVICES), self.functions[index].id, Cap::NONE));
+        // A machine's image starts no driver it cannot confine: one that is
+        // not is trusted with all of memory, and a promise of confinement
+        // that is not kept is refused by name, not logged and broken
+        // (spec/ARCHITECTURE.md, invariant 7; the 2026-11-26 review, N5). A
+        // test image runs it unconfined and says so: the same image on a
+        // machine without an IOMMU (`unconfined`).
+        #[cfg(not(feature = "harness"))]
+        match attached {
+            Some(Err(sys::Error::Unsupported)) => {
+                return Err("its DMA cannot be confined on this machine, and only a test image trusts a driver with all of memory");
+            }
+            Some(Err(e)) => {
+                println!("devmgr: the kernel did not say whether {} can be confined: {e:?}", PciAddress(self.functions[index].id));
+                return Err("the kernel did not say whether its DMA can be confined");
+            }
+            _ => {}
+        }
+        #[cfg(feature = "harness")]
+        let _ = attached;
         let f = &self.functions[index];
         let image = ramdisk::find(self.archive, driver).ok_or("its driver is not in the boot archive")?;
         let (id, config) = (f.id, f.config);
@@ -991,7 +1132,14 @@ impl Manager {
                 }
             }
         }
-        registers.write16(4, registers.read16(4) | pci::COMMAND_MEMORY | pci::COMMAND_MASTER | pci::COMMAND_NO_INTX);
+        // Bus mastering only for a driver that does DMA (`nodma`: off).
+        let master = if dma { pci::COMMAND_MASTER } else { 0 };
+        registers.write16(4, (registers.read16(4) & !pci::COMMAND_MASTER) | pci::COMMAND_MEMORY | master | pci::COMMAND_NO_INTX);
+        // A device that keeps bus mastering after it was told no is not
+        // given a driver trusted to do no DMA.
+        if !dma && registers.read16(4) & pci::COMMAND_MASTER != 0 {
+            return Err("its device kept bus mastering on, and its driver is trusted only because it does no DMA");
+        }
         if let Some(msix) = config.msix() {
             // Every entry masked and emptied before any can fire: the table
             // still holds the last driver's messages, whose lines may since
@@ -1075,6 +1223,7 @@ impl Manager {
             events,
             gone: Vec::new(),
             opened: false,
+            opens: 0,
         });
         self.changed(index);
         Ok(())
@@ -1140,7 +1289,7 @@ impl Manager {
         silence(&config);
         let ok = r.child.destroy().is_ok();
         // Its clients hear of it now, not on their next call.
-        for (_, g) in r.gone {
+        for (_, _, g) in r.gone {
             let _ = sys::signal(g.cap());
         }
         self.changed(r.function);
@@ -1341,7 +1490,6 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         next_id: 0,
         listing: Vec::new(),
         described: silica_rt::alloc::string::String::new(),
-        next_client: CLIENTS,
         ports: Vec::new(),
         bridges: Vec::new(),
         settling: Vec::new(),
@@ -1350,6 +1498,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         longest_turn: 0,
         table: drivers(archive),
         writes: config_writes(archive),
+        no_dma: no_dma_drivers(archive),
         configs: BTreeMap::new(),
         watchers: Vec::new(),
         watchdog_news: true,
@@ -1361,8 +1510,13 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
     if table.is_empty() {
         println!("devmgr: the boot archive lists no drivers");
     }
+    #[cfg(feature = "harness")]
     if info.dma_top == 0 {
         println!("devmgr: this machine cannot confine DMA: every driver started here is trusted with all of memory");
+    }
+    #[cfg(not(feature = "harness"))]
+    if info.dma_top == 0 {
+        println!("devmgr: this machine cannot confine DMA: no driver that does DMA is started (only a test image runs one unconfined)");
     }
     // Say what there is, then start the drivers.
     let mut failed = false;
@@ -1580,6 +1734,18 @@ fn mask_msix_table(frame: Cap, bits: u8, offset: usize, vectors: usize) -> Resul
 /// a device without a running driver (stopped, or never started because
 /// starting it failed) is silenced, so that without an IOMMU it cannot
 /// reach memory at all. Says so if the device does not take it.
+/// A function just found: an endpoint is silenced ([`silence`]) until a
+/// driver that does DMA is started for it, whatever the firmware left on
+/// (the review of 2026-11-27: a device with no driver, or one refused,
+/// kept the firmware's bus mastering). A bridge is left alone: its bus
+/// mastering carries the requests of every device below it, each of which
+/// is silenced itself.
+fn silence_found(config: &Config) {
+    if config.registers().read8(0x0E) & 0x7F == 0 {
+        silence(config);
+    }
+}
+
 fn silence(config: &Config) {
     let registers = config.registers();
     registers.write16(4, registers.read16(4) & !pci::COMMAND_MASTER);
@@ -1686,4 +1852,16 @@ fn find_in_lent(archive: &[u8], info: &[u8], memory: &mut DeviceMemory, root: &R
             None => println!("devmgr: find: {word} is not in what this program was lent"),
         }
     }
+}
+
+/// `gone` notices kept for one caller at once: the block server's, one for
+/// each client of it a driver has.
+const GONE_PER_CALLER: usize = 64;
+/// `gone` notices kept for one holder at once (`silica_protocols::driver_badge`).
+const GONE_PER_HOLDER: usize = 16;
+
+/// Whether this program still holds `h` (a notification whose holder has
+/// ended is gone from its slot).
+fn held(h: &Handle) -> bool {
+    matches!(sys::inspect_slot(slots::SPACE, h.cap().0), Ok(Some(_)))
 }

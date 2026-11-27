@@ -127,6 +127,15 @@ pub mod scope {
     /// No declaration can name it: the service manager alone holds it, so
     /// nothing else can pet the watchdog of a hung machine.
     pub const DEVICE_WATCHDOG: u64 = 1 << 7;
+    /// `silica.device.Manager`: `list` and `watch` of every class but the
+    /// watchdog, and no `open`: what a program that shows or waits for
+    /// devices needs (the shell's `devices`).
+    pub const DEVICE_LIST: u64 = 1 << 8;
+    /// `silica.device.Manager`: `open_for`, a driver of a class it may open
+    /// charged to another consumer: the block server's, which opens
+    /// partitions for its clients so each client's use of a disk is its
+    /// own at the driver, not the block server's for all of them together.
+    pub const DEVICE_DELEGATE: u64 = 1 << 9;
 
     /// `silica.block.Partitions`: `list`.
     pub const PARTITIONS_LIST: u64 = 1 << 0;
@@ -192,6 +201,8 @@ pub mod scope {
                 ("input", DEVICE_INPUT),
                 ("entropy", DEVICE_ENTROPY),
                 ("control", DEVICE_CONTROL),
+                ("list", DEVICE_LIST),
+                ("delegate", DEVICE_DELEGATE),
             ],
             "silica.block.Partitions" => &[("list", PARTITIONS_LIST), ("open", PARTITIONS_OPEN)],
             "silica.net.Tcp" => &[("connect", TCP_CONNECT)],
@@ -272,6 +283,77 @@ pub mod scope {
                 assert!(parse("silica.net.Tcp", bad).is_err(), "{bad}");
             }
         }
+    }
+}
+
+/// The badge of a capability to a driver the device manager hands out
+/// (`silica.device.Manager`'s `open` and `open_for`). Bit 63 is never set:
+/// a driver's own badges (a block driver's windows) are from there up.
+///
+/// - From `open`: bit 62 clear, the consumer that opened in bits 46 to 61
+///   (its number in its own badge to the device manager, the bits below
+///   [`scope::SHIFT`]), and which of that driver's opens it was in the low
+///   46 bits, counted for each running driver and never reused while it
+///   runs (a million opens a second for two years).
+/// - From `open_for`: bit 62 set, the delegator (the consumer that called)
+///   in bits 46 to 61 and its client, a number of the delegator's own, in
+///   bits 30 to 45. Not counted: the delegator narrows through it, and its
+///   clients connect through what it narrows.
+///
+/// A driver keeps state for each capability (a connection, a window) and
+/// charges it to its holder ([`driver_badge::holder`]: the consumer, or the delegator's
+/// client) within a share of the consumer's ([`driver_badge::share`]: the consumer, or
+/// the delegator): a delegator divides its own share among its clients,
+/// and can neither make shares of its own nor charge another program's.
+pub mod driver_badge {
+    /// Programs an image may let reach a block driver (with the `block` scope
+    /// of `silica.device.Manager`): what a block driver's share of each is
+    /// sized for (`silica_block::service::SHARE`). The service manager
+    /// refuses a list of services with more, and so does the image build.
+    pub const BLOCK_PROGRAMS: usize = 8;
+
+    /// Opens of one running driver a badge from `open` can tell apart.
+    pub const OPENS: u64 = 1 << 46;
+    /// The bit of a badge from `open_for`.
+    pub const DELEGATED: u64 = 1 << 62;
+    /// The largest consumer or client number a badge holds.
+    pub const MOST: u64 = 0xFFFF;
+
+    /// The badge of a consumer's capability from a driver's `open`-th open
+    /// (`consumer` at most [`MOST`], `open` below [`OPENS`]).
+    pub const fn of(consumer: u64, open: u64) -> u64 {
+        (consumer & MOST) << 46 | (open & (OPENS - 1))
+    }
+
+    /// The badge of a capability `delegator` opened for its `client` (each
+    /// at most [`MOST`]).
+    pub const fn delegated(delegator: u64, client: u64) -> u64 {
+        DELEGATED | (delegator & MOST) << 46 | (client & MOST) << 30
+    }
+
+    /// Whom a driver charges what it keeps for a capability with `badge`:
+    /// equal for every capability of one consumer from `open`, and for
+    /// every one a delegator opened for one client, and else different.
+    pub const fn holder(badge: u64) -> u64 {
+        if badge & DELEGATED != 0 { badge } else { badge & !(OPENS - 1) }
+    }
+
+    /// Whose share a holder ([`holder`]) or a badge is charged within: the
+    /// consumer's, or for a delegator's client the delegator's.
+    pub const fn share(badge: u64) -> u64 {
+        badge >> 46 & MOST
+    }
+
+    /// Whether a holder ([`holder`]) or a badge is a delegator's client.
+    pub const fn is_delegated(badge: u64) -> bool {
+        badge & DELEGATED != 0
+    }
+
+    /// The consumer's number in its badge to the device manager, if a badge
+    /// can hold it.
+    pub const fn consumer_of_caller(caller: u64) -> Option<u64> {
+        let n = caller & 0xFFFF_FFFF;
+        if n <= MOST { Some(n) } else { None }
     }
 }
 

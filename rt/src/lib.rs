@@ -238,9 +238,10 @@ pub struct ProcessInfo {
 
 /// Where in the start-up page (after the [`ProcessInfo`] at its start) the
 /// parent puts the program's options: two bytes of length, then the text
-/// (`key=value` words, space-separated), at most [`OPTIONS_MAX`] bytes. The
-/// service manager gives each service the boot command line's
-/// `<service>.<key>=<value>` words, as `<key>=<value>`.
+/// (`key=value` words, space-separated), at most [`OPTIONS_MAX`] bytes. A
+/// test image's service manager gives each service the boot command line's
+/// `<service>.<key>=<value>` words, as `<key>=<value>`; a machine's gives
+/// none (the line is unsigned: spec/ARCHITECTURE.md, invariant 10).
 pub const OPTIONS_OFFSET: usize = 2560;
 pub const OPTIONS_MAX: usize = 4096 - OPTIONS_OFFSET - 2;
 

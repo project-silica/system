@@ -12,6 +12,12 @@ publish.workspace = true
 [package.metadata.silica]
 drivers = ["pci 8086:25ab"]
 config = ["60:2:0003", "68:1:02"]
+# Its registers are all it uses: no DMA, so it runs (and the machine is
+# watched) where DMA cannot be confined. Its device is left without bus
+# mastering, so it raises no interrupts either (a message interrupt is a
+# write the device masters the bus for, and INTx is off): it needs none.
+# Only an exact device identity may say so (`pci`, not a class).
+dma = false
 
 [[bin]]
 name = "watchdog-esb"

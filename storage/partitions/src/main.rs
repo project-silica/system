@@ -228,7 +228,12 @@ impl partitions::Server<Handle> for Server {
             self.parts.extend(t);
         }
         let p = self.parts.iter().find(|p| p.id == id).ok_or(Error::NoSuchPartition)?;
-        let driver = self.devices.open(p.disk, gone).map_err(|_| Error::Gone)?.driver;
+        // Charged to the client at the driver, not to this service: what each
+        // client holds of a disk (its windows, its connections) is its own
+        // share, and no client of this service fills what another needs
+        // (`silica.device.Manager`'s `open_for`).
+        let client = silica_protocols::driver_badge::consumer_of_caller(self.caller).ok_or(Error::Refused)? as u32;
+        let driver = self.devices.open_for(p.disk, client, gone).map_err(|_| Error::Gone)?.driver;
         let mut control = device::Client::<Channel, Handle>::from(Channel::within(driver.cap(), silica_rt::ipc::DRIVER_CALL_LIMIT));
         let narrowed = control.narrow(p.first, p.blocks).map_err(|_| Error::Gone)?.device;
         Ok(OpenReply { device: narrowed })
@@ -256,9 +261,48 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     let disks: Vec<u32> = block_disks(&mut devices);
     let mut names = Vec::new();
     let (parts, unread) = read_tables(&disks, &mut names);
+    #[cfg(feature = "harness")]
+    if silica_rt::option("hostile_delegate").is_some() {
+        hostile_delegate(&disks);
+    }
     let mut server = Server { devices, parts, listed: Vec::new(), changed, unread, names, caller: 0 };
     serve(ENDPOINT, |badge, request, caps: CapList<Handle>, reply, reply_caps| {
         server.caller = badge;
         partitions::dispatch(&mut server, request, caps, reply, reply_caps)
     })
+}
+
+/// A test image's hostile block server (`partitions.hostile_delegate=1`):
+/// for clients it makes up, opens the first disk (`open_for`), connects and
+/// registers memory as long as it is let, and keeps it all, so the test can
+/// see that a holder of `delegate` divides its own share and takes nothing
+/// of another program's (once, each made-up client was a share of its own,
+/// and 40 of them filled the driver's capability space for everyone).
+#[cfg(feature = "harness")]
+fn hostile_delegate(disks: &[u32]) {
+    use silica_block::client::Disk;
+    struct MadeUp(manager::Client<Channel, Handle>, u32);
+    impl silica_queue::client::Opener for MadeUp {
+        fn open(&mut self, id: u32, gone: Handle) -> Result<Handle, silica_queue::client::Error> {
+            let r = self.0.open_for(id, self.1, Some(gone)).map_err(|_| silica_queue::client::Error::Gone)?;
+            Ok(r.driver)
+        }
+    }
+    let Some(&disk) = disks.first() else { return };
+    let Ok(memory) = Memory::new(12) else { return };
+    let (mut held, mut frames) = (Vec::new(), 0);
+    for client in 0..40u32 {
+        let opener = MadeUp(manager::Client::<Channel, Handle>::from(Channel::new(DEVICES)), 40_000 + client);
+        let Ok(mut d) = Disk::open_with(silica_rt::alloc::boxed::Box::new(opener), disk) else { continue };
+        for id in 0..64 {
+            if d.add_memory(id, &memory, true).is_err() {
+                break;
+            }
+            frames += 1;
+        }
+        held.push(d);
+    }
+    println!("partitions: a hostile delegator holds {} connections and {frames} frames for clients it made up", held.len());
+    core::mem::forget(held);
+    core::mem::forget(memory);
 }
