@@ -106,10 +106,10 @@ pub fn offset(t1: u64, t2: u64, t3: u64, t4: u64) -> Option<(i64, i64)> {
 /// leaves too much room for its times to be wrong (half of it is the
 /// offset's uncertainty).
 pub const DELAY_MOST: i64 = 1_000_000_000;
-/// The most a clock the network already set is moved by one answer: past
-/// it, the answer is not believed (ntpd's panic threshold). A clock not set
-/// from the network yet (the firmware's may be years out) is moved any
-/// amount.
+/// The most a clock is moved by one answer: past it, the answer is not
+/// believed alone (ntpd's panic threshold), whether the clock was set or
+/// not (one nothing set reads 1970, so every answer moves it this far).
+/// [`Steps`] takes such a step once a second answer agrees.
 pub const STEP_MOST: u64 = 1000 * NS;
 
 /// Why an answer is not believed ([`judge`]).
@@ -119,21 +119,21 @@ pub enum Refused {
     Impossible,
     /// The round trip took this many nanoseconds, past [`DELAY_MOST`].
     Slow(i64),
-    /// It would move a set clock by this many nanoseconds, past [`STEP_MOST`].
+    /// It would move the clock by this many nanoseconds, past [`STEP_MOST`].
     Step(i64),
     /// As `Step`, and no earlier answer agrees yet ([`Steps`]).
     Unconfirmed(i64),
 }
 
-/// Whether to believe an answer with the four times of [`offset`], to a
-/// client whose clock the network has (`set`) or has not set yet: the
-/// offset to add to its clock and the round trip, or why not.
-pub fn judge(t1: u64, t2: u64, t3: u64, t4: u64, set: bool) -> Result<(i64, i64), Refused> {
+/// Whether to believe an answer with the four times of [`offset`] alone:
+/// the offset to add to the client's clock and the round trip, or why
+/// not.
+pub fn judge(t1: u64, t2: u64, t3: u64, t4: u64) -> Result<(i64, i64), Refused> {
     let (shift, delay) = offset(t1, t2, t3, t4).ok_or(Refused::Impossible)?;
     if delay > DELAY_MOST {
         return Err(Refused::Slow(delay));
     }
-    if set && shift.unsigned_abs() > STEP_MOST {
+    if shift.unsigned_abs() > STEP_MOST {
         return Err(Refused::Step(shift));
     }
     Ok((shift, delay))
@@ -143,15 +143,20 @@ pub fn judge(t1: u64, t2: u64, t3: u64, t4: u64, set: bool) -> Result<(i64, i64)
 /// ([`Steps`]): separate questions, each with its own random number and port.
 pub const CONFIRM_APART: u64 = NS;
 
-/// A clock's steps past [`STEP_MOST`]: one answer never makes one, two
-/// answers to separate questions at least [`CONFIRM_APART`] apart that agree
-/// within their round trips do. So a lie, or a wrong first answer, is not
-/// locked in or acted on alone, and a clock that really is wrong (a
-/// firmware's clock years out, set before a restart) is still corrected.
+/// A clock's steps past [`STEP_MOST`]: one answer never makes one; a second
+/// answer, to a separate question at least [`CONFIRM_APART`] later, that
+/// agrees within the two round trips does, and where more than one server
+/// is known it must come from another server than the first. So a wrong
+/// answer, or one server that lies, is not acted on alone, and a clock that
+/// really is wrong (a firmware's clock years out) is still corrected. Where
+/// only one server is known, the second answer guards against a single
+/// wrong answer, not against that server, or anyone on the path to it,
+/// answering both: authenticated time (NTS) is what does.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Steps {
-    /// The last step refused: its offset, round trip, and when (ns).
-    pending: Option<(i64, i64, u64)>,
+    /// The last step refused: its offset, round trip, when (ns), and the
+    /// server that answered (as the caller names it).
+    pending: Option<(i64, i64, u64, u64)>,
 }
 
 impl Steps {
@@ -159,21 +164,31 @@ impl Steps {
         Steps { pending: None }
     }
 
-    /// [`judge`], at `now` (ns, monotonic): a step past [`STEP_MOST`] on a set
-    /// clock is [`Refused::Unconfirmed`] until a second answer agrees.
-    pub fn judge(&mut self, t1: u64, t2: u64, t3: u64, t4: u64, set: bool, now: u64) -> Result<(i64, i64), Refused> {
-        match judge(t1, t2, t3, t4, set) {
+    /// The server that asked for the step waiting to be confirmed, if one
+    /// does: the next question goes to another, where there is one.
+    pub fn waiting_on(&self) -> Option<u64> {
+        self.pending.map(|p| p.3)
+    }
+
+    /// [`judge`], at `now` (ns, monotonic), of an answer from `server` (any
+    /// number the caller gives each server), `alone` when no other server
+    /// is known: a step past [`STEP_MOST`] is [`Refused::Unconfirmed`] until
+    /// a second answer agrees, from another server unless `alone`, whether
+    /// the clock was set or not.
+    pub fn judge(&mut self, [t1, t2, t3, t4]: [u64; 4], now: u64, server: u64, alone: bool) -> Result<(i64, i64), Refused> {
+        match judge(t1, t2, t3, t4) {
             Err(Refused::Step(shift)) => {
                 // Within the limits judge checked but the step.
                 let delay = offset(t1, t2, t3, t4).map_or(DELAY_MOST, |(_, d)| d);
-                if let Some((before, before_delay, at)) = self.pending
+                if let Some((before, before_delay, at, from)) = self.pending
                     && now.saturating_sub(at) >= CONFIRM_APART
+                    && (alone || from != server)
                     && shift.abs_diff(before) <= (before_delay + delay) as u64 + 10_000_000
                 {
                     self.pending = None;
                     return Ok((shift, delay));
                 }
-                self.pending = Some((shift, delay, now));
+                self.pending = Some((shift, delay, now, server));
                 Err(Refused::Unconfirmed(shift))
             }
             Ok(j) => {
@@ -271,15 +286,15 @@ mod tests {
         // Ten years ahead, a 4 ms round trip.
         let far = 10 * 365 * 86_400 * s;
         let (t2, t3, t4) = (t1 + far + 2_000_000, t1 + far + 2_000_000, t1 + 4_000_000);
-        assert_eq!(judge(t1, t2, t3, t4, false).map(|(_, d)| d), Ok(4_000_000), "the first set moves any amount");
-        assert!(matches!(judge(t1, t2, t3, t4, true), Err(Refused::Step(x)) if x > 0));
-        // Back 2,000 s on a set clock.
-        assert!(matches!(judge(t1, t1 - 2000 * s, t1 - 2000 * s, t1 + 1_000_000, true), Err(Refused::Step(x)) if x < 0));
-        // 999 s on a set clock is believed.
-        assert!(judge(t1, t1 + 999 * s, t1 + 999 * s, t1 + 1_000_000, true).is_ok());
+        // Not alone, whether the clock was set or not (`Steps` confirms it).
+        assert!(matches!(judge(t1, t2, t3, t4), Err(Refused::Step(x)) if x > 0));
+        // Back 2,000 s.
+        assert!(matches!(judge(t1, t1 - 2000 * s, t1 - 2000 * s, t1 + 1_000_000), Err(Refused::Step(x)) if x < 0));
+        // 999 s is believed.
+        assert!(judge(t1, t1 + 999 * s, t1 + 999 * s, t1 + 1_000_000).is_ok());
         // A round trip of 1.5 s.
-        assert_eq!(judge(t1, t1 + s, t1 + s, t1 + 1_500_000_000, false), Err(Refused::Slow(1_500_000_000)));
-        assert_eq!(judge(t1, t1 + s, t1 + s - 1, t1 + 1000, false), Err(Refused::Impossible));
+        assert_eq!(judge(t1, t1 + s, t1 + s, t1 + 1_500_000_000), Err(Refused::Slow(1_500_000_000)));
+        assert_eq!(judge(t1, t1 + s, t1 + s - 1, t1 + 1000), Err(Refused::Impossible));
     }
 
     /// A clock set before a restart (the time page says so) is not moved
@@ -297,18 +312,66 @@ mod tests {
         let mut steps = Steps::new();
         // After a restart: the clock is set (firmware, or the instance before).
         let (t1, t2, t3, t4) = at(1_000_000 * s);
-        assert!(matches!(steps.judge(t1, t2, t3, t4, true, 10 * s), Err(Refused::Unconfirmed(x)) if x > 0), "a lone answer ten years out");
+        assert!(
+            matches!(steps.judge([t1, t2, t3, t4], 10 * s, 1, true), Err(Refused::Unconfirmed(x)) if x > 0),
+            "a lone answer ten years out"
+        );
         // Another answer at once, or one that disagrees, confirms nothing.
-        assert!(steps.judge(t1, t2, t3, t4, true, 10 * s + 1).is_err(), "too soon after the first");
+        assert!(steps.judge([t1, t2, t3, t4], 10 * s + 1, 1, true).is_err(), "too soon after the first");
         let (u1, u2, u3, u4) = (1_000_005 * s, 1_000_005 * s + far + 60 * s, 1_000_005 * s + far + 60 * s, 1_000_005 * s + 4_000_000);
-        assert!(steps.judge(u1, u2, u3, u4, true, 15 * s).is_err(), "an answer a minute away from the last");
+        assert!(steps.judge([u1, u2, u3, u4], 15 * s, 1, true).is_err(), "an answer a minute away from the last");
         // Two that agree, apart: the step is taken.
         let (v1, v2, v3, v4) = at(1_000_020 * s);
-        assert!(matches!(steps.judge(v1, v2, v3, v4, true, 30 * s), Err(Refused::Unconfirmed(_))));
+        assert!(matches!(steps.judge([v1, v2, v3, v4], 30 * s, 1, true), Err(Refused::Unconfirmed(_))));
         let (w1, w2, w3, w4) = at(1_000_022 * s);
-        assert!(matches!(steps.judge(w1, w2, w3, w4, true, 32 * s), Ok((x, _)) if x > 0), "agreeing answers correct a wrong clock");
+        assert!(matches!(steps.judge([w1, w2, w3, w4], 32 * s, 1, true), Ok((x, _)) if x > 0), "agreeing answers correct a wrong clock");
         // Within the limit, one answer is enough, as before.
-        assert!(steps.judge(t1, t1 + 999 * s, t1 + 999 * s, t1 + 1_000_000, true, 40 * s).is_ok());
+        assert!(steps.judge([t1, t1 + 999 * s, t1 + 999 * s, t1 + 1_000_000], 40 * s, 1, true).is_ok());
+    }
+
+    /// A clock nothing has set (no firmware clock: it reads 1970) is not
+    /// set by one answer either: any answer moves it far, and the one a
+    /// forger got in first was taken whole (the audit of 2026-11-27, M9).
+    /// Two agreeing answers to separate questions set it.
+    #[test]
+    fn one_answer_never_sets_an_unset_clock() {
+        let s = NS;
+        let years = 50 * 365 * 86_400 * s;
+        let (t1, t4) = (5 * s, 5 * s + 2_000_000);
+        let mut steps = Steps::new();
+        assert!(
+            matches!(steps.judge([t1, years, years, t4], 5 * s, 1, true), Err(Refused::Unconfirmed(_))),
+            "one answer set a clock nothing had set"
+        );
+        let (u1, u4) = (8 * s, 8 * s + 2_000_000);
+        assert!(matches!(steps.judge([u1, years + 3 * s, years + 3 * s, u4], 8 * s, 1, true), Ok((x, _)) if x > 0));
+    }
+
+    /// Where more than one server is known, a step is confirmed by another
+    /// server than the one that asked for it: one server (or anyone on the
+    /// path to it) answering twice does not move the clock (the review of
+    /// audit-net-auth). Alone, it confirms itself, against a wrong answer
+    /// only.
+    #[test]
+    fn a_step_is_confirmed_by_another_server_where_there_is_one() {
+        let s = NS;
+        let years = 50 * 365 * 86_400 * s;
+        let answer = |at: u64| (at, years + at, years + at, at + 2_000_000);
+        let mut steps = Steps::new();
+        let (t1, t2, t3, t4) = answer(5 * s);
+        assert!(matches!(steps.judge([t1, t2, t3, t4], 5 * s, 1, false), Err(Refused::Unconfirmed(_))));
+        assert_eq!(steps.waiting_on(), Some(1));
+        let (u1, u2, u3, u4) = answer(8 * s);
+        assert!(
+            matches!(steps.judge([u1, u2, u3, u4], 8 * s, 1, false), Err(Refused::Unconfirmed(_))),
+            "the same server confirmed its own step while another was known"
+        );
+        let (v1, v2, v3, v4) = answer(11 * s);
+        assert!(matches!(steps.judge([v1, v2, v3, v4], 11 * s, 2, false), Ok((x, _)) if x > 0), "another server's agreeing answer");
+        // One server known: its second answer confirms.
+        let mut alone = Steps::new();
+        assert!(alone.judge([t1, t2, t3, t4], 5 * s, 1, true).is_err());
+        assert!(alone.judge([u1, u2, u3, u4], 8 * s, 1, true).is_ok());
     }
 
     #[test]

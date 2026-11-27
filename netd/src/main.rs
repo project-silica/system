@@ -10,11 +10,14 @@
 //! and reading it in place twice could see two different packets. What is
 //! malformed or not for this host is dropped and counted by reason.
 //!
-//! It sets the wall clock from a time server (SNTP: the `ntp` option,
-//! `netd.ntp=<address>[:<port>]`, which only a test image's command line
-//! gives, else the server the lease names), when
-//! bound and then every 64 s doubling to 1,024 s; an answer is taken only
-//! from that server, to the port asked from, echoing the question's time.
+//! It sets the wall clock from up to three time servers named by the lease.
+//! A test image can select a server with `netd.ntp=<address>[:<port>]`.
+//! It asks when bound and then every 64 s doubling to 1,024 s. An answer is
+//! taken only from the server asked, to the port asked from, echoing the
+//! question's random number. A step past 1,000 s waits for a second answer
+//! that agrees, from another server where one is known: where only one is,
+//! that guards against a wrong answer, not against the server (or anyone on
+//! the path to it) answering both; authenticated time (NTS) is owed.
 //!
 //! It provides TCP to programs (`silica.net.Tcp`, the `tcp` module), in the
 //! same thread and the same wait as its interface: one notification, the
@@ -311,7 +314,8 @@ fn use_interface(id: u32, fixed: Option<Lease>, left: Option<Cap>, note: Cap) ->
 /// each question, so that an answer must reach the one it was asked from.
 const TIME_PORTS: core::ops::Range<u16> = 50_000..60_000;
 
-/// The time-server client's state (SNTP to one server).
+/// The time-server client's state (SNTP to the servers it knows, one at a
+/// time).
 struct TimeClient {
     /// The time page, writable (this service `sets_time`); none: no clock
     /// to set, and no question asked.
@@ -320,12 +324,12 @@ struct TimeClient {
     configured: Option<(Ipv4, u16)>,
     /// The question in flight: the random number it carried as its
     /// transmit timestamp, its time (ns since 1970 by this clock), and
-    /// the port it was asked from.
-    asked: Option<(u64, u64, u16)>,
+    /// the port it was asked from, and the server asked (`server_key`).
+    asked: Option<(u64, u64, u16, (Ipv4, u16))>,
     /// When to ask next, questions sent since the last answer, seconds
     /// between answers, and whether the clock was set: by the firmware, by
-    /// this instance, or by one before it (the time page says which), so
-    /// that the step limit holds from the first answer after a restart.
+    /// this instance, or by one before it (the time page says which), for
+    /// what is said of a step (the step limit holds whether or not).
     next: u64,
     tries: u32,
     poll: u64,
@@ -347,9 +351,30 @@ impl TimeClient {
         TimeClient { page, configured, asked: None, next: now, tries: 0, poll: 64, set, steps: ntp::Steps::new() }
     }
 
-    /// The server to ask: the configured one, else the lease's.
+    /// The servers that may be asked: the configured one, else the lease's
+    /// (up to three), and how many there are.
+    fn servers(&self, lease: Option<&Lease>) -> ([(Ipv4, u16); 3], usize) {
+        let mut out = [(Ipv4::UNSPECIFIED, 0); 3];
+        if let Some(c) = self.configured {
+            out[0] = c;
+            return (out, 1);
+        }
+        let mut n = 0;
+        for a in lease.map_or(&[][..], |l| &l.ntp[..]).iter().filter(|a| **a != Ipv4::UNSPECIFIED) {
+            out[n] = (*a, ntp::PORT);
+            n += 1;
+        }
+        (out, n)
+    }
+
+    /// The server to ask: the first, or, while a step waits to be
+    /// confirmed, another than the one that asked for it, where there is
+    /// one (`ntp::Steps`).
     fn server(&self, lease: Option<&Lease>) -> Option<(Ipv4, u16)> {
-        self.configured.or_else(|| lease?.ntp.map(|a| (a, ntp::PORT)))
+        let (list, n) = self.servers(lease);
+        let list = &list[..n];
+        let waiting = self.steps.waiting_on();
+        list.iter().find(|s| n > 1 && waiting.is_some_and(|w| w != server_key(**s))).or(list.first()).copied()
     }
 }
 
@@ -389,7 +414,7 @@ fn fixed_lease() -> Result<Option<Lease>, &'static str> {
         prefix,
         router,
         dns,
-        ntp: None,
+        ntp: [Ipv4::UNSPECIFIED; 3],
         server: Ipv4::from_u32(0),
         seconds: u32::MAX,
         renew_at: u64::MAX,
@@ -420,7 +445,7 @@ fn kept_lease(k: &Mmio, mac: Mac) -> Option<Lease> {
         prefix,
         router: ((a >> 40) & 1 != 0).then(|| lo(r)),
         dns: [lo(d), hi(d), lo(e)],
-        ntp: ((k.read64(72) >> 32) & 1 != 0).then(|| lo(k.read64(72))),
+        ntp: [if (k.read64(72) >> 32) & 1 != 0 { lo(k.read64(72)) } else { Ipv4::UNSPECIFIED }, lo(k.read64(80)), hi(k.read64(80))],
         server: hi(r),
         seconds: (e >> 32) as u32,
         renew_at: k.read64(48),
@@ -842,7 +867,7 @@ impl Stack {
         let from = TIME_PORTS.start + (r as u32 % TIME_PORTS.len() as u32) as u16;
         let mut q = [0u8; ntp::LEN];
         ntp::request(&mut q, nonce);
-        self.time.asked = Some((nonce, t1, from));
+        self.time.asked = Some((nonce, t1, from, (server, port)));
         self.time.tries += 1;
         self.time.next = if self.time.tries < 3 { now + 2 * SECOND } else { now + self.time.poll * SECOND };
         if self.time.tries >= 3 {
@@ -854,7 +879,7 @@ impl Stack {
     /// The time server answered: set the clock if it answers our question.
     fn time_answer(&mut self, now: u64, r: &ntp::Reply) {
         let Some(page) = self.time.page else { return };
-        let Some((nonce, t1, _)) = self.time.asked else { return };
+        let Some((nonce, t1, _, asked_of)) = self.time.asked else { return };
         // Only the answer to the question in flight: a blind sender does
         // not know its number.
         if r.originate != nonce {
@@ -864,7 +889,8 @@ impl Stack {
         self.time.asked = None;
         let (offset, _) = silica_rt::time::read(&page);
         let t4 = offset.wrapping_add(now);
-        let (shift, delay) = match self.time.steps.judge(t1, t2, t3, t4, self.time.set, now) {
+        let alone = self.time.servers(self.lease.as_ref()).1 <= 1;
+        let (shift, delay) = match self.time.steps.judge([t1, t2, t3, t4], now, server_key(asked_of), alone) {
             Ok(j) => j,
             Err(ntp::Refused::Impossible) => {
                 println!("netd: a time server's answer gives times that cannot be; not believed");
@@ -892,7 +918,7 @@ impl Stack {
         let Some(wall) = t4.checked_add_signed(shift) else { return };
         silica_rt::time::set(&page, wall, now, silica_rt::time::Source::Network);
         if !self.time.set || shift.unsigned_abs() > SECOND {
-            let (server, port) = self.time.server(self.lease.as_ref()).unwrap_or((Ipv4::UNSPECIFIED, 0));
+            let (server, port) = asked_of;
             println!(
                 "netd: the wall clock is {} from {server}:{port} (moved {:+} ms, round trip {} us)",
                 silica_rt::time::Civil::from_unix(wall / SECOND),
@@ -921,7 +947,8 @@ impl Stack {
         k.write64(48, l.renew_at);
         k.write64(56, l.rebind_at);
         k.write64(64, l.expires_at);
-        k.write64(72, ip(l.ntp.unwrap_or(Ipv4::UNSPECIFIED)) | (l.ntp.is_some() as u64) << 32);
+        k.write64(72, ip(l.ntp[0]) | ((l.ntp[0] != Ipv4::UNSPECIFIED) as u64) << 32);
+        k.write64(80, ip(l.ntp[1]) | ip(l.ntp[2]) << 32);
         k.write64(0, KEPT_LEASE);
     }
 
@@ -1218,8 +1245,8 @@ impl Stack {
                 },
                 Ok(d)
                     if ours
-                        && self.time.asked.is_some_and(|(_, _, from)| from == d.dst_port)
-                        && self.time.server(self.lease.as_ref()) == Some((p.src, d.src_port)) =>
+                        && self.time.asked.is_some_and(|(_, _, from, _)| from == d.dst_port)
+                        && self.time.asked.is_some_and(|(_, _, _, s)| s == (p.src, d.src_port)) =>
                 {
                     match ntp::parse(d.data) {
                         Ok(r) => self.time_answer(now, &r),
@@ -1384,4 +1411,9 @@ impl proto::Server<Handle> for Stack {
         let badge = self.caller;
         self.tcp.as_mut().ok_or(proto::Error::NoRoom)?.unlisten(badge, listener)
     }
+}
+
+/// How a time server is named to `ntp::Steps`: its address and port.
+fn server_key((a, port): (Ipv4, u16)) -> u64 {
+    u64::from(a.to_u32()) << 16 | u64::from(port)
 }
