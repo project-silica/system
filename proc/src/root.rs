@@ -14,6 +14,8 @@ use silica_rt::mem;
 const RAMDISK_VADDR: usize = 0x40_0000_0000;
 /// Where children's memory is filled in.
 const SCRATCH_VADDR: usize = 0x50_0000_0000;
+/// Where a ramdisk frame is mapped again, writable, for [`Root::wipe`].
+const WIPE_VADDR: usize = 0x60_0000_0000;
 
 /// What the root task works with once it has started.
 pub struct Root {
@@ -24,9 +26,13 @@ pub struct Root {
     pub parent: Parent,
     /// Every I/O port of the machine (x86_64; an empty slot elsewhere).
     pub ports: Cap,
-    /// The frames of the ramdisk, in the order the kernel listed its memory:
-    /// what a program that reads the boot archive itself is lent.
-    pub ramdisk: Vec<Cap>,
+    /// The frames of the ramdisk (capability, physical base, size in
+    /// bits), in the order the kernel listed its memory: lent to nobody.
+    /// The archive holds files provisioned for one service each (`files=`:
+    /// a machine key), wiped once their service has them ([`Root::wipe`]);
+    /// a program that reads part of the archive is lent an archive of just
+    /// that part ([`archive_of`]).
+    ramdisk: Vec<(Cap, u64, u8)>,
     /// The boot secret (`libsys::root::secret`): every seed and key the root
     /// task hands out descends from it. It is in the root task's memory
     /// only, never in a frame lent to anyone.
@@ -62,7 +68,7 @@ pub fn start(info: &'static RootInfo, secret: [u64; 4]) -> Result<Root, &'static
     let mut ramdisk = Vec::new();
     for (i, d) in descs.iter().enumerate().filter(|(_, d)| d.kind == KIND_RAMDISK) {
         let frame = free_slot().ok_or("the root CapSpace is full")?;
-        ramdisk.push(Cap(frame));
+        ramdisk.push((Cap(frame), d.base, d.bits));
         sys::retype(Cap(SLOT_FIRST_UNTYPED + i as u64), ObjectType::Frame, d.bits, space, frame, 1)
             .and_then(|()| sys::map(aspace, Cap(frame), RAMDISK_VADDR + d.base as usize, Rights::READ))
             .map_err(|_| "cannot map the ramdisk")?;
@@ -92,6 +98,76 @@ pub fn start(info: &'static RootInfo, secret: [u64; 4]) -> Result<Root, &'static
         sched: Cap(libsys::root::SLOT_CONTEXT),
     };
     Ok(Root { archive, parent, ports, ramdisk, secret })
+}
+
+impl Root {
+    /// Zero `data`, a part of the boot archive (an entry's bytes, as
+    /// `silica_formats::ramdisk::find` gives them), where it lies in memory:
+    /// a file provisioned for one service (`files=`) once that service's
+    /// copy is made, so that no later reader of the archive, and nothing
+    /// else that reaches its memory, finds it there. Each frame it lies in
+    /// is mapped again, writable, through a copy of its capability, and the
+    /// copy deleted after. The archive's checksum no longer holds for that
+    /// entry: it is checked once, by the kernel, before anything runs.
+    pub fn wipe(&self, data: &[u8]) -> Result<(), &'static str> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let (at, archive) = (data.as_ptr() as usize, self.archive.as_ptr() as usize);
+        if at < archive || at + data.len() > archive + self.archive.len() {
+            return Err("what is to be wiped is not part of the boot archive");
+        }
+        // Physical addresses: the archive is mapped at RAMDISK_VADDR plus them.
+        let (from, to) = ((at - RAMDISK_VADDR) as u64, (at - RAMDISK_VADDR + data.len()) as u64);
+        let rw = Rights(Rights::READ.0 | Rights::WRITE.0);
+        for &(frame, base, bits) in &self.ramdisk {
+            let (lo, hi) = (from.max(base), to.min(base + (1u64 << bits)));
+            if lo >= hi {
+                continue;
+            }
+            let copy = free_slot().ok_or("the root CapSpace is full")?;
+            sys::cap_derive(Cap(SLOT_CAPSPACE), copy, frame, rw, 0)
+                .and_then(|()| sys::map(Cap(SLOT_ASPACE), Cap(copy), WIPE_VADDR + base as usize, rw))
+                .map_err(|_| "cannot map the boot archive to wipe it")?;
+            // SAFETY: the frame's copy was just mapped writable at
+            // WIPE_VADDR plus its physical base, and `lo..hi` lies inside
+            // it. The bytes are also seen through `archive` (read-only at
+            // RAMDISK_VADDR), which the compiler takes for memory that never
+            // changes: so a wiped entry is never read through it as plain
+            // memory again. Its reader (init) copies each provisioned entry
+            // once, before it is wiped, and a test image's check after the
+            // wipe reads it with volatile reads.
+            #[allow(unsafe_code)]
+            unsafe {
+                core::ptr::write_bytes((WIPE_VADDR + lo as usize) as *mut u8, 0, (hi - lo) as usize);
+                // Deleting the copy unmaps it.
+                let _ = sys::cap_delete(Cap(copy));
+            }
+            silica_rt::ipc::release_slot(copy);
+        }
+        Ok(())
+    }
+}
+
+/// A boot archive holding `entries` (name and bytes, in this order) in a
+/// frame of its own, written by the format's own writer
+/// (`silica_formats::ramdisk::write`, which the loader uses too) and checked
+/// by its validator before it is returned: what a program that reads part of
+/// the boot archive is lent instead of all of it (the device manager: the
+/// drivers it starts).
+pub fn archive_of(entries: &[(&str, &[u8])]) -> Result<mem::Memory, &'static str> {
+    use silica_formats::ramdisk as f;
+    let len = f::archive_len(entries).ok_or("these entries make no archive")?;
+    let bits = (len.next_power_of_two().trailing_zeros() as u8).max(12);
+    let m = mem::Memory::new(bits).map_err(|_| "no memory for an archive")?;
+    // SAFETY: the frame is this program's own, mapped readable and writable
+    // for as long as `m` lives, zeroed, at least `len` bytes; nothing else
+    // refers to it yet.
+    #[allow(unsafe_code)]
+    let out = unsafe { core::slice::from_raw_parts_mut(m.addr() as *mut u8, len) };
+    let len = f::write(entries, out, f::crc32c_update).ok_or("these entries make no archive")?;
+    f::check(&out[..len], f::crc32c_update).map_err(|_| "the archive made does not pass its format's check")?;
+    Ok(m)
 }
 
 /// Turn the machine off, telling a test harness whether everything

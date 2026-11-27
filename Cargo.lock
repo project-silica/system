@@ -126,6 +126,7 @@ name = "init"
 version = "0.0.0"
 dependencies = [
  "libsys",
+ "silica-crypto",
  "silica-formats",
  "silica-idl-rt",
  "silica-manifest",
