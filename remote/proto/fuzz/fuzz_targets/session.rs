@@ -59,7 +59,7 @@ fn payloads(machine: &Keypair, owner: &Keypair, rest: &[u8]) {
         None => assert_ne!(p1.len(), silica_remote::STAMP),
     }
     let mut second = [0u8; noise::SECOND + 64];
-    let (mut machine_side, n) = resp.answer([4; 32], p2, &mut second).unwrap();
+    let (mut machine_side, n) = resp.answer(&mut [4; 32], p2, &mut second).unwrap();
     let (mut owner_side, q) = init.finish(&mut second[..n]).unwrap();
     assert_eq!(&second[..q], p2, "an answer's payload arrives as sent");
     let mut m = rest.to_vec();
@@ -97,7 +97,7 @@ fn tampered(machine: &Keypair, owner: &Keypair, rest: &[u8]) {
     }
     let (resp, _) = Responder::read(PROLOGUE, machine, &mut first[..n1]).unwrap();
     let mut second = [0u8; noise::SECOND];
-    let (_, n2) = resp.answer([4; 32], &[], &mut second).unwrap();
+    let (_, n2) = resp.answer(&mut [4; 32], &[], &mut second).unwrap();
     let before = second;
     flip(&mut second[..n2]);
     let changed = second[..n2] != before[..n2];
@@ -170,7 +170,7 @@ fuzz_target!(|data: &[u8]| {
             let (resp, p) = Responder::read(PROLOGUE, &machine, &mut first[..n]).unwrap();
             assert_eq!((silica_remote::stamp_of(&first[..p]), resp.peer()), (Some(u64::from(mode)), &owner.public));
             let mut second = [0u8; noise::SECOND];
-            let (mut machine_side, n) = resp.answer([4; 32], &[], &mut second).unwrap();
+            let (mut machine_side, n) = resp.answer(&mut [4; 32], &[], &mut second).unwrap();
             let (mut owner_side, _) = init.finish(&mut second[..n]).unwrap();
             frames(rest, |f| {
                 let Some((&kind, body)) = f.split_first() else { return };
