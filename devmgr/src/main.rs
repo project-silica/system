@@ -1184,6 +1184,17 @@ impl Manager {
                 listener.answer(&msg, |request, caps, reply, reply_caps| manager::dispatch(self, request, caps, reply, reply_caps));
                 continue;
             }
+            // A driver touching memory a client lent it and took back (the
+            // service manager stops the clients before it ends this
+            // program) is answered as at any other time: before, it was
+            // taken for the driver's end, and the driver was ended before
+            // its flush (a hosted runner: "nvme ... did not end in order").
+            if msg.badge & FAULT_BADGE != 0
+                && let Some(at) = self.running.iter().position(|r| r.id == msg.badge & !FAULT_BADGE)
+                && self.running[at].child.answer_peer_fault(&msg)
+            {
+                continue;
+            }
             let Some(k) = asked.iter().position(|id| *id == msg.badge & !FAULT_BADGE) else { continue };
             asked.swap_remove(k);
             let Some(at) = self.running.iter().position(|r| r.id == msg.badge & !FAULT_BADGE) else { continue };
@@ -1420,9 +1431,11 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
                 && b.pressed()
             {
                 println!("devmgr: the power button was pressed: shutting down");
-                // The service manager cannot ask this program to end while it
-                // waits in the call below: its drivers end in order first.
-                m.end_drivers(&mut listener);
+                // The service manager answers at once and then turns the
+                // machine off, asking this program to end (END, below) like
+                // every service that has something to finish: its drivers
+                // end in order then, and its clients are answered until it
+                // exits.
                 let mut system = silica_protocols::system::manager::Client::<Channel, Handle>::from(Channel::new(granted(GRANT_SYSTEM)));
                 if let Err(e) = system.shutdown(false) {
                     println!("ERROR: devmgr: the service manager would not shut down: {e:?}");
