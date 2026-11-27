@@ -520,8 +520,20 @@ fn hostile(devices: &mut manager::Client<Channel, Handle>, disk: u32, buffer: &M
             }
             _ => {
                 use silica_protocols::display::device;
-                match device::Client::<Channel, Handle>::from(channel).attach(lend(ring.frame(), Rights::READ)?) {
-                    Err(silica_idl_rt::CallError::Error(device::Error::InUse)) => false,
+                let mut display = device::Client::<Channel, Handle>::from(channel);
+                match display.attach(lend(ring.frame(), Rights::READ)?) {
+                    // Nor may it present the frame the console attached:
+                    // when, and which parts of it, reach the screen are the
+                    // console's to say.
+                    Err(silica_idl_rt::CallError::Error(device::Error::InUse)) => {
+                        match display.present(device::Rect { x: 0, y: 0, width: 1, height: 1 }, 0, 1) {
+                            Err(silica_idl_rt::CallError::Error(device::Error::NotAttached)) => false,
+                            r => {
+                                println!("blkcheck: presenting the console's frame: {r:?}");
+                                true
+                            }
+                        }
+                    }
                     r => {
                         println!("blkcheck: attaching to the display: {r:?}");
                         true
