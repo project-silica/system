@@ -22,6 +22,7 @@
 //! | `short` | virtio-blk: completes a read saying it wrote only the status byte, not the data |
 //! | `unplugged` | e1000e: holds every transmit while its link is down, as an 82574 does |
 //! | `slow_start` | NVMe: answers the first admin command 3 s late, so whatever the driver is told while it comes up arrives during an admin wait |
+//! | `end_faults` | virtio-rogue: does nothing until asked to end, then reads a page a peer took back, a new one each time, for ever: a driver the device manager must still end on its time |
 //!
 //! The virtio queue ([`crate::virtio`]) commits all six (`broken` by
 //! offering the device a descriptor chain it must refuse, which a virtio
@@ -50,6 +51,7 @@ pub enum Fault {
     Short = 10,
     Unplugged = 11,
     SlowStart = 12,
+    EndFaults = 13,
 }
 
 impl Fault {
@@ -68,6 +70,7 @@ impl Fault {
             b"short" => Fault::Short,
             b"unplugged" => Fault::Unplugged,
             b"slow_start" => Fault::SlowStart,
+            b"end_faults" => Fault::EndFaults,
             _ => return None,
         })
     }
@@ -86,6 +89,7 @@ impl Fault {
             10 => Fault::Short,
             11 => Fault::Unplugged,
             12 => Fault::SlowStart,
+            13 => Fault::EndFaults,
             _ => return None,
         })
     }
