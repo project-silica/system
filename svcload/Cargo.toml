@@ -9,6 +9,7 @@ publish.workspace = true
 # How the service manager runs it (init documents the fields).
 [package.metadata.silica.service]
 needs = ["silica.system.Manager:observe+control+logs", "silica.block.Partitions:list+open", "silica.log.Reader", "silica.console.Terminal", "silica.device.Manager:block+network+display+port+input+entropy+control"]
+controls = ["*", "devmgr"]
 memory = 22
 start = "check:services"
 # The logs its flood asks for (LOGS in src/main.rs): given all of them, and

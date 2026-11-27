@@ -13,6 +13,7 @@ publish.workspace = true
 # neither, it says so and ends: remote management is off.
 [package.metadata.silica.service]
 needs = ["silica.net.Tcp:listen=22", "silica.system.Manager:observe+control+update+power", "silica.log.Reader"]
+controls = ["*", "remote"]
 files = ["remote.key", "remote.owners"]
 keeps = true
 memory = 23

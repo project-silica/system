@@ -937,6 +937,19 @@ impl Manager {
         if scope::has(self.caller, want) { Ok(()) } else { Err(manager::Error::Refused) }
     }
 
+    /// Whether the caller's `control` and `update` reach service `i`: its
+    /// declaration's `controls=` names it, or says `*` and `i` is neither
+    /// the machine's nor holding secrets. A scope says what a caller may
+    /// do; this says to whom (before, every service by name: the audit's
+    /// M1).
+    fn reaches(&self, i: usize) -> Result<(), manager::Error> {
+        let target = &self.services[i];
+        let list = self.calling().and_then(|s| s.controls).ok_or(manager::Error::Refused)?;
+        let named = list.split(',').any(|c| c == target.name);
+        let every = list.split(',').any(|c| c == "*") && !target.machine && !target.secrets;
+        if named || every { Ok(()) } else { Err(manager::Error::Refused) }
+    }
+
     /// The service the current caller is (its capability's badge holds its
     /// number below the scopes).
     fn calling(&self) -> Option<&Service> {
@@ -989,6 +1002,7 @@ impl manager::Server<Handle> for Manager {
     fn stop(&mut self, name: &str) -> Result<manager::StopReply, manager::Error> {
         self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        self.reaches(i)?;
         if self.services[i].machine || self.running[i].child.is_none() {
             return Err(manager::Error::Refused);
         }
@@ -1000,6 +1014,7 @@ impl manager::Server<Handle> for Manager {
     fn restart(&mut self, name: &str) -> Result<manager::RestartReply, manager::Error> {
         self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        self.reaches(i)?;
         let child = self.running[i].child.take().ok_or(manager::Error::Refused)?;
         self.end(i, child);
         Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
@@ -1018,6 +1033,7 @@ impl manager::Server<Handle> for Manager {
     fn start(&mut self, name: &str) -> Result<manager::StartReply, manager::Error> {
         self.may(scope::SYSTEM_CONTROL)?;
         let i = self.services.iter().position(|s| s.name == name).ok_or(manager::Error::NoSuchService)?;
+        self.reaches(i)?;
         if self.running[i].child.is_none() {
             self.running[i].stopped = false;
             Manager::start(self, i).map_err(|_| manager::Error::Refused)?;
@@ -1154,6 +1170,13 @@ impl manager::Server<Handle> for Manager {
             frame.destroy()
         };
         let i = self.find(name)?;
+        self.reaches(i)?;
+        // No program a caller sends is given the machine (its device
+        // authority, memory and firmware tables): a `machine` service runs
+        // the boot archive's program, as it is never stopped by request.
+        if self.services[i].machine {
+            return Err(manager::Error::Refused);
+        }
         let program = program?;
         if let Err(e) = silica_proc::check_image(&program) {
             println!("init: the program sent to update {name} is not one this machine runs: {e:?}");
@@ -1188,6 +1211,10 @@ impl manager::Server<Handle> for Manager {
     fn revert(&mut self, name: &str) -> Result<manager::RevertReply, manager::Error> {
         self.may(scope::SYSTEM_UPDATE)?;
         let i = self.find(name)?;
+        self.reaches(i)?;
+        if self.services[i].machine {
+            return Err(manager::Error::Refused);
+        }
         if self.running[i].program.is_none() {
             return Ok(manager::RevertReply {});
         }

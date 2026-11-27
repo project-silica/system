@@ -6,7 +6,7 @@
 //! <name> [program=<binary>] [memory=<bits>] [provides=<protocol>]
 //!        [needs=<protocol>,<protocol>...] [machine] [start=boot|check:<check>]
 //!        [restart=always|never] [seed] [keeps] [ends] [sets_time] [secrets] [files=<name>,...]
-//!        [logs=<n>]
+//!        [logs=<n>] [controls=<service>,...|*]
 //! ```
 //!
 //! - `provides`: the protocol it serves; the service manager makes its
@@ -75,6 +75,14 @@
 //!   device manager, one per device it starts a driver for. Those places
 //!   are its own; without the word it has none, and past `n` it is
 //!   refused.
+//! - `controls=<service>,<service>...`: the services its
+//!   `silica.system.Manager` `control` (start, stop, restart) and `update`
+//!   (update, revert) reach; `*` names every service that is neither the
+//!   machine's (`machine`) nor holding secrets (`secrets`), which only
+//!   their own names reach. A service given either scope names them, or
+//!   the list is refused. A `machine` service is never updated or
+//!   reverted, whoever names it: no program a caller sends is given the
+//!   machine.
 
 use silica_rt::alloc::vec::Vec;
 
@@ -120,6 +128,11 @@ pub struct Service {
     pub restart: bool,
     /// Where it runs.
     pub cpu: Cpu,
+    /// The services its `silica.system.Manager` `control` and `update`
+    /// reach (`controls=`): names, and `*` for every service that is
+    /// neither the machine's (`machine`) nor holding secrets (`secrets`).
+    /// None: they reach no service.
+    pub controls: Option<&'static str>,
 }
 
 /// The services the list declares, or what is wrong with a line.
@@ -146,6 +159,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             start: Start::Boot,
             restart: false,
             cpu: Cpu::Fixed(0),
+            controls: None,
         };
         for w in words {
             let (key, value) = w.split_once('=').unwrap_or((w, ""));
@@ -182,6 +196,7 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
                 ("ends", "") => s.ends = true,
                 ("sets_time", "") => s.sets_time = true,
                 ("secrets", "") => s.secrets = true,
+                ("controls", c) if !c.is_empty() => s.controls = Some(c),
                 ("files", f) => s.files = f.split(',').filter(|n| !n.is_empty()).collect(),
                 ("logs", n) => s.logs = n.parse().ok().filter(|n| *n <= 64).ok_or("a service's logs is not a number up to 64")?,
                 ("start", "boot") => s.start = Start::Boot,
@@ -214,6 +229,24 @@ pub fn parse(text: &'static str) -> Result<Vec<Service>, &'static str> {
             && out.iter().filter(|o| o.provides == Some(p)).count() > 1
         {
             return Err("two services provide one protocol");
+        }
+    }
+    // Authority over other services names them: a service whose service
+    // manager capability may control or update says which services
+    // (`controls=`), and each name is a service here. (Before, those scopes
+    // reached every service by name, the machine's among them, and an
+    // `update` gave a program of the caller's choosing the target's grants:
+    // the audit's M1.)
+    for s in &out {
+        let reaching = silica_protocols::scope::SYSTEM_CONTROL | silica_protocols::scope::SYSTEM_UPDATE;
+        let manager = s.needs.iter().zip(&s.scopes).filter(|(n, _)| **n == ROOT_PROTOCOL).fold(0, |a, (_, b)| a | b);
+        if manager & reaching != 0 && s.controls.is_none() {
+            return Err("a service that may control or update services does not name them (`controls=`)");
+        }
+        if let Some(c) = s.controls
+            && c.split(',').any(|n| n != "*" && !out.iter().any(|o| o.name == n))
+        {
+            return Err("a service's `controls=` names a service that is not declared");
         }
     }
     // A TCP port is given to one service: the second declaration that names

@@ -104,5 +104,13 @@ fn run() -> Result<(), String> {
         }
     }
     println!("TEST entropy.a_restarted_service_repeats_nothing PASS");
+
+    // Its `control` reaches the service its declaration names (`controls=`)
+    // and no other: before, any service by name (the audit's M1).
+    match system.restart("netd") {
+        Err(silica_idl_rt::CallError::Error(system::Error::Refused)) => {}
+        other => return Err(format!("restarting netd, which this check's declaration does not name, was not refused: {other:?}")),
+    }
+    println!("TEST entropy.control_reaches_only_the_services_declared PASS");
     Ok(())
 }
