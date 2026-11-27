@@ -7,7 +7,8 @@
 //! block reads back through the whole disk at the right place (and is put
 //! back). Prints `TEST partitions.<name> PASS` for each.
 //!
-//! Grants: 0 the device manager, 1 the block server.
+//! Grants: 0 the device manager, 1 the block server, 2 the block server
+//! (list only), 3 the device manager (list only).
 #![no_std]
 #![no_main]
 
@@ -180,6 +181,24 @@ fn run() -> Result<(), &'static str> {
     }
     pass("scopes");
 
+    // The fourth grant may see the devices and not open them: it lists the
+    // disk, and its open of the disk's driver is refused (a program that
+    // only shows devices was given `open` of every class with `list`).
+    let mut seeing = manager::Client::<Channel, Handle>::from(Channel::new(Cap(slots::FIRST_GRANT + 3)));
+    let seen = seeing.list(manager::Class::Block, 0).map_err(|_| "the device manager does not answer a list-only capability")?;
+    if !seen.devices.iter().any(|d| d.id == disk_id) {
+        return Err("a capability given `list` does not see the disk");
+    }
+    match seeing.open(disk_id, None) {
+        Err(silica_idl_rt::CallError::Error(manager::Error::Refused)) => {}
+        Ok(_) => return Err("a capability given only `list` opened a disk's driver"),
+        Err(e) => {
+            println!("partcheck: open through the list-only device capability: {e:?}");
+            return Err("open through the list-only device capability failed otherwise than refused");
+        }
+    }
+    pass("device_list");
+
     // Opening a partition again and again (each open asks the driver to
     // narrow the disk's capability): the same range is the same window,
     // so the driver's windows are not used up (they were, at 256 opens).
@@ -191,19 +210,21 @@ fn run() -> Result<(), &'static str> {
     }
     pass("opens_bounded");
 
-    // A partition's client narrowing its capability as often as it likes:
-    // it gets a few windows under its own, and the disk's holders can
-    // still narrow theirs (a client once used up every window there was,
-    // and no partition could be opened after it).
+    // A partition's client narrowing its capability as often as it likes,
+    // holding every window it is given: it gets a few under its own, and
+    // the disk's holders can still narrow theirs (a client once used up
+    // every window there was, and no partition could be opened after it).
+    // Windows it lets go of are its own to have again, so it holds them.
     // The capability is kept while it is used: dropping it deletes it.
     let opened = list.open(id, None).map_err(|_| "the partition cannot be opened")?.device;
     let mut inside = device::Client::<Channel, Handle>::from(Channel::new(opened.cap()));
-    let mut granted = 0;
+    let mut kept = silica_rt::alloc::vec::Vec::new();
     for i in 0..300u64 {
-        if inside.narrow(i % blocks, 1).is_ok() {
-            granted += 1;
+        if let Ok(r) = inside.narrow(i % blocks, 1) {
+            kept.push(r.device);
         }
     }
+    let granted = kept.len();
     println!("partcheck: a partition's client asked for 300 windows under its own and was given {granted}");
     let mut devices_client = manager::Client::<Channel, Handle>::from(Channel::new(devices));
     let driver = devices_client.open(disk_id, None).map_err(|_| "the disk's driver cannot be opened")?.driver;
@@ -242,5 +263,66 @@ fn run() -> Result<(), &'static str> {
         }
     }
     pass("flush_bounded");
+
+    // Two openers of one partition are two holders: the second cannot
+    // touch the first's connection, its memory or its traces (every holder
+    // of a partition once shared one badge, so a second opener removed the
+    // first's memory and read its traces, and could not connect at all).
+    part.run(&req(Op::Read, 0, 0, 1, TRACED | 40), deadline()).map_err(|_| "a traced read failed")?;
+    let second = list.open(id, None).map_err(|_| "the partition cannot be opened a second time")?.device;
+    let mut other = device::Client::<Channel, Handle>::from(Channel::new(second.cap()));
+    if other.remove_memory(0).is_ok() {
+        return Err("a second opener of a partition removed the first opener's memory");
+    }
+    if other.trace(TRACED | 40).is_ok() {
+        return Err("a second opener of a partition read the first opener's trace");
+    }
+    drop(second);
+    part.run(&req(Op::Read, 0, 0, 1, 41), deadline()).map_err(|_| "the first opener's read failed after a second opener came")?;
+    let mut again = Disk::open_partition(server, id).map_err(|_| "a second opener of a partition has no connection of its own")?;
+    let memory2 = Memory::new(12).map_err(|_| "no memory")?;
+    again.add_memory(0, &memory2, true).map_err(|_| "the second opener cannot register its memory")?;
+    again.run(&req(Op::Read, 0, 0, 1, 42), deadline()).map_err(|_| "the second opener's read failed")?;
+    part.run(&req(Op::Read, 0, 0, 1, 43), deadline()).map_err(|_| "the first opener's read failed beside a second")?;
+    drop(again);
+    pass("holders_apart");
+
+    // A holder of the whole disk narrowing as many windows as it likes
+    // takes none of anyone else's: the partition's holder reads on (the
+    // oldest of 128 windows went for each new one, the partitions' first).
+    let driver = devices_client.open(disk_id, None).map_err(|_| "the disk's driver cannot be opened")?.driver;
+    let mut narrower = device::Client::<Channel, Handle>::from(Channel::new(driver.cap()));
+    let mut held = silica_rt::alloc::vec::Vec::new();
+    for i in 0..200u64 {
+        if let Ok(r) = narrower.narrow(first + i % blocks, 1 + i / blocks) {
+            held.push(r.device);
+        }
+    }
+    println!("partcheck: a holder of the disk asked for 200 windows and was given {}", held.len());
+    part.run(&req(Op::Read, 0, 0, 1, 44), deadline())
+        .map_err(|_| "a holder of the disk narrowing 200 windows took the partition's away")?;
+    drop(held);
+    drop(driver);
+    pass("windows_kept");
+
+    // A client opening the disk again and again (each open a capability of
+    // its own, each connected) fills only its own share of the driver's
+    // connections: another program's partition still connects (there were
+    // 16 connections for every client of the driver together).
+    let mut opened_disks = silica_rt::alloc::vec::Vec::new();
+    for _ in 0..20 {
+        match Disk::open(devices, disk_id) {
+            Ok(d) => opened_disks.push(d),
+            Err(_) => break,
+        }
+    }
+    println!("partcheck: a client opened and connected the disk {} times", opened_disks.len());
+    let mut late =
+        Disk::open_partition(server, id).map_err(|_| "a client filling the driver's connections kept a partition from connecting")?;
+    late.add_memory(0, &memory2, true).map_err(|_| "the late partition cannot register its memory")?;
+    late.run(&req(Op::Read, 0, 0, 1, 45), deadline()).map_err(|_| "the late partition's read failed")?;
+    drop(late);
+    drop(opened_disks);
+    pass("connections_apart");
     Ok(())
 }

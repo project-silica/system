@@ -231,13 +231,17 @@ fn status(s: Result<(), Status>) -> u32 {
 /// in [`Windows`], so a request finds what its capability reaches in one
 /// step. Above any badge the device manager gives clients.
 const NARROWED: u64 = 1 << 48;
-/// Windows narrowed from a capability to the whole device (a partition
-/// each, as the partitions service opens them), and windows narrowed from
-/// those, kept apart so that neither kind can use up the other's.
-const FIRST_WINDOWS: usize = 128;
-const INNER_WINDOWS: usize = 128;
-/// Most windows narrowed (at any depth) under one first window.
+/// Most windows narrowed from capabilities to the whole device (a partition
+/// each, as the partitions service opens them) that one consumer of the
+/// device manager holds at once (`silica_protocols::driver_badge`): a
+/// consumer that holds them all is refused more (`no_room`), and no other
+/// consumer's window is touched.
+const FIRST_PER_CLIENT: usize = 128;
+/// Most windows narrowed (at any depth) under one first window, held at once.
 const INNER_PER_FIRST: u32 = 4;
+/// Most windows of every consumer together: the table's bound, far above
+/// what the consumers a service manager declares hold.
+const WINDOWS_MOST: usize = 1 << 16;
 
 /// A request's tag with this bit set asks for its way through the provider
 /// to be kept (`trace`).
@@ -262,10 +266,16 @@ struct Trace {
     done: u64,
 }
 
-/// The blocks a narrowed capability reaches, and how it came to be.
+/// The blocks a narrowed capability reaches, and how it came to be. Each
+/// `narrow` makes one, for one holder: its badge is the holder's alone, so
+/// no other holder of the same blocks can reach its connection, its memory
+/// or its traces. (Every holder of a range once shared one window and its
+/// badge: a second opener of a partition removed the first's memory and
+/// read its traces.)
 #[derive(Debug)]
 struct Window {
-    /// The badge of the capability it was narrowed from.
+    /// The consumer it is charged to: the one whose capability it was
+    /// narrowed from (`silica_protocols::driver_badge`).
     owner: u64,
     first: u64,
     blocks: u64,
@@ -273,26 +283,34 @@ struct Window {
     under: Option<usize>,
     /// A first window: how many windows lie under it now.
     inner: u32,
-    /// When it was made, among this run's windows (the oldest goes first).
-    made: u64,
-    /// This service's capability with the window's badge: what each holder
-    /// is given is derived from it, so deleting it takes every one back.
+    /// This service's capability with the window's badge: what its holder
+    /// is given is derived from it, so deleting it takes that back, and
+    /// while anything derived from it exists (`Inspect`'s
+    /// `INSPECT_DERIVED`) somebody holds the window.
     keep: Handle,
 }
 
-/// Every window, by index ([`NARROWED`]): the first `FIRST_WINDOWS` are
-/// first windows, the rest inner ones. An index is used again only after
-/// its window's capabilities are all gone and its client disconnected.
+/// Every window, by index ([`NARROWED`]). An index is used again only once
+/// nothing derived from its window's capability exists and its client is
+/// disconnected: then the window is nobody's.
 struct Windows {
     all: Vec<Option<Window>>,
-    made: u64,
 }
 
 impl Windows {
     fn new() -> Windows {
-        let mut all = Vec::new();
-        all.resize_with(FIRST_WINDOWS + INNER_WINDOWS, || None);
-        Windows { all, made: 0 }
+        Windows { all: Vec::new() }
+    }
+
+    /// The consumer a capability with `badge` is charged to.
+    fn owner(&self, badge: u64) -> u64 {
+        if badge < NARROWED {
+            return silica_protocols::driver_badge::consumer(badge);
+        }
+        let at = usize::try_from(badge - NARROWED).ok();
+        // A window that is gone reaches nothing and is charged to nobody
+        // who can be told apart: a consumer number no driver badge has.
+        at.and_then(|k| self.all.get(k)).and_then(Option::as_ref).map_or(u64::MAX, |w| w.owner)
     }
 
     /// What the capability with `badge` reaches: its first block and how
@@ -414,9 +432,9 @@ impl<D: Device> Service<D> {
             }
             r
         });
-        if broken != 0 {
+        if !broken.is_empty() {
             // Clients that broke their rings, or are gone with their memory.
-            self.session.close(broken, &mut Map(&mut self.device));
+            self.session.close(&broken, &mut Map(&mut self.device));
         }
         self.device.kick();
     }
@@ -546,11 +564,37 @@ impl<D: Device> Service<D> {
         self.session.unmap_finished(&mut Map(&mut self.device));
     }
 
+    /// Whether nobody holds window `k` any more: nothing derived from its
+    /// capability exists (the kernel says so: `Inspect`'s `INSPECT_DERIVED`),
+    /// no client is connected through it, and no window lies under it.
+    fn unheld(&self, k: usize) -> bool {
+        let Some(w) = self.windows.all.get(k).and_then(Option::as_ref) else { return false };
+        w.inner == 0
+            && matches!(sys::inspect_slot(slots::SPACE, w.keep.cap().0), Ok(Some(s)) if !s.derived)
+            && !self.session.connected(NARROWED + k as u64)
+    }
+
+    /// End every window `which` picks that nobody holds any more: what a
+    /// consumer at its share gets back of its own. Looks only at the
+    /// windows `which` picks (one consumer's, or one first window's).
+    fn give_back(&mut self, which: impl Fn(&Window) -> bool) {
+        for k in 0..self.windows.all.len() {
+            if self.windows.all[k].as_ref().is_some_and(&which) && self.unheld(k) {
+                self.end_window(k);
+            }
+        }
+    }
+
     /// End window `k`: every capability to it goes, its client is
-    /// disconnected, and so is every window under it.
+    /// disconnected, and so is every window under it; what it traced is
+    /// forgotten, so a window given its index later sees none of it.
     fn end_window(&mut self, k: usize) {
         let Some(w) = self.windows.all[k].take() else { return };
-        self.session.disconnect(NARROWED + k as u64, &mut Map(&mut self.device));
+        let badge = NARROWED + k as u64;
+        for t in self.traces.iter_mut().filter(|t| t.client == badge) {
+            *t = Trace::default();
+        }
+        self.session.disconnect(badge, &mut Map(&mut self.device));
         // Its capability goes, and with it every one derived from it (the
         // holders'), which is the point (`Handle` deletes it when dropped).
         let under = w.under;
@@ -562,7 +606,7 @@ impl<D: Device> Service<D> {
                 }
             }
             None => {
-                for i in FIRST_WINDOWS..FIRST_WINDOWS + INNER_WINDOWS {
+                for i in 0..self.windows.all.len() {
                     if self.windows.all[i].as_ref().is_some_and(|w| w.under == Some(k)) {
                         self.end_window(i);
                     }
@@ -651,16 +695,16 @@ impl<D: Device> device::Server<Handle> for Service<D> {
         Ok(TraceReply { taken: t.taken, started: t.started, done: t.done })
     }
 
-    /// Windows are kept for as long as the driver runs, so they are
-    /// bounded. A first window (narrowed from the whole device) is named by
-    /// its range alone: every holder of the whole device may reach it, so
-    /// whoever narrows the same range again (a partition opened again, by
-    /// the same or another opener) is given the same window; there are
-    /// `FIRST_WINDOWS`, and past them the oldest ends (its capabilities
-    /// are taken back, its client disconnected). An inner window (narrowed
-    /// from a narrowed capability) is named by its range and the window it
-    /// was narrowed from; under one first window there are at most
-    /// `INNER_PER_FIRST`, past them `no_room`.
+    /// Each `narrow` is a window of its own, for one holder (see
+    /// `Window`), charged to the consumer whose capability it was narrowed
+    /// from. A consumer holds at most `FIRST_PER_CLIENT` windows of the
+    /// whole device, and under one first window there are at most
+    /// `INNER_PER_FIRST`; past either, the consumer's own windows that
+    /// nobody holds any more (the kernel says when: `Service::unheld`) make
+    /// room, and else it is refused (`no_room`). No window anyone holds is
+    /// ever taken to make room: before, past 128 windows the oldest ended,
+    /// so any holder of the whole disk could narrow 128 ranges and cut off
+    /// every partition's holder, the root filesystem's among them.
     fn narrow(&mut self, first: u64, blocks: u64) -> Result<NarrowReply<Handle>, Error> {
         let info = self.device.info();
         let caller = self.caller;
@@ -669,34 +713,34 @@ impl<D: Device> device::Server<Handle> for Service<D> {
             return Err(Error::Outside);
         }
         let first = base + first;
-        let narrowed = caller >= NARROWED;
-        let same = |w: &Window| (w.first, w.blocks) == (first, blocks) && if narrowed { w.owner == caller } else { w.under.is_none() };
-        if let Some(k) = self.windows.all.iter().position(|w| w.as_ref().is_some_and(same)) {
-            return self.give_window(k);
-        }
+        let owner = self.windows.owner(caller);
         // Under which first window it lies, if the caller's is narrowed.
         let under = (caller >= NARROWED).then(|| {
             let k = (caller - NARROWED) as usize;
             self.windows.all[k].as_ref().and_then(|w| w.under).unwrap_or(k)
         });
-        let k = match under {
-            Some(f) => {
-                if self.windows.all[f].as_ref().is_none_or(|w| w.inner >= INNER_PER_FIRST) {
-                    return Err(Error::NoRoom);
-                }
-                (FIRST_WINDOWS..FIRST_WINDOWS + INNER_WINDOWS).find(|i| self.windows.all[*i].is_none()).ok_or(Error::NoRoom)?
+        let full = |s: &Self| match under {
+            Some(f) => s.windows.all[f].as_ref().is_none_or(|w| w.inner >= INNER_PER_FIRST),
+            None => s.windows.all.iter().flatten().filter(|w| w.owner == owner && w.under.is_none()).count() >= FIRST_PER_CLIENT,
+        };
+        if full(self) {
+            match under {
+                Some(f) => self.give_back(|w| w.under == Some(f)),
+                None => self.give_back(|w| w.owner == owner && w.under.is_none()),
             }
-            None => match (0..FIRST_WINDOWS).find(|i| self.windows.all[*i].is_none()) {
-                Some(k) => k,
-                None => {
-                    // The oldest goes.
-                    let oldest = (0..FIRST_WINDOWS)
-                        .min_by_key(|i| self.windows.all[*i].as_ref().map_or(u64::MAX, |w| w.made))
-                        .ok_or(Error::NoRoom)?;
-                    self.end_window(oldest);
-                    oldest
-                }
-            },
+            if full(self) {
+                return Err(Error::NoRoom);
+            }
+        }
+        // A free index, else a new one.
+        let k = match self.windows.all.iter().position(Option::is_none) {
+            Some(k) => k,
+            None if self.windows.all.len() < WINDOWS_MOST => {
+                self.windows.all.try_reserve(1).map_err(|_| Error::NoRoom)?;
+                self.windows.all.push(None);
+                self.windows.all.len() - 1
+            }
+            None => return Err(Error::NoRoom),
         };
         let badge = NARROWED + k as u64;
         let keep = free_slot().ok_or(Error::NoRoom)?;
@@ -704,9 +748,7 @@ impl<D: Device> device::Server<Handle> for Service<D> {
             release_slot(keep);
             return Err(Error::NoRoom);
         }
-        self.windows.made += 1;
-        self.windows.all[k] =
-            Some(Window { owner: caller, first, blocks, under, inner: 0, made: self.windows.made, keep: Handle::new(Cap(keep)) });
+        self.windows.all[k] = Some(Window { owner, first, blocks, under, inner: 0, keep: Handle::new(Cap(keep)) });
         if let Some(f) = under
             && let Some(w) = self.windows.all[f].as_mut()
         {
@@ -716,7 +758,8 @@ impl<D: Device> device::Server<Handle> for Service<D> {
     }
 
     fn connect(&mut self, rings: Handle, completions: Handle) -> Result<ConnectReply<Handle>, Error> {
-        let requests = self.session.connect(self.caller, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
+        let owner = self.windows.owner(self.caller);
+        let requests = self.session.connect(self.caller, owner, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
         Ok(ConnectReply { requests })
     }
 

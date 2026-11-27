@@ -175,8 +175,9 @@ struct Manager {
     listing: Vec<manager::Device<'static>>,
     /// What `describe` answers with, one part of it.
     described: silica_rt::alloc::string::String,
-    /// Badges of driver capabilities handed out, so each client is told apart.
-    next_client: u64,
+    /// Driver capabilities handed out, so each is told apart: the low half
+    /// of their badges (`silica_protocols::driver_badge`).
+    opens: u32,
     /// Hot-plug capable ports, with the configuration space base (ECAM)
     /// and segment of the buses behind them.
     /// (Each with the segment's last bus.)
@@ -216,6 +217,14 @@ struct Manager {
     /// The badge of the call being answered: whose capability, and its
     /// scopes (`silica_protocols::scope`).
     caller: u64,
+}
+
+/// Whether `caller` may see the devices of `class` (`list`, `watch`): with
+/// the class's scope, or with `list` for any class but the watchdog. Seeing
+/// a device does not let a caller open it (`open` takes the class's scope).
+fn may_see(caller: u64, class: manager::Class) -> bool {
+    let s = scope_of(class);
+    s != 0 && (scope::has(caller, s) || (class != manager::Class::Watchdog && scope::has(caller, scope::DEVICE_LIST)))
 }
 
 /// The scope a caller needs for devices of `class`.
@@ -278,7 +287,7 @@ fn class_of(f: &Function) -> Option<manager::Class> {
 impl manager::Server<Handle> for Manager {
     fn list<'a>(&'a mut self, class: manager::Class, from: u32) -> manager::ListReply<'a, Handle> {
         self.listing.clear();
-        if scope_of(class) == 0 || !scope::has(self.caller, scope_of(class)) {
+        if !may_see(self.caller, class) {
             return manager::ListReply { devices: silica_idl_rt::Array::new(&self.listing), next: 0 };
         }
         let functions = &self.functions;
@@ -306,9 +315,17 @@ impl manager::Server<Handle> for Manager {
             return Err(manager::Error::Refused);
         }
         let slot = free_slot().ok_or(manager::Error::NoRoom)?;
-        self.next_client += 1;
+        // Each capability its own badge, never one given before, and charged
+        // to the consumer that asked: the driver keeps its connections and
+        // windows apart by it (`silica_protocols::driver_badge`).
+        let Some(open) = self.opens.checked_add(1) else {
+            release_slot(slot);
+            return Err(manager::Error::NoRoom);
+        };
+        self.opens = open;
+        let badge = silica_protocols::driver_badge::of(silica_protocols::driver_badge::consumer_of_caller(caller), open);
         let rights = Rights(Rights::WRITE.0 | Rights::GRANT.0);
-        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, self.next_client).is_err() {
+        if sys::cap_derive(slots::SPACE, slot, r.service.cap(), rights, badge).is_err() {
             release_slot(slot);
             return Err(manager::Error::NoRoom);
         }
@@ -346,7 +363,7 @@ impl manager::Server<Handle> for Manager {
     }
 
     fn watch(&mut self, class: manager::Class, changed: Handle) -> manager::WatchReply {
-        if scope_of(class) != 0 && scope::has(self.caller, scope_of(class)) {
+        if may_see(self.caller, class) {
             let caller = self.caller;
             self.watchers.retain(|(c, k, _)| (*c, *k) != (caller, class));
             self.watchers.push((caller, class, changed));
@@ -1302,7 +1319,7 @@ fn run(process: &ProcessInfo) -> Result<core::convert::Infallible, &'static str>
         next_id: 0,
         listing: Vec::new(),
         described: silica_rt::alloc::string::String::new(),
-        next_client: CLIENTS,
+        opens: 0,
         ports: Vec::new(),
         bridges: Vec::new(),
         settling: Vec::new(),

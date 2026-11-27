@@ -127,6 +127,11 @@ pub mod scope {
     /// No declaration can name it: the service manager alone holds it, so
     /// nothing else can pet the watchdog of a hung machine.
     pub const DEVICE_WATCHDOG: u64 = 1 << 7;
+    /// `silica.device.Manager`: `list` and `watch` of every class but the
+    /// watchdog, and no `open`: what a program that shows or waits for
+    /// devices needs (the shell's `devices`), which before could only be
+    /// given with `open`, and with it every class's drivers.
+    pub const DEVICE_LIST: u64 = 1 << 8;
 
     /// `silica.block.Partitions`: `list`.
     pub const PARTITIONS_LIST: u64 = 1 << 0;
@@ -172,6 +177,7 @@ pub mod scope {
                 ("input", DEVICE_INPUT),
                 ("entropy", DEVICE_ENTROPY),
                 ("control", DEVICE_CONTROL),
+                ("list", DEVICE_LIST),
             ],
             "silica.block.Partitions" => &[("list", PARTITIONS_LIST), ("open", PARTITIONS_OPEN)],
             "silica.net.Tcp" => &[("connect", TCP_CONNECT)],
@@ -221,6 +227,31 @@ pub mod scope {
             // The other protocols take no port.
             assert!(parse("silica.system.Manager", "listen=22").is_err());
         }
+    }
+}
+
+/// The badge of a capability to a driver the device manager hands out
+/// (`silica.device.Manager`'s `open`): the consumer that asked, in bits 32
+/// to 47 (its number in its own badge to the device manager, the bits below
+/// [`scope::SHIFT`]), and which of the device manager's opens it was, in the
+/// low 32 bits, never reused. A driver keeps state for each capability (a
+/// connection, a window) and charges it to the consumer, so one program
+/// filling its share takes none of another's (2026-11-27: one program
+/// opening a disk 16 times kept every other from connecting to it).
+pub mod driver_badge {
+    /// The badge of a consumer's `open`-th capability to a driver.
+    pub const fn of(consumer: u64, open: u32) -> u64 {
+        (consumer & 0xFFFF) << 32 | open as u64
+    }
+
+    /// The consumer a driver capability's `badge` was given to.
+    pub const fn consumer(badge: u64) -> u64 {
+        badge >> 32 & 0xFFFF
+    }
+
+    /// The consumer's number in its badge to the device manager.
+    pub const fn consumer_of_caller(caller: u64) -> u64 {
+        caller & 0xFFFF
     }
 }
 

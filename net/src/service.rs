@@ -176,8 +176,8 @@ impl<D: Device> Service<D> {
             device.start(&r, m.address + r.offset as u64, ticket)?;
             Ok(ticket)
         });
-        if broken != 0 {
-            self.session.close(broken, &mut Map(&mut self.device));
+        if !broken.is_empty() {
+            self.session.close(&broken, &mut Map(&mut self.device));
         }
         self.device.kick();
     }
@@ -216,7 +216,8 @@ impl<D: Device> device::Server<Handle> for Service<D> {
         if !self.session.has_client() && self.device.holding() > 0 {
             self.device.forget_client();
         }
-        let requests = self.session.connect(self.caller, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
+        let owner = silica_protocols::driver_badge::consumer(self.caller);
+        let requests = self.session.connect(self.caller, owner, rings, completions, &mut Map(&mut self.device)).map_err(error)?;
         Ok(ConnectReply { requests })
     }
 
