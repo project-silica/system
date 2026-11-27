@@ -50,7 +50,7 @@ use silica_net::tcp::{Read, Stream, Tcp};
 use silica_protocols::remote::session;
 use silica_protocols::scope;
 use silica_protocols::system::manager;
-use silica_remote::{Frames, MAX_FRAME, MAX_MESSAGE, PROLOGUE, Stamp, Status, TAG};
+use silica_remote::{Floor, Frames, MAX_FRAME, MAX_MESSAGE, PROLOGUE, Stamp, Status, TAG};
 use silica_rt::alloc::string::String;
 use silica_rt::alloc::vec::Vec;
 use silica_rt::ipc::{Channel, Handle};
@@ -106,9 +106,9 @@ struct Session {
     /// read the answer nor send one message that opens).
     proven: bool,
     /// Its handshake was answered while this machine did not know the
-    /// time, so whether it is new could not be judged: until proven it
-    /// holds no place (`make_room`).
-    unjudged: bool,
+    /// time, so whether it is new could not be judged: the time its first
+    /// message carries, by which `make_room` bounds such handshakes.
+    unjudged: Option<u64>,
     state: State,
     /// What arrived and is not yet a whole message.
     input: Vec<u8>,
@@ -143,35 +143,62 @@ struct Machine {
     /// across this service's restarts (`keep`): one taken before a restart
     /// is no more taken after it.
     newest: Vec<u64>,
+    /// The clock first messages are judged by (`silica_remote::Floor`): a
+    /// step back of the machine's clock does not move it back. Kept after
+    /// the newest times.
+    floor: Floor,
     keep: Option<silica_rt::mmio::Mmio>,
 }
 
-/// The keep page: this word, the number of owners, then each one's newest
-/// time. Another program (an update) is given a fresh page, and the times
-/// start again from zero.
+/// The keep page: this word, the number of owners, each one's newest time,
+/// then the floor of the clock first messages are judged by. Another program
+/// (an update) is given a fresh page, and the times start again from zero.
 const KEPT: u64 = u64::from_be_bytes(*b"rmtnewst");
 
 impl Machine {
-    /// The newest times kept for `owners` owners, or zeros.
-    fn kept(keep: Option<&silica_rt::mmio::Mmio>, owners: usize) -> Vec<u64> {
+    /// The newest times kept for `owners` owners, or zeros, and the clock
+    /// first messages are judged by (`silica_remote::Floor`), which follows
+    /// them.
+    fn kept(keep: Option<&silica_rt::mmio::Mmio>, owners: usize) -> (Vec<u64>, Floor) {
         match keep {
             Some(k) if k.read64(0) == KEPT && k.read64(8) == owners as u64 => {
-                (0..owners).map(|o| if 16 + 8 * o + 8 <= k.len() { k.read64(16 + 8 * o) } else { 0 }).collect()
+                let word = |i: usize| if 16 + 8 * i + 8 <= k.len() { k.read64(16 + 8 * i) } else { 0 };
+                ((0..owners).map(word).collect(), Floor { offset: word(owners) })
             }
-            _ => silica_rt::alloc::vec![0; owners],
+            _ => (silica_rt::alloc::vec![0; owners], Floor::default()),
         }
+    }
+
+    /// Keep the newest times and the floor in the keep page, whole.
+    fn save(&self) {
+        let Some(k) = &self.keep else { return };
+        let n = self.newest.len();
+        if 16 + 8 * n + 8 > k.len() {
+            return;
+        }
+        k.write64(0, KEPT);
+        k.write64(8, n as u64);
+        for (o, t) in self.newest.iter().enumerate() {
+            k.write64(16 + 8 * o, *t);
+        }
+        k.write64(16 + 8 * n, self.floor.offset);
     }
 
     /// A first message of owner `o` made at `made` was taken.
     fn took(&mut self, o: usize, made: u64) {
         self.newest[o] = made;
-        if let Some(k) = &self.keep
-            && 16 + 8 * o + 8 <= k.len()
-        {
-            k.write64(0, KEPT);
-            k.write64(8, self.newest.len() as u64);
-            k.write64(16 + 8 * o, made);
+        self.save();
+    }
+
+    /// The wall clock first messages are judged by now (`Floor`): the
+    /// machine's, never earlier than this service has read it.
+    fn judging_clock(&mut self) -> Option<u64> {
+        let before = self.floor;
+        let wall = self.floor.read(silica_rt::time::now().map(|w| w.ns), silica_rt::clock().now());
+        if self.floor != before {
+            self.save();
         }
+        wall
     }
 }
 
@@ -240,9 +267,12 @@ fn main(_info: &'static ProcessInfo) -> i64 {
     silica_rt::serving();
     // A page of 4 KiB, read and written one access at a time.
     let keep = silica_rt::mem::peer(slots::KEEP, 12, Rights(Rights::READ.0 | Rights::WRITE.0)).ok();
-    let newest = Machine::kept(keep.as_ref(), owners.len());
+    let (newest, floor) = Machine::kept(keep.as_ref(), owners.len());
     let sending = owners.iter().map(|_| silica_remote::Sending::default()).collect();
-    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), sending, newest, keep };
+    let mut m = Machine { key, owners, manager: Channel::new(Cap(MANAGER)), log: Channel::new(Cap(LOG)), sending, newest, floor, keep };
+    // The clock as it reads at the start, before any time server could step
+    // it back (`Floor`).
+    let _ = m.judging_clock();
     let mut sessions: Vec<Session> = Vec::new();
     loop {
         let now = silica_rt::clock().now();
@@ -259,7 +289,7 @@ fn main(_info: &'static ProcessInfo) -> i64 {
                         owner: None,
                         from,
                         proven: false,
-                        unjudged: false,
+                        unjudged: None,
                         state: State::Handshake,
                         input: Vec::new(),
                         output: Vec::new(),
@@ -342,13 +372,23 @@ fn main(_info: &'static ProcessInfo) -> i64 {
 /// many there are), so a stream of newcomers cannot push out an owner's
 /// connection before its first message is read; one whose owner's
 /// handshake was answered (a fresh one: a replay is refused, `stamp`) is
-/// the owner's, a round trip from proving it, and is never closed for room,
-/// unless it was answered while the machine did not know the time
-/// (`unjudged`: a recording would be answered too), which holds no place.
+/// the owner's, a round trip from proving it, and is never closed for room.
+/// Handshakes answered while the machine did not know the time (`unjudged`: a
+/// recording would be answered too) are bounded apart: more than
+/// `MAX_UNJUDGED` close the oldest made, never an owner's new one.
 /// Whether any was closed.
 fn make_room(sessions: &mut [Session], now: u64) -> bool {
-    let stranger = |s: &Session| !s.proven && !s.closing && (matches!(s.state, State::Handshake) || s.unjudged) && now >= s.since + GRACE;
+    let stranger = |s: &Session| !s.proven && !s.closing && matches!(s.state, State::Handshake) && now >= s.since + GRACE;
     let mut closed = false;
+    // Handshakes answered while the time is unknown, unproven: a bound of
+    // their own, the oldest made closed first (`unjudged_to_close`), so an
+    // owner's new one outlasts recordings and is never a stranger's to lose.
+    let unjudged = |s: &Session| if !s.proven && !s.closing { s.unjudged } else { None };
+    while let Some(i) = silica_remote::unjudged_to_close(sessions.iter().enumerate().filter_map(|(i, s)| unjudged(s).map(|m| (i, m)))) {
+        println!("remote: a connection from {} closed: newer handshakes this machine cannot judge need its place", sessions[i].peer);
+        sessions[i].close();
+        closed = true;
+    }
     loop {
         let waiting = sessions.iter().filter(|s| !s.proven && !s.closing).count();
         let crowded = sessions
@@ -525,14 +565,15 @@ impl Session {
         // Made long before this machine's clock: a recording, even when the
         // newest times were lost (the kept page is empty after a boot and
         // after this service's program changes), as long as the machine
-        // knows the time. An owner's clock may lag it by `STAMP_WINDOW`.
+        // knows the time (by a clock a step back does not move back:
+        // `Floor`). An owner's clock may lag it by `STAMP_WINDOW`.
         // While it does not, a recording made after the newest kept cannot
         // be told from a new message: it is answered (the owner may need
         // this machine before it knows the time), but holds no place until
         // its sender proves itself, which a recording cannot (`make_room`).
-        match silica_remote::judge_stamp(made, m.newest[o], silica_rt::time::now().map(|w| w.ns)) {
+        match silica_remote::judge_stamp(made, m.newest[o], m.judging_clock()) {
             Stamp::Fresh => {}
-            Stamp::Unjudged => self.unjudged = true,
+            Stamp::Unjudged => self.unjudged = Some(made),
             Stamp::Replayed => {
                 println!(
                     "remote: a connection from {} closed: a handshake of {} made no later than the last taken from them (replayed, or their clock went back)",

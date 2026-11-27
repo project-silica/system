@@ -173,8 +173,8 @@ pub mod scope {
 
     /// The scopes protocol `protocol` defines, by the names declarations
     /// use; `None` for a protocol without scopes (a capability to it
-    /// allows all of it). `silica.net.Tcp` also takes `listen=<port>`
-    /// ([`parse`]).
+    /// allows all of it). `silica.net.Tcp` also takes `listen=<port>` or
+    /// `connect=<port>`, one port a capability ([`parse`]).
     pub fn names(protocol: &str) -> Option<&'static [(&'static str, u64)]> {
         Some(match protocol {
             "silica.system.Manager" => &[
